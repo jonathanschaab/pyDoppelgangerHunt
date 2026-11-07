@@ -18,15 +18,18 @@ from typing import (
     Union,
 )
 
+from pydoppelgangerhunt.config import (
+    resolve_closure_strictness_mode,
+    resolve_strict_with_suppression,
+)
 from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
 from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context
 from pydoppelgangerhunt.fixer._df_cell_hazards import (
     _UnitClosureHazardContext,
-    _find_enclosing_chain_definite_pre_bound,
-    _find_enclosing_function_chain,
-    _has_invalid_lexical_scope_declarations,
     _has_severed_closure_cell_hazard,
-    _resolve_unit_col_bounds,
+)
+from pydoppelgangerhunt.fixer._df_cell_traversal import (
+    _find_enclosing_chain_definite_pre_bound,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
     _COMPREHENSION_TYPES,
@@ -34,21 +37,27 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _extract_scope_nonlocals_and_outer_globals,
     _extract_single_node_local_names,
     _extract_strict_fn_local_names,
+    _is_irrefutable_case,
+    _is_irrefutable_pattern,
     _is_span_in_scope_header,
     _node_earliest_start_pos,
     _node_strictly_encloses_bounds,
     _resolve_immediate_scope_in_fn,
     iter_nested_scope_header_nodes,
 )
+from pydoppelgangerhunt.fixer._df_span_index import (
+    _find_enclosing_function_chain,
+    _has_invalid_lexical_scope_declarations,
+    _resolve_unit_col_bounds,
+)
 from pydoppelgangerhunt.fixer._df_with_provenance import (
+    _EMPTY_SUPPRESS_PROVENANCE,
+    _SuppressProvenance,
     _analyze_block_assignment,
     _block_terminates,
-    _clear_name_provenance,
     _demote_deletions_to_conditional,
     _extract_deleted_names,
     _seed_scope_suppress_aliases,
-    _split_with_body_by_mode,
-    _update_suppress_aliases_from_stmt,
     _walrus_assignment_in_expr,
     _walrus_in_sequence,
 )
@@ -58,7 +67,9 @@ from pydoppelgangerhunt.fixer._df_visitors import (
     _UnitLiveInVisitor,
     _is_ast_node_within_unit_bounds,
 )
-from pydoppelgangerhunt.reporters import extract_unit_source_code
+from pydoppelgangerhunt.reporters import (
+    extract_unit_source_lines_with_state,
+)
 from pydoppelgangerhunt.fixer.source import (
     _SUBROUTINE_KINDS,
     _WHOLE_UNIT_KINDS,
@@ -79,20 +90,18 @@ __all__ = [
     "_ScopeVisitor",
     "_analyze_block_assignment",
     "_block_terminates",
-    "_clear_name_provenance",
     "_demote_deletions_to_conditional",
     "_determine_binding_kind",
     "_extract_deleted_names",
     "_inspect_unit_scope",
+    "_is_irrefutable_case",
+    "_is_irrefutable_pattern",
     "_is_mangled_name",
     "_normalize_receiver_attr_name",
     "_normalize_receiver_attrs",
     "_normalize_receiver_order",
     "_rank_param_kind",
-    "_seed_scope_suppress_aliases",
-    "_split_with_body_by_mode",
     "_unfold_receiver_attribute",
-    "_update_suppress_aliases_from_stmt",
     "_walrus_assignment_in_expr",
     "_walrus_in_sequence",
     "analyze_unit_variable_scope",
@@ -1516,18 +1525,28 @@ def _inspect_unit_scope(
             full_source_loaded[0] = True
         return cached_full_source[0]
 
-    unit_code_lines = extract_unit_source_code(unit, repo_root=repo_root)
+    unit_code_lines, is_pre_sliced = extract_unit_source_lines_with_state(
+        unit, repo_root=repo_root
+    )
     inferred_s_col, inferred_e_col = _unit_cols(unit, unit_code_lines)
     slice_unit = (
         {**unit, "start_col": inferred_s_col, "end_col": inferred_e_col}
         if inferred_s_col is not None or inferred_e_col is not None
         else unit
     )
-    raw_lines = _slice_unit_token_lines(slice_unit, unit_code_lines)
+    raw_lines = _slice_unit_token_lines(
+        slice_unit, unit_code_lines, is_pre_sliced=is_pre_sliced
+    )
     src_code_str = (
         unit["source_code"].strip()
         if isinstance(unit.get("source_code"), str)
         else ""
+    )
+    is_placeholder_source = (
+        not src_code_str
+        and not isinstance(unit.get("source_lines"), (list, tuple))
+        and len(unit_code_lines) == 1
+        and unit_code_lines[0].startswith(("# Source for ", "# Unable to read "))
     )
     if (
         raw_lines
@@ -1601,7 +1620,14 @@ def _inspect_unit_scope(
         else:
             raw_lines = split_source_lines(str(unit["source_code"]))
     dedented = dedent_source_text("".join(raw_lines))
-    skip_pre_unit_closures_flag = bool(unit.get("skip_pre_unit_closures"))
+    _, skip_pre_unit_closures_flag = resolve_closure_strictness_mode(
+        closure_strictness=unit.get("closure_strictness"),
+        skip_pre_unit_closures=unit.get("skip_pre_unit_closures"),
+    )
+    strict_with_flag = resolve_strict_with_suppression(
+        closure_strictness=unit.get("closure_strictness"),
+        strict_with_suppression=unit.get("strict_with_suppression"),
+    )
     empty_res: Dict[str, Any] = {
         "inputs": [],
         "outputs": [],
@@ -1640,7 +1666,7 @@ def _inspect_unit_scope(
         "has_class_scoped_type_params": False,
         "deleted_names": [],
         "skip_pre_unit_closures": skip_pre_unit_closures_flag,
-        "_skip_pre_unit_closures": skip_pre_unit_closures_flag,
+        "strict_with_suppression": strict_with_flag,
     }
     if stale_source_code_mismatch:
         return {
@@ -1648,6 +1674,19 @@ def _inspect_unit_scope(
             "control_flow_hazards": ["pathological_ast"],
             "is_control_flow_safe": False,
         }
+    if is_placeholder_source and file_tree is None:
+        unit_kind_str = str(unit.get("kind") or "")
+        if (
+            bool(unit.get("is_subroutine"))
+            or unit_kind_str in _SUBROUTINE_KINDS
+            or unit_kind_str in ("closure", "comprehension", "complex_expr")
+        ):
+            return {
+                **empty_res,
+                "control_flow_hazards": ["severed_closure_cell"],
+                "closure_hazard_reasons": ["unresolved_span_bounds"],
+                "is_control_flow_safe": False,
+            }
     if not dedented.strip():
         return empty_res
 
@@ -1931,9 +1970,7 @@ def _inspect_unit_scope(
         # Definite, conditional, and branch-aware deletion analysis across candidate statements
         may_deleted: Set[str] = set()
         live_in_deleted: Set[str] = set()
-        initial_sup_aliases: Set[str] = set()
-        if "open" in visitor.params:
-            initial_sup_aliases.add("!shadow:open")
+        initial_sup_prov: _SuppressProvenance = _EMPTY_SUPPRESS_PROVENANCE
         if mod_tree is not None and any(
             isinstance(n, (ast.With, ast.AsyncWith))
             for st in candidate_stmts
@@ -1949,13 +1986,15 @@ def _inspect_unit_scope(
                 if isinstance(sup_fn, (ast.FunctionDef, ast.AsyncFunctionDef))
                 else None
             )
-            initial_sup_aliases.update(
-                _seed_scope_suppress_aliases(
-                    sup_fn,
-                    mod_tree=mod_tree,
-                    u_start=u_start,
-                    scope_ctx=sup_scope_ctx,
-                )
+            initial_sup_prov = _seed_scope_suppress_aliases(
+                sup_fn,
+                mod_tree=mod_tree,
+                u_start=u_start,
+                scope_ctx=sup_scope_ctx,
+            )
+        if "open" in visitor.params:
+            initial_sup_prov = initial_sup_prov.with_shadowed_builtins(
+                ("open",)
             )
         extra_non_sup = frozenset(
             str(n)
@@ -1966,8 +2005,9 @@ def _inspect_unit_scope(
             candidate_stmts,
             may_deleted=may_deleted,
             live_in_deleted=live_in_deleted,
-            suppress_aliases=initial_sup_aliases,
+            suppress_aliases=initial_sup_prov,
             extra_non_suppressing_ctx_managers=extra_non_sup,
+            strict_with_suppression=strict_with_flag,
         )
         for del_name in sorted(live_in_deleted):
             if (
@@ -2044,6 +2084,7 @@ def _inspect_unit_scope(
                                 u_start_col=u_start_col,
                                 u_end_col=u_end_col,
                                 mod_tree=mod_tree,
+                                strict_with_suppression=strict_with_flag,
                             )
                         )
                         for v in cond_escaping_cands:
@@ -2297,6 +2338,7 @@ def _inspect_unit_scope(
                             has_yield=visitor.has_yield,
                             is_async=visitor.is_async,
                             skip_pre_unit_closures=skip_pre_unit_closures_flag,
+                            strict_with_suppression=strict_with_flag,
                             definite_stores=def_assigned,
                             cols_resolved=cols_resolved,
                             enclosing_chain=enclosing_chain,
@@ -2306,6 +2348,18 @@ def _inspect_unit_scope(
                     )
                 ):
                     hazards.append("severed_closure_cell")
+            elif "severed_closure_cell" not in hazards and (
+                bool(_get_full_source())
+                or (unit.get("kind") == "closure" and bool(free_vars))
+            ):
+                # Fail closed when module source exists but failed AST parsing, or when
+                # a closure unit captures free variables without an enclosing module AST.
+                # Standalone snippet-only subroutine units (source_code/source_lines with
+                # no enclosing module source) are an intentional exception for isolated
+                # snippet scope inspection.
+                hazards.append("severed_closure_cell")
+                if "unresolved_span_bounds" not in closure_hazard_reasons:
+                    closure_hazard_reasons.append("unresolved_span_bounds")
 
         is_control_flow_safe = not any(
             h
@@ -2413,7 +2467,7 @@ def _inspect_unit_scope(
             "has_class_scoped_type_params": has_class_scoped_type_params,
             "deleted_names": sorted(may_deleted),
             "skip_pre_unit_closures": skip_pre_unit_closures_flag,
-            "_skip_pre_unit_closures": skip_pre_unit_closures_flag,
+            "strict_with_suppression": strict_with_flag,
         }
     except (RecursionError, MemoryError):
         return {
@@ -2423,20 +2477,21 @@ def _inspect_unit_scope(
         }
 
 
-
 def inspect_single_unit_scope(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
     tree: Optional[ast.AST] = None,
     *,
     skip_pre_unit_closures: Optional[bool] = None,
+    strict_with_suppression: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping for an individual code unit."""
-    if skip_pre_unit_closures is not None:
-        unit = {
-            **unit,
-            "skip_pre_unit_closures": bool(skip_pre_unit_closures),
-        }
+    if skip_pre_unit_closures is not None or strict_with_suppression is not None:
+        unit = dict(unit)
+        if skip_pre_unit_closures is not None:
+            unit["skip_pre_unit_closures"] = bool(skip_pre_unit_closures)
+        if strict_with_suppression is not None:
+            unit["strict_with_suppression"] = bool(strict_with_suppression)
     return _inspect_unit_scope(unit, repo_root=repo_root, file_tree=tree)
 
 
@@ -2488,18 +2543,43 @@ def _merge_type_params(tp1: Sequence[str], tp2: Sequence[str]) -> List[str]:
 
 
 def scope_matches_closure_mode(
-    scope: Optional[Dict[str, Any]], expected_skip: bool
+    scope: Optional[Dict[str, Any]],
+    expected_skip: bool,
+    *,
+    expected_strict_with: Optional[bool] = None,
+    strict_with_suppression: Optional[bool] = None,
 ) -> bool:
-    """Checks whether a precomputed scope dictionary explicitly matches expected_skip."""
+    """Checks whether a precomputed scope dictionary is compatible with expected_skip.
+
+    Unmarked caller-supplied or serialized scopes (lacking the
+    ``skip_pre_unit_closures`` key) are treated as matching the default strict
+    mode (``expected_skip=False``, ``strict_with_suppression=False``) so
+    precomputed scopes are preserved without forced recomputation. When a
+    non-default mode (such as lenient ``expected_skip=True`` or pedantic
+    ``strict_with_suppression=True``) is requested, unmarked scopes return
+    ``False`` so ``ensure_unit_scope_closure_mode`` can recompute if source is
+    available.
+    """
     if scope is None:
         return False
-    if "skip_pre_unit_closures" in scope:
-        raw_flag = scope.get("skip_pre_unit_closures")
-    elif "_skip_pre_unit_closures" in scope:
-        raw_flag = scope.get("_skip_pre_unit_closures")
-    else:
-        return False
-    return isinstance(raw_flag, bool) and raw_flag is bool(expected_skip)
+    eff_expected_with = (
+        strict_with_suppression
+        if strict_with_suppression is not None
+        else expected_strict_with
+    )
+    for flag_key, expected_val in (
+        ("skip_pre_unit_closures", bool(expected_skip)),
+        ("strict_with_suppression", eff_expected_with),
+    ):
+        if expected_val is None:
+            continue
+        if flag_key in scope:
+            raw_flag = scope.get(flag_key)
+            if not (isinstance(raw_flag, bool) and raw_flag is bool(expected_val)):
+                return False
+        elif bool(expected_val) is not False:
+            return False
+    return True
 
 
 def ensure_unit_scope_closure_mode(
@@ -2507,28 +2587,60 @@ def ensure_unit_scope_closure_mode(
     scope: Optional[Dict[str, Any]],
     skip_pre_unit_closures: bool,
     *,
+    strict_with_suppression: Optional[bool] = None,
     source_text: Optional[str] = None,
     tree: Optional[ast.AST] = None,
     repo_root: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Returns scope if its closure strictness mode matches, else recomputes it."""
+    """Returns scope if its closure strictness mode matches, else recomputes it.
+
+    Unmarked caller-supplied precomputed scopes (without ``skip_pre_unit_closures``)
+    are preserved in default strict mode, or when no unit source is loadable.
+    Marked scopes whose ``skip_pre_unit_closures`` or ``strict_with_suppression``
+    flag differs from the requested mode are recomputed when unit source or AST
+    is available, or fail closed if upgrading an explicitly marked scope to a
+    stricter mode without source.
+    """
+    eff_strict_with = (
+        bool(strict_with_suppression)
+        if strict_with_suppression is not None
+        else resolve_strict_with_suppression(
+            closure_strictness=unit.get("closure_strictness"),
+            strict_with_suppression=unit.get("strict_with_suppression"),
+        )
+    )
     if scope is not None and (
-        scope_matches_closure_mode(scope, bool(skip_pre_unit_closures))
+        scope_matches_closure_mode(
+            scope,
+            bool(skip_pre_unit_closures),
+            expected_strict_with=eff_strict_with,
+        )
         or "pathological_ast" in scope.get("control_flow_hazards", ())
     ):
         return scope
     u_copy = dict(unit)
     u_copy["skip_pre_unit_closures"] = bool(skip_pre_unit_closures)
+    u_copy["strict_with_suppression"] = eff_strict_with
     if source_text is not None and (
         not isinstance(u_copy.get("source_text"), str)
         or not u_copy["source_text"].strip()
     ):
         u_copy["source_text"] = source_text
-    if (
-        scope is not None
-        and tree is None
-        and not _load_unit_file_text(u_copy, repo_root=repo_root)
-    ):
+    has_unit_source = (
+        tree is not None
+        or bool(_load_unit_file_text(u_copy, repo_root=repo_root))
+        or (
+            isinstance(u_copy.get("source_code"), str)
+            and bool(u_copy["source_text" if "source_text" in u_copy else "source_code"].strip())
+        )
+        or isinstance(u_copy.get("source_lines"), (list, tuple))
+    )
+    if scope is not None and not has_unit_source:
+        if (
+            "skip_pre_unit_closures" not in scope
+            and "strict_with_suppression" not in scope
+        ):
+            return scope
         hazards = list(scope.get("control_flow_hazards", ()))
         if "severed_closure_cell" not in hazards:
             hazards.append("severed_closure_cell")
@@ -2537,7 +2649,7 @@ def ensure_unit_scope_closure_mode(
             "control_flow_hazards": hazards,
             "is_control_flow_safe": False,
             "skip_pre_unit_closures": bool(skip_pre_unit_closures),
-            "_skip_pre_unit_closures": bool(skip_pre_unit_closures),
+            "strict_with_suppression": eff_strict_with,
         }
     fresh_scope = inspect_single_unit_scope(
         u_copy, repo_root=repo_root, tree=tree
@@ -2554,7 +2666,7 @@ def ensure_unit_scope_closure_mode(
                 "is_control_flow_safe", True
             ),
             "skip_pre_unit_closures": bool(skip_pre_unit_closures),
-            "_skip_pre_unit_closures": bool(skip_pre_unit_closures),
+            "strict_with_suppression": eff_strict_with,
         }
     return fresh_scope
 
@@ -2569,6 +2681,7 @@ def analyze_unit_variable_scope(
     scope2: Optional[Dict[str, Any]] = None,
     *,
     skip_pre_unit_closures: Optional[bool] = None,
+    strict_with_suppression: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
     expected_skip1 = (
@@ -2576,8 +2689,21 @@ def analyze_unit_variable_scope(
         if skip_pre_unit_closures is not None
         else bool(u1.get("skip_pre_unit_closures", False))
     )
+    expected_strict_with1 = (
+        bool(strict_with_suppression)
+        if strict_with_suppression is not None
+        else resolve_strict_with_suppression(
+            closure_strictness=u1.get("closure_strictness"),
+            strict_with_suppression=u1.get("strict_with_suppression"),
+        )
+    )
     info1 = ensure_unit_scope_closure_mode(
-        u1, scope1, expected_skip1, repo_root=repo_root, tree=tree1
+        u1,
+        scope1,
+        expected_skip1,
+        strict_with_suppression=expected_strict_with1,
+        repo_root=repo_root,
+        tree=tree1,
     )
     if u2 is not None:
         expected_skip2 = (
@@ -2585,8 +2711,21 @@ def analyze_unit_variable_scope(
             if skip_pre_unit_closures is not None
             else bool(u2.get("skip_pre_unit_closures", False))
         )
+        expected_strict_with2 = (
+            bool(strict_with_suppression)
+            if strict_with_suppression is not None
+            else resolve_strict_with_suppression(
+                closure_strictness=u2.get("closure_strictness"),
+                strict_with_suppression=u2.get("strict_with_suppression"),
+            )
+        )
         info2 = ensure_unit_scope_closure_mode(
-            u2, scope2, expected_skip2, repo_root=repo_root, tree=tree2
+            u2,
+            scope2,
+            expected_skip2,
+            strict_with_suppression=expected_strict_with2,
+            repo_root=repo_root,
+            tree=tree2,
         )
         inputs = _align_symmetric_var_list(info1["inputs"], info2["inputs"])
         outputs = _align_symmetric_var_list(info1["outputs"], info2["outputs"])
@@ -2770,25 +2909,17 @@ def analyze_unit_variable_scope(
             )
         ),
         "skip_pre_unit_closures": bool(
-            info1.get(
-                "skip_pre_unit_closures",
-                info1.get("_skip_pre_unit_closures", False),
-            )
+            info1.get("skip_pre_unit_closures", False)
         )
         and (
             u2 is None
-            or bool(
-                info2.get(
-                    "skip_pre_unit_closures",
-                    info2.get("_skip_pre_unit_closures", False),
-                )
-            )
+            or bool(info2.get("skip_pre_unit_closures", False))
         ),
-        "_skip_pre_unit_closures": bool(
-            info1.get("_skip_pre_unit_closures", False)
+        "strict_with_suppression": bool(
+            info1.get("strict_with_suppression", False)
         )
-        and (
-            u2 is None
-            or bool(info2.get("_skip_pre_unit_closures", False))
+        or (
+            u2 is not None
+            and bool(info2.get("strict_with_suppression", False))
         ),
     }

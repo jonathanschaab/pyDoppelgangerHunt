@@ -17,12 +17,21 @@ from typing import (
     Set,
     Tuple,
     Union,
+    cast,
 )
 
+from pydoppelgangerhunt.fixer._df_cache import (
+    _ScopeCacheKey,
+    _get_or_compute_scope_cached,
+    _get_scope_parent_map,
+    _scope_cell_info_cache,
+)
 from pydoppelgangerhunt.fixer._df_cell_carriers import (
     _FnScopeContext,
     _can_bind_in_fn_scope,
     _extract_store_names_in_node,
+)
+from pydoppelgangerhunt.fixer._df_span_index import (
     _extract_type_alias_or_pattern_name,
     _find_enclosing_function_chain,
 )
@@ -32,6 +41,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _extract_node_type_param_names,
     _extract_scope_local_names,
     _is_irrefutable_case,
+    _node_has_star_import,
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
     _collect_func_params as _extract_arg_names,
@@ -137,9 +147,15 @@ _SHADOWABLE_BUILTIN_CTX_NAMES: frozenset[str] = frozenset(
     {"open", "builtins", "__builtins__"}
 )
 
+_SUSPICIOUS_SUPPRESS_SUBSTRINGS: Tuple[str, ...] = (
+    "suppress",
+    "raises",
+    "ignore",
+)
+
 
 @dataclass(frozen=True)
-class _SuppressProvenance(AbstractSet[str]):
+class _SuppressProvenance:
     """Structured provenance for context-manager suppression and stdlib non-suppression."""
 
     suppressors: frozenset[str] = frozenset()
@@ -158,95 +174,43 @@ class _SuppressProvenance(AbstractSet[str]):
         """Returns non-suppressing context-manager names."""
         return self.non_suppressors
 
-    def to_tokens(self) -> Set[str]:
-        """Serializes provenance into canonical token strings for set compatibility."""
-        tokens: Set[str] = set(self.suppressors)
-        for name in self.non_suppressors:
-            tokens.add(f"!nonsup:{name}")
-        for alias, mod_name in self.stdlib_modules:
-            tokens.add(f"!mod:{alias}:{mod_name}")
-        for b_name in self.shadowed_builtins:
-            tokens.add(f"!shadow:{b_name}")
-        if self.has_star_import:
-            tokens.add("!star_import")
-        return tokens
+    def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
+        """Returns AST nodes retained by this cached value (none)."""
+        return ()
 
-    @classmethod
-    def from_tokens(
-        cls, tokens: Union[_SuppressProvenance, Iterable[str]]
-    ) -> _SuppressProvenance:
-        """Constructs a structured _SuppressProvenance from an existing instance or token iterable."""
-        if isinstance(tokens, _SuppressProvenance):
-            return tokens
-        suppressors: Set[str] = set()
-        non_suppressors: Set[str] = set()
-        stdlib_modules: Set[Tuple[str, str]] = set()
-        shadowed_builtins: Set[str] = set()
-        has_star_import = False
-        for tok in tokens:
-            if not isinstance(tok, str) or not tok:
-                continue
-            if tok == "!star_import":
-                has_star_import = True
-            elif tok.startswith("!nonsup:"):
-                name = tok[len("!nonsup:") :]
-                if name:
-                    non_suppressors.add(name)
-            elif tok.startswith("!mod:"):
-                rest = tok[len("!mod:") :]
-                parts = rest.split(":", 1)
-                if len(parts) == 2 and parts[0] and parts[1]:
-                    stdlib_modules.add((parts[0], parts[1]))
-            elif tok.startswith("!shadow:"):
-                b_name = tok[len("!shadow:") :]
-                if b_name:
-                    shadowed_builtins.add(b_name)
-            elif not tok.startswith("!"):
-                suppressors.add(tok)
-        return cls(
-            suppressors=frozenset(suppressors),
-            non_suppressors=frozenset(non_suppressors),
-            stdlib_modules=frozenset(stdlib_modules),
-            shadowed_builtins=frozenset(shadowed_builtins),
-            has_star_import=has_star_import,
+    def as_cache_key_tuple(self) -> Tuple[Any, ...]:
+        """Returns a deterministic hashable tuple representation for cache keys."""
+        return (
+            tuple(sorted(self.suppressors)),
+            tuple(sorted(self.non_suppressors)),
+            tuple(sorted(self.stdlib_modules)),
+            tuple(sorted(self.shadowed_builtins)),
+            self.has_star_import,
         )
 
     def __contains__(self, item: object) -> bool:
-        if not isinstance(item, str) or not item:
-            return False
-        if item == "!star_import":
-            return self.has_star_import
-        if item.startswith("!nonsup:"):
-            return item[len("!nonsup:") :] in self.non_suppressors
-        if item.startswith("!mod:"):
-            parts = item[len("!mod:") :].split(":", 1)
-            return (
-                len(parts) == 2
-                and (parts[0], parts[1]) in self.stdlib_modules
-            )
-        if item.startswith("!shadow:"):
-            return item[len("!shadow:") :] in self.shadowed_builtins
-        if item.startswith("!"):
-            return False
-        return item in self.suppressors
+        return isinstance(item, str) and item in self.suppressors
 
     def __iter__(self) -> Iterator[str]:
-        return iter(self.to_tokens())
+        return iter(self.suppressors)
 
     def __len__(self) -> int:
-        return (
-            len(self.suppressors)
-            + len(self.non_suppressors)
-            + len(self.stdlib_modules)
-            + len(self.shadowed_builtins)
-            + (1 if self.has_star_import else 0)
+        return len(self.suppressors)
+
+    def __bool__(self) -> bool:
+        return bool(
+            self.suppressors
+            or self.non_suppressors
+            or self.stdlib_modules
+            or self.shadowed_builtins
+            or self.has_star_import
         )
 
     def clear_name(
         self, name: str, *, mark_shadow: bool = True
     ) -> _SuppressProvenance:
         """Returns provenance with suppressor and non-suppressing bindings cleared for name."""
-        if not name or name.startswith("!"):
+        if not name:
             return self
         new_sup = self.suppressors - {name}
         new_nonsup = self.non_suppressors - {name}
@@ -284,7 +248,7 @@ class _SuppressProvenance(AbstractSet[str]):
     ) -> _SuppressProvenance:
         """Clears prior bindings for name and optionally records a new provenance entry."""
         cleared = self.clear_name(name)
-        if not allow_positive or not name or name.startswith("!"):
+        if not allow_positive or not name:
             return cleared
         return _SuppressProvenance(
             suppressors=(
@@ -378,27 +342,19 @@ _EMPTY_SUPPRESS_PROVENANCE = _SuppressProvenance()
 
 
 def _coerce_suppress_provenance(
-    suppress_aliases: Optional[Union[_SuppressProvenance, AbstractSet[str]]],
+    suppress_aliases: Optional[Union[_SuppressProvenance, Iterable[str]]],
 ) -> _SuppressProvenance:
-    """Coerces an optional token set or _SuppressProvenance into a _SuppressProvenance."""
+    """Coerces an optional suppressor iterable or _SuppressProvenance into a _SuppressProvenance."""
     if suppress_aliases is None:
         return _EMPTY_SUPPRESS_PROVENANCE
     if isinstance(suppress_aliases, _SuppressProvenance):
         return suppress_aliases
-    if not suppress_aliases:
+    names = frozenset(
+        s for s in suppress_aliases if isinstance(s, str) and s
+    )
+    if not names:
         return _EMPTY_SUPPRESS_PROVENANCE
-    return _SuppressProvenance.from_tokens(suppress_aliases)
-
-
-def _sync_mutable_suppress_aliases(
-    target: Union[Set[str], _SuppressProvenance],
-    updated: _SuppressProvenance,
-) -> _SuppressProvenance:
-    """Synchronizes a mutable Set[str] in-place when used by legacy callers."""
-    if isinstance(target, set):
-        target.clear()
-        target.update(updated.to_tokens())
-    return updated
+    return _SuppressProvenance(suppressors=names)
 
 
 def _extract_ctx_manager_call_name(expr: ast.AST) -> Optional[str]:
@@ -413,29 +369,26 @@ def _extract_ctx_manager_call_name(expr: ast.AST) -> Optional[str]:
 
 def _clear_name_provenance(
     name: str,
-    suppress_aliases: Union[Set[str], _SuppressProvenance],
+    suppress_aliases: Union[Iterable[str], _SuppressProvenance],
     *,
     mark_shadow: bool = True,
 ) -> _SuppressProvenance:
     """Clears suppressor and non-suppressing stdlib provenance for a rebound name."""
-    return _sync_mutable_suppress_aliases(
-        suppress_aliases,
-        _coerce_suppress_provenance(suppress_aliases).clear_name(
-            name, mark_shadow=mark_shadow
-        ),
+    return _coerce_suppress_provenance(suppress_aliases).clear_name(
+        name, mark_shadow=mark_shadow
     )
 
 
 def _is_suppress_alias_target_expr(
     expr: Optional[ast.AST],
     suppress_aliases: Union[
-        _SuppressProvenance, AbstractSet[str]
+        _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
 ) -> bool:
     """Returns True if expr references a known suppressing context manager or alias."""
     prov = _coerce_suppress_provenance(suppress_aliases)
     if isinstance(expr, ast.Name):
-        return not expr.id.startswith("!") and (
+        return (
             expr.id in _SUPPRESSING_CTX_MANAGER_NAMES
             or expr.id in prov.suppressors
         )
@@ -447,7 +400,7 @@ def _is_suppress_alias_target_expr(
 def _is_proven_non_suppressing_target_expr(
     expr: Optional[ast.AST],
     suppress_aliases: Union[
-        _SuppressProvenance, AbstractSet[str]
+        _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
     *,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
@@ -456,7 +409,7 @@ def _is_proven_non_suppressing_target_expr(
     prov = _coerce_suppress_provenance(suppress_aliases)
     if isinstance(expr, ast.Name):
         fn_id = expr.id
-        if fn_id.startswith("!") or fn_id in prov.suppressors:
+        if fn_id in prov.suppressors:
             return False
         if fn_id in prov.non_suppressors:
             return True
@@ -501,7 +454,7 @@ def _is_proven_non_suppressing_target_expr(
 def _is_proven_non_suppressing_call(
     expr: ast.AST,
     suppress_aliases: Union[
-        _SuppressProvenance, AbstractSet[str]
+        _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
     *,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
@@ -527,6 +480,22 @@ def _class_def_may_suppress_in_exit(cls_node: ast.ClassDef) -> bool:
                         and not bool(sub.value.value)
                     ):
                         return True
+    return False
+
+
+def _func_def_may_return_suppressor(
+    fn_stmt: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+    prov: _SuppressProvenance,
+) -> bool:
+    """Returns True if a function definition returns a call or reference to a known suppressor."""
+    for sub in ast.walk(fn_stmt):
+        if isinstance(sub, ast.Return) and sub.value is not None:
+            if _is_suppress_alias_target_expr(sub.value, prov):
+                return True
+            if isinstance(sub.value, ast.Call) and _is_suppress_alias_target_expr(
+                sub.value.func, prov
+            ):
+                return True
     return False
 
 
@@ -730,6 +699,8 @@ def _update_suppress_provenance_from_stmt(
         prov = _update_suppress_provenance_from_expr_walrus(
             iter_nested_scope_header_nodes(stmt), prov, allow_positive=allow_pos
         )
+        if _func_def_may_return_suppressor(stmt, prov):
+            return prov.with_suppressor(stmt.name)
         return prov.clear_name(stmt.name)
 
     if isinstance(stmt, ast.ClassDef):
@@ -848,23 +819,22 @@ def _update_suppress_provenance_from_stmt(
 
 def _update_suppress_aliases_from_stmt(
     stmt: ast.AST,
-    suppress_aliases: Union[Set[str], _SuppressProvenance],
+    suppress_aliases: Union[Iterable[str], _SuppressProvenance],
     *,
     in_branch: bool = False,
 ) -> _SuppressProvenance:
     """Updates suppress_aliases from import, assignment, definition, or compound statements."""
-    return _sync_mutable_suppress_aliases(
-        suppress_aliases,
-        _update_suppress_provenance_from_stmt(
-            stmt,
-            _coerce_suppress_provenance(suppress_aliases),
-            in_branch=in_branch,
-        ),
+    return _update_suppress_provenance_from_stmt(
+        stmt,
+        _coerce_suppress_provenance(suppress_aliases),
+        in_branch=in_branch,
     )
 
 
 def _scope_has_direct_star_import(scope_node: ast.AST) -> bool:
     """Checks whether scope_node contains a wildcard 'from ... import *' outside nested scopes."""
+    if isinstance(scope_node, ast.Module):
+        return _node_has_star_import(scope_node)
     body_attr = getattr(scope_node, "body", ())
     if not isinstance(body_attr, (list, tuple)):
         return False
@@ -881,53 +851,101 @@ def _scope_has_direct_star_import(scope_node: ast.AST) -> bool:
     return False
 
 
-def _seed_scope_suppress_aliases(
-    fn_node: ast.AST,
-    mod_tree: Optional[ast.AST] = None,
-    scope_ctx: Optional[_FnScopeContext] = None,
-    *,
-    u_start: int = 0,
-) -> _SuppressProvenance:
-    """Seeds initial context-manager suppression and shadowing provenance for fn_node."""
-    prov = _EMPTY_SUPPRESS_PROVENANCE
-    eff_mod = (
-        mod_tree
-        if isinstance(mod_tree, ast.Module)
-        else (fn_node if isinstance(fn_node, ast.Module) else None)
-    )
-    if eff_mod is not None:
-        reached_cutoff = False
-        for m_stmt in eff_mod.body:
-            if m_stmt is fn_node:
-                reached_cutoff = True
-                continue
-            if (
-                not reached_cutoff
-                and fn_node is eff_mod
-                and 0 < u_start <= (getattr(m_stmt, "lineno", 0) or 0)
-            ):
-                reached_cutoff = True
-            prov = _update_suppress_provenance_from_stmt(
-                m_stmt, prov, in_branch=reached_cutoff
-            )
+@dataclass(frozen=True)
+class _ModuleSuppressSeed:
+    """Cached per-module top-level suppression provenance summary."""
 
-    enclosing_nodes: Sequence[ast.AST] = (
-        scope_ctx.enclosing_scopes
-        if scope_ctx is not None and scope_ctx.enclosing_scopes
-        else tuple(
-            enc_n
-            for _, _, enc_n in _find_enclosing_function_chain(
-                eff_mod,
-                int(getattr(fn_node, "lineno", 0) or 0),
-                int(getattr(fn_node, "end_lineno", 0) or 0),
-                getattr(fn_node, "col_offset", None),
-                getattr(fn_node, "end_col_offset", None),
-            )
-            if enc_n is not fn_node
+    full_forward_prov: _SuppressProvenance
+    by_top_stmt_id: Mapping[int, _SuppressProvenance]
+    has_any_positive_or_suppressor: bool
+
+    def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
+        """Returns AST nodes retained by this cached value (none)."""
+        return ()
+
+
+def _build_module_suppress_seed(eff_mod: ast.Module) -> _ModuleSuppressSeed:
+    """Builds a reusable module-level suppression provenance summary in one scan."""
+    prefix_provs: List[_SuppressProvenance] = []
+    cur = _EMPTY_SUPPRESS_PROVENANCE
+    has_pos_or_sup = False
+    for m_stmt in eff_mod.body:
+        prefix_provs.append(cur)
+        cur = _update_suppress_provenance_from_stmt(
+            m_stmt, cur, in_branch=False
         )
-        if eff_mod is not None and fn_node is not eff_mod
-        else ()
+        if cur.suppressors or cur.non_suppressors or cur.stdlib_modules:
+            has_pos_or_sup = True
+    if not has_pos_or_sup:
+        return _ModuleSuppressSeed(
+            full_forward_prov=cur,
+            by_top_stmt_id=MappingProxyType({}),
+            has_any_positive_or_suppressor=False,
+        )
+    by_top_id: dict[int, _SuppressProvenance] = {}
+    body = eff_mod.body
+    for idx, m_stmt in enumerate(body):
+        if isinstance(
+            m_stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            p_stmt = prefix_provs[idx]
+            for tail_stmt in body[idx + 1 :]:
+                p_stmt = _update_suppress_provenance_from_stmt(
+                    tail_stmt, p_stmt, in_branch=True
+                )
+            by_top_id[id(m_stmt)] = p_stmt
+    return _ModuleSuppressSeed(
+        full_forward_prov=cur,
+        by_top_stmt_id=MappingProxyType(by_top_id),
+        has_any_positive_or_suppressor=True,
     )
+
+
+def _get_module_suppress_seed(eff_mod: ast.Module) -> _ModuleSuppressSeed:
+    """Returns the cached _ModuleSuppressSeed for eff_mod."""
+    if getattr(eff_mod, "_is_ephemeral_unit_mod", False):
+        return _build_module_suppress_seed(eff_mod)
+    cache_key = _ScopeCacheKey(eff_mod, "module_suppress_seed")
+    return cast(
+        _ModuleSuppressSeed,
+        _get_or_compute_scope_cached(
+            _scope_cell_info_cache,
+            cache_key,
+            lambda: _build_module_suppress_seed(eff_mod),
+        ),
+    )
+
+
+def _seed_scope_suppress_aliases_uncached(
+    fn_node: ast.AST,
+    eff_mod: Optional[ast.Module],
+    enclosing_nodes: Sequence[ast.AST],
+    scope_ctx: Optional[_FnScopeContext],
+    u_start: int,
+) -> _SuppressProvenance:
+    """Uncached implementation of _seed_scope_suppress_aliases."""
+    prov = _EMPTY_SUPPRESS_PROVENANCE
+    if eff_mod is not None:
+        mod_seed = _get_module_suppress_seed(eff_mod)
+        if not mod_seed.has_any_positive_or_suppressor:
+            prov = mod_seed.full_forward_prov
+        elif fn_node is not eff_mod:
+            prov = mod_seed.by_top_stmt_id.get(
+                id(fn_node), mod_seed.full_forward_prov
+            )
+        elif u_start <= 0:
+            prov = mod_seed.full_forward_prov
+        else:
+            reached_cutoff = False
+            for m_stmt in eff_mod.body:
+                if not reached_cutoff and 0 < u_start <= (
+                    getattr(m_stmt, "lineno", 0) or 0
+                ):
+                    reached_cutoff = True
+                prov = _update_suppress_provenance_from_stmt(
+                    m_stmt, prov, in_branch=reached_cutoff
+                )
+
     for enc in enclosing_nodes:
         enc_args = getattr(enc, "args", None)
         if isinstance(enc_args, ast.arguments):
@@ -974,9 +992,15 @@ def _seed_scope_suppress_aliases(
         bound_in_chain.update(scope_ctx.shadowed_names | scope_ctx.fn_locals)
         if scope_ctx.has_star_import:
             has_star = True
+    if not has_star and eff_mod is not None and _node_has_star_import(eff_mod):
+        has_star = True
     for sc_node in scope_chain:
         bound_in_chain.update(_extract_scope_local_names(sc_node))
-        if not has_star and _scope_has_direct_star_import(sc_node):
+        if (
+            not has_star
+            and sc_node is not eff_mod
+            and _scope_has_direct_star_import(sc_node)
+        ):
             has_star = True
     if has_star:
         prov = prov.with_star_import()
@@ -986,10 +1010,103 @@ def _seed_scope_suppress_aliases(
     return prov
 
 
+def _seed_scope_suppress_aliases(
+    fn_node: ast.AST,
+    mod_tree: Optional[ast.AST] = None,
+    scope_ctx: Optional[_FnScopeContext] = None,
+    *,
+    u_start: int = 0,
+) -> _SuppressProvenance:
+    """Seeds initial context-manager suppression and shadowing provenance for fn_node."""
+    eff_mod = (
+        mod_tree
+        if isinstance(mod_tree, ast.Module)
+        else (fn_node if isinstance(fn_node, ast.Module) else None)
+    )
+    enclosing_nodes: Tuple[ast.AST, ...] = (
+        tuple(scope_ctx.enclosing_scopes)
+        if scope_ctx is not None and scope_ctx.enclosing_scopes
+        else tuple(
+            enc_n
+            for _, _, enc_n in _find_enclosing_function_chain(
+                eff_mod,
+                int(getattr(fn_node, "lineno", 0) or 0),
+                int(getattr(fn_node, "end_lineno", 0) or 0),
+                getattr(fn_node, "col_offset", None),
+                getattr(fn_node, "end_col_offset", None),
+            )
+            if enc_n is not fn_node
+        )
+        if eff_mod is not None and fn_node is not eff_mod
+        else ()
+    )
+    aux_nodes: Tuple[ast.AST, ...] = (
+        *(
+            (eff_mod,)
+            if eff_mod is not None and eff_mod is not fn_node
+            else ()
+        ),
+        *enclosing_nodes,
+    )
+    can_cache = not getattr(fn_node, "_is_ephemeral_unit_mod", False) and all(
+        not getattr(n, "_is_ephemeral_unit_mod", False) for n in aux_nodes
+    )
+    if can_cache and eff_mod is not None and fn_node is not eff_mod:
+        pmap = _get_scope_parent_map(eff_mod)
+        if fn_node not in pmap or any(
+            n is not eff_mod and n not in pmap for n in aux_nodes
+        ):
+            can_cache = False
+    if not can_cache:
+        return _seed_scope_suppress_aliases_uncached(
+            fn_node, eff_mod, enclosing_nodes, scope_ctx, int(u_start)
+        )
+    cache_key = _ScopeCacheKey(
+        fn_node,
+        "suppress_seed",
+        params=(int(u_start),),
+        aux_ast_nodes=aux_nodes,
+    )
+    return cast(
+        _SuppressProvenance,
+        _get_or_compute_scope_cached(
+            _scope_cell_info_cache,
+            cache_key,
+            lambda: _seed_scope_suppress_aliases_uncached(
+                fn_node, eff_mod, enclosing_nodes, scope_ctx, int(u_start)
+            ),
+        ),
+    )
+
+
+def _classify_with_item_suppression(
+    expr: ast.AST,
+    prov: _SuppressProvenance,
+    *,
+    extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
+) -> str:
+    """Classifies a single with-item context_expr as 'suppressing', 'non_suppressing', or 'unknown'."""
+    call_name = _extract_ctx_manager_call_name(expr)
+    if call_name is not None and (
+        call_name in _SUPPRESSING_CTX_MANAGER_NAMES
+        or call_name in prov.suppressors
+    ):
+        return "suppressing"
+    if isinstance(expr, ast.Name) and expr.id in prov.suppressors:
+        return "suppressing"
+    if _is_proven_non_suppressing_call(
+        expr,
+        prov,
+        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+    ):
+        return "non_suppressing"
+    return "unknown"
+
+
 def _classify_with_suppression(
     stmt: Union[ast.With, ast.AsyncWith],
     suppress_aliases: Union[
-        _SuppressProvenance, AbstractSet[str]
+        _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
     *,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
@@ -1000,35 +1117,87 @@ def _classify_with_suppression(
     prov = _coerce_suppress_provenance(suppress_aliases)
     all_non_suppressing = True
     for item in stmt.items:
-        call_name = _extract_ctx_manager_call_name(item.context_expr)
-        if (
-            call_name is not None
-            and not call_name.startswith("!")
-            and (
-                call_name in _SUPPRESSING_CTX_MANAGER_NAMES
-                or call_name in prov.suppressors
-            )
-        ):
-            return "suppressing"
-        if (
-            isinstance(item.context_expr, ast.Name)
-            and not item.context_expr.id.startswith("!")
-            and item.context_expr.id in prov.suppressors
-        ):
-            return "suppressing"
-        if not _is_proven_non_suppressing_call(
+        prov = _update_suppress_provenance_from_expr_walrus(
+            (item.context_expr,), prov
+        )
+        item_mode = _classify_with_item_suppression(
             item.context_expr,
             prov,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-        ):
+        )
+        if item_mode == "suppressing":
+            return "suppressing"
+        if item_mode != "non_suppressing":
             all_non_suppressing = False
+        if item.optional_vars is not None:
+            for o_n in _extract_store_names_in_node(item.optional_vars):
+                prov = prov.clear_name(o_n)
     return "non_suppressing" if all_non_suppressing else "unknown"
+
+
+def _looks_like_suppressing_ctx_manager(
+    expr: ast.AST,
+    suppress_aliases: Union[
+        _SuppressProvenance, Iterable[str]
+    ] = _EMPTY_SUPPRESS_PROVENANCE,
+) -> bool:
+    """Returns True if an unknown context manager expression has a suppressor-like name or shadowed builtin."""
+    prov = _coerce_suppress_provenance(suppress_aliases)
+    call_name = _extract_ctx_manager_call_name(expr)
+    if call_name == "open" and (
+        "open" in prov.shadowed_builtins or prov.has_star_import
+    ):
+        return True
+    for sub in ast.walk(expr):
+        ident: Optional[str] = None
+        if isinstance(sub, ast.Name):
+            ident = sub.id
+            if ident in prov.suppressors:
+                return True
+        elif isinstance(sub, ast.Attribute):
+            ident = sub.attr
+        if ident is not None:
+            low = ident.lower()
+            if any(tok in low for tok in _SUSPICIOUS_SUPPRESS_SUBSTRINGS):
+                return True
+    return False
+
+
+def _with_stmt_looks_suppressing(
+    stmt: Union[ast.With, ast.AsyncWith],
+    suppress_aliases: Union[
+        _SuppressProvenance, Iterable[str]
+    ] = _EMPTY_SUPPRESS_PROVENANCE,
+    *,
+    extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
+) -> bool:
+    """Returns True if any unproven item in stmt looks like an exception-suppressing manager."""
+    prov = _coerce_suppress_provenance(suppress_aliases)
+    for item in stmt.items:
+        prov = _update_suppress_provenance_from_expr_walrus(
+            (item.context_expr,), prov
+        )
+        item_mode = _classify_with_item_suppression(
+            item.context_expr,
+            prov,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+        )
+        if item_mode == "suppressing":
+            return True
+        if item_mode == "unknown" and _looks_like_suppressing_ctx_manager(
+            item.context_expr, prov
+        ):
+            return True
+        if item.optional_vars is not None:
+            for o_n in _extract_store_names_in_node(item.optional_vars):
+                prov = prov.clear_name(o_n)
+    return False
 
 
 def _is_exception_suppressing_with(
     stmt: Union[ast.With, ast.AsyncWith],
     suppress_aliases: Union[
-        _SuppressProvenance, AbstractSet[str]
+        _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
 ) -> bool:
     """Checks whether a with/async with statement uses a known exception-suppressing manager."""
@@ -1038,19 +1207,28 @@ def _is_exception_suppressing_with(
 def _may_suppress_exceptions_with(
     stmt: Union[ast.With, ast.AsyncWith],
     suppress_aliases: Union[
-        _SuppressProvenance, AbstractSet[str]
+        _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
     *,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
+    strict_with_suppression: bool = False,
 ) -> bool:
-    """Returns True unless all context managers in stmt are known non-suppressing."""
-    return (
-        _classify_with_suppression(
-            stmt,
-            suppress_aliases,
-            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-        )
-        != "non_suppressing"
+    """Returns True if stmt may suppress exceptions under the active suppression policy."""
+    w_mode = _classify_with_suppression(
+        stmt,
+        suppress_aliases,
+        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+    )
+    if w_mode == "suppressing":
+        return True
+    if w_mode == "non_suppressing":
+        return False
+    if strict_with_suppression:
+        return True
+    return _with_stmt_looks_suppressing(
+        stmt,
+        suppress_aliases,
+        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
     )
 
 
@@ -1413,12 +1591,13 @@ def _split_unknown_with_body(
 def _split_with_body_by_mode(
     stmt: Union[ast.With, ast.AsyncWith],
     suppress_aliases: Union[
-        _SuppressProvenance, AbstractSet[str]
+        _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
     *,
     safe_names: AbstractSet[str] = frozenset(),
     strict_names: bool = True,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
+    strict_with_suppression: bool = False,
 ) -> Tuple[List[ast.stmt], List[ast.stmt]]:
     """Splits a with-block body into (guaranteed_prefix, potentially_suppressed_suffix) across 3 suppression states."""
     w_mode = _classify_with_suppression(
@@ -1428,7 +1607,14 @@ def _split_with_body_by_mode(
     )
     if w_mode == "suppressing":
         return _split_suppress_with_body(stmt.body, safe_names=safe_names)
-    if w_mode == "unknown":
+    if w_mode == "unknown" and (
+        strict_with_suppression
+        or _with_stmt_looks_suppressing(
+            stmt,
+            suppress_aliases,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+        )
+    ):
         return _split_unknown_with_body(
             stmt.body, safe_names=safe_names, strict_names=strict_names
         )
@@ -1590,12 +1776,13 @@ def _block_terminates(
     statements: Sequence[ast.AST],
     *,
     suppress_aliases: Union[
-        _SuppressProvenance, AbstractSet[str]
+        _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
     loop_control_terminates: bool = False,
     safe_names: AbstractSet[str] = frozenset(),
     strict_names: bool = False,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
+    strict_with_suppression: bool = False,
 ) -> bool:
     """Returns True if the statement sequence unconditionally terminates."""
     local_prov = _coerce_suppress_provenance(suppress_aliases)
@@ -1619,6 +1806,7 @@ def _block_terminates(
                     safe_names=cur_safe,
                     strict_names=strict_names,
                     extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                    strict_with_suppression=strict_with_suppression,
                 )
                 and _block_terminates(
                     stmt.orelse,
@@ -1627,6 +1815,7 @@ def _block_terminates(
                     safe_names=cur_safe,
                     strict_names=strict_names,
                     extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                    strict_with_suppression=strict_with_suppression,
                 )
             ):
                 return True
@@ -1634,6 +1823,7 @@ def _block_terminates(
                 stmt, local_prov
             )
         elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+            header_prov = local_prov
             item_prov = local_prov
             for item in stmt.items:
                 item_prov = _update_suppress_provenance_from_expr_walrus(
@@ -1649,10 +1839,11 @@ def _block_terminates(
                         item_prov = item_prov.clear_name(t_n)
             w_body = _split_with_body_by_mode(
                 stmt,
-                item_prov,
+                header_prov,
                 safe_names=cur_safe,
                 strict_names=strict_names,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                strict_with_suppression=strict_with_suppression,
             )[0]
             if _block_terminates(
                 w_body,
@@ -1661,6 +1852,7 @@ def _block_terminates(
                 safe_names=cur_safe,
                 strict_names=strict_names,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                strict_with_suppression=strict_with_suppression,
             ):
                 return True
             local_prov = _update_suppress_provenance_from_stmt(
@@ -1684,6 +1876,7 @@ def _block_terminates(
                         safe_names=cur_safe,
                         strict_names=strict_names,
                         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                        strict_with_suppression=strict_with_suppression,
                     )
                     for c in reachable_cases
                 ):
@@ -1707,6 +1900,7 @@ def _block_terminates(
                 safe_names=cur_safe,
                 strict_names=strict_names,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                strict_with_suppression=strict_with_suppression,
             ):
                 return True
             handlers = getattr(stmt, "handlers", [])
@@ -1718,6 +1912,7 @@ def _block_terminates(
                 safe_names=cur_safe,
                 strict_names=strict_names,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                strict_with_suppression=strict_with_suppression,
             ) or (
                 bool(o_stmts)
                 and _block_terminates(
@@ -1727,6 +1922,7 @@ def _block_terminates(
                     safe_names=cur_safe,
                     strict_names=strict_names,
                     extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                    strict_with_suppression=strict_with_suppression,
                 )
             )
             if not handlers and body_terminates:
@@ -1747,6 +1943,7 @@ def _block_terminates(
                         safe_names=cur_safe,
                         strict_names=strict_names,
                         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                        strict_with_suppression=strict_with_suppression,
                     )
                     for h in handlers
                 )
@@ -1799,13 +1996,14 @@ def _analyze_block_assignment_impl(
     may_deleted: Optional[Set[str]] = None,
     live_in_deleted: Optional[Set[str]] = None,
     suppress_aliases: Union[
-        _SuppressProvenance, AbstractSet[str]
+        _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
     active_nonlocals: Optional[Set[str]] = None,
     fn_globals: AbstractSet[str] = frozenset(),
     loop_control_terminates: bool = False,
     known_safe_names: AbstractSet[str] = frozenset(),
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
+    strict_with_suppression: bool = False,
 ) -> Tuple[Set[str], Set[str], bool, _SuppressProvenance]:
     """Unified single-pass analyzer for definite/conditional bindings, deletions, and termination."""
     if definite is None:
@@ -1924,6 +2122,7 @@ def _analyze_block_assignment_impl(
                 loop_control_terminates=loop_control_terminates,
                 known_safe_names=cur_safe,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                strict_with_suppression=strict_with_suppression,
             )
             if stmt.orelse:
                 o_def, o_cond, o_term, o_prov = _analyze_block_assignment_impl(
@@ -1936,6 +2135,7 @@ def _analyze_block_assignment_impl(
                     loop_control_terminates=loop_control_terminates,
                     known_safe_names=cur_safe,
                     extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                    strict_with_suppression=strict_with_suppression,
                 )
             else:
                 o_def, o_cond, o_term, o_prov = (
@@ -2027,6 +2227,7 @@ def _analyze_block_assignment_impl(
                 loop_control_terminates=loop_control_terminates,
                 known_safe_names=definite | set(known_safe_names),
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                strict_with_suppression=strict_with_suppression,
             )
             local_prov = local_prov.merge_branch_conservative(sub_prov)
             live_in_del.update(sub_live - definite)
@@ -2064,6 +2265,7 @@ def _analyze_block_assignment_impl(
                 loop_control_terminates=loop_control_terminates,
                 known_safe_names=definite | set(known_safe_names) | t_names,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                strict_with_suppression=strict_with_suppression,
             )
             local_prov = local_prov.merge_branch_conservative(sub_prov)
             live_in_del.update((for_live - t_names) - definite)
@@ -2074,6 +2276,7 @@ def _analyze_block_assignment_impl(
             )
             definite.difference_update(_extract_shallow_deleted_names(stmt))
         elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+            header_prov = local_prov
             for item in stmt.items:
                 local_prov = _update_suppress_provenance_from_expr_walrus(
                     (item.context_expr,), local_prov
@@ -2091,9 +2294,10 @@ def _analyze_block_assignment_impl(
             cur_safe = definite | set(known_safe_names)
             safe_prefix, risky_suffix = _split_with_body_by_mode(
                 stmt,
-                local_prov,
+                header_prov,
                 safe_names=cur_safe,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                strict_with_suppression=strict_with_suppression,
             )
             _, _, w_term, local_prov = _analyze_block_assignment_impl(
                 safe_prefix,
@@ -2107,6 +2311,7 @@ def _analyze_block_assignment_impl(
                 loop_control_terminates=loop_control_terminates,
                 known_safe_names=cur_safe,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                strict_with_suppression=strict_with_suppression,
             )
             if w_term:
                 may_del.difference_update(definite - before_def)
@@ -2124,6 +2329,7 @@ def _analyze_block_assignment_impl(
                     loop_control_terminates=loop_control_terminates,
                     known_safe_names=definite | set(known_safe_names),
                     extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                    strict_with_suppression=strict_with_suppression,
                 )
                 local_prov = local_prov.merge_branch_conservative(w_prov)
                 live_in_del.update(w_live - definite)
@@ -2160,6 +2366,7 @@ def _analyze_block_assignment_impl(
                     loop_control_terminates=loop_control_terminates,
                     known_safe_names=cur_safe,
                     extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                    strict_with_suppression=strict_with_suppression,
                 )
             )
             for b_stmt in t_body:
@@ -2186,6 +2393,7 @@ def _analyze_block_assignment_impl(
                         loop_control_terminates=loop_control_terminates,
                         known_safe_names=cur_safe | t_def,
                         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                        strict_with_suppression=strict_with_suppression,
                     )
                 )
                 for o_stmt in o_stmts:
@@ -2242,6 +2450,7 @@ def _analyze_block_assignment_impl(
                         loop_control_terminates=loop_control_terminates,
                         known_safe_names=(cur_safe - raw_try_del) | h_bound,
                         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                        strict_with_suppression=strict_with_suppression,
                     )
                 )
                 for h_stmt in h_body:
@@ -2376,6 +2585,7 @@ def _analyze_block_assignment_impl(
                     loop_control_terminates=loop_control_terminates,
                     known_safe_names=definite | set(known_safe_names),
                     extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                    strict_with_suppression=strict_with_suppression,
                 )
                 local_prov = final_prov.merge_branch_conservative(f_out_prov)
             else:
@@ -2448,6 +2658,7 @@ def _analyze_block_assignment_impl(
                         loop_control_terminates=loop_control_terminates,
                         known_safe_names=cur_safe | case_init_def,
                         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                        strict_with_suppression=strict_with_suppression,
                     )
                 )
                 merged_match_prov = (
@@ -2556,9 +2767,10 @@ def _analyze_block_assignment(
     may_deleted: Optional[Set[str]] = None,
     live_in_deleted: Optional[Set[str]] = None,
     suppress_aliases: Union[
-        _SuppressProvenance, AbstractSet[str]
+        _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
+    strict_with_suppression: bool = False,
 ) -> Tuple[Set[str], Set[str]]:
     """Analyzes a sequence of statements to determine unconditionally and conditionally assigned variables."""
     def_out, cond_out, _, _ = _analyze_block_assignment_impl(
@@ -2569,6 +2781,7 @@ def _analyze_block_assignment(
         live_in_deleted=live_in_deleted,
         suppress_aliases=suppress_aliases,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+        strict_with_suppression=strict_with_suppression,
     )
     return def_out, cond_out
 
@@ -2580,9 +2793,10 @@ def _extract_block_definite_bindings_and_term(
     fn_globals: AbstractSet[str] = frozenset(),
     *,
     suppress_aliases: Union[
-        _SuppressProvenance, AbstractSet[str]
+        _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
+    strict_with_suppression: bool = False,
 ) -> Tuple[Set[str], bool]:
     """Extracts (unconditionally_bound_names, block_terminates) across a statement sequence."""
     def_out, _, term, _ = _analyze_block_assignment_impl(
@@ -2593,6 +2807,7 @@ def _extract_block_definite_bindings_and_term(
         loop_control_terminates=True,
         suppress_aliases=suppress_aliases,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+        strict_with_suppression=strict_with_suppression,
     )
     return def_out, term
 
@@ -2604,9 +2819,10 @@ def _extract_block_definite_bindings(
     fn_globals: AbstractSet[str] = frozenset(),
     *,
     suppress_aliases: Union[
-        _SuppressProvenance, AbstractSet[str]
+        _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
+    strict_with_suppression: bool = False,
 ) -> Set[str]:
     """Extracts variable names unconditionally bound across a statement sequence."""
     return _extract_block_definite_bindings_and_term(
@@ -2616,6 +2832,7 @@ def _extract_block_definite_bindings(
         fn_globals,
         suppress_aliases=suppress_aliases,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+        strict_with_suppression=strict_with_suppression,
     )[0]
 
 
@@ -2643,8 +2860,9 @@ def _eval_try_definite_bindings(
     fn_globals: AbstractSet[str],
     *,
     suppress_aliases: Union[
-        _SuppressProvenance, AbstractSet[str]
+        _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
+    strict_with_suppression: bool = False,
 ) -> Tuple[Set[str], bool]:
     """Computes definite bindings and termination across a Try/TryStar statement."""
     return _extract_block_definite_bindings_and_term(
@@ -2653,6 +2871,7 @@ def _eval_try_definite_bindings(
         bound,
         fn_globals,
         suppress_aliases=suppress_aliases,
+        strict_with_suppression=strict_with_suppression,
     )
 
 
@@ -2663,8 +2882,9 @@ def _eval_match_definite_bindings(
     fn_globals: AbstractSet[str],
     *,
     suppress_aliases: Union[
-        _SuppressProvenance, AbstractSet[str]
+        _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
+    strict_with_suppression: bool = False,
 ) -> Tuple[Set[str], bool]:
     """Computes definite bindings and termination across a Match statement."""
     return _extract_block_definite_bindings_and_term(
@@ -2673,4 +2893,5 @@ def _eval_match_definite_bindings(
         bound,
         fn_globals,
         suppress_aliases=suppress_aliases,
+        strict_with_suppression=strict_with_suppression,
     )

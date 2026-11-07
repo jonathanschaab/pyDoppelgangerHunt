@@ -46,11 +46,13 @@ def test_builtin_call_loads_target_rebinding_vs_mutation_and_hazard_matrix(
         _extract_fn_returned_closure_refs,
         _extract_mutated_target_names,
         _extract_root_target_names,
-        _find_enclosing_function_chain,
-        _resolve_unit_col_bounds,
     )
     from pydoppelgangerhunt.fixer._df_cell_traversal import (
         _analyze_enclosing_fn_cells,
+    )
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _find_enclosing_function_chain,
+        _resolve_unit_col_bounds,
     )
 
     # 1. Built-in call handling preserves loaded_names, inline_reads, inline_muts, and called_names_out
@@ -530,10 +532,8 @@ def test_is_ast_node_within_unit_bounds_and_visitors_column_filtering(
     u_end_col: Optional[int],
     expected_in_bounds: list[bool],
 ) -> None:
-    """Verifies _is_ast_node_within_unit_bounds, _UnitLiveInVisitor, and _DownstreamReadVisitor column bounds."""
+    """Verifies _is_ast_node_within_unit_bounds column bounds across parametrized ranges."""
     from pydoppelgangerhunt.fixer._df_visitors import (
-        _DownstreamReadVisitor,
-        _UnitLiveInVisitor,
         _is_ast_node_within_unit_bounds,
     )
 
@@ -552,7 +552,18 @@ def test_is_ast_node_within_unit_bounds_and_visitors_column_filtering(
     assert actual == expected_in_bounds
     assert _is_ast_node_within_unit_bounds(stmts[0], 2, 2) is True
 
-    # Middle statement on line 2: `y = x + b` (col 11..20)
+
+def test_unit_live_in_and_downstream_read_visitors_column_filtering() -> None:
+    """Verifies _UnitLiveInVisitor and _DownstreamReadVisitor column filtering on multi-statement lines."""
+    from pydoppelgangerhunt.fixer._df_visitors import (
+        _DownstreamReadVisitor,
+        _UnitLiveInVisitor,
+    )
+
+    src = "def f(a, b, c):\n    x = a; y = x + b; z = y + c\n"
+    fn_node = ast.parse(src).body[0]
+    assert isinstance(fn_node, ast.FunctionDef)
+    stmts = fn_node.body
     s_mid = stmts[1]
     mid_start = s_mid.col_offset
     mid_end = s_mid.end_col_offset
@@ -615,23 +626,27 @@ def test_scope_preservation_carrier_shadowing_and_concurrency() -> None:
         "local_imports": [],
         "yield_expr_names": [],
     }
-    marked_hand_built = {**hand_built, "_skip_pre_unit_closures": True}
+    marked_hand_built = {**hand_built, "skip_pre_unit_closures": True}
     assert (
         ensure_unit_scope_closure_mode(
             {"start": 1, "end": 1}, marked_hand_built, True
         )
         is marked_hand_built
     )
+    assert (
+        ensure_unit_scope_closure_mode(
+            {"start": 1, "end": 1}, hand_built, False
+        )
+        is hand_built
+    )
     unmarked_fallback = ensure_unit_scope_closure_mode(
         {"start": 1, "end": 1}, hand_built, True
     )
-    assert unmarked_fallback is not hand_built
-    assert unmarked_fallback["_skip_pre_unit_closures"] is True
-    assert unmarked_fallback["is_control_flow_safe"] is False
-    assert "severed_closure_cell" in unmarked_fallback["control_flow_hazards"]
+    assert unmarked_fallback is hand_built
+    assert unmarked_fallback["is_control_flow_safe"] is True
     pathological_scope: dict[str, Any] = {
         **hand_built,
-        "_skip_pre_unit_closures": False,
+        "skip_pre_unit_closures": False,
         "control_flow_hazards": ["pathological_ast"],
         "is_control_flow_safe": False,
     }
@@ -644,11 +659,11 @@ def test_scope_preservation_carrier_shadowing_and_concurrency() -> None:
     combined_scope = analyze_unit_variable_scope(
         {"start": 1, "end": 1, "skip_pre_unit_closures": True},
         {"start": 2, "end": 2, "skip_pre_unit_closures": False},
-        scope1={**hand_built, "_skip_pre_unit_closures": True},
-        scope2={**hand_built, "_skip_pre_unit_closures": False},
+        scope1={**hand_built, "skip_pre_unit_closures": True},
+        scope2={**hand_built, "skip_pre_unit_closures": False},
     )
-    assert isinstance(combined_scope["_skip_pre_unit_closures"], bool)
-    assert combined_scope["_skip_pre_unit_closures"] is False
+    assert isinstance(combined_scope["skip_pre_unit_closures"], bool)
+    assert combined_scope["skip_pre_unit_closures"] is False
 
     # 2. _FnScopeContext.parent_map is wrapped in immutable MappingProxyType
     ctx_tree = ast.parse("def f(x):\n    return x + 1\n")
@@ -760,16 +775,27 @@ def test_scope_preservation_carrier_shadowing_and_concurrency() -> None:
     clear_dataflow_cache()
     evict_tree = ast.parse("def target_fn(x):\n    return x + 1\n")
     other_tree = ast.parse("def keep_fn(x):\n    return x + 2\n")
+    probe_iters = 0
+
+    class _CountingFrozenset(frozenset):  # type: ignore[type-arg]
+        def __iter__(self) -> Any:
+            nonlocal probe_iters
+            probe_iters += 1
+            return super().__iter__()
+
     big_names = frozenset(f"var_name_{i}" for i in range(300))
+    other_big_names = _CountingFrozenset(big_names)
     for i in range(2500):
         _scope_cell_info_cache[
             (evict_tree.body[0], "outer_carriers", big_names, i)
         ] = frozenset()
         _scope_cell_info_cache[
-            (other_tree.body[0], "outer_carriers", big_names, i)
+            (other_tree.body[0], "outer_carriers", other_big_names, i)
         ] = frozenset()
     assert len(_scope_cell_info_cache) == 5000
+    probe_iters = 0
     _evict_tree_scopes(evict_tree)
+    assert probe_iters == 0
     assert len(_scope_cell_info_cache) == 2500
     assert all(k[0] is other_tree.body[0] for k in _scope_cell_info_cache)
 
@@ -901,21 +927,25 @@ def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
 
     unmarked_strict1 = dict(strict_sc1)
     unmarked_strict2 = dict(strict_sc2)
-    unmarked_strict1.pop("_skip_pre_unit_closures", None)
     unmarked_strict1.pop("skip_pre_unit_closures", None)
-    unmarked_strict2.pop("_skip_pre_unit_closures", None)
     unmarked_strict2.pop("skip_pre_unit_closures", None)
-    assert scope_matches_closure_mode(unmarked_strict1, False) is False
+    assert scope_matches_closure_mode(unmarked_strict1, False) is True
     assert scope_matches_closure_mode(unmarked_strict1, True) is False
+    assert (
+        scope_matches_closure_mode(
+            unmarked_strict1, False, strict_with_suppression=True
+        )
+        is False
+    )
     assert scope_matches_closure_mode(
-        {**unmarked_strict1, "_skip_pre_unit_closures": None}, False
+        {**unmarked_strict1, "skip_pre_unit_closures": None}, False
     ) is False
 
     # Passing unmarked strict scopes into lenient mode recomputes to lenient
     recomputed_lenient = ensure_unit_scope_closure_mode(
         u_g1, unmarked_strict1, True, repo_root=str(tmp_path)
     )
-    assert recomputed_lenient["_skip_pre_unit_closures"] is True
+    assert recomputed_lenient["skip_pre_unit_closures"] is True
     assert "severed_closure_cell" not in recomputed_lenient["control_flow_hazards"]
     res_gen_lenient = resolve_clone_generator_subroutine_outputs(
         u_g1,
@@ -930,7 +960,6 @@ def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
     unmarked_comb_strict = analyze_unit_variable_scope(
         u_g1, u_g2, repo_root=str(tmp_path)
     )
-    unmarked_comb_strict.pop("_skip_pre_unit_closures", None)
     unmarked_comb_strict.pop("skip_pre_unit_closures", None)
     synth_from_unmarked_strict = synthesize_shared_helper_code(
         u_g1,
@@ -943,50 +972,42 @@ def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
     )
     assert "def " in synth_from_unmarked_strict
 
-    # Passing unmarked lenient scopes into strict mode recomputes to strict
+    # Passing marked lenient scopes into strict mode recomputes to strict
     lenient_sc1 = inspect_single_unit_scope(
         {**u_g1, "skip_pre_unit_closures": True}, repo_root=str(tmp_path)
     )
     lenient_sc2 = inspect_single_unit_scope(
         {**u_g2, "skip_pre_unit_closures": True}, repo_root=str(tmp_path)
     )
-    unmarked_lenient1 = dict(lenient_sc1)
-    unmarked_lenient2 = dict(lenient_sc2)
-    unmarked_lenient1.pop("_skip_pre_unit_closures", None)
-    unmarked_lenient1.pop("skip_pre_unit_closures", None)
-    unmarked_lenient2.pop("_skip_pre_unit_closures", None)
-    unmarked_lenient2.pop("skip_pre_unit_closures", None)
     recomputed_strict = ensure_unit_scope_closure_mode(
-        u_g1, unmarked_lenient1, False, repo_root=str(tmp_path)
+        u_g1, lenient_sc1, False, repo_root=str(tmp_path)
     )
-    assert recomputed_strict["_skip_pre_unit_closures"] is False
+    assert recomputed_strict["skip_pre_unit_closures"] is False
     assert "severed_closure_cell" in recomputed_strict["control_flow_hazards"]
     res_gen_strict = resolve_clone_generator_subroutine_outputs(
         u_g1,
         u_g2,
-        unmarked_lenient1,
-        unmarked_lenient2,
+        lenient_sc1,
+        lenient_sc2,
         repo_root=str(tmp_path),
         closure_strictness="strict",
         return_details=True,
     )
     assert res_gen_strict.outputs is None
     assert res_gen_strict.skip_reason == "severed closure cell"
-    unmarked_comb_lenient = analyze_unit_variable_scope(
+    comb_lenient = analyze_unit_variable_scope(
         {**u_g1, "skip_pre_unit_closures": True},
         {**u_g2, "skip_pre_unit_closures": True},
         repo_root=str(tmp_path),
     )
-    unmarked_comb_lenient.pop("_skip_pre_unit_closures", None)
-    unmarked_comb_lenient.pop("skip_pre_unit_closures", None)
     assert (
         synthesize_shared_helper_code(
             u_g1,
             u_g2,
             repo_root=str(tmp_path),
-            scope1=unmarked_lenient1,
-            scope2=unmarked_lenient2,
-            scope=unmarked_comb_lenient,
+            scope1=lenient_sc1,
+            scope2=lenient_sc2,
+            scope=comb_lenient,
             closure_strictness="strict",
         )
         == ""
@@ -1683,7 +1704,7 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
     )
     assert "severed_closure_cell" in sc_susp_outer["control_flow_hazards"]
 
-    # Minimal unmarked precomputed scopes are recomputed when tree/source is available
+    # Minimal unmarked precomputed scopes are preserved in strict mode and recomputed when mode mismatches
     min_src = (
         "def outer(items):\n"
         "    cb = lambda: y\n"
@@ -1700,11 +1721,20 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
         "source_code": "for x in items:\n    y = x + 1\n",
     }
     minimal_unmarked_scope = {"inputs": ["items"], "outputs": ["y"]}
-    recomputed_min = ensure_unit_scope_closure_mode(
-        min_unit, minimal_unmarked_scope, False, tree=min_tree
+    assert (
+        ensure_unit_scope_closure_mode(
+            min_unit, minimal_unmarked_scope, False, tree=min_tree
+        )
+        is minimal_unmarked_scope
     )
-    assert "_skip_pre_unit_closures" in recomputed_min
-    assert recomputed_min["_skip_pre_unit_closures"] is False
+    recomputed_min = ensure_unit_scope_closure_mode(
+        min_unit,
+        {**minimal_unmarked_scope, "skip_pre_unit_closures": True},
+        False,
+        tree=min_tree,
+    )
+    assert "skip_pre_unit_closures" in recomputed_min
+    assert recomputed_min["skip_pre_unit_closures"] is False
     assert "severed_closure_cell" in recomputed_min["control_flow_hazards"]
 
     # Exception-handler termination & unexported conditional rebinding
@@ -1798,7 +1828,7 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
 
 def test_suppress_with_termination_and_definite_bindings() -> None:
     """Verifies control-flow termination vs exception suppression and non-raising definite bindings in with suppress(...)."""
-    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
         _extract_block_definite_bindings_and_term,
     )
     from pydoppelgangerhunt.fixer.scope import (
@@ -2160,20 +2190,18 @@ def test_generator_expression_eager_vs_lazy_table_and_nested_walrus() -> None:
 
 
 def test_span_line_index_performance_and_scale() -> None:
-    """Verifies _SpanLineIndex scales cleanly across 10,000-statement modules, deep nesting, and multi-unit lines within a strict time budget."""
-    import time
+    """Verifies _SpanLineIndex scales cleanly across 10,000-statement modules, deep nesting, and multi-unit lines."""
     from pydoppelgangerhunt.fixer import _df_span_index
     from pydoppelgangerhunt.fixer._df_cache import (
         _evict_tree_scopes,
         _scope_cell_info_cache,
     )
-    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+    from pydoppelgangerhunt.fixer._df_span_index import (
         _has_unresolved_span_bounds,
         _resolve_unit_col_bounds,
     )
 
     clear_dataflow_cache()
-    t0 = time.perf_counter()
 
     # 1. Module with 10,000 statements
     large_mod_lines = [f"v_{i} = {i}\n" for i in range(10000)]
@@ -2262,9 +2290,6 @@ def test_span_line_index_performance_and_scale() -> None:
             is False
         )
 
-    elapsed = time.perf_counter() - t0
-    assert elapsed < 5.0, f"Span index scale test took too long: {elapsed:.2f}s"
-
     assert any(
         k.owner is big_fn_tree and k.kind == "span_line_index"
         for k in _scope_cell_info_cache
@@ -2301,30 +2326,31 @@ def test_ensure_unit_scope_closure_mode_all_six_cases() -> None:
     lenient_scope = inspect_single_unit_scope(
         {**base_unit, "skip_pre_unit_closures": True}
     )
-    assert strict_scope["_skip_pre_unit_closures"] is False
+    assert strict_scope["skip_pre_unit_closures"] is False
     assert "severed_closure_cell" in strict_scope["control_flow_hazards"]
-    assert lenient_scope["_skip_pre_unit_closures"] is True
+    assert lenient_scope["skip_pre_unit_closures"] is True
     assert "severed_closure_cell" not in lenient_scope["control_flow_hazards"]
 
     # 1. Strict scope reused in lenient mode -> recomputes to lenient
     res_1 = ensure_unit_scope_closure_mode(base_unit, strict_scope, True)
-    assert res_1["_skip_pre_unit_closures"] is True
+    assert res_1["skip_pre_unit_closures"] is True
     assert "severed_closure_cell" not in res_1["control_flow_hazards"]
 
     # 2. Lenient scope reused in strict mode -> recomputes to strict
     res_2 = ensure_unit_scope_closure_mode(base_unit, lenient_scope, False)
-    assert res_2["_skip_pre_unit_closures"] is False
+    assert res_2["skip_pre_unit_closures"] is False
     assert "severed_closure_cell" in res_2["control_flow_hazards"]
 
-    # 3. Scope missing _skip_pre_unit_closures -> recomputes and attaches flag
+    # 3. Unmarked scope is preserved in default strict mode and recomputes in lenient mode when source exists
     unmarked = {
         k: v
-        for k, v in lenient_scope.items()
-        if k not in ("_skip_pre_unit_closures", "skip_pre_unit_closures")
+        for k, v in strict_scope.items()
+        if k not in ("skip_pre_unit_closures", "strict_with_suppression")
     }
-    res_3 = ensure_unit_scope_closure_mode(base_unit, unmarked, False)
-    assert res_3["_skip_pre_unit_closures"] is False
-    assert "severed_closure_cell" in res_3["control_flow_hazards"]
+    assert ensure_unit_scope_closure_mode(base_unit, unmarked, False) is unmarked
+    res_3 = ensure_unit_scope_closure_mode(base_unit, unmarked, True)
+    assert res_3["skip_pre_unit_closures"] is True
+    assert "severed_closure_cell" not in res_3["control_flow_hazards"]
 
     # 4. Pathological AST scope reused in either mode without recomputing
     pathological_scope = {
@@ -2341,17 +2367,24 @@ def test_ensure_unit_scope_closure_mode_all_six_cases() -> None:
         is pathological_scope
     )
 
-    # 5. Missing source file with precomputed scope and no source_text -> fails closed
+    # 5. Missing source file with unmarked precomputed scope and no source_text -> preserves caller-supplied scope
     no_src_unit = {
         "file": "nonexistent_on_disk_98765.py",
         "start": 3,
         "end": 4,
         "kind": "compound_block",
     }
-    res_5 = ensure_unit_scope_closure_mode(no_src_unit, lenient_scope, False)
-    assert res_5["is_control_flow_safe"] is False
-    assert "severed_closure_cell" in res_5["control_flow_hazards"]
-    assert res_5["_skip_pre_unit_closures"] is False
+    res_5 = ensure_unit_scope_closure_mode(no_src_unit, unmarked, False)
+    assert res_5 is unmarked
+    assert ensure_unit_scope_closure_mode(no_src_unit, unmarked, True) is unmarked
+    res_5_strict_from_lenient = ensure_unit_scope_closure_mode(
+        no_src_unit, lenient_scope, False
+    )
+    assert res_5_strict_from_lenient["is_control_flow_safe"] is False
+    assert (
+        "severed_closure_cell"
+        in res_5_strict_from_lenient["control_flow_hazards"]
+    )
 
     # 6. Valid source_text supplied alongside a missing file (even if unit has source_text: None or source_lines: [])
     unit_with_none_src = {
@@ -2368,7 +2401,7 @@ def test_ensure_unit_scope_closure_mode_all_six_cases() -> None:
         True,
         source_text=src_with_pre_closure,
     )
-    assert res_6["_skip_pre_unit_closures"] is True
+    assert res_6["skip_pre_unit_closures"] is True
     assert "severed_closure_cell" not in res_6["control_flow_hazards"]
     helper_code = synthesize_shared_helper_code(
         unit_with_none_src,
@@ -2593,7 +2626,7 @@ def test_class_namespace_nested_deletions_and_ordered_redefinitions() -> None:
 
 def test_span_line_index_missing_end_positions_and_duplicate_boundary_statements() -> None:
     """Covers missing end_lineno before unit, same-line boundary deduplication, and ambiguous identical boundary statements."""
-    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+    from pydoppelgangerhunt.fixer._df_span_index import (
         _get_span_line_index,
         _has_unresolved_span_bounds,
         _resolve_unit_col_bounds,

@@ -13,7 +13,7 @@ from pydoppelgangerhunt.fixer import (
     resolve_clone_pair_outputs,
     synthesize_shared_helper_code,
 )
-from tests.fixer.test_closure_cells_scenarios import (
+from tests.fixer.conftest import (
     _run_differential_refactoring_case,
 )
 
@@ -25,6 +25,8 @@ def test_pep227_pep3104_class_body_vs_method_lexical_declarations_and_differenti
     from pydoppelgangerhunt.fixer._df_cell_carriers import (
         _extract_closure_nonlocal_mutations_and_deletions,
         _extract_fn_outer_carrier_targets,
+    )
+    from pydoppelgangerhunt.fixer._df_span_index import (
         _find_enclosing_function_chain,
         _has_invalid_lexical_scope_declarations,
     )
@@ -502,14 +504,19 @@ def test_differential_global_and_nonlocal_declarations_before_inside_after() -> 
 def test_context_manager_provenance_definite_bindings_and_termination() -> None:
     """Covers context-manager definite bindings, termination, provenance, and branch aliases."""
     from pydoppelgangerhunt.fixer._df_cell_carriers import (
-        _find_enclosing_function_chain,
         _get_fn_scope_context,
     )
     from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _find_enclosing_chain_definite_pre_bound,
+    )
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _find_enclosing_function_chain,
+    )
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _SuppressProvenance,
         _classify_with_suppression,
         _clear_name_provenance,
         _extract_block_definite_bindings_and_term,
-        _find_enclosing_chain_definite_pre_bound,
         _is_proven_non_suppressing_call,
         _is_proven_non_suppressing_target_expr,
         _seed_scope_suppress_aliases,
@@ -676,24 +683,26 @@ def test_context_manager_provenance_definite_bindings_and_termination() -> None:
     )
     assert "val" not in bound_star
 
-    sup_set: set[str] = {"!nonsup:nc", "!mod:cl:contextlib"}
-    _clear_name_provenance("", sup_set)
-    _clear_name_provenance("!internal", sup_set)
-    assert "!nonsup:nc" in sup_set
-    _clear_name_provenance("nc", sup_set)
-    assert "!nonsup:nc" not in sup_set
+    sup_prov = _SuppressProvenance(
+        non_suppressors=frozenset({"nc"}),
+        stdlib_modules=frozenset({("cl", "contextlib")}),
+    )
+    assert _clear_name_provenance("", sup_prov) == sup_prov
+    assert "nc" in sup_prov.non_suppressors
+    cleared_prov = _clear_name_provenance("nc", sup_prov)
+    assert "nc" not in cleared_prov.non_suppressors
     assert (
-        _is_proven_non_suppressing_target_expr(ast.Constant(value=1), sup_set)
+        _is_proven_non_suppressing_target_expr(ast.Constant(value=1), cleared_prov)
         is False
     )
     assert (
-        _is_proven_non_suppressing_call(ast.Name(id="nc", ctx=ast.Load()), sup_set)
+        _is_proven_non_suppressing_call(ast.Name(id="nc", ctx=ast.Load()), cleared_prov)
         is False
     )
     assert (
         _is_proven_non_suppressing_call(
             ast.parse("(1)()").body[0].value,  # type: ignore[attr-defined]
-            sup_set,
+            cleared_prov,
         )
         is False
     )
@@ -721,10 +730,10 @@ def test_context_manager_provenance_definite_bindings_and_termination() -> None:
     inner_fn = outer_fn.body[-2]
     ctx = _get_fn_scope_context(inner_fn, seed_tree)
     seeded = _seed_scope_suppress_aliases(inner_fn, seed_tree, ctx)
-    assert "!shadow:open" in seeded
-    assert "!star_import" in seeded
-    assert "LocalSup" in seeded
-    assert "sup_mod" in seeded
+    assert "open" in seeded.shadowed_builtins
+    assert seeded.has_star_import is True
+    assert "LocalSup" in seeded.suppressors
+    assert "sup_mod" in seeded.suppressors
 
     branch_alias_stmts = ast.parse(
         "from contextlib import suppress\n"
@@ -796,14 +805,14 @@ def test_context_manager_provenance_definite_bindings_and_termination() -> None:
 
 def test_lexical_closure_semantics_lambda_comprehension_and_class_attributes() -> None:
     """Covers enclosing lambda/comprehension cell analysis and class attribute non-shadowing."""
-    from pydoppelgangerhunt.fixer._df_cell_carriers import (
-        _find_enclosing_function_chain,
-        _has_unresolved_span_bounds,
-    )
     from pydoppelgangerhunt.fixer._df_closures import (
         _extract_nested_scope_free_reads,
         _extract_scope_local_names,
         _is_span_in_scope_header,
+    )
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _find_enclosing_function_chain,
+        _has_unresolved_span_bounds,
     )
 
     # Enclosing lambda scope captures and mutates x via walrus
@@ -1243,3 +1252,140 @@ def test_differential_execution_closure_and_context_manager_hazards() -> None:
     helper_fn = ns_cls["_calc_helper"]
     assert callable(helper_fn)
     assert calc_inst.total1([1, 2, 3]) == helper_fn([1, 2, 3]) == 12
+
+
+def test_seeded_generated_closure_program_differential_fuzzer(tmp_path: Path) -> None:
+    """Seeded differential fuzzer generating nested-closure programs and verifying runtime equivalence."""
+    import random  # pylint: disable=import-outside-toplevel
+    import shutil  # pylint: disable=import-outside-toplevel
+    import subprocess  # pylint: disable=import-outside-toplevel
+    import pytest  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer import generate_refactoring_patch
+
+    if shutil.which("git") is None:
+        pytest.skip("git executable is required for differential fuzzer patch application")
+
+    rng = random.Random(20261106)
+    patched_count = 0
+    blocked_count = 0
+
+    for idx in range(24):
+        has_pre_sibling = rng.choice([False, True])
+        mutate_acc_in_unit = rng.choice([False, True])
+        call_sibling_in_unit = has_pre_sibling and rng.choice([False, True])
+        capture_mode = rng.choice(["default_arg", "late_cell", "nonlocal_inc", "none"])
+        post_mutate_scale = rng.choice([False, True])
+        use_with_lock = rng.choice([False, True])
+
+        lines: list[str] = [
+            "import contextlib",
+            "def entry(items, cond):",
+            "    scale = 3",
+            "    acc = 1",
+            "    cbs = []",
+        ]
+        if has_pre_sibling:
+            lines.extend(
+                [
+                    "    def read_acc():",
+                    "        return acc",
+                ]
+            )
+        u_start = len(lines) + 1
+        if use_with_lock:
+            lines.append("    with contextlib.nullcontext():")
+            indent = "        "
+        else:
+            indent = "    "
+        lines.append(f"{indent}for x in items:")
+        loop_indent = indent + "    "
+        if mutate_acc_in_unit:
+            lines.append(f"{loop_indent}acc = acc + x")
+        else:
+            lines.append(f"{loop_indent}step = x + scale")
+        if call_sibling_in_unit:
+            lines.append(f"{loop_indent}cbs.append(read_acc())")
+        elif capture_mode == "default_arg":
+            lines.append(f"{loop_indent}cbs.append((lambda v, s=scale, i=x: v + s + i)(2))")
+        elif capture_mode == "late_cell":
+            lines.append(f"{loop_indent}cbs.append(lambda v: v + scale + x)")
+        elif capture_mode == "nonlocal_inc":
+            lines.extend(
+                [
+                    f"{loop_indent}def bump():",
+                    f"{loop_indent}    nonlocal acc",
+                    f"{loop_indent}    acc += 1",
+                    f"{loop_indent}bump()",
+                ]
+            )
+        else:
+            lines.append(f"{loop_indent}cbs.append(x * scale)")
+        u_end = len(lines)
+        if post_mutate_scale:
+            lines.append("    scale = 10")
+        if not call_sibling_in_unit and capture_mode == "late_cell":
+            lines.append("    out = [fn(1) for fn in cbs]")
+        else:
+            lines.append("    out = list(cbs)")
+        lines.append("    return out, acc, scale")
+
+        fn_src = "\n".join(lines) + "\n"
+        fn_b_src = fn_src.replace("def entry(", "def entry_b(", 1)
+        line_offset = len(lines)
+        combined_src = f"{fn_src}{fn_b_src}"
+
+        for mode in ("strict", "pedantic"):
+            case_dir = tmp_path / f"fuzz_{idx}_{mode}"
+            case_dir.mkdir(parents=True, exist_ok=True)
+            (case_dir / ".git").mkdir(exist_ok=True)
+            mod_file = case_dir / "mod.py"
+            mod_file.write_text(combined_src, encoding="utf-8")
+
+            u1 = {
+                "file": str(mod_file),
+                "start": u_start,
+                "end": u_end,
+                "name": "entry:block",
+                "kind": "compound_block",
+            }
+            u2 = {
+                "file": str(mod_file),
+                "start": u_start + line_offset,
+                "end": u_end + line_offset,
+                "name": "entry_b:block",
+                "kind": "compound_block",
+            }
+            patch = generate_refactoring_patch(
+                [(1.0, u1, u2)],
+                repo_root=str(case_dir),
+                replace_clones=False,
+                closure_strictness=mode,
+            )
+            if patch:
+                patched_count += 1
+                subprocess.run(
+                    ["git", "apply", "--whitespace=nowarn"],
+                    input=patch,
+                    text=True,
+                    cwd=str(case_dir),
+                    check=True,
+                    capture_output=True,
+                )
+                refactored_src = mod_file.read_text(encoding="utf-8")
+                for test_items, test_cond in [([1, 2, 3], True), ([5], False)]:
+                    ns_orig: dict[str, Any] = {}
+                    ns_ref: dict[str, Any] = {}
+                    exec(compile(combined_src, "<orig>", "exec"), ns_orig)  # pylint: disable=exec-used
+                    exec(compile(refactored_src, "<ref>", "exec"), ns_ref)  # pylint: disable=exec-used
+                    assert ns_orig["entry"](test_items, test_cond) == ns_ref["entry"](
+                        test_items, test_cond
+                    )
+                    assert ns_orig["entry"](test_items, test_cond) == ns_ref["entry_b"](
+                        test_items, test_cond
+                    )
+            else:
+                blocked_count += 1
+
+    assert patched_count > 0
+    assert blocked_count > 0
+

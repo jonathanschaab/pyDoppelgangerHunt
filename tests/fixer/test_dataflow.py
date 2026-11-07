@@ -1901,8 +1901,8 @@ def test_resolve_clone_generator_subroutine_outputs_precomputed_definite_stores(
         "end": 2,
     }
     # Scope 1 only definitely assigns x, leaving unassigned lacking definite store
-    s1 = {"definite_stores": ["x"], "inputs": [], "_skip_pre_unit_closures": False}
-    s2 = {"definite_stores": ["a", "b"], "inputs": [], "_skip_pre_unit_closures": False}
+    s1 = {"definite_stores": ["x"], "inputs": []}
+    s2 = {"definite_stores": ["a", "b"], "inputs": []}
     res_rejected = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
     assert res_rejected is None
 
@@ -1910,7 +1910,6 @@ def test_resolve_clone_generator_subroutine_outputs_precomputed_definite_stores(
     s1_valid = {
         "definite_stores": ["x", "unassigned"],
         "inputs": [],
-        "_skip_pre_unit_closures": False,
     }
     res_valid = resolve_clone_generator_subroutine_outputs(u1, u2, s1_valid, s2)
     assert res_valid == (["x", "unassigned"], ["a", "b"])
@@ -2229,12 +2228,10 @@ def test_generator_subroutine_outputs_mocked_scope_fails_closed() -> None:
     s1: Dict[str, Any] = {
         "globals": [],
         "nonlocals": [],
-        "_skip_pre_unit_closures": False,
     }
     s2: Dict[str, Any] = {
         "globals": [],
         "nonlocals": [],
-        "_skip_pre_unit_closures": False,
     }
     res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
     assert res is None

@@ -10,6 +10,7 @@ import pytest
 
 from pydoppelgangerhunt.fixer import analyze_unit_variable_scope
 from pydoppelgangerhunt.fixer.dataflow import collect_downstream_read_names
+from tests.fixer.conftest import _run_differential_refactoring_case
 
 
 _CLOSURE_CELL_SCENARIOS = [
@@ -2869,7 +2870,7 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
     strict_combined = analyze_unit_variable_scope(
         u_pre_g1, u_pre_g2, repo_root=str(tmp_path), scope1=strict_sc1, scope2=strict_sc2
     )
-    assert strict_sc1["_skip_pre_unit_closures"] is False
+    assert strict_sc1["skip_pre_unit_closures"] is False
     assert "severed_closure_cell" in strict_sc1["control_flow_hazards"]
 
     # Lenient synthesis and output resolution with strict precomputed scopes matches uncached lenient
@@ -2894,7 +2895,7 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
     lenient_sc2 = inspect_single_unit_scope(
         {**u_pre_g2, "skip_pre_unit_closures": True}, repo_root=str(tmp_path)
     )
-    assert lenient_sc1["_skip_pre_unit_closures"] is True
+    assert lenient_sc1["skip_pre_unit_closures"] is True
     assert "severed_closure_cell" not in lenient_sc1["control_flow_hazards"]
 
     res_lenient_matching_pre = resolve_clone_pair_outputs(
@@ -2926,7 +2927,7 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
         scope1=lenient_sc1,
         scope2=lenient_sc2,
     )
-    assert strict_combined_from_lenient["_skip_pre_unit_closures"] is False
+    assert strict_combined_from_lenient["skip_pre_unit_closures"] is False
     assert "severed_closure_cell" in strict_combined_from_lenient["control_flow_hazards"]
     res_strict_with_lenient_pre = resolve_clone_pair_outputs(
         u_pre_g1,
@@ -3137,10 +3138,12 @@ def test_df_cell_hazards_numbered_checks_unit() -> None:
         _check_captured_cell_mutations,
         _check_intra_unit_nonlocal_mutators,
         _check_sibling_closure_sharing,
-        _find_enclosing_function_chain,
     )
     from pydoppelgangerhunt.fixer._df_cell_traversal import (
         _analyze_enclosing_fn_cells,
+    )
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _find_enclosing_function_chain,
     )
 
     # Check 1 & 2: _check_captured_cell_mutations
@@ -3489,76 +3492,6 @@ def test_expr_traversal_subscript_compare_unary_fstring_and_ifexp() -> None:
         assert "severed_closure_cell" in scope["control_flow_hazards"]
 
 
-def _run_differential_refactoring_case(
-    tmp_path: Path,
-    case_name: str,
-    fn_src: str,
-    u1_bounds: tuple[int, int],
-    expect_patch: bool,
-    call_args_list: list[tuple[object, ...]],
-) -> None:
-    """Executes original and refactored modules and verifies identical return values and side effects."""
-    import shutil  # pylint: disable=import-outside-toplevel
-    import subprocess  # pylint: disable=import-outside-toplevel
-    from pydoppelgangerhunt.fixer import generate_refactoring_patch
-
-    if shutil.which("git") is None:
-        pytest.skip("git executable is required for differential patch application")
-
-    case_dir = tmp_path / case_name
-    case_dir.mkdir(parents=True, exist_ok=True)
-    (case_dir / ".git").mkdir(exist_ok=True)
-    fn_b_src = fn_src.replace("def entry(", "def entry_b(", 1)
-    line_offset = len(fn_src.splitlines()) + 1
-    combined_src = f"{fn_src}\n{fn_b_src}"
-    mod_file = case_dir / "mod.py"
-    mod_file.write_text(combined_src, encoding="utf-8")
-
-    u1 = {
-        "file": str(mod_file),
-        "start": u1_bounds[0],
-        "end": u1_bounds[1],
-        "name": "entry:block",
-        "kind": "compound_block",
-    }
-    u2 = {
-        "file": str(mod_file),
-        "start": u1_bounds[0] + line_offset,
-        "end": u1_bounds[1] + line_offset,
-        "name": "entry_b:block",
-        "kind": "compound_block",
-    }
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)], repo_root=str(case_dir), replace_clones=False
-    )
-    if expect_patch:
-        assert patch != "", f"Expected refactoring patch for {case_name}"
-        subprocess.run(
-            ["git", "apply", "--whitespace=nowarn"],
-            input=patch,
-            text=True,
-            cwd=str(case_dir),
-            check=True,
-            capture_output=True,
-        )
-        refactored_src = mod_file.read_text(encoding="utf-8")
-        assert "_shared_" in refactored_src
-    else:
-        assert patch == "", f"Expected hazard to block patch for {case_name}"
-        refactored_src = combined_src
-
-    for args in call_args_list:
-        ns_orig: dict[str, Any] = {}
-        ns_ref: dict[str, Any] = {}
-        exec(compile(combined_src, "<orig>", "exec"), ns_orig)  # pylint: disable=exec-used
-        exec(compile(refactored_src, "<ref>", "exec"), ns_ref)  # pylint: disable=exec-used
-        res_orig = ns_orig["entry"](*args)
-        res_ref = ns_ref["entry"](*args)
-        res_ref_b = ns_ref["entry_b"](*args)
-        assert res_orig == res_ref, f"Mismatch in {case_name} for args={args}"
-        assert res_orig == res_ref_b, f"Mismatch in {case_name} (entry_b) for args={args}"
-
-
 def test_differential_cell_mutations_vs_ordinary_bindings(tmp_path: Path) -> None:
     """Differential execution tests distinguishing cell mutations, object mutation, locals, branches, and deletion."""
     # 1a. Rebinding a variable captured by a nested function (post/loop rebinding blocked)
@@ -3809,7 +3742,7 @@ def test_nested_scope_reads_do_not_falsely_escape_mutator() -> None:
 def test_partial_column_inference_all_four_combinations_and_utf8() -> None:
     """Verifies _unit_cols and _resolve_unit_col_bounds across all 4 (start_col, end_col) combinations and UTF-8."""
     from pydoppelgangerhunt.fixer import inspect_single_unit_scope
-    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+    from pydoppelgangerhunt.fixer._df_span_index import (
         _resolve_unit_col_bounds,
     )
     from pydoppelgangerhunt.fixer.scope import _unit_cols

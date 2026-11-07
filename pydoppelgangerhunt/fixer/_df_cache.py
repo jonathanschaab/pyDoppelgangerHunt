@@ -7,6 +7,7 @@ from collections import OrderedDict
 import hashlib
 import logging
 import threading
+from types import MappingProxyType
 from typing import (
     Any,
     Callable,
@@ -29,20 +30,26 @@ logger = logging.getLogger(__name__)
 
 _CacheValT = TypeVar("_CacheValT")
 
+_RLOCK_TYPE: type = type(threading.RLock())
 _downstream_cache_lock: threading.RLock = threading.RLock()
 
 
 def _is_reentrant_cache_lock(lock: Any) -> bool:
     """Verifies that lock supports re-entrant acquisition on the same thread."""
-    return hasattr(lock, "_is_owned") or type(lock).__name__ == "RLock"
+    return isinstance(lock, _RLOCK_TYPE) or type(lock).__name__ in ("RLock", "_RLock")
 
-
-if not _is_reentrant_cache_lock(_downstream_cache_lock):
-    raise RuntimeError("_downstream_cache_lock must be a threading.RLock")
 
 _MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
-_MAX_SCOPE_CACHE_SIZE: int = 1024
+_MAX_SCOPE_CACHE_SIZE: int = 2048
 _MAX_PARSED_TREE_CACHE_SIZE: int = 128
+_SCOPE_CACHE_KIND_CAPS: Dict[str, int] = {
+    "span_line_index": 128,
+    "detached_dump_index": 128,
+    "fn_scope_ctx": 512,
+    "stmt_deltas": 512,
+    "enclosing_fn_cells": 512,
+    "suppress_seed": 256,
+}
 _downstream_reads_cache: OrderedDict[Tuple[Any, ...], frozenset[str]] = OrderedDict()
 _parsed_tree_cache: OrderedDict[Tuple[str, int], Optional[ast.AST]] = OrderedDict()
 
@@ -115,10 +122,8 @@ def _validate_scope_cache_params(params: Any) -> None:
                 if not isinstance(elem, _PERMITTED_PARAM_SCALAR_TYPES):
                     stack.append(elem)
             continue
-        raise TypeError(
-            "_ScopeCacheKey.params only permits immutable scalars, tuples, and frozensets; "
-            f"got {type(curr).__name__}"
-        )
+        if invalid_mutable_type is None:
+            invalid_mutable_type = type(curr).__name__
     if invalid_mutable_type is not None:
         raise TypeError(
             "_ScopeCacheKey.params only permits immutable scalars, tuples, and frozensets; "
@@ -135,6 +140,30 @@ def _params_contain_ast(params: Tuple[Any, ...]) -> bool:
         return True
     except TypeError:
         return False
+
+
+def _params_exact_types_match(a: Any, b: Any) -> bool:
+    """Checks that equal parameter structures also match exact scalar types (distinguishing 1 from True)."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, tuple):
+        return len(a) == len(b) and all(
+            _params_exact_types_match(x, y) for x, y in zip(a, b)
+        )
+    if isinstance(a, frozenset):
+        if len(a) != len(b):
+            return False
+        return {(type(x), x) for x in a} == {(type(y), y) for y in b}
+    return True
+
+
+def _params_type_hash(obj: Any) -> int:
+    """Computes a structural type hash for params so 1 and True do not hash-collide."""
+    if isinstance(obj, tuple):
+        return hash((tuple, tuple(_params_type_hash(x) for x in obj)))
+    if isinstance(obj, frozenset):
+        return hash((frozenset, frozenset((type(x), x) for x in obj)))
+    return hash(type(obj))
 
 
 class _BaseScopeCacheKey(NamedTuple):
@@ -186,7 +215,7 @@ class _ScopeCacheKey(_BaseScopeCacheKey):
         Cached values must be immutable (frozenset, tuple, NamedTuple, MappingProxyType,
         bool), wrapped in ``_TrackedCachedDict`` (protected by ``_downstream_cache_lock``
         with O(1) incremental node registration on insert), or returned via defensive
-        copies to callers.
+        copies to callers. All custom cached value types must implement ``cached_ast_nodes()``.
     """
 
     __slots__ = ()
@@ -201,6 +230,24 @@ class _ScopeCacheKey(_BaseScopeCacheKey):
         _validate_scope_cache_key_header(owner, kind, params, aux_ast_nodes)
         return super().__new__(cls, owner, kind, params, aux_ast_nodes)
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _ScopeCacheKey):
+            return False
+        if not tuple.__eq__(self, other):
+            return False
+        if not self.params:
+            return True
+        return _params_exact_types_match(self.params, other.params)
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+    def __hash__(self) -> int:
+        base_h = tuple.__hash__(self)
+        if not self.params:
+            return base_h
+        return hash((base_h, _params_type_hash(self.params)))
+
 
 def _make_trusted_scope_cache_key(
     owner: ast.AST,
@@ -208,9 +255,9 @@ def _make_trusted_scope_cache_key(
     params: Tuple[Any, ...] = (),
     aux_ast_nodes: Tuple[ast.AST, ...] = (),
 ) -> _ScopeCacheKey:
-    """Constructs a validated _ScopeCacheKey instance."""
-    return _ScopeCacheKey(
-        owner=owner, kind=kind, params=params, aux_ast_nodes=aux_ast_nodes
+    """Fast-path constructor for internal callers whose arguments are already trusted."""
+    return _BaseScopeCacheKey.__new__(
+        _ScopeCacheKey, owner, kind, params, aux_ast_nodes
     )
 
 
@@ -243,14 +290,14 @@ def _extract_key_ast_nodes(key: Any) -> Tuple[ast.AST, ...]:
 
 
 def _extract_value_ast_nodes(value: Any) -> Tuple[ast.AST, ...]:
-    """Extracts ast.AST nodes held inside a cached value via cached_ast_nodes() or container traversal."""
+    """Extracts ast.AST nodes held inside a cached value via mandatory cached_ast_nodes() or container traversal."""
     if value is None or isinstance(
         value, (bool, int, str, float, bytes, *_SINGLETON_AST_TYPES)
     ):
         return ()
     if isinstance(value, ast.AST):
         return (value,)
-    if isinstance(value, (frozenset, set)) and all(
+    if type(value) in (frozenset, set) and all(
         isinstance(x, (str, int, bool, float)) for x in value
     ):
         return ()
@@ -271,57 +318,22 @@ def _extract_value_ast_nodes(value: Any) -> Tuple[ast.AST, ...]:
                 ):
                     found.append(n)
             continue
-        node_attr = getattr(curr, "node", None)
-        if isinstance(node_attr, ast.AST) and not isinstance(
-            node_attr, _SINGLETON_AST_TYPES
-        ):
-            found.append(node_attr)
-        pmap_attr = getattr(curr, "parent_map", None)
-        if pmap_attr is not None and hasattr(pmap_attr, "items"):
-            for pk, pv in pmap_attr.items():
-                if isinstance(pk, ast.AST) and not isinstance(
-                    pk, _SINGLETON_AST_TYPES
-                ):
-                    found.append(pk)
-                if isinstance(pv, ast.AST) and not isinstance(
-                    pv, _SINGLETON_AST_TYPES
-                ):
-                    found.append(pv)
-        has_span_maps = False
-        for map_attr_name in (
-            "by_start",
-            "by_start_line",
-            "by_end_line",
-            "stmts_by_start_line",
-            "stmts_by_end_line",
-        ):
-            map_attr = getattr(curr, map_attr_name, None)
-            if isinstance(map_attr, dict):
-                has_span_maps = True
-                for entries in map_attr.values():
-                    for entry in entries:
-                        enode = (
-                            entry[0]
-                            if isinstance(entry, tuple) and entry
-                            else getattr(entry, "node", entry)
-                        )
-                        if isinstance(enode, ast.AST) and not isinstance(
-                            enode, _SINGLETON_AST_TYPES
-                        ):
-                            found.append(enode)
-        if has_span_maps:
-            continue
+        curr_type = type(curr)
         children: Sequence[Any] = ()
-        if isinstance(curr, (tuple, list, set, frozenset)):
+        if curr_type in (tuple, list, set, frozenset):
             children = tuple(curr)
-        elif hasattr(curr, "items") and callable(curr.items):
+        elif curr_type in (dict, _TrackedCachedDict, MappingProxyType):
             children = tuple(part for kv in curr.items() for part in kv)
+        else:
+            raise TypeError(
+                f"Cached value of custom type {curr_type.__name__} must implement cached_ast_nodes()"
+            )
         for elem in children:
             if isinstance(elem, ast.AST):
                 if not isinstance(elem, _SINGLETON_AST_TYPES):
                     found.append(elem)
             elif not isinstance(
-                elem, (bool, int, str, float, bytes, type(None))
+                elem, (bool, int, str, float, bytes, type(None), *_SINGLETON_AST_TYPES)
             ):
                 elem_id = id(elem)
                 if elem_id not in seen:
@@ -364,6 +376,20 @@ def _prune_reverse_index_buckets(
                 reverse_index.pop(node, None)
 
 
+def _ensure_scope_owner_parent_map_locked(owner: ast.AST) -> None:
+    """Ensures a scope root has a parent map recorded so detached child eviction can walk ancestors."""
+    if not isinstance(owner, _SCOPE_ROOT_TYPES) or owner in _scope_parent_maps:
+        return
+    if any(owner in pmap for pmap in _scope_parent_maps.values()):
+        return
+    parent_map: Dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(owner):
+        for child in ast.iter_child_nodes(parent):
+            if not isinstance(child, _SINGLETON_AST_TYPES):
+                parent_map[child] = parent
+    _scope_parent_maps[owner] = parent_map
+
+
 def _register_key_ast_nodes(key: Any, nodes: Sequence[ast.AST]) -> None:
     """Incrementally registers AST nodes for key in _scope_owner_keys_index in O(|nodes|)."""
     if nodes:
@@ -388,11 +414,18 @@ class _TrackedCachedDict(Dict[Any, Any]):
         self._bound_owners: Dict[Tuple[int, Any], Tuple[Any, Any]] = {}
 
     def _ensure_bound_owners(self) -> Dict[Tuple[int, Any], Tuple[Any, Any]]:
-        owners = getattr(self, "_bound_owners", None)
-        if owners is None:
-            owners = {}
-            self._bound_owners = owners
-        return owners
+        return cast(
+            Dict[Tuple[int, Any], Tuple[Any, Any]],
+            self.__dict__.setdefault("_bound_owners", {}),
+        )
+
+    def copy(self) -> _TrackedCachedDict:
+        """Returns a shallow copy with an independent empty _bound_owners table."""
+        with _downstream_cache_lock:
+            return _TrackedCachedDict(self)
+
+    def __copy__(self) -> _TrackedCachedDict:
+        return self.copy()
 
     def bind_owner(self, cache: Any, cache_key: Any) -> None:
         """Registers an owning (_TrackedScopeCache, key) pair for incremental node registration."""
@@ -466,7 +499,20 @@ class _TrackedCachedDict(Dict[Any, Any]):
 class _TrackedScopeCache(OrderedDict[Any, _CacheValT]):
     """OrderedDict cache that incrementally registers AST nodes on insert and prunes on eviction."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._kind_keys: Dict[str, OrderedDict[Any, None]] = {}
+        super().__init__(*args, **kwargs)
+
+    def ensure_kind_keys(self) -> Dict[str, OrderedDict[Any, None]]:
+        """Returns the per-kind LRU key ring dictionary for this cache."""
+        return cast(
+            Dict[str, OrderedDict[Any, None]],
+            self.__dict__.setdefault("_kind_keys", {}),
+        )
+
     def __setitem__(self, key: Any, value: _CacheValT) -> None:
+        val_nodes = _extract_value_ast_nodes(value)
+        key_nodes = _extract_key_ast_nodes(key)
         if isinstance(value, dict) and not isinstance(value, _TrackedCachedDict):
             value = cast(_CacheValT, _TrackedCachedDict(cast(Dict[Any, Any], value)))
         if key in self:
@@ -476,16 +522,30 @@ class _TrackedScopeCache(OrderedDict[Any, _CacheValT]):
         if isinstance(value, _TrackedCachedDict):
             value.bind_owner(self, key)
         super().__setitem__(key, value)
-        _register_key_ast_nodes(
-            key,
-            (*_extract_key_ast_nodes(key), *_extract_value_ast_nodes(value)),
-        )
+        if isinstance(key, _ScopeCacheKey):
+            kind_ring = self.ensure_kind_keys().setdefault(key.kind, OrderedDict())
+            kind_ring[key] = None
+            kind_ring.move_to_end(key)
+            if not val_nodes and isinstance(key.owner, _SCOPE_ROOT_TYPES):
+                _ensure_scope_owner_parent_map_locked(key.owner)
+        _register_key_ast_nodes(key, (*key_nodes, *val_nodes))
+
+    def move_to_end(self, key: Any, last: bool = True) -> None:
+        super().move_to_end(key, last=last)
+        if isinstance(key, _ScopeCacheKey):
+            kind_ring = self.ensure_kind_keys().get(key.kind)
+            if kind_ring is not None and key in kind_ring:
+                kind_ring.move_to_end(key, last=last)
 
     def __delitem__(self, key: Any) -> None:
         if key in self:
             prev_val = dict.__getitem__(self, key)
             if isinstance(prev_val, _TrackedCachedDict):
                 prev_val.unbind_owner(self, key)
+        if isinstance(key, _ScopeCacheKey):
+            kind_ring = self.ensure_kind_keys().get(key.kind)
+            if kind_ring is not None:
+                kind_ring.pop(key, None)
         super().__delitem__(key)
         _unregister_key_if_absent(key)
 
@@ -495,6 +555,10 @@ class _TrackedScopeCache(OrderedDict[Any, _CacheValT]):
             prev_val = dict.__getitem__(self, key)
             if isinstance(prev_val, _TrackedCachedDict):
                 prev_val.unbind_owner(self, key)
+            if isinstance(key, _ScopeCacheKey):
+                kind_ring = self.ensure_kind_keys().get(key.kind)
+                if kind_ring is not None:
+                    kind_ring.pop(key, None)
         res = super().pop(key, *args)
         if in_self:
             _unregister_key_if_absent(key)
@@ -504,6 +568,10 @@ class _TrackedScopeCache(OrderedDict[Any, _CacheValT]):
         k, v = super().popitem(last=last)
         if isinstance(v, _TrackedCachedDict):
             v.unbind_owner(self, k)
+        if isinstance(k, _ScopeCacheKey):
+            kind_ring = self.ensure_kind_keys().get(k.kind)
+            if kind_ring is not None:
+                kind_ring.pop(k, None)
         _unregister_key_if_absent(k)
         return k, v
 
@@ -512,6 +580,7 @@ class _TrackedScopeCache(OrderedDict[Any, _CacheValT]):
             prev_val = dict.__getitem__(self, k)
             if isinstance(prev_val, _TrackedCachedDict):
                 prev_val.unbind_owner(self, k)
+        self.ensure_kind_keys().clear()
         super().clear()
         other = (
             _scope_cell_info_cache
@@ -526,104 +595,12 @@ class _TrackedScopeCache(OrderedDict[Any, _CacheValT]):
                 _unregister_key_if_absent(k)
 
 
-_scope_closures_cache: _TrackedScopeCache[List[Tuple[Any, Set[str]]]] = (
-    _TrackedScopeCache()
-)
+_scope_closures_cache: _TrackedScopeCache[Any] = _TrackedScopeCache()
 _scope_cell_info_cache: _TrackedScopeCache[Any] = _TrackedScopeCache()
 
-_aux_node_to_scope_owners: Dict[ast.AST, Set[ast.AST]] = {}
-_aux_scope_owner_to_nodes: Dict[ast.AST, Set[ast.AST]] = {}
-
-
-def _extract_aux_cache_ast_nodes(value: Any) -> List[ast.AST]:
-    """Extracts AST nodes from a parent-map or line-to-statements cache entry."""
-    nodes: List[ast.AST] = []
-    if not isinstance(value, dict):
-        return nodes
-    for k, v in value.items():
-        if isinstance(k, ast.AST) and not isinstance(k, _SINGLETON_AST_TYPES):
-            nodes.append(k)
-        if isinstance(v, ast.AST) and not isinstance(v, _SINGLETON_AST_TYPES):
-            nodes.append(v)
-        elif isinstance(v, list):
-            for item in v:
-                if isinstance(item, ast.AST) and not isinstance(
-                    item, _SINGLETON_AST_TYPES
-                ):
-                    nodes.append(item)
-    return nodes
-
-
-def _register_aux_scope_nodes(
-    scope_node: ast.AST, nodes: Sequence[ast.AST]
-) -> None:
-    """Indexes AST nodes belonging to scope_node across auxiliary scope caches."""
-    _index_entry_ast_nodes(
-        scope_node,
-        (scope_node, *nodes),
-        _aux_scope_owner_to_nodes,
-        _aux_node_to_scope_owners,
-    )
-
-
-def _unregister_aux_scope_owner_if_absent(scope_node: ast.AST) -> None:
-    """Removes scope_node from the auxiliary AST node index when absent from all aux caches."""
-    if (
-        scope_node not in _scope_parent_maps
-        and scope_node not in _scope_stmts_by_start
-        and scope_node not in _scope_stmts_by_end
-    ):
-        _prune_reverse_index_buckets(
-            scope_node, _aux_scope_owner_to_nodes, _aux_node_to_scope_owners
-        )
-
-
-class _TrackedAuxScopeCache(OrderedDict[ast.AST, _CacheValT]):
-    """OrderedDict for auxiliary AST caches (_scope_parent_maps, _scope_stmts_by_start/end) with indexed eviction."""
-
-    def __setitem__(self, key: ast.AST, value: _CacheValT) -> None:
-        super().__setitem__(key, value)
-        _register_aux_scope_nodes(key, _extract_aux_cache_ast_nodes(value))
-
-    def __delitem__(self, key: ast.AST) -> None:
-        super().__delitem__(key)
-        _unregister_aux_scope_owner_if_absent(key)
-
-    def pop(self, key: ast.AST, *args: Any) -> Any:
-        in_self = key in self
-        res = super().pop(key, *args)
-        if in_self:
-            _unregister_aux_scope_owner_if_absent(key)
-        return res
-
-    def popitem(self, last: bool = True) -> Tuple[ast.AST, _CacheValT]:
-        k, v = super().popitem(last=last)
-        _unregister_aux_scope_owner_if_absent(k)
-        return k, v
-
-    def clear(self) -> None:
-        super().clear()
-        if (
-            not _scope_parent_maps
-            and not _scope_stmts_by_start
-            and not _scope_stmts_by_end
-        ):
-            _aux_node_to_scope_owners.clear()
-            _aux_scope_owner_to_nodes.clear()
-        else:
-            for owner in list(_aux_scope_owner_to_nodes.keys()):
-                _unregister_aux_scope_owner_if_absent(owner)
-
-
-_scope_parent_maps: _TrackedAuxScopeCache[Dict[ast.AST, ast.AST]] = (
-    _TrackedAuxScopeCache()
-)
-_scope_stmts_by_end: _TrackedAuxScopeCache[Dict[int, List[ast.stmt]]] = (
-    _TrackedAuxScopeCache()
-)
-_scope_stmts_by_start: _TrackedAuxScopeCache[Dict[int, List[ast.stmt]]] = (
-    _TrackedAuxScopeCache()
-)
+_scope_parent_maps: OrderedDict[ast.AST, Dict[ast.AST, ast.AST]] = OrderedDict()
+_scope_stmts_by_end: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
+_scope_stmts_by_start: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
 
 
 def _key_references_scope_nodes(
@@ -654,9 +631,9 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
     """Purges scope-cache entries belonging to an evicted AST tree or detached subtree.
 
     Note:
-        Uses indexed lookups via ``_scope_owner_keys_index`` and
-        ``_aux_node_to_scope_owners`` to locate affected cache keys and enclosing
-        scope owners directly from ``tree_nodes`` without scanning unrelated entries.
+        Uses ``_scope_parent_maps`` to walk ancestor scopes from detached subtrees
+        and ``_scope_owner_keys_index`` to locate affected cache keys directly from
+        ``tree_nodes`` and ancestor owners without scanning unrelated cache entries.
     """
     if tree is None or not isinstance(tree, ast.AST):
         return
@@ -668,22 +645,36 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
     }
     scope_nodes.add(tree)
     with _downstream_cache_lock:
-        affected_aux_owners: Set[ast.AST] = set()
-        for node in tree_nodes:
-            owners = _aux_node_to_scope_owners.get(node)
-            if owners:
-                affected_aux_owners.update(owners)
-        for root_node in affected_aux_owners:
-            scope_nodes.add(root_node)
-            tree_nodes.add(root_node)
-            pmap = _scope_parent_maps.get(root_node)
-            if pmap is not None:
-                curr_anc: Optional[ast.AST] = pmap.get(tree)
-                while curr_anc is not None and curr_anc not in tree_nodes:
+        for root_node, pmap in list(_scope_parent_maps.items()):
+            matched_child: Optional[ast.AST] = None
+            if tree in pmap:
+                matched_child = tree
+            elif root_node in tree_nodes:
+                matched_child = root_node
+            else:
+                for n in tree_nodes:
+                    if n in pmap:
+                        matched_child = n
+                        break
+            if matched_child is not None:
+                scope_nodes.add(root_node)
+                tree_nodes.add(root_node)
+                curr_anc: Optional[ast.AST] = pmap.get(matched_child)
+                while curr_anc is not None:
                     tree_nodes.add(curr_anc)
                     if isinstance(curr_anc, _SCOPE_ROOT_TYPES):
                         scope_nodes.add(curr_anc)
                     curr_anc = pmap.get(curr_anc)
+        for stmt_cache in (_scope_stmts_by_start, _scope_stmts_by_end):
+            for s_owner, line_map in list(stmt_cache.items()):
+                if s_owner in scope_nodes:
+                    continue
+                t_lineno = getattr(tree, "lineno", 0) or 0
+                if t_lineno > 0 and any(
+                    s in tree_nodes for s in line_map.get(t_lineno, ())
+                ):
+                    scope_nodes.add(s_owner)
+                    tree_nodes.add(s_owner)
         keys_to_remove: Set[Any] = set()
         for node in tree_nodes:
             node_keys = _scope_owner_keys_index.get(node)
@@ -712,21 +703,33 @@ def _store_lru_cache_entry(
     value: _CacheValT,
     max_size: int,
 ) -> _CacheValT:
-    """Stores key-value pair in an OrderedDict LRU cache with eviction outside lock."""
+    """Stores key-value pair in an OrderedDict LRU cache with per-kind caps and eviction outside lock."""
     evicted_trees: List[ast.AST] = []
     with _downstream_cache_lock:
         if key in cache:
             cache.move_to_end(key)
             return cache[key]
+        if (
+            isinstance(cache, _TrackedScopeCache)
+            and isinstance(key, _ScopeCacheKey)
+            and max_size == _MAX_SCOPE_CACHE_SIZE
+        ):
+            kind_cap = _SCOPE_CACHE_KIND_CAPS.get(key.kind)
+            if kind_cap is not None:
+                kind_ring = cache.ensure_kind_keys().get(key.kind)
+                while kind_ring and len(kind_ring) >= kind_cap:
+                    oldest_k, _ = kind_ring.popitem(last=False)
+                    cache.pop(oldest_k, None)
         while len(cache) >= max_size and cache:
             _, evicted_val = cache.popitem(last=False)
             if cache is _parsed_tree_cache and isinstance(evicted_val, ast.AST):
                 evicted_trees.append(evicted_val)
         cache[key] = value
         cache.move_to_end(key)
+        stored_value = cache[key]
     for evicted_tree in evicted_trees:
         _evict_tree_scopes(evicted_tree)
-    return value
+    return stored_value
 
 
 def _get_or_compute_scope_cached(
@@ -746,17 +749,10 @@ def _get_or_compute_scope_cached(
     # Concurrency Design Note: compute_fn() executes outside _downstream_cache_lock to
     # eliminate lock contention under multi-threading; transient duplicate computation during
     # concurrent misses is harmless because compute_fn is deterministic and pure.
-    effective_fn: Callable[[], _CacheValT] = (
-        cast(Callable[[], _CacheValT], _TrackedCachedDict)
-        if compute_fn is dict and isinstance(cache, _TrackedScopeCache)
-        else compute_fn
+    computed = compute_fn()
+    return _store_lru_cache_entry(
+        cache, scope_node, computed, _MAX_SCOPE_CACHE_SIZE
     )
-    computed = effective_fn()
-
-    try:
-        return _store_lru_cache_entry(cache, scope_node, computed, _MAX_SCOPE_CACHE_SIZE)
-    except TypeError:
-        return computed
 
 
 def _get_or_parse_tree(
@@ -782,6 +778,7 @@ def _get_or_parse_tree(
     try:
         parsed = ast.parse(source_text)
         setattr(parsed, "_immutable_cached", True)
+        setattr(parsed, "_source_lines", tuple(source_text.splitlines()))
     except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
         parsed = None
 
@@ -798,6 +795,8 @@ def _parse_source_tree(
 ) -> Optional[ast.AST]:
     """Parses Python source code into an AST tree if not already provided."""
     if tree is not None:
+        if source_text and getattr(tree, "_source_lines", None) is None:
+            setattr(tree, "_source_lines", tuple(source_text.splitlines()))
         return tree
     return _get_or_parse_tree(source_text, source_digest=source_digest)
 
@@ -1029,8 +1028,6 @@ def clear_dataflow_cache() -> None:
         _scope_cell_info_cache.clear()
         _scope_owner_keys_index.clear()
         _scope_key_nodes_index.clear()
-        _aux_node_to_scope_owners.clear()
-        _aux_scope_owner_to_nodes.clear()
         _scope_loops_cache.clear()
         _scope_try_with_cache.clear()
         _warned_lenient_closure[0] = False

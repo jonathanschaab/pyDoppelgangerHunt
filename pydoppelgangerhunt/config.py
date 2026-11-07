@@ -23,19 +23,24 @@ _CONFIG_KEY_NAMES: Tuple[str, ...] = (
     "exclude",
     "closure_strictness",
     "skip_pre_unit_closures",
+    "strict_with_suppression",
+    "non_suppressing_ctx_managers",
     "top",
 )
 
 
 def resolve_closure_strictness_mode(
     closure_strictness: Optional[str] = None,
-    skip_pre_unit_closures: bool = False,
+    skip_pre_unit_closures: Optional[bool] = False,
 ) -> Tuple[str, bool]:
-    """Resolves canonical closure strictness mode ('strict' or 'lenient') and boolean skip flag.
+    """Resolves canonical closure strictness mode ('strict', 'pedantic', or 'lenient') and boolean skip flag.
 
     Precision vs Soundness Trade-off:
     'strict' (default; alias 'fail_closed') preserves soundness by inspecting escaping closures
-    and callbacks that might execute after the unit.
+    and callbacks that might execute after the unit, while treating unknown context managers as
+    non-suppressing unless their name looks like suppress/raises/ignore or is proven suppressing.
+    'pedantic' (alias 'strict_with') additionally treats all unproven unknown context managers as
+    potentially exception-suppressing unless explicitly listed in non_suppressing_ctx_managers.
     'lenient' (aliases 'fast', 'skip') reduces false-positive rejections by bypassing pre-unit
     closure scanning, at the cost of soundness for escaping closures.
     """
@@ -43,14 +48,17 @@ def resolve_closure_strictness_mode(
         c_mode = str(closure_strictness).strip().lower()
         if c_mode in ("lenient", "fast", "skip"):
             return "lenient", True
-        if c_mode in ("strict", "fail_closed"):
+        if c_mode in ("pedantic", "strict_with", "strict", "fail_closed"):
             if skip_pre_unit_closures:
                 logger.warning(
                     "Conflicting configuration: closure_strictness '%s' takes precedence over "
                     "skip_pre_unit_closures=True",
                     closure_strictness,
                 )
-            return "strict", False
+            resolved_mode = (
+                "pedantic" if c_mode in ("pedantic", "strict_with") else "strict"
+            )
+            return resolved_mode, False
         fallback = "lenient" if skip_pre_unit_closures else "strict"
         raw_key = str(closure_strictness)
         with _warned_closure_lock:
@@ -66,6 +74,18 @@ def resolve_closure_strictness_mode(
         return fallback, bool(skip_pre_unit_closures)
     is_lenient = bool(skip_pre_unit_closures)
     return ("lenient" if is_lenient else "strict"), is_lenient
+
+
+def resolve_strict_with_suppression(
+    closure_strictness: Optional[str] = None,
+    strict_with_suppression: Optional[bool] = None,
+) -> bool:
+    """Resolves whether unproven unknown context managers are treated as potentially suppressing."""
+    if strict_with_suppression is not None:
+        return bool(strict_with_suppression)
+    if closure_strictness is not None:
+        return str(closure_strictness).strip().lower() in ("pedantic", "strict_with")
+    return False
 
 
 def clear_closure_warning_cache() -> None:

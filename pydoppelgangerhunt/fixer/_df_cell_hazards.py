@@ -117,24 +117,25 @@ from pydoppelgangerhunt.fixer._df_cell_carriers import (
     _IntraUnitMutator,
     _collect_escaped_and_executed_intra_unit_defs,
     _collect_unit_nonlocal_mutators,
-    _extract_direct_nonlocals,
-    _find_enclosing_function_chain,
-    _has_invalid_lexical_scope_declarations,
-    _has_unresolved_span_bounds,
     _propagate_sibling_closures,
-    _resolve_unit_col_bounds,
 )
 from pydoppelgangerhunt.fixer._df_cell_traversal import (
     _build_enclosing_chain_cell_infos,
-    _find_enclosing_chain_definite_pre_bound,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
-    _COMPREHENSION_TYPES,
     _collect_scope_closures_uncached,
     _extract_comprehension_walrus_names,
     _extract_scope_nonlocals_and_outer_globals,
     _has_escaped_intra_unit_global_declarations,
     _resolve_immediate_scope_in_fn,
+)
+from pydoppelgangerhunt.fixer._df_span_index import (
+    _extract_direct_nonlocals,
+    _find_enclosing_function_chain,
+    _get_span_line_index,
+    _has_invalid_lexical_scope_declarations,
+    _has_unresolved_span_bounds,
+    _resolve_unit_col_bounds,
 )
 from pydoppelgangerhunt.parser import _node_is_effectively_async
 
@@ -143,11 +144,7 @@ __all__ = [
     "_check_captured_cell_mutations",
     "_check_intra_unit_nonlocal_mutators",
     "_check_sibling_closure_sharing",
-    "_find_enclosing_chain_definite_pre_bound",
-    "_find_enclosing_function_chain",
-    "_has_invalid_lexical_scope_declarations",
     "_has_severed_closure_cell_hazard",
-    "_resolve_unit_col_bounds",
 ]
 
 
@@ -403,6 +400,7 @@ class _UnitClosureHazardContext(NamedTuple):
     enclosing_chain: Optional[Sequence[Tuple[int, int, ast.AST]]] = None
     lex_validated: bool = False
     hazard_reasons_out: Optional[List[str]] = None
+    strict_with_suppression: bool = False
 
 
 def _record_hazard_reason(
@@ -446,14 +444,14 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         sibling closures explicitly referenced via ``eff_input_set`` remain enforced in
         both modes, guaranteeing monotonicity (lenient hazard implies strict hazard).
     """
-    if ctx.mod_tree is None or ctx.u_start <= 0:
-        return False
     if not ctx.is_subroutine and ctx.unit_kind not in (
         "closure",
         "comprehension",
         "complex_expr",
     ):
         return False
+    if ctx.mod_tree is None or ctx.u_start <= 0:
+        return _record_hazard_reason(ctx, "unresolved_span_bounds")
 
     u_start_col, u_end_col = (
         (ctx.u_start_col, ctx.u_end_col)
@@ -481,31 +479,14 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     ):
         return _record_hazard_reason(ctx, "invalid_lexical_declaration")
     if not enclosing_chain:
+        span_idx = _get_span_line_index(ctx.mod_tree)
         has_unresolved = any(
-            isinstance(
-                node,
-                (
-                    ast.FunctionDef,
-                    ast.AsyncFunctionDef,
-                    ast.Lambda,
-                    *_COMPREHENSION_TYPES,
-                ),
-            )
-            and isinstance(getattr(node, "lineno", None), int)
+            isinstance(getattr(node, "lineno", None), int)
             and getattr(node, "lineno", 0) <= ctx.u_end
             and (
                 not isinstance(getattr(node, "end_lineno", None), int)
                 or (
-                    isinstance(
-                        node,
-                        (
-                            ast.FunctionDef,
-                            ast.AsyncFunctionDef,
-                            ast.Lambda,
-                            *_COMPREHENSION_TYPES,
-                        ),
-                    )
-                    and getattr(node, "end_lineno", 0) >= ctx.u_start
+                    getattr(node, "end_lineno", 0) >= ctx.u_start
                     and (u_start_col is None or u_end_col is None)
                     and _has_unresolved_span_bounds(
                         ctx.mod_tree,
@@ -517,7 +498,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
                     )
                 )
             )
-            for node in ast.walk(ctx.mod_tree)
+            for node in span_idx.closure_like_nodes
         )
         return (
             _record_hazard_reason(ctx, "unresolved_span_bounds")
@@ -535,6 +516,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         return _record_hazard_reason(ctx, "unresolved_span_bounds")
 
     unit_mod = ast.Module(body=list(ctx.candidate_stmts), type_ignores=[])
+    setattr(unit_mod, "_is_ephemeral_unit_mod", True)
     is_expr_unit = (
         ctx.unit_kind in ("comprehension", "complex_expr")
         and not ctx.is_subroutine
@@ -699,6 +681,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         u_end_col,
         unit_mutations,
         mod_tree=ctx.mod_tree,
+        strict_with_suppression=ctx.strict_with_suppression,
     )
     if (
         ctx.definite_stores is not None

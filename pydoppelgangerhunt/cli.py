@@ -199,10 +199,18 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         "--closure-strictness",
         type=str,
         default=None,
-        choices=["strict", "lenient", "fail_closed", "fast", "skip"],
+        choices=[
+            "strict",
+            "lenient",
+            "pedantic",
+            "fail_closed",
+            "strict_with",
+            "fast",
+            "skip",
+        ],
         help=(
-            "Closure strictness ('strict'/'fail_closed' vs 'lenient'/'fast'/'skip'; "
-            "takes precedence over --skip-pre-unit-closures)"
+            "Closure strictness ('strict'/'fail_closed', 'pedantic'/'strict_with', "
+            "or 'lenient'/'fast'/'skip'; takes precedence over --skip-pre-unit-closures)"
         ),
     )
 
@@ -1137,7 +1145,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cli_strictness: Optional[str] = args.closure_strictness
         cli_skip: bool = _safe_bool(args.skip_pre_unit_closures)
         if (
-            str(cli_strictness).strip().lower() in ("strict", "fail_closed")
+            str(cli_strictness).strip().lower()
+            in ("strict", "fail_closed", "pedantic", "strict_with")
             and args.skip_pre_unit_closures
         ):
             cli_skip = False
@@ -1152,6 +1161,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if cfg_strictness is not None and str(cfg_strictness).strip().lower() in (
             "strict",
             "fail_closed",
+            "pedantic",
+            "strict_with",
         ):
             logger.warning(
                 "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "

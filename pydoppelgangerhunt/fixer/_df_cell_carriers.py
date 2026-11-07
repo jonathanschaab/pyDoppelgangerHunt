@@ -43,20 +43,8 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _node_strictly_encloses_bounds,
 )
 from pydoppelgangerhunt.fixer._df_span_index import (
-    _IndexedSpanNode,
-    _SpanLineIndex,
     _extract_direct_nonlocals,
     _extract_type_alias_or_pattern_name,
-    _find_enclosing_function_chain,
-    _get_span_line_index,
-    _get_tree_expr_scope_intervals,
-    _has_invalid_lexical_scope_declarations,
-    _has_unresolved_span_bounds,
-    _pick_inferred_col,
-    _resolve_unit_col_bounds,
-    _scope_has_invalid_lexical_declarations,
-    _stmt_dump_set,
-    _walk_invalid_lexical_scope_declarations,
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
     _extract_nested_scope_free_reads,
@@ -68,11 +56,9 @@ from pydoppelgangerhunt.parser import iter_nested_scope_header_nodes
 __all__ = [
     "_EnclosingFnCellInfo",
     "_FnScopeContext",
-    "_IndexedSpanNode",
     "_IntraUnitMutator",
     "_NON_CLOSURE_RETURN_BUILTINS",
     "_SpanBounds",
-    "_SpanLineIndex",
     "_block_contains_span",
     "_can_bind_in_fn_scope",
     "_collect_escaped_and_executed_intra_unit_defs",
@@ -89,7 +75,6 @@ __all__ = [
     "_extract_closure_nonlocal_mutations_and_deletions_uncached",
     "_extract_comprehension_body_walrus_names",
     "_extract_comprehension_deferred_closure_info",
-    "_extract_direct_nonlocals",
     "_extract_direct_scope_nonlocal_mutations_and_deletions",
     "_extract_expr_closure_and_load_info",
     "_extract_expr_scope_free_reads",
@@ -104,14 +89,8 @@ __all__ = [
     "_extract_shallow_defs",
     "_extract_shallow_loads_and_calls",
     "_extract_store_names_in_node",
-    "_extract_type_alias_or_pattern_name",
-    "_find_enclosing_function_chain",
     "_get_fn_scope_context",
     "_get_fn_scope_context_uncached",
-    "_get_span_line_index",
-    "_get_tree_expr_scope_intervals",
-    "_has_invalid_lexical_scope_declarations",
-    "_has_unresolved_span_bounds",
     "_is_closure_factory_scope",
     "_is_closure_factory_scope_uncached",
     "_is_lazy_genexp",
@@ -127,18 +106,15 @@ __all__ = [
     "_make_nested_fn_scope_context",
     "_make_scope_ctx_cache_key",
     "_node_contains_or_encloses_span",
-    "_pick_inferred_col",
     "_propagate_sibling_closures",
-    "_resolve_unit_col_bounds",
-    "_scope_has_invalid_lexical_declarations",
-    "_stmt_dump_set",
     "_strictly_encloses_span",
-    "_walk_invalid_lexical_scope_declarations",
 ]
 
 
 def _is_node_attached_to_tree(node: ast.AST, mod_tree: ast.AST) -> bool:
     """Returns True if node is mod_tree or belongs to mod_tree's parent map."""
+    if getattr(node, "_is_ephemeral_unit_mod", False):
+        return False
     return node is mod_tree or node in _get_scope_parent_map(mod_tree)
 
 
@@ -176,7 +152,9 @@ class _FnScopeContext(NamedTuple):
             else None
         )
         aux_nodes: List[ast.AST] = []
-        if isinstance(self.scope_owner, ast.AST):
+        if isinstance(self.scope_owner, ast.AST) and not getattr(
+            self.scope_owner, "_is_ephemeral_unit_mod", False
+        ):
             if mod_pm is not None:
                 if (
                     self.scope_owner is self.mod_tree
@@ -187,10 +165,14 @@ class _FnScopeContext(NamedTuple):
                 self.parent_map
             ):
                 aux_nodes.append(self.scope_owner)
-        if isinstance(self.mod_tree, ast.AST):
+        if isinstance(self.mod_tree, ast.AST) and not getattr(
+            self.mod_tree, "_is_ephemeral_unit_mod", False
+        ):
             aux_nodes.append(self.mod_tree)
         for enc in self.enclosing_scopes:
-            if isinstance(enc, ast.AST):
+            if isinstance(enc, ast.AST) and not getattr(
+                enc, "_is_ephemeral_unit_mod", False
+            ):
                 if mod_pm is None or enc is self.mod_tree or enc in mod_pm:
                     aux_nodes.append(enc)
         return tuple(aux_nodes)
@@ -558,14 +540,14 @@ def _ensure_subtree_scope_ctx(
     """Synthesizes a subtree _FnScopeContext when scope_ctx is None and node is not a bare GeneratorExp."""
     if scope_ctx is not None or isinstance(node, ast.GeneratorExp):
         return scope_ctx
-    wrap: ast.AST = (
-        node
-        if isinstance(node, ast.Module)
-        else ast.Module(
+    if isinstance(node, ast.Module):
+        wrap: ast.AST = node
+    else:
+        wrap = ast.Module(
             body=[node if isinstance(node, ast.stmt) else ast.Expr(value=cast(ast.expr, node))],
             type_ignores=[],
         )
-    )
+        setattr(wrap, "_is_ephemeral_unit_mod", True)
     return _get_fn_scope_context_uncached(wrap, cache_parent_map=False)
 
 
@@ -714,6 +696,10 @@ class _IntraUnitMutator(NamedTuple):
     is_escaped_def: bool
     node: Optional[ast.AST] = None
 
+    def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
+        """Returns the AST node referenced by this mutator entry."""
+        return (self.node,) if isinstance(self.node, ast.AST) else ()
+
 
 def _is_self_escaping_def_node(
     d_node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef],
@@ -746,6 +732,7 @@ def _collect_unit_nonlocal_mutators(
         body=[s for s in candidate_stmts if isinstance(s, ast.stmt)],
         type_ignores=[],
     )
+    setattr(unit_mod, "_is_ephemeral_unit_mod", True)
     mod_parent_map = (
         _get_scope_parent_map(mod_tree) if mod_tree is not None else None
     )
@@ -895,6 +882,10 @@ class _SpanBounds(NamedTuple):
     start_col: Optional[int] = None
     end_col: Optional[int] = None
 
+    def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
+        """Returns an empty tuple because _SpanBounds holds only integer coordinates."""
+        return ()
+
 
 class _EnclosingFnCellInfo(NamedTuple):
     """Cell binding and mutation summary for an enclosing function relative to a unit span."""
@@ -912,6 +903,10 @@ class _EnclosingFnCellInfo(NamedTuple):
     alias_edges: Tuple[Tuple[str, frozenset[str]], ...] = ()
     pre_unbound: frozenset[str] = frozenset()
     concurrent_sibling_vars: frozenset[str] = frozenset()
+
+    def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
+        """Returns an empty tuple because _EnclosingFnCellInfo retains only string sets."""
+        return ()
 
 
 def _is_pos_before_span(
@@ -1537,6 +1532,7 @@ def _collect_escaped_and_executed_intra_unit_defs(
         (0, name): list(nodes) for name, nodes in root_defs.items()
     }
     unit_mod = ast.Module(body=list(candidate_stmts), type_ignores=[])
+    setattr(unit_mod, "_is_ephemeral_unit_mod", True)
     top_bound_names = (
         _extract_single_node_local_names(unit_mod)
         - _extract_direct_nonlocals(unit_mod, is_global=False)

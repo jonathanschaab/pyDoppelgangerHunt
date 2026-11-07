@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
 from typing import (
     AbstractSet,
     Any,
@@ -36,12 +37,10 @@ from pydoppelgangerhunt.fixer._df_cell_carriers import (
     _extract_closure_nonlocal_mutations_and_deletions,
     _extract_comprehension_body_walrus_names,
     _extract_comprehension_deferred_closure_info,
-    _extract_direct_nonlocals,
     _extract_expr_scope_free_reads,
     _extract_fn_outer_carrier_targets,
     _extract_fn_returned_closure_refs,
     _extract_store_names_in_node,
-    _extract_type_alias_or_pattern_name,
     _get_fn_scope_context,
     _is_closure_factory_scope,
     _is_node_inside_span,
@@ -60,107 +59,54 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _extract_single_node_local_names,
     _node_earliest_start_pos,
 )
+from pydoppelgangerhunt.fixer._df_span_index import (
+    _extract_direct_nonlocals,
+    _extract_type_alias_or_pattern_name,
+)
 from pydoppelgangerhunt.fixer._df_visitors import (
     _collect_func_params as _extract_arg_names,
     _extract_nested_scope_free_reads,
     _record_import_names,
 )
 from pydoppelgangerhunt.fixer._df_with_provenance import (
-    _EMPTY_SUPPRESS_PROVENANCE,
-    _NON_SUPPRESSING_CTX_MANAGER_NAMES,
-    _SAFE_EXCEPTION_TYPE_NAMES,
-    _STDLIB_NON_SUPPRESSING_MODULES,
-    _SUPPRESSING_CTX_MANAGER_NAMES,
     _SuppressProvenance,
-    _analyze_block_assignment,
-    _apply_expr_definite_effects,
-    _block_terminates,
-    _class_def_may_suppress_in_exit,
-    _classify_with_suppression,
-    _clear_name_provenance,
     _coerce_suppress_provenance,
-    _demote_deletions_to_conditional,
-    _eval_match_definite_bindings,
-    _eval_try_definite_bindings,
     _extract_block_definite_bindings,
-    _extract_block_definite_bindings_and_term,
-    _extract_ctx_manager_call_name,
-    _extract_definite_target_names,
-    _extract_deleted_names,
     _extract_shallow_deleted_names,
-    _extract_unconditional_walrus_names,
-    _is_exception_suppressing_with,
-    _is_non_raising_bool_expr,
-    _is_non_raising_expr,
-    _is_non_raising_store_target,
-    _is_proven_non_suppressing_call,
-    _is_proven_non_suppressing_target_expr,
-    _is_suppress_alias_target_expr,
-    _may_suppress_exceptions_with,
     _seed_scope_suppress_aliases,
-    _split_suppress_with_body,
-    _split_unknown_with_body,
-    _split_with_body_by_mode,
-    _stmt_cannot_raise_in_suppress,
-    _stmt_contains_direct_raise,
-    _update_suppress_aliases_from_stmt,
     _update_suppress_provenance_from_stmt,
-    _walrus_assignment_in_expr,
-    _walrus_in_sequence,
 )
 from pydoppelgangerhunt.parser import iter_nested_scope_header_nodes
 
 __all__ = [
     "_CellBindingState",
-    "_EMPTY_SUPPRESS_PROVENANCE",
-    "_NON_SUPPRESSING_CTX_MANAGER_NAMES",
-    "_SAFE_EXCEPTION_TYPE_NAMES",
-    "_STDLIB_NON_SUPPRESSING_MODULES",
-    "_SUPPRESSING_CTX_MANAGER_NAMES",
+    "_CellTraversalBuffers",
     "_StackFrame",
-    "_SuppressProvenance",
-    "_analyze_block_assignment",
+    "_StmtCellDelta",
     "_analyze_enclosing_fn_cells",
     "_analyze_enclosing_fn_cells_uncached",
-    "_apply_expr_definite_effects",
-    "_block_terminates",
+    "_apply_stmt_cell_delta",
     "_build_enclosing_chain_cell_infos",
-    "_class_def_may_suppress_in_exit",
-    "_classify_with_suppression",
-    "_clear_name_provenance",
-    "_coerce_suppress_provenance",
-    "_demote_deletions_to_conditional",
-    "_eval_match_definite_bindings",
-    "_eval_try_definite_bindings",
-    "_extract_block_definite_bindings",
-    "_extract_block_definite_bindings_and_term",
-    "_extract_ctx_manager_call_name",
-    "_extract_definite_target_names",
-    "_extract_deleted_names",
-    "_extract_shallow_deleted_names",
-    "_extract_unconditional_walrus_names",
-    "_is_exception_suppressing_with",
-    "_is_non_raising_bool_expr",
-    "_is_non_raising_expr",
-    "_is_non_raising_store_target",
-    "_is_proven_non_suppressing_call",
-    "_is_proven_non_suppressing_target_expr",
-    "_is_suppress_alias_target_expr",
-    "_may_suppress_exceptions_with",
-    "_seed_scope_suppress_aliases",
-    "_split_suppress_with_body",
-    "_split_unknown_with_body",
-    "_split_with_body_by_mode",
-    "_stmt_cannot_raise_in_suppress",
-    "_stmt_contains_direct_raise",
-    "_update_suppress_aliases_from_stmt",
-    "_update_suppress_provenance_from_stmt",
-    "_walrus_assignment_in_expr",
-    "_walrus_in_sequence",
+    "_find_enclosing_chain_definite_pre_bound",
+    "_find_enclosing_method_class_names",
+    "_handle_nested_scope_node",
+    "_is_frame_after_span",
+    "_is_frame_before_span",
+    "_make_empty_traversal_buffers",
+    "_maybe_push_pre_span_exhaustive_frame",
+    "_push_compound_children",
+    "_push_seq",
+    "_record_binding_at_pos",
+    "_record_carrier_closures_and_aliases",
+    "_record_deletion_at_pos",
+    "_record_simple_node_bindings_and_reads",
+    "_traverse_fn_cell_frames",
+    "_try_apply_cached_stmt_delta",
 ]
 
 
-class _CellBindingState(NamedTuple):
+@dataclass
+class _CellBindingState:
     """Mutable sets tracking cell bindings during enclosing function AST traversal."""
 
     pre_bound: Set[str]
@@ -170,7 +116,8 @@ class _CellBindingState(NamedTuple):
     loop_mutated: Set[str]
     pre_unbound: Set[str]
     fn_globals: AbstractSet[str] = frozenset()
-    suppress_aliases: Optional[Set[str]] = None
+    suppress_aliases: Optional[_SuppressProvenance] = None
+    strict_with_suppression: bool = False
 
 
 class _StackFrame(NamedTuple):
@@ -291,6 +238,10 @@ def _maybe_push_pre_span_exhaustive_frame(
     span: _SpanBounds,
     state: _CellBindingState,
     stack: List[_StackFrame],
+    *,
+    pre_stmt_suppress: Optional[
+        Union[_SuppressProvenance, AbstractSet[str]]
+    ] = None,
 ) -> None:
     """Pushes a post_pre_bound frame when a non-enclosing compound statement precedes span."""
     if (
@@ -304,12 +255,18 @@ def _maybe_push_pre_span_exhaustive_frame(
             frame,
         )
     ):
+        active_sup = (
+            pre_stmt_suppress
+            if pre_stmt_suppress is not None
+            else state.suppress_aliases
+        )
         exh_bound = _extract_block_definite_bindings(
             (curr,),
             frame.active_nonlocals,
             state.pre_bound,
             state.fn_globals,
-            suppress_aliases=state.suppress_aliases or frozenset(),
+            suppress_aliases=active_sup or frozenset(),
+            strict_with_suppression=state.strict_with_suppression,
         )
         if exh_bound:
             stack.append(
@@ -332,6 +289,9 @@ def _push_compound_children(
     stack: List[_StackFrame],
     *,
     unconditional_post_del: bool = False,
+    pre_stmt_suppress: Optional[
+        Union[_SuppressProvenance, AbstractSet[str]]
+    ] = None,
 ) -> bool:
     """Pushes child nodes of compound control-flow statements with branch and loop state."""
     is_br = frame.is_branched
@@ -344,7 +304,14 @@ def _push_compound_children(
         body_span = encloses and _block_contains_span(curr.body, span)
         else_span = encloses and _block_contains_span(curr.orelse, span)
         _maybe_push_pre_span_exhaustive_frame(
-            curr, encloses, bool(curr.body), frame, span, state, stack
+            curr,
+            encloses,
+            bool(curr.body),
+            frame,
+            span,
+            state,
+            stack,
+            pre_stmt_suppress=pre_stmt_suppress,
         )
         _push_seq(
             stack,
@@ -463,6 +430,7 @@ def _push_compound_children(
             span,
             state,
             stack,
+            pre_stmt_suppress=pre_stmt_suppress,
         )
         if body_span:
             for item in curr.items:
@@ -507,6 +475,7 @@ def _push_compound_children(
             span,
             state,
             stack,
+            pre_stmt_suppress=pre_stmt_suppress,
         )
         _push_seq(
             stack,
@@ -587,7 +556,14 @@ def _push_compound_children(
     if type(curr).__name__ == "Match":
         cases_l = getattr(curr, "cases", [])
         _maybe_push_pre_span_exhaustive_frame(
-            curr, encloses, bool(cases_l), frame, span, state, stack
+            curr,
+            encloses,
+            bool(cases_l),
+            frame,
+            span,
+            state,
+            stack,
+            pre_stmt_suppress=pre_stmt_suppress,
         )
         for case in reversed(cases_l):
             case_body = getattr(case, "body", [])
@@ -1025,6 +1001,10 @@ class _StmtCellDelta(NamedTuple):
     fn_return_refs: Tuple[Tuple[str, frozenset[str], frozenset[str]], ...]
     sibling_nl_deletions: frozenset[str]
 
+    def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
+        """Returns an empty tuple because _StmtCellDelta retains only string/int tuples."""
+        return ()
+
 
 class _CellTraversalBuffers(NamedTuple):
     """Mutable accumulators populated while traversing function AST frames."""
@@ -1046,7 +1026,11 @@ def _make_empty_traversal_buffers(
     scope_ctx: _FnScopeContext,
     pre_bound: Optional[Set[str]] = None,
     unit_mutations: AbstractSet[str] = frozenset(),
-    initial_suppress_aliases: Optional[AbstractSet[str]] = None,
+    initial_suppress_aliases: Optional[
+        Union[_SuppressProvenance, AbstractSet[str]]
+    ] = None,
+    *,
+    strict_with_suppression: bool = False,
 ) -> _CellTraversalBuffers:
     """Creates fresh mutable traversal buffers for enclosing function cell analysis."""
     bound_set: Set[str] = set(pre_bound) if pre_bound is not None else set()
@@ -1059,11 +1043,10 @@ def _make_empty_traversal_buffers(
             loop_mutated=set(),
             pre_unbound=set(),
             fn_globals=fn_globals,
-            suppress_aliases=(
-                set(initial_suppress_aliases)
-                if initial_suppress_aliases is not None
-                else set()
+            suppress_aliases=_coerce_suppress_provenance(
+                initial_suppress_aliases
             ),
+            strict_with_suppression=strict_with_suppression,
         ),
         sibling_closures=[],
         concurrent_sib_indices=set(),
@@ -1146,15 +1129,13 @@ def _try_apply_cached_stmt_delta(
     )
     if not (is_before or is_after):
         return False
-    active_sup = frozenset(bufs.state.suppress_aliases or ())
-    if (
-        is_before
-        and not is_branched
-        and bufs.state.suppress_aliases is not None
-    ):
-        _update_suppress_aliases_from_stmt(stmt, bufs.state.suppress_aliases)
+    pre_prov = _coerce_suppress_provenance(bufs.state.suppress_aliases)
+    sup_key = pre_prov.as_cache_key_tuple() if pre_prov else ()
+    strict_w = bool(bufs.state.strict_with_suppression)
     key: Tuple[Any, ...] = (
-        (stmt, is_before, active_sup) if active_sup else (stmt, is_before)
+        (stmt, is_before, sup_key, strict_w)
+        if (sup_key or strict_w)
+        else (stmt, is_before)
     )
     with _downstream_cache_lock:
         has_key = key in stmt_deltas
@@ -1172,7 +1153,8 @@ def _try_apply_cached_stmt_delta(
         sub_bufs = _make_empty_traversal_buffers(
             bufs.state.fn_globals,
             bufs.scope_ctx,
-            initial_suppress_aliases=active_sup,
+            initial_suppress_aliases=pre_prov,
+            strict_with_suppression=strict_w,
         )
         _traverse_fn_cell_frames(
             [_StackFrame(stmt, False, False, None)],
@@ -1214,6 +1196,14 @@ def _try_apply_cached_stmt_delta(
             delta = stmt_deltas.setdefault(key, computed_delta)
     if delta is None:
         return False
+    if (
+        is_before
+        and not is_branched
+        and bufs.state.suppress_aliases is not None
+    ):
+        bufs.state.suppress_aliases = _update_suppress_provenance_from_stmt(
+            stmt, pre_prov
+        )
     _apply_stmt_cell_delta(
         bufs, delta, is_branched=is_branched, in_loop=in_loop
     )
@@ -1265,13 +1255,14 @@ def _traverse_fn_cell_frames(
 
         c_line = getattr(curr, "lineno", None)
         c_col = getattr(curr, "col_offset", None)
+        pre_stmt_suppress = bufs.state.suppress_aliases
         if (
             isinstance(curr, ast.stmt)
             and not frame.is_branched
             and bufs.state.suppress_aliases is not None
             and _is_frame_before_span(c_line, c_col, span, frame)
         ):
-            _update_suppress_aliases_from_stmt(
+            bufs.state.suppress_aliases = _update_suppress_provenance_from_stmt(
                 curr, bufs.state.suppress_aliases
             )
 
@@ -1436,6 +1427,7 @@ def _traverse_fn_cell_frames(
             bufs.state,
             stack,
             unconditional_post_del=enclosed_fn is not None,
+            pre_stmt_suppress=pre_stmt_suppress,
         ):
             continue
 
@@ -1515,6 +1507,7 @@ def _analyze_enclosing_fn_cells_uncached(
     mod_tree: Optional[ast.AST] = None,
     enclosing_scopes: Sequence[ast.AST] = (),
     use_stmt_deltas: bool = True,
+    strict_with_suppression: bool = False,
 ) -> _EnclosingFnCellInfo:
     """Computes variable bindings, post-span mutations, loop mutations, and sibling closures."""
     scope_ctx = _get_fn_scope_context(
@@ -1551,11 +1544,15 @@ def _analyze_enclosing_fn_cells_uncached(
         pre_bound=pre_bound,
         unit_mutations=unit_mutations,
         initial_suppress_aliases=initial_sup,
+        strict_with_suppression=strict_with_suppression,
     )
     if isinstance(fn_node, _COMPREHENSION_TYPES):
         bufs.state.loop_mutated.update(
             comp_targets | comp_walrus | set(unit_mutations)
         )
+    delta_aux_nodes = tuple(
+        n for n in scope_ctx.cache_aux_nodes() if n is not fn_node
+    )
     stmt_deltas: Optional[
         Dict[Tuple[Any, ...], Optional[_StmtCellDelta]]
     ] = (
@@ -1566,7 +1563,7 @@ def _analyze_enclosing_fn_cells_uncached(
                 _ScopeCacheKey(
                     owner=fn_node,
                     kind="stmt_deltas",
-                    aux_ast_nodes=(mod_tree,) if mod_tree is not None else (),
+                    aux_ast_nodes=delta_aux_nodes,
                 ),
                 dict,
             ),
@@ -1713,6 +1710,7 @@ def _analyze_enclosing_fn_cells(
     enclosed_fn: Optional[ast.AST] = None,
     mod_tree: Optional[ast.AST] = None,
     enclosing_scopes: Sequence[ast.AST] = (),
+    strict_with_suppression: bool = False,
 ) -> _EnclosingFnCellInfo:
     """Analyzes and caches cell bindings, post-span mutations, loop mutations, and closures."""
     norm_span = span if isinstance(span, _SpanBounds) else _SpanBounds(*span)
@@ -1725,10 +1723,15 @@ def _analyze_enclosing_fn_cells(
         *(n for n in (enclosed_fn, mod_tree) if n is not None),
         *norm_enclosing,
     )
+    params: Tuple[Any, ...] = (
+        (norm_span, frozenset(unit_mutations), enclosed_fn is not None, True)
+        if strict_with_suppression
+        else (norm_span, frozenset(unit_mutations), enclosed_fn is not None)
+    )
     cache_key = _ScopeCacheKey(
         owner=fn_node,
         kind="enclosing_fn_cells",
-        params=(norm_span, frozenset(unit_mutations), enclosed_fn is not None),
+        params=params,
         aux_ast_nodes=aux_nodes,
     )
     return cast(
@@ -1743,6 +1746,7 @@ def _analyze_enclosing_fn_cells(
                 enclosed_fn=enclosed_fn,
                 mod_tree=mod_tree,
                 enclosing_scopes=norm_enclosing,
+                strict_with_suppression=strict_with_suppression,
             ),
         ),
     )
@@ -1789,6 +1793,8 @@ def _build_enclosing_chain_cell_infos(
     u_end_col: Optional[int],
     unit_mutations: AbstractSet[str],
     mod_tree: Optional[ast.AST] = None,
+    *,
+    strict_with_suppression: bool = False,
 ) -> List[_EnclosingFnCellInfo]:
     """Builds _EnclosingFnCellInfo summaries for each function in enclosing_chain."""
     rev_infos: List[_EnclosingFnCellInfo] = []
@@ -1823,6 +1829,7 @@ def _build_enclosing_chain_cell_infos(
             enclosed_fn=enc_child,
             mod_tree=mod_tree,
             enclosing_scopes=tuple(n for _, _, n in enclosing_chain[:idx]),
+            strict_with_suppression=strict_with_suppression,
         )
         is_static_enc = any(
             (isinstance(d, ast.Name) and d.id == "staticmethod")
@@ -1877,6 +1884,8 @@ def _find_enclosing_chain_definite_pre_bound(
     u_start_col: Optional[int] = None,
     u_end_col: Optional[int] = None,
     mod_tree: Optional[ast.AST] = None,
+    *,
+    strict_with_suppression: bool = False,
 ) -> Set[str]:
     """Computes variables definitely bound prior to the unit across enclosing functions."""
     chain_infos = _build_enclosing_chain_cell_infos(
@@ -1887,6 +1896,7 @@ def _find_enclosing_chain_definite_pre_bound(
         u_end_col,
         frozenset(),
         mod_tree=mod_tree,
+        strict_with_suppression=strict_with_suppression,
     )
     acc_pre_bound: Set[str] = set()
     acc_pre_unbound: Set[str] = set()

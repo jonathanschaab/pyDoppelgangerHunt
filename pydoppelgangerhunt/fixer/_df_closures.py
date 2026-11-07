@@ -59,6 +59,10 @@ def _node_earliest_start_pos(
     n_col = getattr(node, "col_offset", None)
     best_line: Optional[int] = n_line if isinstance(n_line, int) else None
     best_col: Optional[int] = n_col if isinstance(n_col, int) else None
+    if source_lines is None:
+        raw_src_lines = getattr(node, "_source_lines", None)
+        if isinstance(raw_src_lines, (list, tuple)):
+            source_lines = raw_src_lines
     for dec in getattr(node, "decorator_list", ()):
         d_line = getattr(dec, "lineno", None)
         d_col = getattr(dec, "col_offset", None)
@@ -86,6 +90,7 @@ def _node_earliest_start_pos(
                         scan_ln < d_line
                         and stripped
                         and not stripped.startswith(("#", "("))
+                        and not line_txt.rstrip().endswith("\\")
                     ):
                         break
                     scan_ln -= 1
@@ -169,6 +174,10 @@ class _ClosurePos(NamedTuple):
 
     line: int
     col: int = 0
+
+    def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
+        """Returns AST nodes retained by this cached value (none)."""
+        return ()
 
 
 _EAGER_CONSUMER_NAMES: frozenset[str] = frozenset(
@@ -883,6 +892,35 @@ def _is_eagerly_consumed_genexp(
     return False
 
 
+class _FrozenClosureList(List[Tuple[Any, frozenset[str]]]):
+    """Immutable list subclass for cached scope closure records."""
+
+    __slots__ = ()
+
+    def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
+        """Returns AST nodes referenced by this cached closure list (none)."""
+        return ()
+
+    def _immutable(self, *args: Any, **kwargs: Any) -> Any:
+        raise TypeError("_FrozenClosureList is immutable")
+
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __iadd__ = _immutable
+    __imul__ = _immutable
+
+
+_EMPTY_FROZEN_CLOSURE_LIST: _FrozenClosureList = _FrozenClosureList()
+
+
 def _collect_scope_closures_uncached(
     scope_node: ast.AST,
     module_tree: Optional[ast.AST] = None,
@@ -890,8 +928,24 @@ def _collect_scope_closures_uncached(
     genexp_include_header: bool = True,
     cache_parent_map: bool = True,
     enclosing_scopes: Sequence[ast.AST] = (),
-) -> List[Tuple[_ClosurePos, Set[str]]]:
-    closures: List[Tuple[_ClosurePos, Set[str]]] = []
+) -> _FrozenClosureList:
+    raw_scope_body = getattr(scope_node, "body", None)
+    skip_root = isinstance(raw_scope_body, list)
+    if not any(
+        (not skip_root or n is not scope_node)
+        and isinstance(
+            n,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.Lambda,
+                ast.GeneratorExp,
+            ),
+        )
+        for n in ast.walk(scope_node)
+    ):
+        return _EMPTY_FROZEN_CLOSURE_LIST
+    closures: List[Tuple[_ClosurePos, frozenset[str]]] = []
     use_parent_cache = cache_parent_map and not (
         isinstance(scope_node, ast.Module)
         and module_tree is not None
@@ -910,9 +964,14 @@ def _collect_scope_closures_uncached(
         cache_scope_node=use_parent_cache,
         enclosing_scopes=enclosing_scopes,
     )
+    src_lines: Optional[Sequence[str]] = (
+        getattr(module_tree, "_source_lines", None)
+        if module_tree is not None
+        else None
+    ) or getattr(scope_node, "_source_lines", None)
 
     def _resolve_stmt_start_pos(s: ast.AST) -> Tuple[int, int]:
-        estart, ecol = _node_earliest_start_pos(s)
+        estart, ecol = _node_earliest_start_pos(s, source_lines=src_lines)
         return int(estart or 0), int(ecol or 0)
 
     class _ExprClosureCollector(_BaseScopeVisitor):
@@ -944,13 +1003,13 @@ def _collect_scope_closures_uncached(
             closures.append(
                 (
                     _ClosurePos(sub_line, sub_col),
-                    {
+                    frozenset(
                         r
                         for r in _extract_nested_scope_free_reads(
                             subnode, include_header=include_header
                         )
                         if not self._is_in_comp(r) and r not in self.bound_names
-                    },
+                    ),
                 )
             )
 
@@ -1057,7 +1116,7 @@ def _collect_scope_closures_uncached(
                     inner_bound,
                     eff_shadowed,
                 )
-                body_reads = (
+                body_reads = frozenset(
                     _extract_nested_scope_free_reads(stmt, include_header=False)
                     - bound_names
                 )
@@ -1142,7 +1201,6 @@ def _collect_scope_closures_uncached(
                     )
                 _walk_stmts(getattr(case, "body", []), case_bound, cls_shadowed)
 
-    raw_scope_body = getattr(scope_node, "body", [])
     scope_stmts = (
         raw_scope_body if isinstance(raw_scope_body, list)
         else [raw_scope_body] if isinstance(raw_scope_body, ast.AST)
@@ -1150,7 +1208,7 @@ def _collect_scope_closures_uncached(
     )
     root_tp_names = frozenset(_extract_node_type_param_names(scope_node))
     _walk_stmts(scope_stmts, root_tp_names)
-    return closures
+    return _FrozenClosureList(closures) if closures else _EMPTY_FROZEN_CLOSURE_LIST
 
 
 def _collect_scope_closures(
@@ -1158,7 +1216,7 @@ def _collect_scope_closures(
     module_tree: Optional[ast.AST] = None,
     *,
     enclosing_scopes: Sequence[ast.AST] = (),
-) -> List[Tuple[_ClosurePos, Set[str]]]:
+) -> _FrozenClosureList:
     """Discovers all closures defined in a scope, recorded with their starting line."""
     aux_nodes: Tuple[ast.AST, ...] = (
         *(
@@ -1175,13 +1233,16 @@ def _collect_scope_closures(
             scope_node, "scope_closures", aux_ast_nodes=aux_nodes
         )
     )
-    return _get_or_compute_scope_cached(
-        _scope_closures_cache,
-        cache_key,
-        lambda: _collect_scope_closures_uncached(
-            scope_node,
-            module_tree=module_tree,
-            enclosing_scopes=enclosing_scopes,
+    return cast(
+        _FrozenClosureList,
+        _get_or_compute_scope_cached(
+            _scope_closures_cache,
+            cache_key,
+            lambda: _collect_scope_closures_uncached(
+                scope_node,
+                module_tree=module_tree,
+                enclosing_scopes=enclosing_scopes,
+            ),
         ),
     )
 

@@ -71,6 +71,9 @@ def _find_enclosing_function_chain(
 ) -> List[Tuple[int, int, ast.AST]]:
     """Finds enclosing function, lambda, and comprehension scopes ordered outermost to innermost."""
     chain: List[Tuple[int, int, int, int, ast.AST]] = []
+    src_lines: Optional[Sequence[str]] = getattr(
+        mod_tree, "_source_lines", None
+    )
     for estart, n_end, _span, node in _get_tree_scope_intervals(mod_tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -98,7 +101,7 @@ def _find_enclosing_function_chain(
         ):
             continue
         if u_start in (estart, n_lineno):
-            _, e_col = _node_earliest_start_pos(node)
+            _, e_col = _node_earliest_start_pos(node, source_lines=src_lines)
             bound_col = (
                 e_col
                 if (u_start == estart and e_col is not None)
@@ -183,8 +186,6 @@ class _IndexedSpanNode(NamedTuple):
     n_end: int
     n_col: Optional[int]
     n_end_col: Optional[int]
-    req_u_start_le: int
-    req_u_end_ge: int
 
     def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
         """Returns the AST node retained by this span index entry."""
@@ -202,6 +203,7 @@ class _SpanLineIndex:
         "one_line_scope_lines",
         "missing_end_lineno_starts",
         "missing_col_spans",
+        "closure_like_nodes",
         "_dump_cache",
     )
 
@@ -213,12 +215,28 @@ class _SpanLineIndex:
         one_line_scopes: Set[int] = set()
         missing_end_starts: List[int] = []
         missing_cols: List[Tuple[int, int]] = []
+        closure_nodes: List[ast.AST] = []
         self._dump_cache: Dict[int, str] = {}
+        src_lines: Optional[Sequence[str]] = getattr(
+            root_node, "_source_lines", None
+        )
 
-        stack: List[Tuple[ast.AST, int, int]] = [(root_node, 0, 10**9)]
+        stack: List[ast.AST] = [root_node]
         while stack:
-            node, anc_max_start, anc_min_end = stack.pop()
-            n_start, n_col = _node_earliest_start_pos(node)
+            node = stack.pop()
+            if isinstance(
+                node,
+                (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.Lambda,
+                    *_COMPREHENSION_TYPES,
+                ),
+            ):
+                closure_nodes.append(node)
+            n_start, n_col = _node_earliest_start_pos(
+                node, source_lines=src_lines
+            )
             raw_end = getattr(node, "end_lineno", None)
             n_end_col = getattr(node, "end_col_offset", None)
             is_stmt_or_expr = isinstance(node, (ast.stmt, ast.expr))
@@ -243,20 +261,12 @@ class _SpanLineIndex:
 
             n_end = raw_end if isinstance(raw_end, int) else n_start
             if isinstance(n_start, int) and isinstance(n_end, int):
-                req_start_le = (
-                    n_start if n_start < anc_min_end else anc_min_end
-                )
-                req_end_ge = (
-                    n_end if n_end > anc_max_start else anc_max_start
-                )
                 entry = _IndexedSpanNode(
                     node=node,
                     n_start=n_start,
                     n_end=n_end,
                     n_col=n_col if isinstance(n_col, int) else None,
                     n_end_col=n_end_col if isinstance(n_end_col, int) else None,
-                    req_u_start_le=req_start_le,
-                    req_u_end_ge=req_end_ge,
                 )
                 self.by_start_line.setdefault(n_start, []).append(entry)
                 if n_end != n_start:
@@ -291,17 +301,10 @@ class _SpanLineIndex:
                     self.stmts_by_end_line.setdefault(raw_end, []).append(
                         (node, n_start, has_compound_child)
                     )
-                next_max_start = (
-                    n_start if n_start > anc_max_start else anc_max_start
-                )
-                next_min_end = n_end if n_end < anc_min_end else anc_min_end
-            else:
-                next_max_start = anc_max_start
-                next_min_end = anc_min_end
 
             children = list(ast.iter_child_nodes(node))
             for ch in reversed(children):
-                stack.append((ch, next_max_start, next_min_end))
+                stack.append(ch)
 
         self.one_line_scope_lines: frozenset[int] = frozenset(one_line_scopes)
         self.missing_end_lineno_starts: Tuple[int, ...] = tuple(
@@ -310,6 +313,7 @@ class _SpanLineIndex:
         self.missing_col_spans: Tuple[Tuple[int, int], ...] = tuple(
             missing_cols
         )
+        self.closure_like_nodes: Tuple[ast.AST, ...] = tuple(closure_nodes)
 
     def get_dump(self, node: ast.AST) -> str:
         """Returns the cached ast.dump(node) string."""
@@ -343,7 +347,7 @@ class _SpanLineIndex:
         return combined
 
     def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
-        """Returns all AST nodes retained across the four span-line index maps."""
+        """Returns all AST nodes retained across the span-line index maps."""
         nodes: List[ast.AST] = []
         seen_ids: Set[int] = set()
         for entry_map in (self.by_start_line, self.by_end_line):
@@ -365,6 +369,10 @@ class _SpanLineIndex:
                 if isinstance(stmt, ast.AST) and id(stmt) not in seen_ids:
                     seen_ids.add(id(stmt))
                     nodes.append(stmt)
+        for c_node in self.closure_like_nodes:
+            if isinstance(c_node, ast.AST) and id(c_node) not in seen_ids:
+                seen_ids.add(id(c_node))
+                nodes.append(c_node)
         return tuple(nodes)
 
 
@@ -439,10 +447,6 @@ def _resolve_unit_col_bounds(
     end_matches: List[Tuple[int, int]] = []
     span_stmts: List[Tuple[int, int]] = []
     for entry in line_index.iter_boundary_entries(u_start, u_end):
-        if not (
-            u_start <= entry.req_u_start_le and entry.req_u_end_ge <= u_end
-        ):
-            continue
         node = entry.node
         n_start = entry.n_start
         n_end = entry.n_end

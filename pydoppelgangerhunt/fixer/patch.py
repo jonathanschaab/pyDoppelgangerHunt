@@ -13,7 +13,11 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, TypedDict, Union
 
-from pydoppelgangerhunt.config import normalize_path_string, resolve_closure_strictness_mode
+from pydoppelgangerhunt.config import (
+    normalize_path_string,
+    resolve_closure_strictness_mode,
+    resolve_strict_with_suppression,
+)
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
     _extract_child_indentation,
@@ -80,7 +84,9 @@ from pydoppelgangerhunt.fixer.source import (
     resolve_unit_replacement,
     split_source_lines,
 )
-from pydoppelgangerhunt.reporters import extract_unit_source_code
+from pydoppelgangerhunt.reporters import (
+    extract_unit_source_lines_with_state,
+)
 from pydoppelgangerhunt.source_lines import (
     normalize_unit_coordinates,
     resolve_unit_line_bounds,
@@ -3479,30 +3485,40 @@ def _generate_refactoring_patch_impl(
 
             u1_eff["skip_pre_unit_closures"] = bool(effective_skip_closures)
             u2_eff["skip_pre_unit_closures"] = bool(effective_skip_closures)
+            u1_eff["strict_with_suppression"] = resolve_strict_with_suppression(
+                closure_strictness=closure_strictness,
+                strict_with_suppression=u1_eff.get("strict_with_suppression"),
+            )
+            u2_eff["strict_with_suppression"] = resolve_strict_with_suppression(
+                closure_strictness=closure_strictness,
+                strict_with_suppression=u2_eff.get("strict_with_suppression"),
+            )
             s1 = inspect_single_unit_scope(u1_eff, repo_root=str(root), tree=tree1)
             s2 = inspect_single_unit_scope(u2_eff, repo_root=str(root), tree=tree2)
             if u1_eff.get("kind") in ("comprehension", "complex_expr") or u2_eff.get(
                 "kind"
             ) in ("comprehension", "complex_expr"):
+                raw_l1, is_sl1 = extract_unit_source_lines_with_state(
+                    u1_eff, repo_root=str(root)
+                )
+                raw_l2, is_sl2 = extract_unit_source_lines_with_state(
+                    u2_eff, repo_root=str(root)
+                )
                 stmt_lines1 = _slice_unit_token_lines(
                     u1_eff,
                     _extract_unit_body_lines(
                         u1_eff,
-                        [
-                            ln.rstrip("\r\n")
-                            for ln in extract_unit_source_code(u1_eff, repo_root=str(root))
-                        ],
+                        [ln.rstrip("\r\n") for ln in raw_l1],
                     ),
+                    is_pre_sliced=is_sl1,
                 )
                 stmt_lines2 = _slice_unit_token_lines(
                     u2_eff,
                     _extract_unit_body_lines(
                         u2_eff,
-                        [
-                            ln.rstrip("\r\n")
-                            for ln in extract_unit_source_code(u2_eff, repo_root=str(root))
-                        ],
+                        [ln.rstrip("\r\n") for ln in raw_l2],
                     ),
+                    is_pre_sliced=is_sl2,
                 )
                 if not _prune_pair_lhs_and_augassign_scopes(
                     u1_eff, u2_eff, s1, s2, stmt_lines1, stmt_lines2
@@ -3664,6 +3680,7 @@ def _generate_refactoring_patch_impl(
                 skip_pre_unit_closures=effective_skip_closures,
                 source_digest1=digest1,
                 source_digest2=digest2,
+                closure_strictness=closure_strictness,
                 require_pairing=replace_clones,
                 return_details=True,
             )

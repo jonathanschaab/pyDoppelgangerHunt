@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from tests.fixer.test_closure_cells_scenarios import (
+from tests.fixer.conftest import (
     _run_differential_refactoring_case,
 )
 
@@ -164,6 +164,8 @@ def test_definite_bindings_exceptional_control_flow_table(
     import textwrap  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.fixer._df_cell_traversal import (
         _analyze_enclosing_fn_cells,
+    )
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
         _extract_block_definite_bindings_and_term,
     )
 
@@ -1886,15 +1888,19 @@ def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
         _collect_escaped_intra_unit_names,
         _get_fn_scope_context,
     )
-    from pydoppelgangerhunt.fixer._df_cell_hazards import (
-        _find_enclosing_function_chain,
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _SpanBounds,
     )
     from pydoppelgangerhunt.fixer._df_cell_traversal import (
-        _SpanBounds,
         _analyze_enclosing_fn_cells,
-        _extract_block_definite_bindings_and_term,
         _make_empty_traversal_buffers,
         _try_apply_cached_stmt_delta,
+    )
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _find_enclosing_function_chain,
+    )
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _extract_block_definite_bindings_and_term,
     )
     from pydoppelgangerhunt.fixer._df_pairing import resolve_clone_pair_outputs
     from pydoppelgangerhunt.fixer.scope import (
@@ -2430,6 +2436,8 @@ def test_chained_walrus_augassign_trystar_and_slice_edge_cases(
     )
     from pydoppelgangerhunt.fixer._df_cell_traversal import (
         _analyze_enclosing_fn_cells,
+    )
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
         _extract_block_definite_bindings_and_term,
         _extract_unconditional_walrus_names,
     )
@@ -2598,11 +2606,11 @@ def test_chained_walrus_augassign_trystar_and_slice_edge_cases(
     assert "skip_pre_unit_closures" not in u2_orig
     recomputed_sc = ensure_unit_scope_closure_mode(
         u1_orig,
-        {"_skip_pre_unit_closures": False, "inputs": ["a"]},
+        {"skip_pre_unit_closures": False, "inputs": ["a"]},
         True,
         source_text=src_patch_mode,
     )
-    assert recomputed_sc["_skip_pre_unit_closures"] is True
+    assert recomputed_sc["skip_pre_unit_closures"] is True
     assert "skip_pre_unit_closures" not in u1_orig
 
     # 4. Performance: module star-import and single-node-locals caching across many units
@@ -2824,11 +2832,13 @@ def test_suppress_with_name_errors_and_custom_bool_dunder() -> None:
     """Verifies ast.Name and truthiness checks inside suppress(...) are not assumed non-raising."""
     from pydoppelgangerhunt.fixer import inspect_single_unit_scope
     from pydoppelgangerhunt.fixer._df_cell_traversal import (
-        _extract_block_definite_bindings_and_term,
         _find_enclosing_chain_definite_pre_bound,
     )
-    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+    from pydoppelgangerhunt.fixer._df_span_index import (
         _find_enclosing_function_chain,
+    )
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _extract_block_definite_bindings_and_term,
     )
     from pydoppelgangerhunt.fixer.scope import (
         _analyze_block_assignment,
@@ -2919,7 +2929,7 @@ def test_suppress_with_name_errors_and_custom_bool_dunder() -> None:
 def test_unknown_and_aliased_and_nested_suppressing_context_managers() -> None:
     """Covers 3-state context manager classification, custom/unknown/aliased suppressors, and nested suppressors."""
     from pydoppelgangerhunt.fixer import inspect_single_unit_scope
-    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
         _classify_with_suppression,
         _extract_block_definite_bindings_and_term,
     )
@@ -3084,3 +3094,67 @@ def test_unknown_and_aliased_and_nested_suppressing_context_managers() -> None:
     )
     assert bound_nt == {"x"}
     assert term_nt is True
+
+
+def test_try_apply_cached_stmt_delta_self_rebinding_with_cm_as_cm() -> None:
+    """Verifies _try_apply_cached_stmt_delta evaluates with pre-statement provenance on 'with cm() as cm:'."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _SpanBounds,
+        _get_fn_scope_context,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _make_empty_traversal_buffers,
+        _try_apply_cached_stmt_delta,
+    )
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _SuppressProvenance,
+    )
+
+    mod = ast.parse(
+        "def f():\n"
+        "    with cm(ValueError) as cm:\n"
+        "        x = may_fail()\n"
+        "    with cm():\n"
+        "        y = may_fail()\n"
+    )
+    fn_node = mod.body[0]
+    assert isinstance(fn_node, ast.FunctionDef)
+    ctx = _get_fn_scope_context(fn_node, mod)
+    prov_init = _SuppressProvenance(suppressors=frozenset({"cm"}))
+    bufs = _make_empty_traversal_buffers(
+        frozenset(),
+        ctx,
+        initial_suppress_aliases=prov_init,
+    )
+    bounds = _SpanBounds(10, 10, None, None)
+    stmt_deltas: dict[tuple[Any, ...], Any] = {}
+
+    # First statement `with cm(ValueError) as cm:` uses pre-statement `cm` (suppressing)
+    # and then clears `cm` from provenance for subsequent statements.
+    assert (
+        _try_apply_cached_stmt_delta(
+            fn_node.body[0], bounds, bufs, stmt_deltas
+        )
+        is True
+    )
+    assert "x" not in bufs.state.pre_bound
+    assert bufs.state.suppress_aliases is not None
+    assert "cm" not in bufs.state.suppress_aliases.suppressors
+    assert len(stmt_deltas) == 1
+
+    # Re-applying cached delta with identical pre-statement provenance hits the cache
+    bufs2 = _make_empty_traversal_buffers(
+        frozenset(),
+        ctx,
+        initial_suppress_aliases=prov_init,
+    )
+    assert (
+        _try_apply_cached_stmt_delta(
+            fn_node.body[0], bounds, bufs2, stmt_deltas
+        )
+        is True
+    )
+    assert "x" not in bufs2.state.pre_bound
+    assert bufs2.state.suppress_aliases is not None
+    assert "cm" not in bufs2.state.suppress_aliases.suppressors
+

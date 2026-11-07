@@ -39,7 +39,10 @@ from pydoppelgangerhunt.fixer._df_hazards import (
     _resolve_downstream_scope_node,
     collect_downstream_read_names,
 )
-from pydoppelgangerhunt.config import resolve_closure_strictness_mode
+from pydoppelgangerhunt.config import (
+    resolve_closure_strictness_mode,
+    resolve_strict_with_suppression,
+)
 from pydoppelgangerhunt.fixer.scope import ensure_unit_scope_closure_mode
 from pydoppelgangerhunt.fixer.source import (
     _load_unit_file_text,
@@ -288,6 +291,52 @@ def _extract_effective_unit_outputs(
     return list(dict.fromkeys(v for v in cands if v not in excluded))
 
 
+def _ensure_pair_scopes_closure_mode(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    scope1: Optional[Dict[str, Any]],
+    scope2: Optional[Dict[str, Any]],
+    *,
+    closure_strictness: Optional[str],
+    skip_pre_unit_closures: bool,
+    source_text1: Optional[str],
+    source_text2: Optional[str],
+    tree1: Optional[ast.AST],
+    tree2: Optional[ast.AST],
+    repo_root: Optional[str],
+) -> Tuple[Dict[str, Any], Dict[str, Any], bool]:
+    """Ensures both clone units' scopes match the requested closure strictness mode."""
+    _, effective_skip_closures = resolve_closure_strictness_mode(
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+    )
+    resolved_s1 = ensure_unit_scope_closure_mode(
+        u1,
+        scope1,
+        effective_skip_closures,
+        strict_with_suppression=resolve_strict_with_suppression(
+            closure_strictness=closure_strictness,
+            strict_with_suppression=u1.get("strict_with_suppression"),
+        ),
+        source_text=source_text1,
+        tree=tree1,
+        repo_root=repo_root,
+    )
+    resolved_s2 = ensure_unit_scope_closure_mode(
+        u2,
+        scope2,
+        effective_skip_closures,
+        strict_with_suppression=resolve_strict_with_suppression(
+            closure_strictness=closure_strictness,
+            strict_with_suppression=u2.get("strict_with_suppression"),
+        ),
+        source_text=source_text2,
+        tree=tree2,
+        repo_root=repo_root,
+    )
+    return resolved_s1, resolved_s2, effective_skip_closures
+
+
 @overload
 def resolve_clone_generator_subroutine_outputs(
     u1: Dict[str, Any],
@@ -385,24 +434,17 @@ def resolve_clone_generator_subroutine_outputs(
                     else None
                 )
 
-    _, effective_skip_closures = resolve_closure_strictness_mode(
+    scope1, scope2, effective_skip_closures = _ensure_pair_scopes_closure_mode(
+        u1,
+        u2,
+        scope1,
+        scope2,
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
-    )
-    scope1 = ensure_unit_scope_closure_mode(
-        u1,
-        scope1,
-        effective_skip_closures,
-        source_text=source_text1,
-        tree=tree1,
-        repo_root=repo_root,
-    )
-    scope2 = ensure_unit_scope_closure_mode(
-        u2,
-        scope2,
-        effective_skip_closures,
-        source_text=source_text2,
-        tree=tree2,
+        source_text1=source_text1,
+        source_text2=source_text2,
+        tree1=tree1,
+        tree2=tree2,
         repo_root=repo_root,
     )
 
@@ -555,17 +597,17 @@ def resolve_clone_generator_subroutine_outputs(
                 u_end_col = _extract_unit_end_col(u_item)
                 if u_end_col is None:
                     u_end_col = _resolve_unit_ast_end_col(scope_node, u_item)
-                for c_pos, reads in _collect_scope_closures(scope_node, module_tree=eff_tr):
+                for c_pos, c_reads in _collect_scope_closures(scope_node, module_tree=eff_tr):
                     _, is_intra, _ = _classify_closure_position(
                         c_pos, u_s, u_e, u_start_col=u_start_col, u_end_col=u_end_col
                     )
-                    if is_intra and bool(reads & set(needed_outs)):
+                    if is_intra and bool(c_reads & set(needed_outs)):
                         c_line, _ = _normalize_closure_position(c_pos)
                         logger.debug(
                             "Rejecting generator subroutine pair: intra-unit closure at line %d "
                             "captures needed output(s) %r for unit %s",
                             c_line,
-                            reads & set(needed_outs),
+                            c_reads & set(needed_outs),
                             side_idx + 1,
                         )
                         return (
@@ -707,24 +749,17 @@ def resolve_clone_pair_outputs(
             else None
         )
 
-    _, effective_skip_closures = resolve_closure_strictness_mode(
+    scope1, scope2, effective_skip_closures = _ensure_pair_scopes_closure_mode(
+        u1,
+        u2,
+        scope1,
+        scope2,
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
-    )
-    scope1 = ensure_unit_scope_closure_mode(
-        u1,
-        scope1,
-        effective_skip_closures,
-        source_text=source_text1,
-        tree=tree1,
-        repo_root=repo_root,
-    )
-    scope2 = ensure_unit_scope_closure_mode(
-        u2,
-        scope2,
-        effective_skip_closures,
-        source_text=source_text2,
-        tree=tree2,
+        source_text1=source_text1,
+        source_text2=source_text2,
+        tree1=tree1,
+        tree2=tree2,
         repo_root=repo_root,
     )
 

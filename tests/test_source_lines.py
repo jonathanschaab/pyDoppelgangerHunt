@@ -2374,4 +2374,3 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     assert "self" in super_scope["inputs"]
     assert super_scope["has_instance_binding"] is True
     assert super_scope["binding_kind"] == "instance"
-

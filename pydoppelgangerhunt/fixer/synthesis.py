@@ -11,8 +11,11 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 from pydoppelgangerhunt.config import (
     normalize_path_string,
     resolve_closure_strictness_mode,
+    resolve_strict_with_suppression,
 )
-from pydoppelgangerhunt.reporters import extract_unit_source_code
+from pydoppelgangerhunt.reporters import (
+    extract_unit_source_lines_with_state,
+)
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
     _has_receiver_reference,
@@ -1347,13 +1350,25 @@ def synthesize_shared_helper_code(
         u2["source_text"] = source_text2
     if not _align_pair_expr_kinds(u1, u2):
         return ""
+    raw_lines1, is_sliced1 = extract_unit_source_lines_with_state(
+        u1, repo_root=repo_root
+    )
+    raw_lines2, is_sliced2 = extract_unit_source_lines_with_state(
+        u2, repo_root=repo_root
+    )
     lines1 = _slice_unit_token_lines(
         u1,
-        _extract_unit_body_lines(u1, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u1, repo_root=repo_root)]),
+        _extract_unit_body_lines(
+            u1, [ln.rstrip("\r\n") for ln in raw_lines1]
+        ),
+        is_pre_sliced=is_sliced1,
     )
     lines2 = _slice_unit_token_lines(
         u2,
-        _extract_unit_body_lines(u2, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u2, repo_root=repo_root)]),
+        _extract_unit_body_lines(
+            u2, [ln.rstrip("\r\n") for ln in raw_lines2]
+        ),
+        is_pre_sliced=is_sliced2,
     )
 
     base_name1 = _base_unit_name(u1)
@@ -1401,10 +1416,30 @@ def synthesize_shared_helper_code(
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
     )
+    effective_strict_with1 = resolve_strict_with_suppression(
+        closure_strictness=closure_strictness,
+        strict_with_suppression=u1.get("strict_with_suppression"),
+    )
+    effective_strict_with2 = resolve_strict_with_suppression(
+        closure_strictness=closure_strictness,
+        strict_with_suppression=u2.get("strict_with_suppression"),
+    )
     has_precomputed_scopes = (
-        scope_matches_closure_mode(scope1, effective_skip_closures)
-        and scope_matches_closure_mode(scope2, effective_skip_closures)
-        and scope_matches_closure_mode(scope, effective_skip_closures)
+        scope_matches_closure_mode(
+            scope1,
+            effective_skip_closures,
+            expected_strict_with=effective_strict_with1,
+        )
+        and scope_matches_closure_mode(
+            scope2,
+            effective_skip_closures,
+            expected_strict_with=effective_strict_with2,
+        )
+        and scope_matches_closure_mode(
+            scope,
+            effective_skip_closures,
+            expected_strict_with=effective_strict_with1 or effective_strict_with2,
+        )
     )
     can_skip_tree_parse = (
         has_precomputed_scopes
@@ -1451,9 +1486,9 @@ def synthesize_shared_helper_code(
     tree1 = _resolve_tree(tree1, source_text1, u1)
     tree2 = _resolve_tree(tree2, source_text2, u2)
     scopes: List[Dict[str, Any]] = []
-    for u_item, s_text, t_item, pre_s in (
-        (u1, source_text1, tree1, scope1),
-        (u2, source_text2, tree2, scope2),
+    for u_item, s_text, t_item, pre_s, eff_sw in (
+        (u1, source_text1, tree1, scope1, effective_strict_with1),
+        (u2, source_text2, tree2, scope2, effective_strict_with2),
     ):
         if s_text is not None and (
             not isinstance(u_item.get("source_text"), str)
@@ -1468,6 +1503,7 @@ def synthesize_shared_helper_code(
                 u_item,
                 pre_s,
                 effective_skip_closures,
+                strict_with_suppression=eff_sw,
                 source_text=s_text,
                 tree=t_item,
                 repo_root=repo_root,

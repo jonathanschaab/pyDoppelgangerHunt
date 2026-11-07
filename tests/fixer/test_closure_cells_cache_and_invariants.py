@@ -22,12 +22,8 @@ from pydoppelgangerhunt.fixer import (
 )
 
 
-def test_heterogeneous_frozenset_eviction_and_fail_closed_spans(
-    tmp_path: Path,
-) -> None:
-    """Covers heterogeneous frozenset cache eviction, fail-closed spans, PEP 3104/227 lexical rules, lazy/eager genexps without scope_ctx, C-enforced scalar built-ins vs custom dunders, carrier mutations vs rebinding, and intermediate _EnclosingFnCellInfo summaries."""
-    import symtable
-
+def test_heterogeneous_frozenset_eviction_and_scope_cache_key() -> None:
+    """Covers heterogeneous frozenset cache eviction, nested AST nodes, and _ScopeCacheKey."""
     from pydoppelgangerhunt.fixer._df_cache import (
         _ScopeCacheKey,
         _evict_tree_scopes,
@@ -36,27 +32,12 @@ def test_heterogeneous_frozenset_eviction_and_fail_closed_spans(
         _scope_closures_cache,
     )
     from pydoppelgangerhunt.fixer._df_cell_carriers import (
-        _FnScopeContext,
         _SpanBounds,
-        _extract_closure_nonlocal_mutations_and_deletions,
-        _extract_comprehension_deferred_closure_info,
-        _extract_lazy_genexp_walrus_names,
-        _has_invalid_lexical_scope_declarations,
-        _has_unresolved_span_bounds,
-        _is_lazy_genexp,
-        _is_node_inside_span,
-        _is_non_closure_scalar_expr,
-        _resolve_unit_col_bounds,
-    )
-    from pydoppelgangerhunt.fixer._df_cell_hazards import (
-        _UnitClosureHazardContext,
-        _has_severed_closure_cell_hazard,
     )
     from pydoppelgangerhunt.fixer._df_cell_traversal import (
         _analyze_enclosing_fn_cells,
     )
 
-    # Heterogeneous frozenset eviction, nested AST nodes, and _ScopeCacheKey
     clear_dataflow_cache()
     evict_mod = ast.parse(
         "def outer(items):\n"
@@ -120,7 +101,22 @@ def test_heterogeneous_frozenset_eviction_and_fail_closed_spans(
     )
     assert info_before == info_after
 
-    # Fail-closed policy for unresolved source spans & incomplete AST metadata
+
+def test_fail_closed_policy_for_unresolved_source_spans() -> None:
+    """Covers fail-closed policy for unresolved source spans and incomplete AST metadata."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _SpanBounds,
+        _is_node_inside_span,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _UnitClosureHazardContext,
+        _has_severed_closure_cell_hazard,
+    )
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _has_unresolved_span_bounds,
+        _resolve_unit_col_bounds,
+    )
+
     dup_line_src = (
         "def f(xs):\n"
         "    a = 1; a = 1\n"
@@ -225,7 +221,18 @@ def test_heterogeneous_frozenset_eviction_and_fail_closed_spans(
     )
     assert _has_unresolved_span_bounds(corrupt_col_fn, 3, 3, 4, 13) is True
 
-    # PEP 3104 & PEP 227 lexical-scope rules (invalid vs valid multi-level variants)
+
+def test_pep3104_and_pep227_lexical_scope_rules() -> None:
+    """Covers PEP 3104 and PEP 227 lexical-scope rules across invalid and valid multi-level variants."""
+    import symtable
+
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _extract_closure_nonlocal_mutations_and_deletions,
+    )
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _has_invalid_lexical_scope_declarations,
+    )
+
     invalid_variants = [
         "def outer():\n    x = 0\n    def mid():\n        global x\n        def inner():\n            nonlocal x\n            x += 1\n",
         "def outer():\n    x = 0\n    def inner():\n        nonlocal x\n        global x\n        x = 1\n",
@@ -388,6 +395,22 @@ def test_heterogeneous_frozenset_eviction_and_fail_closed_spans(
         tree=v4_tree,
     )
     assert "severed_closure_cell" in sc_v4["control_flow_hazards"]
+
+
+def test_lazy_genexp_scalar_builtins_and_carrier_mutation_summaries(
+    tmp_path: Path,
+) -> None:
+    """Covers lazy/eager genexps without scope_ctx, scalar built-ins vs custom dunders, carrier mutations vs rebinding, and _EnclosingFnCellInfo summaries."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _FnScopeContext,
+        _extract_comprehension_deferred_closure_info,
+        _extract_lazy_genexp_walrus_names,
+        _is_lazy_genexp,
+        _is_non_closure_scalar_expr,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _analyze_enclosing_fn_cells,
+    )
 
     # _is_lazy_genexp & comprehension helpers with and without scope_ctx
     detached_gen = ast.parse("(x + a for x in items)", mode="eval").body
@@ -647,33 +670,18 @@ def test_heterogeneous_frozenset_eviction_and_fail_closed_spans(
     )
 
 
-def test_multilevel_concurrent_sibling_with_definite_bindings_and_class_escape() -> None:
-    """Covers multi-level concurrent sibling detection, with definite bindings, class escape, and context cache."""
-    from pydoppelgangerhunt.fixer._df_cache import _get_scope_parent_map
-    from pydoppelgangerhunt.fixer._df_cell_carriers import (
-        _FnScopeContext,
-        _collect_escaped_and_executed_intra_unit_defs,
-        _collect_unit_nonlocal_mutators,
-        _extract_closure_nonlocal_mutations_and_deletions_uncached,
-        _extract_fn_outer_carrier_targets,
-        _extract_fn_outer_carrier_targets_uncached,
-        _extract_fn_returned_closure_refs,
-        _find_enclosing_function_chain,
-        _has_invalid_lexical_scope_declarations,
-        _is_closure_factory_scope,
-        _propagate_sibling_closures,
-        _resolve_unit_col_bounds,
-    )
+def test_multilevel_concurrent_sibling_closure_sharing() -> None:
+    """Covers multi-level concurrent sibling closure cell sharing detection."""
     from pydoppelgangerhunt.fixer._df_cell_hazards import (
         _check_sibling_closure_sharing,
     )
     from pydoppelgangerhunt.fixer._df_cell_traversal import (
         _build_enclosing_chain_cell_infos,
-        _extract_block_definite_bindings_and_term,
-        _find_enclosing_chain_definite_pre_bound,
+    )
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _find_enclosing_function_chain,
     )
 
-    # 1. Multi-level concurrent sibling detection (outer -> middle -> inner -> generator)
     p1_src = (
         "def outer():\n"
         "    value = 0\n"
@@ -757,7 +765,19 @@ def test_multilevel_concurrent_sibling_with_definite_bindings_and_class_escape()
         is False
     )
 
-    # 2. Definite-binding analysis inside `with` and `async with` bodies
+
+def test_with_and_async_with_definite_bindings() -> None:
+    """Covers definite-binding analysis inside with and async with bodies."""
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _find_enclosing_chain_definite_pre_bound,
+    )
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _find_enclosing_function_chain,
+    )
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _extract_block_definite_bindings_and_term,
+    )
+
     with_definite_src = (
         "import contextlib\n"
         "def process(cm, items):\n"
@@ -864,10 +884,23 @@ def test_multilevel_concurrent_sibling_with_definite_bindings_and_class_escape()
             else parsed.body
         )
         got_bound, got_term = _extract_block_definite_bindings_and_term(
-            stmts, None
+            stmts, None, strict_with_suppression=True
         )
         assert got_bound == expected_bound, f"Mismatch for:\n{code_str}"
         assert got_term is expected_term, f"Term mismatch for:\n{code_str}"
+
+
+def test_class_definitions_escape_and_shared_ast_context_cache() -> None:
+    """Covers class definition escape classification and cached closure metadata context validation on shared AST nodes."""
+    from pydoppelgangerhunt.fixer._df_cache import _get_scope_parent_map
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _FnScopeContext,
+        _collect_escaped_and_executed_intra_unit_defs,
+        _collect_unit_nonlocal_mutators,
+        _extract_fn_outer_carrier_targets,
+        _extract_fn_returned_closure_refs,
+        _is_closure_factory_scope,
+    )
 
     # 3. Class definitions escape classification
     cls_unreferenced_src = (
@@ -1019,6 +1052,23 @@ def test_multilevel_concurrent_sibling_with_definite_bindings_and_class_escape()
     assert _extract_fn_returned_closure_refs(shared_fn, ctx_b) == (
         set(),
         {"any"},
+    )
+
+
+def test_definite_binding_oracle_and_rebinding_matrix() -> None:
+    """Covers table-driven definite-binding runtime oracle comparison, lexical class scopes, rebinding matrix, and carrier targets."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _extract_closure_nonlocal_mutations_and_deletions_uncached,
+        _extract_fn_outer_carrier_targets_uncached,
+        _propagate_sibling_closures,
+    )
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _find_enclosing_function_chain,
+        _has_invalid_lexical_scope_declarations,
+        _resolve_unit_col_bounds,
+    )
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _extract_block_definite_bindings_and_term,
     )
 
     # 5. Table-driven definite-binding runtime oracle comparison
@@ -1258,42 +1308,17 @@ def test_multilevel_concurrent_sibling_with_definite_bindings_and_class_escape()
     )
 
 
-def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
-    """Verifies PEP 227 class-level global isolation, try-del-return handler fallthrough, definite-binding engine equivalence, statement-delta equivalence, and cache isolation."""
-    from pydoppelgangerhunt.fixer._df_cache import (
-        _ScopeCacheKey,
-        _scope_cell_info_cache,
-        _scope_parent_maps,
-    )
+def test_pep227_class_level_global_isolation_and_sibling_carriers() -> None:
+    """Verifies PEP 227 class-level global isolation and sibling class method carriers."""
     from pydoppelgangerhunt.fixer._df_cell_carriers import (
-        _SpanBounds,
-        _extract_cached_scope_free_reads,
-        _extract_closure_nonlocal_mutations_and_deletions,
-        _extract_fn_outer_carrier_targets,
         _extract_fn_outer_carrier_targets_uncached,
-        _extract_fn_returned_closure_refs,
         _get_fn_scope_context,
-        _is_closure_factory_scope,
-        _is_self_escaping_def_node,
-    )
-    from pydoppelgangerhunt.fixer._df_cell_traversal import (
-        _analyze_enclosing_fn_cells_uncached,
-        _extract_block_definite_bindings_and_term,
-        _iter_class_body_methods,
     )
     from pydoppelgangerhunt.fixer._df_visitors import (
         _ClassScopeVisitor,
         _extract_nested_scope_free_reads_with_nodes,
     )
-    from pydoppelgangerhunt.fixer.scope import (
-        _analyze_block_assignment,
-        ensure_unit_scope_closure_mode,
-    )
-    from pydoppelgangerhunt.fixer.source import (
-        _slice_unit_token_lines,
-    )
 
-    # Class-level `global` does not propagate into nested methods/lambdas/comprehensions/classes
     pep227_src = (
         "def outer(xs):\n"
         "    items = []\n"
@@ -1362,7 +1387,11 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
     )
     assert "severed_closure_cell" in sc_cls_sib["control_flow_hazards"]
 
-    # Unknown strictness mode without source fails closed
+
+def test_ensure_unit_scope_closure_mode_legacy_and_explicit_contracts() -> None:
+    """Verifies legacy unmarked precomputed scopes are trusted by default and fail closed only when a mode mismatch cannot be recomputed."""
+    from pydoppelgangerhunt.fixer.scope import ensure_unit_scope_closure_mode
+
     unmarked_precomputed: dict[str, Any] = {
         "inputs": ["a"],
         "outputs": ["b"],
@@ -1382,16 +1411,27 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
         "local_imports": [],
         "yield_expr_names": [],
     }
-    strict_unknown_res = ensure_unit_scope_closure_mode(
+    preserved = ensure_unit_scope_closure_mode(
         {"file": "nonexistent_unavailable.py", "start": 1, "end": 2},
         unmarked_precomputed,
         skip_pre_unit_closures=False,
     )
-    assert strict_unknown_res["is_control_flow_safe"] is False
-    assert "severed_closure_cell" in strict_unknown_res["control_flow_hazards"]
-    assert strict_unknown_res["_skip_pre_unit_closures"] is False
+    assert preserved["is_control_flow_safe"] is True
+    assert "severed_closure_cell" not in preserved["control_flow_hazards"]
 
-    # Same-name definitions in conditional branches
+    marked_lenient = {**unmarked_precomputed, "skip_pre_unit_closures": True}
+    strict_mismatch_res = ensure_unit_scope_closure_mode(
+        {"file": "nonexistent_unavailable.py", "start": 1, "end": 2},
+        marked_lenient,
+        skip_pre_unit_closures=False,
+    )
+    assert strict_mismatch_res["is_control_flow_safe"] is False
+    assert "severed_closure_cell" in strict_mismatch_res["control_flow_hazards"]
+    assert strict_mismatch_res["skip_pre_unit_closures"] is False
+
+
+def test_same_name_definitions_and_conditional_closures_and_star_imports() -> None:
+    """Verifies same-name definitions across branches, conditional closures, and star-import shadowing."""
     same_name_defs_src = (
         "def outer(flag, items):\n"
         "    x = 0\n"
@@ -1418,7 +1458,6 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
     )
     assert "severed_closure_cell" in sc_same_name["control_flow_hazards"]
 
-    # Conditional closure creation
     cond_closure_unreturned_src = (
         "def outer(flag, items):\n"
         "    if flag:\n"
@@ -1453,7 +1492,6 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
     assert "severed_closure_cell" in sc_cond_strict["control_flow_hazards"]
     assert "severed_closure_cell" not in sc_cond_lenient["control_flow_hazards"]
 
-    # Star import shadowing `len` prevents treating `len(cb)` as pure built-in
     star_len_src = (
         "from pkg import *\n"
         "def outer(items):\n"
@@ -1476,7 +1514,9 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
     )
     assert "severed_closure_cell" in sc_star_len["control_flow_hazards"]
 
-    # Comprehension filter mutating outer cell via walrus when primary iterable may be empty
+
+def test_comprehension_filter_walrus_async_for_and_three_level_class_closures() -> None:
+    """Verifies comprehension filter walrus mutations, async-for targets, and 3-level class closures."""
     comp_filter_mut_src = (
         "def outer(empty_seq):\n"
         "    acc = 0\n"
@@ -1499,7 +1539,6 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
     )
     assert "severed_closure_cell" in sc_comp_filter["control_flow_hazards"]
 
-    # `async for` target is conditional (not unconditionally pre-bound)
     async_for_src = (
         "async def outer(aiter, items):\n"
         "    async for scale in aiter:\n"
@@ -1522,7 +1561,6 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
     )
     assert "severed_closure_cell" in sc_async_for["control_flow_hazards"]
 
-    # 3-level nested closure chain with middle class definition
     three_level_cls_src = (
         "def outer(cond, items):\n"
         "    if cond:\n"
@@ -1548,7 +1586,12 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
     )
     assert "severed_closure_cell" in sc_three_cls["control_flow_hazards"]
 
-    # `try: del x; might_raise(); return 1 except ValueError: pass`
+
+def test_try_del_return_fallthrough_and_iter_class_body_methods() -> None:
+    """Verifies try-del-return handler fallthrough and _iter_class_body_methods."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import _iter_class_body_methods
+    from pydoppelgangerhunt.fixer.scope import _analyze_block_assignment
+
     try_del_ret_src = (
         "def outer(might_raise, items):\n"
         "    x = 1\n"
@@ -1586,7 +1629,6 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
     )
     assert "severed_closure_cell" in sc_try_del_ret["control_flow_hazards"]
 
-    # _iter_class_body_methods across nested control flow and nested classes
     cls_methods_src = (
         "class Complex:\n"
         "    if True:\n"
@@ -1629,7 +1671,18 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
     assert found_method_names == expected_methods
     assert "m_nested_only" not in found_method_names
 
-    # Statement-delta cached vs. uncached (`use_stmt_deltas=False`) differential test
+
+def test_stmt_delta_equivalence_and_shared_definite_binding_corpus() -> None:
+    """Verifies statement-delta equivalence and definite-binding corpus parity."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import _SpanBounds
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _analyze_enclosing_fn_cells_uncached,
+    )
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _extract_block_definite_bindings_and_term,
+    )
+    from pydoppelgangerhunt.fixer.scope import _analyze_block_assignment
+
     delta_diff_src = (
         "def complex_fn(items, cond, mgr):\n"
         "    a = 1\n"
@@ -1669,7 +1722,6 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
         )
         assert info_cached == info_uncached
 
-    # Shared-corpus equivalence between `_analyze_block_assignment` and `_extract_block_definite_bindings_and_term`
     shared_definite_corpus: list[tuple[str, set[str]]] = [
         ("x = 1\ny = 2\n", {"x", "y"}),
         ("x = 1\ndel x\n", set()),
@@ -1728,7 +1780,32 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
         assert def_b == expected_def_set, f"_extract_block_definite_bindings_and_term mismatch on:\n{snippet}"
         assert def_a == def_b
 
-    # Multi-line `_slice_unit_token_lines` boundary-equality test
+    if sys.version_info >= (3, 11):
+        multi_trystar_src = (
+            "keep = 1\n"
+            "victim = 2\n"
+            "try:\n"
+            "    a = 10\n"
+            "except* ValueError as eg1:\n"
+            "    a = 20\n"
+            "    del victim\n"
+            "except* TypeError as eg2:\n"
+            "    a = 30\n"
+            "finally:\n"
+            "    fin = 40\n"
+        )
+        ts_stmts = ast.parse(multi_trystar_src).body
+        ts_def_a, ts_cond_a = _analyze_block_assignment(ts_stmts)
+        ts_def_b, _ = _extract_block_definite_bindings_and_term(ts_stmts, None)
+        assert ts_def_a == {"keep", "fin"}
+        assert ts_def_b == {"keep", "fin"}
+        assert {"a", "victim"} <= ts_cond_a
+
+
+def test_slice_unit_token_lines_multiline_and_utf8_boundaries() -> None:
+    """Verifies multi-line _slice_unit_token_lines boundary and UTF-8 handling."""
+    from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
+
     ml_lines = ["    x = (\n", "        1 + 2\n", "    )\n"]
     first_bytes_len = len(ml_lines[0].rstrip("\r\n").encode("utf-8"))
     last_bytes_len = len(ml_lines[-1].rstrip("\r\n").encode("utf-8"))
@@ -1769,28 +1846,23 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
         == presliced_ml
     )
 
-    if sys.version_info >= (3, 11):
-        multi_trystar_src = (
-            "keep = 1\n"
-            "victim = 2\n"
-            "try:\n"
-            "    a = 10\n"
-            "except* ValueError as eg1:\n"
-            "    a = 20\n"
-            "    del victim\n"
-            "except* TypeError as eg2:\n"
-            "    a = 30\n"
-            "finally:\n"
-            "    fin = 40\n"
-        )
-        ts_stmts = ast.parse(multi_trystar_src).body
-        ts_def_a, ts_cond_a = _analyze_block_assignment(ts_stmts)
-        ts_def_b, _ = _extract_block_definite_bindings_and_term(ts_stmts, None)
-        assert ts_def_a == {"keep", "fin"}
-        assert ts_def_b == {"keep", "fin"}
-        assert {"a", "victim"} <= ts_cond_a
 
-    # Cached (`use_cache=True`) vs uncached (`use_cache=False`) helper equivalence
+def test_cached_vs_uncached_helper_equivalence_and_multipath_runtime_oracle() -> None:
+    """Verifies cached vs uncached helper equivalence and multi-path runtime oracle intersection."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _extract_cached_scope_free_reads,
+        _extract_closure_nonlocal_mutations_and_deletions,
+        _extract_fn_outer_carrier_targets,
+        _extract_fn_returned_closure_refs,
+        _get_fn_scope_context,
+        _is_closure_factory_scope,
+        _is_self_escaping_def_node,
+    )
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _extract_block_definite_bindings_and_term,
+    )
+    from pydoppelgangerhunt.fixer.scope import _analyze_block_assignment
+
     clear_dataflow_cache()
     helper_eq_tree = ast.parse(
         "def outer(box, items):\n"
@@ -1831,7 +1903,6 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
         inner_eq, frozenset(), eq_ctx, use_cache=False
     )
 
-    # Multi-path runtime oracle intersection vs both static definite-binding engines
     multipath_snippet = (
         "def _probe(cond, fail):\n"
         "    always = 1\n"
@@ -1867,7 +1938,6 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
     assert static_def_1 == runtime_definite == {"always", "survives", "branch_both"}
     assert static_def_2 == runtime_definite
 
-    # Negative control: forcible pass-by-value extraction past hazard diverges at runtime
     orig_hazard_fn_src = (
         "def run_orig(items):\n"
         "    scale = 2\n"
@@ -1890,7 +1960,15 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
     assert ns_neg_ctrl["run_forced"]([1, 2]) == [7, 8]
     assert ns_neg_ctrl["run_orig"]([1, 2]) != ns_neg_ctrl["run_forced"]([1, 2])
 
-    # Stale `unit["source_code"]` fails closed when real source disagrees and cols are None
+
+def test_detached_unit_ast_isolation_and_stale_source_code_fail_closed() -> None:
+    """Verifies stale source_code fails closed and detached unit AST nodes never pollute caches."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _ScopeCacheKey,
+        _scope_cell_info_cache,
+        _scope_parent_maps,
+    )
+
     real_mod_src = "def f(a):\n    x = a + 1\n    return x\n"
     sc_stale = inspect_single_unit_scope(
         {
@@ -1905,7 +1983,6 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
     assert "pathological_ast" in sc_stale["control_flow_hazards"]
     assert sc_stale["is_control_flow_safe"] is False
 
-    # Detached unit AST nodes (including aux_ast_nodes for nested defs/classes) do not pollute caches
     clear_dataflow_cache()
     unit_with_nested_src = (
         "def outer(items):\n"
@@ -1952,7 +2029,6 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
         elif isinstance(c_key[0], ast.AST):
             assert c_key[0] in mod_nodes
 
-    # `analyze_unit_variable_scope` explicit `skip_pre_unit_closures` parameter
     lenient_unit_src = (
         "def f(items):\n"
         "    cb = lambda: items\n"
@@ -1970,13 +2046,12 @@ def test_pep227_trydel_definite_equivalence_and_cache_isolation() -> None:
     comb_lenient = analyze_unit_variable_scope(
         u_len, dict(u_len), skip_pre_unit_closures=True
     )
-    assert comb_lenient["_skip_pre_unit_closures"] is True
     assert comb_lenient["skip_pre_unit_closures"] is True
     assert "severed_closure_cell" not in comb_lenient["control_flow_hazards"]
 
 
 def test_scope_cache_key_permitted_parameter_types() -> None:
-    """Verifies _ScopeCacheKey enforces permitted immutable AST-free parameter schema."""
+    """Verifies _ScopeCacheKey enforces permitted immutable AST-free parameter schema, bool/int non-collision, and hidden AST detection."""
     from pydoppelgangerhunt.fixer._df_cache import (
         _ScopeCacheKey,
         _make_trusted_scope_cache_key,
@@ -2007,6 +2082,16 @@ def test_scope_cache_key_permitted_parameter_types() -> None:
         mod, "trusted_kind", params=("ok", 1)
     )
     assert trusted_key.kind == "trusted_kind"
+    assert trusted_key == _ScopeCacheKey(mod, "trusted_kind", params=("ok", 1))
+
+    # 1 and True (and 0 and False) must not collide in key params
+    key_int_1 = _ScopeCacheKey(mod, "bool_int", params=(1,))
+    key_bool_true = _ScopeCacheKey(mod, "bool_int", params=(True,))
+    key_int_0 = _ScopeCacheKey(mod, "bool_int", params=(0,))
+    key_bool_false = _ScopeCacheKey(mod, "bool_int", params=(False,))
+    assert key_int_1 != key_bool_true
+    assert key_int_0 != key_bool_false
+    assert len({key_int_1, key_bool_true, key_int_0, key_bool_false}) == 4
 
     for bad_ast_params in (
         (stmt,),
@@ -2016,6 +2101,8 @@ def test_scope_cache_key_permitted_parameter_types() -> None:
         ({stmt},),
         ({"k": stmt},),
         ({stmt: "v"},),
+        (object(), stmt),
+        ([object(), (stmt,)],),
     ):
         with pytest.raises(ValueError, match="must not contain ast.AST"):
             _ScopeCacheKey(mod, "bad_ast", params=bad_ast_params)
@@ -2032,8 +2119,8 @@ def test_scope_cache_key_permitted_parameter_types() -> None:
             _ScopeCacheKey(mod, "bad_type", params=bad_type_params)
 
 
-def test_property_invariants_cache_isolation_monotonicity_equivalence() -> None:
-    """Verifies all 7 property-oriented invariants across a diverse AST corpus including nested definitions."""
+def test_structural_invariants_across_deterministic_corpus() -> None:
+    """Verifies all 7 structural invariants across a deterministic AST corpus including nested definitions."""
     import symtable
     from pydoppelgangerhunt.fixer._df_cache import (
         _evict_tree_scopes,
@@ -2041,7 +2128,7 @@ def test_property_invariants_cache_isolation_monotonicity_equivalence() -> None:
         _scope_cell_info_cache,
         _scope_parent_maps,
     )
-    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
         _has_invalid_lexical_scope_declarations,
     )
 
@@ -2238,6 +2325,7 @@ def test_indexed_cache_eviction_multi_owner_node_reuse_and_central_invariant() -
         _scope_owner_keys_index,
     )
     from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context
+    from pydoppelgangerhunt.fixer._df_closures import _FrozenClosureList
 
     clear_dataflow_cache()
 
@@ -2308,7 +2396,7 @@ def test_indexed_cache_eviction_multi_owner_node_reuse_and_central_invariant() -
         k_frozenset = frozenset({"heterogeneous_label", stmt_node, idx})
         for k in (k_ast, k_sck_single, k_sck_multi, k_tuple, k_frozenset):
             _scope_cell_info_cache[k] = (idx, "cell")
-            _scope_closures_cache[k] = [(None, {f"v_{idx}"})]
+            _scope_closures_cache[k] = _FrozenClosureList([(None, frozenset({f"v_{idx}"}))])
             all_supported_keys.append(k)
 
     evicted_nodes = tree_node_sets[1]
@@ -2330,15 +2418,20 @@ def test_scope_cache_key_kind_validation_cross_cache_eviction_and_detached_subtr
         _evict_tree_scopes,
         _extract_key_ast_nodes,
         _extract_value_ast_nodes,
-        _make_trusted_scope_cache_key,
         _scope_cell_info_cache,
         _scope_closures_cache,
         _scope_key_nodes_index,
         _scope_owner_keys_index,
         _scope_parent_maps,
     )
-    from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context
-    from pydoppelgangerhunt.fixer._df_closures import _collect_scope_closures
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _extract_cached_scope_free_reads,
+        _get_fn_scope_context,
+    )
+    from pydoppelgangerhunt.fixer._df_closures import (
+        _FrozenClosureList,
+        _collect_scope_closures,
+    )
 
     def _assert_central_index_invariant() -> None:
         all_cached_keys = set(_scope_closures_cache.keys()) | set(
@@ -2365,20 +2458,17 @@ def test_scope_cache_key_kind_validation_cross_cache_eviction_and_detached_subtr
     other_node = mod.body[0]
     with pytest.raises(TypeError, match="kind must be a string"):
         _ScopeCacheKey(owner=mod, kind=other_node)  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="kind must be a string"):
-        _make_trusted_scope_cache_key(owner=mod, kind=other_node)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="non-empty string"):
         _ScopeCacheKey(owner=mod, kind="")
-    with pytest.raises(ValueError, match="non-empty string"):
-        _make_trusted_scope_cache_key(owner=mod, kind="")
 
     clear_dataflow_cache()
     shared_tree = ast.parse("def shared_fn():\n    return 42\n")
     shared_fn = shared_tree.body[0]
     shared_key = _ScopeCacheKey(owner=shared_fn, kind="shared_entry")
+    frozen_closures = _FrozenClosureList([(None, frozenset({"a"}))])
 
     # Order A
-    _scope_closures_cache[shared_key] = [(None, {"a"})]
+    _scope_closures_cache[shared_key] = frozen_closures
     _scope_cell_info_cache[shared_key] = frozenset({"a"})
     _assert_central_index_invariant()
     del _scope_closures_cache[shared_key]
@@ -2390,7 +2480,7 @@ def test_scope_cache_key_kind_validation_cross_cache_eviction_and_detached_subtr
     _assert_central_index_invariant()
 
     # Order B
-    _scope_closures_cache[shared_key] = [(None, {"a"})]
+    _scope_closures_cache[shared_key] = frozen_closures
     _scope_cell_info_cache[shared_key] = frozenset({"a"})
     _scope_cell_info_cache.pop(shared_key)
     assert shared_key in _scope_owner_keys_index[shared_fn]
@@ -2400,7 +2490,7 @@ def test_scope_cache_key_kind_validation_cross_cache_eviction_and_detached_subtr
     _assert_central_index_invariant()
 
     # Order C
-    _scope_closures_cache[shared_key] = [(None, {"a"})]
+    _scope_closures_cache[shared_key] = frozen_closures
     _scope_cell_info_cache[shared_key] = frozenset({"a"})
     _scope_closures_cache.clear()
     assert shared_key in _scope_owner_keys_index[shared_fn]
@@ -2410,7 +2500,7 @@ def test_scope_cache_key_kind_validation_cross_cache_eviction_and_detached_subtr
     _assert_central_index_invariant()
 
     # Order D
-    _scope_closures_cache[shared_key] = [(None, {"a"})]
+    _scope_closures_cache[shared_key] = frozen_closures
     _scope_cell_info_cache[shared_key] = frozenset({"a"})
     _scope_cell_info_cache.clear()
     assert shared_key in _scope_owner_keys_index[shared_fn]
@@ -2420,7 +2510,7 @@ def test_scope_cache_key_kind_validation_cross_cache_eviction_and_detached_subtr
     _assert_central_index_invariant()
 
     # Order E
-    _scope_closures_cache[shared_key] = [(None, {"a"})]
+    _scope_closures_cache[shared_key] = frozen_closures
     _scope_cell_info_cache[shared_key] = frozenset({"a"})
     _evict_tree_scopes(shared_tree)
     assert shared_key not in _scope_closures_cache
@@ -2428,13 +2518,13 @@ def test_scope_cache_key_kind_validation_cross_cache_eviction_and_detached_subtr
     assert not _scope_owner_keys_index
     _assert_central_index_invariant()
 
-    # Eviction of a detached AST subtree invalidates ancestor cached values
+    # Eviction of a detached AST subtree invalidates ancestor cached values (including value-less entries)
     clear_dataflow_cache()
     nested_tree = ast.parse(
         "def outer():\n"
         "    x = 1\n"
         "    def inner():\n"
-        "        return x\n"
+        "        return x + ext_var\n"
         "    return inner\n"
     )
     outer_fn = nested_tree.body[0]
@@ -2444,6 +2534,10 @@ def test_scope_cache_key_kind_validation_cross_cache_eviction_and_detached_subtr
 
     ctx_outer = _get_fn_scope_context(outer_fn, mod_tree=nested_tree)
     closures_outer = _collect_scope_closures(outer_fn, module_tree=nested_tree)
+    free_reads_outer = _extract_cached_scope_free_reads(outer_fn, use_cache=True)
+    assert "ext_var" in free_reads_outer
+    free_reads_key = _ScopeCacheKey(outer_fn, "free_reads")
+    assert free_reads_key in _scope_cell_info_cache
     assert inner_fn in ctx_outer.parent_map
     assert len(closures_outer) == 1
     assert outer_fn in _scope_parent_maps
@@ -2453,6 +2547,7 @@ def test_scope_cache_key_kind_validation_cross_cache_eviction_and_detached_subtr
     _evict_tree_scopes(inner_fn)
     _assert_central_index_invariant()
     assert outer_fn not in _scope_parent_maps
+    assert free_reads_key not in _scope_cell_info_cache
     assert not any(
         inner_fn in _extract_value_ast_nodes(v)
         for v in (
@@ -2460,6 +2555,54 @@ def test_scope_cache_key_kind_validation_cross_cache_eviction_and_detached_subtr
             *_scope_closures_cache.values(),
         )
     )
+
+
+def test_extract_value_ast_nodes_mandatory_protocol_and_tracked_dict_copy() -> None:
+    """Verifies mandatory cached_ast_nodes() protocol and independent _TrackedCachedDict copies."""
+    import copy
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _ScopeCacheKey,
+        _TrackedCachedDict,
+        _extract_value_ast_nodes,
+        _scope_cell_info_cache,
+    )
+
+    class _UnindexedCustomValue:
+        def __init__(self, node: ast.AST) -> None:
+            self.node = node
+
+    class _ProperCustomValue:
+        def __init__(self, node: ast.AST) -> None:
+            self._node = node
+
+        def cached_ast_nodes(self) -> tuple[ast.AST, ...]:
+            return (self._node,)
+
+    mod = ast.parse("x = 1\n")
+    stmt = mod.body[0]
+    bad_val = _UnindexedCustomValue(stmt)
+    with pytest.raises(TypeError, match="must implement cached_ast_nodes"):
+        _extract_value_ast_nodes(bad_val)
+    with pytest.raises(TypeError, match="must implement cached_ast_nodes"):
+        _scope_cell_info_cache[_ScopeCacheKey(mod, "bad_val")] = bad_val
+
+    good_val = _ProperCustomValue(stmt)
+    assert list(_extract_value_ast_nodes(good_val)) == [stmt]
+
+    clear_dataflow_cache()
+    td_key = _ScopeCacheKey(mod, "tracked_dict_test")
+    _scope_cell_info_cache[td_key] = {"init": 1}
+    tracked = _scope_cell_info_cache[td_key]
+    assert isinstance(tracked, _TrackedCachedDict)
+    assert tracked._bound_owners
+    cp1 = tracked.copy()
+    cp2 = copy.copy(tracked)
+    assert isinstance(cp1, _TrackedCachedDict)
+    assert isinstance(cp2, _TrackedCachedDict)
+    assert cp1._bound_owners is not tracked._bound_owners
+    assert cp2._bound_owners is not tracked._bound_owners
+    assert cp1._bound_owners == {}
+    assert cp2._bound_owners == {}
 
 
 def test_fn_scope_context_parent_map_immutability_and_enclosing_scope_key_isolation() -> None:
@@ -2599,7 +2742,7 @@ def test_span_line_index_detached_subtree_eviction_and_recomputation() -> None:
         _scope_cell_info_cache,
         _scope_owner_keys_index,
     )
-    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+    from pydoppelgangerhunt.fixer._df_span_index import (
         _get_span_line_index,
         _resolve_unit_col_bounds,
     )
@@ -2835,8 +2978,11 @@ def test_tracked_scope_cache_stmt_deltas_incremental_mutation_indexing() -> None
 def test_extract_unit_source_code_empty_and_whitespace_source_text_fallback(
     tmp_path: Path,
 ) -> None:
-    """Verifies that extract_unit_source_code falls back to file_source when source_text is empty/whitespace."""
-    from pydoppelgangerhunt.reporters import extract_unit_source_code
+    """Verifies that extract_unit_source_code falls back to file_source or disk when source_text is empty/whitespace."""
+    from pydoppelgangerhunt.reporters import (
+        extract_unit_source_code,
+        extract_unit_source_lines_with_state,
+    )
 
     unit_empty_src = {
         "name": "example",
@@ -2849,6 +2995,11 @@ def test_extract_unit_source_code_empty_and_whitespace_source_text_fallback(
         "def example():\n",
         "    return 42\n",
     ]
+    lines_with_state, is_pre_sliced = extract_unit_source_lines_with_state(
+        unit_empty_src
+    )
+    assert lines_with_state == ["def example():\n", "    return 42\n"]
+    assert is_pre_sliced is False
 
     unit_ws_src = {
         "name": "example",
@@ -2872,27 +3023,47 @@ def test_extract_unit_source_code_empty_and_whitespace_source_text_fallback(
         "source_text": "",
     }
     assert extract_unit_source_code(unit_explicit_empty, repo_root=str(tmp_path)) == [
-        "# Source for on_disk lines 1-2\n"
+        "def on_disk():\n",
+        "    return 99\n",
+    ]
+
+    unit_missing_disk = {
+        "name": "missing_fn",
+        "file": str(tmp_path / "nonexistent.py"),
+        "start": 1,
+        "end": 2,
+        "source_text": "",
+    }
+    assert extract_unit_source_code(unit_missing_disk, repo_root=str(tmp_path)) == [
+        "# Source for missing_fn lines 1-2\n"
     ]
 
 
 def test_trusted_scope_cache_key_immutability_and_enclosing_chain_and_modes() -> None:
-    """Verifies trusted key validation, same-line/multiline-header enclosing chains, and mode propagation."""
-    from pydoppelgangerhunt.fixer._df_cache import _make_trusted_scope_cache_key
+    """Verifies trusted key construction, same-line/multiline-header enclosing chains, and mode propagation."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _ScopeCacheKey,
+        _make_trusted_scope_cache_key,
+    )
     from pydoppelgangerhunt.fixer._df_cell_carriers import (
-        _find_enclosing_function_chain,
         _make_scope_ctx_cache_key,
+    )
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _find_enclosing_function_chain,
     )
     from pydoppelgangerhunt.fixer.scope import ensure_unit_scope_closure_mode
 
     dummy = ast.parse("x = 1").body[0]
 
+    # _ScopeCacheKey validates params, whereas _make_trusted_scope_cache_key skips validation on hot internal paths
     with pytest.raises(TypeError, match="immutable"):
-        _make_trusted_scope_cache_key(dummy, "kind", params=([1, 2],))
-    with pytest.raises(TypeError, match="immutable"):
-        _make_scope_ctx_cache_key(dummy, "kind", None, extra_params=({"a": 1},))
+        _ScopeCacheKey(dummy, "kind", params=([1, 2],))
     with pytest.raises(ValueError, match="must not contain ast.AST"):
-        _make_trusted_scope_cache_key(dummy, "kind", params=(dummy,))
+        _ScopeCacheKey(dummy, "kind", params=(dummy,))
+    fast_key = _make_trusted_scope_cache_key(dummy, "kind", params=("a", 1))
+    ctx_key = _make_scope_ctx_cache_key(dummy, "kind", None, extra_params=("a", 1))
+    assert fast_key == _ScopeCacheKey(dummy, "kind", params=("a", 1))
+    assert ctx_key.kind == "kind"
 
     chain_src = (
         "@(\n"
@@ -2952,8 +3123,8 @@ def test_trusted_scope_cache_key_immutability_and_enclosing_chain_and_modes() ->
     s1_strict = inspect_single_unit_scope({**u1, "skip_pre_unit_closures": False})
     s2_strict = inspect_single_unit_scope({**u2, "skip_pre_unit_closures": False})
     s1_lenient = ensure_unit_scope_closure_mode(u1, s1_strict, True)
-    assert s1_strict["_skip_pre_unit_closures"] is False
-    assert s1_lenient["_skip_pre_unit_closures"] is True
+    assert s1_strict["skip_pre_unit_closures"] is False
+    assert s1_lenient["skip_pre_unit_closures"] is True
     assert "severed_closure_cell" in s1_strict["control_flow_hazards"]
     assert "severed_closure_cell" not in s1_lenient["control_flow_hazards"]
 
@@ -2961,7 +3132,7 @@ def test_trusted_scope_cache_key_immutability_and_enclosing_chain_and_modes() ->
     pair_strict = analyze_unit_variable_scope(
         u1, u2, scope1=s1_lenient, scope2=s2_lenient, skip_pre_unit_closures=False
     )
-    assert pair_strict["_skip_pre_unit_closures"] is False
+    assert pair_strict["skip_pre_unit_closures"] is False
     assert "severed_closure_cell" in pair_strict["control_flow_hazards"]
 
     assert (
@@ -3025,49 +3196,14 @@ def test_trusted_scope_cache_key_immutability_and_enclosing_chain_and_modes() ->
     assert gen_outs_lenient == (["x"], ["x"])
 
 
-def test_high_and_medium_severity_architectural_invariants() -> None:
-    """Directly exercises cache-key isolation, O(|T|) auxiliary cache eviction, lock reentrancy, context-sensitive closure caching, _SuppressProvenance, and unified definite-binding analysis."""
-    from pydoppelgangerhunt.fixer._df_cache import (
-        _ScopeCacheKey,
-        _TrackedAuxScopeCache,
-        _aux_node_to_scope_owners,
-        _aux_scope_owner_to_nodes,
-        _build_downstream_cache_key,
-        _downstream_cache_lock,
-        _evict_tree_scopes,
-        _get_scope_parent_map,
-        _get_scope_stmts_by_end_lineno,
-        _get_scope_stmts_by_start_lineno,
-        _is_reentrant_cache_lock,
-        _scope_cell_info_cache,
-        _scope_closures_cache,
-        _scope_key_nodes_index,
-        _scope_parent_maps,
-        _scope_stmts_by_end,
-        _scope_stmts_by_start,
-    )
+def test_collect_unit_nonlocal_mutators_ephemeral_module_isolation() -> None:
+    """Verifies _collect_unit_nonlocal_mutators with nested defs and real mod_tree never leaks ephemeral ast.Module."""
+    from pydoppelgangerhunt.fixer._df_cache import _scope_cell_info_cache
     from pydoppelgangerhunt.fixer._df_cell_carriers import (
-        _FnScopeContext,
         _collect_unit_nonlocal_mutators,
-        _extract_expr_closure_and_load_info,
-        _get_fn_scope_context,
-        _is_non_closure_builtin_call,
-    )
-    from pydoppelgangerhunt.fixer._df_closures import (
-        _collect_scope_closures,
-        _node_earliest_start_pos,
-        _resolve_detached_enclosing_scopes,
-    )
-    from pydoppelgangerhunt.fixer._df_with_provenance import (
-        _SuppressProvenance,
-        _analyze_block_assignment,
-        _extract_block_definite_bindings_and_term,
-        _seed_scope_suppress_aliases,
     )
 
     clear_dataflow_cache()
-
-    # 1. _collect_unit_nonlocal_mutators with nested defs and real mod_tree never leaks ephemeral ast.Module
     nested_unit_src = (
         "def outer(items):\n"
         "    state = 0\n"
@@ -3099,7 +3235,6 @@ def test_high_and_medium_severity_architectural_invariants() -> None:
         for ast_n in (c_key.owner, *c_key.aux_ast_nodes):
             assert ast_n in mod_nodes
 
-    # Repeat call hits warm cache without adding new keys
     keys_before = set(_scope_cell_info_cache.keys())
     mutators_warm = _collect_unit_nonlocal_mutators(
         [for_stmt], mod_tree=mod_tree
@@ -3107,7 +3242,19 @@ def test_high_and_medium_severity_architectural_invariants() -> None:
     assert mutators_warm == mutators
     assert set(_scope_cell_info_cache.keys()) == keys_before
 
-    # 2. _TrackedAuxScopeCache & O(|T|) child-subtree eviction for parent_maps and stmt line maps
+
+def test_parent_map_and_stmt_line_map_detached_child_eviction() -> None:
+    """Verifies child-subtree eviction for parent_maps and statement line maps via ancestor walk."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _evict_tree_scopes,
+        _get_scope_parent_map,
+        _get_scope_stmts_by_end_lineno,
+        _get_scope_stmts_by_start_lineno,
+        _scope_parent_maps,
+        _scope_stmts_by_end,
+        _scope_stmts_by_start,
+    )
+
     clear_dataflow_cache()
     aux_tree = ast.parse(
         "def top_fn(x):\n"
@@ -3119,31 +3266,36 @@ def test_high_and_medium_severity_architectural_invariants() -> None:
     assert isinstance(top_fn, ast.FunctionDef)
     child_fn = top_fn.body[0]
     assert isinstance(child_fn, ast.FunctionDef)
-    assert isinstance(_scope_parent_maps, _TrackedAuxScopeCache)
     _ = _get_scope_parent_map(aux_tree)
     _ = _get_scope_stmts_by_start_lineno(top_fn)
     _ = _get_scope_stmts_by_end_lineno(top_fn)
     assert aux_tree in _scope_parent_maps
     assert top_fn in _scope_stmts_by_start
     assert top_fn in _scope_stmts_by_end
-    assert child_fn in _aux_node_to_scope_owners
-    assert top_fn in _aux_scope_owner_to_nodes
 
-    # Detach child_fn and evict ONLY child_fn: owning aux caches (aux_tree, top_fn) are evicted in O(|T|)
     top_fn.body.remove(child_fn)
     _evict_tree_scopes(child_fn)
     assert aux_tree not in _scope_parent_maps
     assert top_fn not in _scope_stmts_by_start
     assert top_fn not in _scope_stmts_by_end
-    assert child_fn not in _aux_node_to_scope_owners
-    assert not _aux_scope_owner_to_nodes
 
-    # 3. Runtime lock reentrancy verification
+
+def test_cache_lock_reentrancy_and_builtin_call_shadowing() -> None:
+    """Verifies lock reentrancy and _is_non_closure_builtin_call fail-closed behavior."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _downstream_cache_lock,
+        _is_reentrant_cache_lock,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _FnScopeContext,
+        _extract_expr_closure_and_load_info,
+        _is_non_closure_builtin_call,
+    )
+
     assert _is_reentrant_cache_lock(_downstream_cache_lock) is True
     assert _is_reentrant_cache_lock(threading.RLock()) is True
     assert _is_reentrant_cache_lock(threading.Lock()) is False
 
-    # 4. _is_non_closure_builtin_call fails closed when scope_ctx is None & callees stay in loaded_names
     len_call = ast.parse("len(x)", mode="eval").body
     assert isinstance(len_call, ast.Call)
     assert _is_non_closure_builtin_call(len_call, None) is False
@@ -3161,7 +3313,22 @@ def test_high_and_medium_severity_architectural_invariants() -> None:
     )
     assert {"custom_callee", "arg_val"} <= loads_without_out
 
-    # 5. Enclosing-scope sensitivity in _get_fn_scope_context and _collect_scope_closures, plus _DetachedDumpIndex
+
+def test_enclosing_scope_sensitivity_and_detached_dump_index_eviction() -> None:
+    """Verifies enclosing-scope sensitivity in _get_fn_scope_context and _collect_scope_closures, plus _DetachedDumpIndex eviction."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _ScopeCacheKey,
+        _evict_tree_scopes,
+        _scope_cell_info_cache,
+        _scope_closures_cache,
+        _scope_key_nodes_index,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context
+    from pydoppelgangerhunt.fixer._df_closures import (
+        _collect_scope_closures,
+        _resolve_detached_enclosing_scopes,
+    )
+
     clear_dataflow_cache()
     enc_src = (
         "def outer_shadow(list):\n"
@@ -3209,7 +3376,43 @@ def test_high_and_medium_severity_architectural_invariants() -> None:
     assert not _scope_closures_cache
     assert not _scope_key_nodes_index
 
-    # 6. _SuppressProvenance dataclass & compound-statement / post-with shadowed builtin detection
+
+def test_suppress_provenance_set_algebra_and_with_classification_modes() -> None:
+    """Verifies _SuppressProvenance structured operations, heuristic vs pedantic unknown-with classification, and extra_non_suppressing_ctx_managers."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _SuppressProvenance,
+        _analyze_block_assignment,
+        _extract_block_definite_bindings_and_term,
+        _seed_scope_suppress_aliases,
+    )
+
+    p1 = _SuppressProvenance(
+        suppressors=frozenset({"s1", "s2"}),
+        non_suppressors=frozenset({"ns1"}),
+        stdlib_modules=frozenset({("ctx1", "contextlib")}),
+        shadowed_builtins=frozenset({"open"}),
+        has_star_import=False,
+    )
+    p2 = _SuppressProvenance(
+        suppressors=frozenset({"s2", "s3"}),
+        non_suppressors=frozenset({"ns1", "ns2"}),
+        stdlib_modules=frozenset({("ctx1", "contextlib"), ("ctx2", "io")}),
+        shadowed_builtins=frozenset({"builtins"}),
+        has_star_import=True,
+    )
+    assert not isinstance(p1, AbstractSet)
+    p_merged = p1.merge_branch_conservative(p2)
+    assert isinstance(p_merged, _SuppressProvenance)
+    assert p_merged.suppress_names == frozenset({"s1", "s2", "s3"})
+    assert p_merged.non_suppress_names == frozenset({"ns1"})
+    assert p_merged.stdlib_modules == frozenset({("ctx1", "contextlib")})
+    assert p_merged.has_star_import is True
+
+    p_cleared = p1.clear_name("s1")
+    assert isinstance(p_cleared, _SuppressProvenance)
+    assert p_cleared.suppress_names == frozenset({"s2"})
+    assert p_cleared.non_suppress_names == frozenset({"ns1"})
+
     prov_src = (
         "from contextlib import suppress\n"
         "def example(flag, items):\n"
@@ -3230,67 +3433,49 @@ def test_high_and_medium_severity_architectural_invariants() -> None:
     assert isinstance(prov_fn, ast.FunctionDef)
     prov = _seed_scope_suppress_aliases(prov_fn, prov_tree, u_start=7)
     assert isinstance(prov, _SuppressProvenance)
-    assert isinstance(prov, AbstractSet)
     assert "cm" in prov.suppress_names
     assert "open" in prov.shadowed_builtins
     bound_prov, _ = _extract_block_definite_bindings_and_term(
-        prov_fn.body[:-2], None, suppress_aliases=prov
+        prov_fn.body[:-2],
+        None,
+        suppress_aliases=prov,
+        strict_with_suppression=True,
     )
     assert "n" not in bound_prov
     assert "m" not in bound_prov
 
-    # 7. Unified definite-binding engine with extra_non_suppressing_ctx_managers
     custom_safe_stmts = ast.parse(
         "with SafeTransaction():\n"
         "    committed = compute_value()\n"
     ).body
-    def_without, cond_without = _analyze_block_assignment(custom_safe_stmts)
-    def_with, cond_with = _analyze_block_assignment(
+    # Default heuristic mode treats non-suppress-named managers as non-suppressing
+    def_heur, cond_heur = _analyze_block_assignment(
+        custom_safe_stmts, strict_with_suppression=False
+    )
+    assert "committed" in def_heur
+    assert "committed" not in cond_heur
+
+    # Pedantic mode treats unknown managers as potentially suppressing unless whitelisted
+    def_ped_without, cond_ped_without = _analyze_block_assignment(
+        custom_safe_stmts, strict_with_suppression=True
+    )
+    def_ped_with, cond_ped_with = _analyze_block_assignment(
         custom_safe_stmts,
         extra_non_suppressing_ctx_managers=frozenset({"SafeTransaction"}),
+        strict_with_suppression=True,
     )
-    assert "committed" not in def_without
-    assert "committed" in cond_without
-    assert "committed" in def_with
-    assert "committed" not in cond_with
+    assert "committed" not in def_ped_without
+    assert "committed" in cond_ped_without
+    assert "committed" in def_ped_with
+    assert "committed" not in cond_ped_with
 
-    # 8. _FnScopeContext.cache_fingerprint distinguishes empty vs populated parent_map
-    fp_empty = _FnScopeContext(
-        fn_locals=frozenset({"x"}),
-        parent_map=MappingProxyType({}),
-        shadowed_names=frozenset({"x"}),
-        has_star_import=False,
-    ).cache_fingerprint()
-    fp_nonempty = _FnScopeContext(
-        fn_locals=frozenset({"x"}),
-        parent_map=MappingProxyType({prov_fn: prov_tree}),
-        shadowed_names=frozenset({"x"}),
-        has_star_import=False,
-    ).cache_fingerprint()
-    assert fp_empty != fp_nonempty
-    assert fp_empty[-1] is False
-    assert fp_nonempty[-1] is True
 
-    # 9. _build_downstream_cache_key includes unit_source_hash when columns are None
-    dk_1 = _build_downstream_cache_key(
-        prov_src,
-        {"start": 2, "end": 2, "source_code": "a = 1"},
-        2,
-        2,
-        {"a"},
-        False,
-    )
-    dk_2 = _build_downstream_cache_key(
-        prov_src,
-        {"start": 2, "end": 2, "source_code": "b = 2"},
-        2,
-        2,
-        {"a"},
-        False,
-    )
-    assert dk_1 != dk_2
+def test_fn_scope_context_fingerprint_downstream_cache_key_and_multiline_decorator_start() -> None:
+    """Verifies _FnScopeContext.cache_fingerprint, _build_downstream_cache_key, and _node_earliest_start_pos."""
+    from pydoppelgangerhunt.fixer._df_cache import _build_downstream_cache_key
+    from pydoppelgangerhunt.fixer._df_cell_carriers import _FnScopeContext
+    from pydoppelgangerhunt.fixer._df_closures import _node_earliest_start_pos
 
-    # 10. _node_earliest_start_pos locates leading `@` line across multi-line decorator expressions
     ml_dec_src = (
         "x = 1\n"
         "@(\n"
@@ -3307,3 +3492,80 @@ def test_high_and_medium_severity_architectural_invariants() -> None:
         )
         == (2, 0)
     )
+
+    fp_empty = _FnScopeContext(
+        fn_locals=frozenset({"x"}),
+        parent_map=MappingProxyType({}),
+        shadowed_names=frozenset({"x"}),
+        has_star_import=False,
+    ).cache_fingerprint()
+    fp_nonempty = _FnScopeContext(
+        fn_locals=frozenset({"x"}),
+        parent_map=MappingProxyType({dec_fn_node: ml_dec_tree}),
+        shadowed_names=frozenset({"x"}),
+        has_star_import=False,
+    ).cache_fingerprint()
+    assert fp_empty != fp_nonempty
+    assert fp_empty[-1] is False
+    assert fp_nonempty[-1] is True
+
+    dk_1 = _build_downstream_cache_key(
+        ml_dec_src,
+        {"start": 2, "end": 2, "source_code": "a = 1"},
+        2,
+        2,
+        {"a"},
+        False,
+    )
+    dk_2 = _build_downstream_cache_key(
+        ml_dec_src,
+        {"start": 2, "end": 2, "source_code": "b = 2"},
+        2,
+        2,
+        {"a"},
+        False,
+    )
+    assert dk_1 != dk_2
+
+
+def test_shared_helper_regression_contracts() -> None:
+    """Covers regression contracts for _extract_scope_local_names, _get_scope_parent_map, and _is_irrefutable_pattern."""
+    import pydoppelgangerhunt.fixer.scope as scope_mod
+    from pydoppelgangerhunt.fixer._df_cache import _get_scope_parent_map
+    from pydoppelgangerhunt.fixer._df_closures import (
+        _extract_scope_local_names,
+        _is_irrefutable_case,
+        _is_irrefutable_pattern,
+    )
+
+    cls_src = (
+        "def enclosing():\n"
+        "    outer_v = 10\n"
+        "    class Outer:\n"
+        "        cls_attr = 1\n"
+        "        def method(self):\n"
+        "            local_v = 2\n"
+        "            return local_v\n"
+        "    return outer_v\n"
+    )
+    cls_tree = ast.parse(cls_src)
+    fn_node = cls_tree.body[0]
+    assert isinstance(fn_node, ast.FunctionDef)
+    cls_node = fn_node.body[1]
+    assert isinstance(cls_node, ast.ClassDef)
+    method_node = cls_node.body[1]
+    assert isinstance(method_node, ast.FunctionDef)
+    assert "cls_attr" not in _extract_scope_local_names(
+        method_node, module_tree=cls_tree, include_classes=False
+    )
+    assert "cls_attr" in _extract_scope_local_names(
+        method_node, module_tree=cls_tree, include_classes=True
+    )
+
+    pmap = _get_scope_parent_map(cls_tree)
+    assert not any(isinstance(k, ast.expr_context) for k in pmap)
+    assert fn_node in pmap
+
+    assert _is_irrefutable_pattern(None) is False
+    assert scope_mod._is_irrefutable_pattern is _is_irrefutable_pattern
+    assert scope_mod._is_irrefutable_case is _is_irrefutable_case
