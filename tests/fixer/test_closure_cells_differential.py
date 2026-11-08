@@ -13,7 +13,7 @@ from pydoppelgangerhunt.fixer import (
     resolve_clone_pair_outputs,
     synthesize_shared_helper_code,
 )
-from tests.fixer.conftest import (
+from tests.fixer._closure_test_helpers import (
     _run_differential_refactoring_case,
 )
 
@@ -1355,10 +1355,35 @@ def test_seeded_generated_closure_program_differential_fuzzer(tmp_path: Path) ->
                 "name": "entry_b:block",
                 "kind": "compound_block",
             }
+            from pydoppelgangerhunt.fixer._df_cell_carriers import _SpanBounds
+            from pydoppelgangerhunt.fixer._df_cell_traversal import (
+                _analyze_enclosing_fn_cells_uncached,
+            )
+
+            fuzz_tree = ast.parse(combined_src)
+            fuzz_fn = fuzz_tree.body[1]
+            assert isinstance(fuzz_fn, ast.FunctionDef)
+            span_bounds = _SpanBounds(u_start, u_end)
+            info_with_deltas = _analyze_enclosing_fn_cells_uncached(
+                fuzz_fn,
+                span_bounds,
+                mod_tree=fuzz_tree,
+                use_stmt_deltas=True,
+                strict_with_suppression=(mode == "pedantic"),
+            )
+            info_without_deltas = _analyze_enclosing_fn_cells_uncached(
+                fuzz_fn,
+                span_bounds,
+                mod_tree=fuzz_tree,
+                use_stmt_deltas=False,
+                strict_with_suppression=(mode == "pedantic"),
+            )
+            assert info_with_deltas == info_without_deltas
+
             patch = generate_refactoring_patch(
                 [(1.0, u1, u2)],
                 repo_root=str(case_dir),
-                replace_clones=False,
+                replace_clones=True,
                 closure_strictness=mode,
             )
             if patch:
@@ -1372,6 +1397,7 @@ def test_seeded_generated_closure_program_differential_fuzzer(tmp_path: Path) ->
                     capture_output=True,
                 )
                 refactored_src = mod_file.read_text(encoding="utf-8")
+                assert "_shared_" in refactored_src
                 for test_items, test_cond in [([1, 2, 3], True), ([5], False)]:
                     ns_orig: dict[str, Any] = {}
                     ns_ref: dict[str, Any] = {}
@@ -1388,4 +1414,3 @@ def test_seeded_generated_closure_program_differential_fuzzer(tmp_path: Path) ->
 
     assert patched_count > 0
     assert blocked_count > 0
-

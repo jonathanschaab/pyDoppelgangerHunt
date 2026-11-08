@@ -19,6 +19,10 @@ from typing import (
     cast,
 )
 
+from pydoppelgangerhunt.fixer._ast_compat import (
+    is_match_node,
+    is_try_or_trystar_node,
+)
 from pydoppelgangerhunt.fixer._df_cache import (
     _downstream_cache_lock,
     _get_or_compute_scope_cached,
@@ -286,6 +290,251 @@ def _maybe_push_pre_span_exhaustive_frame(
             )
 
 
+def _push_with_compound_children(
+    curr: Union[ast.With, ast.AsyncWith],
+    encloses: bool,
+    span: _SpanBounds,
+    frame: _StackFrame,
+    state: _CellBindingState,
+    stack: List[_StackFrame],
+    pre_stmt_suppress: Optional[Union[_SuppressProvenance, AbstractSet[str]]],
+) -> None:
+    """Pushes child frames for a With or AsyncWith statement."""
+    is_br = frame.is_branched
+    in_lp = frame.in_loop
+    act_nl = frame.active_nonlocals
+    f_after = frame.force_after_span
+    body_span = encloses and _block_contains_span(curr.body, span)
+    _maybe_push_pre_span_exhaustive_frame(
+        curr,
+        encloses,
+        bool(curr.body or curr.items),
+        frame,
+        span,
+        state,
+        stack,
+        pre_stmt_suppress=pre_stmt_suppress,
+    )
+    if body_span:
+        for item in curr.items:
+            if item.optional_vars is not None:
+                w_stores = [
+                    n
+                    for n in _extract_store_names_in_node(item.optional_vars)
+                    if _can_bind_in_fn_scope(n, act_nl, state.fn_globals)
+                ]
+                state.pre_mutated.update(w_stores)
+                if not is_br:
+                    state.pre_bound.update(w_stores)
+                    state.pre_unbound.difference_update(w_stores)
+    _push_seq(
+        stack,
+        curr.body,
+        is_br if body_span else True,
+        in_lp,
+        act_nl,
+        force_after_span=f_after,
+    )
+    active_sup = _coerce_suppress_provenance(
+        pre_stmt_suppress
+        if pre_stmt_suppress is not None
+        else state.suppress_aliases
+    )
+    item_prov = active_sup
+    after_sup = False
+    item_frames: List[_StackFrame] = []
+    for item in curr.items:
+        item_br = is_br or (after_sup and not encloses)
+        w_prov = _update_suppress_provenance_from_expr_walrus(
+            (item.context_expr,),
+            item_prov,
+            allow_positive=not item_br,
+        )
+        item_prov = (
+            item_prov.merge_branch_conservative(w_prov) if item_br else w_prov
+        )
+        item_may_sup = _with_item_may_suppress_exceptions(
+            item.context_expr,
+            item_prov,
+            strict_with_suppression=state.strict_with_suppression,
+            extra_non_suppressing_ctx_managers=state.extra_non_suppressing_ctx_managers,
+        )
+        if (
+            not encloses
+            and not item_br
+            and item_may_sup
+            and item.optional_vars is not None
+            and not _is_non_raising_store_target(item.optional_vars)
+        ):
+            item_frames.append(
+                _StackFrame(
+                    item.context_expr,
+                    item_br,
+                    in_lp,
+                    act_nl,
+                    force_after_span=f_after,
+                )
+            )
+            item_frames.append(
+                _StackFrame(
+                    item.optional_vars,
+                    True,
+                    in_lp,
+                    act_nl,
+                    force_after_span=f_after,
+                )
+            )
+        else:
+            item_frames.append(
+                _StackFrame(
+                    item,
+                    item_br,
+                    in_lp,
+                    act_nl,
+                    force_after_span=f_after,
+                )
+            )
+        if item.optional_vars is not None:
+            opt_cond = item_br or (
+                item_may_sup
+                and not _is_non_raising_store_target(item.optional_vars)
+            )
+            item_prov = _clear_store_target_provenance(
+                item.optional_vars, item_prov, is_conditional=opt_cond
+            )
+        if item_may_sup:
+            after_sup = True
+    stack.extend(reversed(item_frames))
+
+
+def _push_try_compound_children(
+    curr: ast.AST,
+    encloses: bool,
+    span: _SpanBounds,
+    frame: _StackFrame,
+    state: _CellBindingState,
+    stack: List[_StackFrame],
+    pre_stmt_suppress: Optional[Union[_SuppressProvenance, AbstractSet[str]]],
+) -> None:
+    """Pushes child frames for a Try or TryStar statement."""
+    is_br = frame.is_branched
+    in_lp = frame.in_loop
+    act_nl = frame.active_nonlocals
+    f_after = frame.force_after_span
+    body_l = getattr(curr, "body", [])
+    else_l = getattr(curr, "orelse", [])
+    final_l = getattr(curr, "finalbody", [])
+    handlers_l = getattr(curr, "handlers", [])
+    else_span = encloses and _block_contains_span(else_l, span)
+    body_span = encloses and (_block_contains_span(body_l, span) or else_span)
+    final_span = encloses and _block_contains_span(final_l, span)
+    _maybe_push_pre_span_exhaustive_frame(
+        curr,
+        encloses,
+        bool(body_l or final_l),
+        frame,
+        span,
+        state,
+        stack,
+        pre_stmt_suppress=pre_stmt_suppress,
+    )
+    _push_seq(
+        stack,
+        final_l,
+        is_br if final_span else True,
+        in_lp,
+        act_nl,
+        force_after_span=f_after,
+    )
+    _push_seq(
+        stack,
+        else_l,
+        is_br if else_span else True,
+        in_lp,
+        act_nl,
+        force_after_span=f_after,
+    )
+    for h_node in reversed(handlers_l):
+        h_span = encloses and _block_contains_span(
+            getattr(h_node, "body", ()), span
+        )
+        stack.append(
+            _StackFrame(
+                h_node,
+                is_br if h_span else True,
+                in_lp,
+                act_nl,
+                force_after_span=f_after,
+            )
+        )
+    _push_seq(
+        stack,
+        body_l,
+        is_br if body_span else True,
+        in_lp,
+        act_nl,
+        force_after_span=f_after,
+    )
+
+
+def _push_match_compound_children(
+    curr: ast.AST,
+    encloses: bool,
+    span: _SpanBounds,
+    frame: _StackFrame,
+    state: _CellBindingState,
+    stack: List[_StackFrame],
+    pre_stmt_suppress: Optional[Union[_SuppressProvenance, AbstractSet[str]]],
+) -> None:
+    """Pushes child frames for a Match statement."""
+    is_br = frame.is_branched
+    in_lp = frame.in_loop
+    act_nl = frame.active_nonlocals
+    f_after = frame.force_after_span
+    cases_l = getattr(curr, "cases", [])
+    _maybe_push_pre_span_exhaustive_frame(
+        curr,
+        encloses,
+        bool(cases_l),
+        frame,
+        span,
+        state,
+        stack,
+        pre_stmt_suppress=pre_stmt_suppress,
+    )
+    for case in reversed(cases_l):
+        case_body = getattr(case, "body", [])
+        c_br = (
+            is_br
+            if (encloses and _block_contains_span(case_body, span))
+            else True
+        )
+        _push_seq(
+            stack,
+            case_body,
+            c_br,
+            in_lp,
+            act_nl,
+            force_after_span=f_after,
+        )
+        _push_seq(
+            stack,
+            [
+                sub
+                for attr in ("pattern", "guard")
+                if isinstance(sub := getattr(case, attr, None), ast.AST)
+            ],
+            c_br,
+            in_lp,
+            act_nl,
+            force_after_span=f_after,
+        )
+    if isinstance(subject := getattr(curr, "subject", None), ast.AST):
+        stack.append(
+            _StackFrame(subject, is_br, in_lp, act_nl, force_after_span=f_after)
+        )
+
+
 def _push_compound_children(
     curr: ast.AST,
     span: _SpanBounds,
@@ -427,167 +676,14 @@ def _push_compound_children(
         return True
 
     if isinstance(curr, (ast.With, ast.AsyncWith)):
-        body_span = encloses and _block_contains_span(curr.body, span)
-        _maybe_push_pre_span_exhaustive_frame(
-            curr,
-            encloses,
-            bool(curr.body or curr.items),
-            frame,
-            span,
-            state,
-            stack,
-            pre_stmt_suppress=pre_stmt_suppress,
+        _push_with_compound_children(
+            curr, encloses, span, frame, state, stack, pre_stmt_suppress
         )
-        if body_span:
-            for item in curr.items:
-                if item.optional_vars is not None:
-                    w_stores = [
-                        n
-                        for n in _extract_store_names_in_node(item.optional_vars)
-                        if _can_bind_in_fn_scope(n, act_nl, state.fn_globals)
-                    ]
-                    state.pre_mutated.update(w_stores)
-                    if not is_br:
-                        state.pre_bound.update(w_stores)
-                        state.pre_unbound.difference_update(w_stores)
-        _push_seq(
-            stack,
-            curr.body,
-            is_br if body_span else True,
-            in_lp,
-            act_nl,
-            force_after_span=f_after,
-        )
-        active_sup = _coerce_suppress_provenance(
-            pre_stmt_suppress
-            if pre_stmt_suppress is not None
-            else state.suppress_aliases
-        )
-        item_prov = active_sup
-        after_sup = False
-        item_frames: List[_StackFrame] = []
-        for item in curr.items:
-            item_br = is_br or (after_sup and not encloses)
-            w_prov = _update_suppress_provenance_from_expr_walrus(
-                (item.context_expr,),
-                item_prov,
-                allow_positive=not item_br,
-            )
-            item_prov = (
-                item_prov.merge_branch_conservative(w_prov)
-                if item_br
-                else w_prov
-            )
-            item_may_sup = _with_item_may_suppress_exceptions(
-                item.context_expr,
-                item_prov,
-                strict_with_suppression=state.strict_with_suppression,
-                extra_non_suppressing_ctx_managers=state.extra_non_suppressing_ctx_managers,
-            )
-            if (
-                not encloses
-                and not item_br
-                and item_may_sup
-                and item.optional_vars is not None
-                and not _is_non_raising_store_target(item.optional_vars)
-            ):
-                item_frames.append(
-                    _StackFrame(
-                        item.context_expr,
-                        item_br,
-                        in_lp,
-                        act_nl,
-                        force_after_span=f_after,
-                    )
-                )
-                item_frames.append(
-                    _StackFrame(
-                        item.optional_vars,
-                        True,
-                        in_lp,
-                        act_nl,
-                        force_after_span=f_after,
-                    )
-                )
-            else:
-                item_frames.append(
-                    _StackFrame(
-                        item,
-                        item_br,
-                        in_lp,
-                        act_nl,
-                        force_after_span=f_after,
-                    )
-                )
-            if item.optional_vars is not None:
-                opt_cond = item_br or (
-                    item_may_sup
-                    and not _is_non_raising_store_target(item.optional_vars)
-                )
-                item_prov = _clear_store_target_provenance(
-                    item.optional_vars, item_prov, is_conditional=opt_cond
-                )
-            if item_may_sup:
-                after_sup = True
-        stack.extend(reversed(item_frames))
         return True
 
-    if isinstance(curr, ast.Try) or type(curr).__name__ == "TryStar":
-        body_l = getattr(curr, "body", [])
-        else_l = getattr(curr, "orelse", [])
-        final_l = getattr(curr, "finalbody", [])
-        handlers_l = getattr(curr, "handlers", [])
-        else_span = encloses and _block_contains_span(else_l, span)
-        body_span = encloses and (
-            _block_contains_span(body_l, span) or else_span
-        )
-        final_span = encloses and _block_contains_span(final_l, span)
-        _maybe_push_pre_span_exhaustive_frame(
-            curr,
-            encloses,
-            bool(body_l or final_l),
-            frame,
-            span,
-            state,
-            stack,
-            pre_stmt_suppress=pre_stmt_suppress,
-        )
-        _push_seq(
-            stack,
-            final_l,
-            is_br if final_span else True,
-            in_lp,
-            act_nl,
-            force_after_span=f_after,
-        )
-        _push_seq(
-            stack,
-            else_l,
-            is_br if else_span else True,
-            in_lp,
-            act_nl,
-            force_after_span=f_after,
-        )
-        for h_node in reversed(handlers_l):
-            h_span = encloses and _block_contains_span(
-                getattr(h_node, "body", ()), span
-            )
-            stack.append(
-                _StackFrame(
-                    h_node,
-                    is_br if h_span else True,
-                    in_lp,
-                    act_nl,
-                    force_after_span=f_after,
-                )
-            )
-        _push_seq(
-            stack,
-            body_l,
-            is_br if body_span else True,
-            in_lp,
-            act_nl,
-            force_after_span=f_after,
+    if is_try_or_trystar_node(curr):
+        _push_try_compound_children(
+            curr, encloses, span, frame, state, stack, pre_stmt_suppress
         )
         return True
 
@@ -628,51 +724,10 @@ def _push_compound_children(
             )
         return True
 
-    if type(curr).__name__ == "Match":
-        cases_l = getattr(curr, "cases", [])
-        _maybe_push_pre_span_exhaustive_frame(
-            curr,
-            encloses,
-            bool(cases_l),
-            frame,
-            span,
-            state,
-            stack,
-            pre_stmt_suppress=pre_stmt_suppress,
+    if is_match_node(curr):
+        _push_match_compound_children(
+            curr, encloses, span, frame, state, stack, pre_stmt_suppress
         )
-        for case in reversed(cases_l):
-            case_body = getattr(case, "body", [])
-            c_br = (
-                is_br
-                if (encloses and _block_contains_span(case_body, span))
-                else True
-            )
-            _push_seq(
-                stack,
-                case_body,
-                c_br,
-                in_lp,
-                act_nl,
-                force_after_span=f_after,
-            )
-            _push_seq(
-                stack,
-                [
-                    sub
-                    for attr in ("pattern", "guard")
-                    if isinstance(sub := getattr(case, attr, None), ast.AST)
-                ],
-                c_br,
-                in_lp,
-                act_nl,
-                force_after_span=f_after,
-            )
-        if isinstance(subject := getattr(curr, "subject", None), ast.AST):
-            stack.append(
-                _StackFrame(
-                    subject, is_br, in_lp, act_nl, force_after_span=f_after
-                )
-            )
         return True
 
     if isinstance(curr, (ast.BoolOp, ast.Compare)):
@@ -1180,6 +1235,34 @@ def _apply_stmt_cell_delta(
     bufs.sibling_nl_deletions.update(delta.sibling_nl_deletions)
 
 
+_stmt_with_summary_cache: Dict[ast.stmt, Tuple[bool, frozenset[str]]] = {}
+
+
+def _get_stmt_with_summary(
+    stmt: ast.stmt,
+) -> Tuple[bool, frozenset[str]]:
+    """Returns cached (has_with, stmt_name_ids) for a statement node."""
+    with _downstream_cache_lock:
+        cached = _stmt_with_summary_cache.get(stmt)
+    if cached is not None:
+        return cached
+    has_w = False
+    name_ids: Set[str] = set()
+    for node in ast.walk(stmt):
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            has_w = True
+        elif isinstance(node, ast.Name):
+            name_ids.add(node.id)
+    result: Tuple[bool, frozenset[str]] = (
+        has_w,
+        frozenset(name_ids) if has_w else frozenset(),
+    )
+    with _downstream_cache_lock:
+        if len(_stmt_with_summary_cache) >= 512:
+            _stmt_with_summary_cache.pop(next(iter(_stmt_with_summary_cache)))
+        return _stmt_with_summary_cache.setdefault(stmt, result)
+
+
 def _try_apply_cached_stmt_delta(
     stmt: ast.stmt,
     span: _SpanBounds,
@@ -1213,14 +1296,12 @@ def _try_apply_cached_stmt_delta(
     sup_key = pre_prov.as_cache_key_tuple() if pre_prov else ()
     strict_w = bool(bufs.state.strict_with_suppression)
     extra_non_sup = frozenset(bufs.state.extra_non_suppressing_ctx_managers)
-    has_with = is_before and any(
-        isinstance(n, (ast.With, ast.AsyncWith)) for n in ast.walk(stmt)
-    )
+    has_with = False
+    stmt_name_ids: frozenset[str] = frozenset()
+    if is_before:
+        has_with, stmt_name_ids = _get_stmt_with_summary(stmt)
     init_pre_bound: frozenset[str] = (
-        frozenset(
-            bufs.state.pre_bound
-            & {n.id for n in ast.walk(stmt) if isinstance(n, ast.Name)}
-        )
+        frozenset(bufs.state.pre_bound & stmt_name_ids)
         if has_with and bufs.state.pre_bound
         else frozenset()
     )
@@ -1834,22 +1915,11 @@ def _analyze_enclosing_fn_cells(
     )
     extra_non_sup = frozenset(extra_non_suppressing_ctx_managers)
     params: Tuple[Any, ...] = (
-        (
-            norm_span,
-            frozenset(unit_mutations),
-            enclosed_fn is not None,
-            bool(strict_with_suppression),
-            extra_non_sup,
-        )
-        if extra_non_sup
-        else (
-            norm_span,
-            frozenset(unit_mutations),
-            enclosed_fn is not None,
-            True,
-        )
-        if strict_with_suppression
-        else (norm_span, frozenset(unit_mutations), enclosed_fn is not None)
+        norm_span,
+        frozenset(unit_mutations),
+        enclosed_fn is not None,
+        bool(strict_with_suppression),
+        extra_non_sup,
     )
     cache_key = _make_trusted_scope_cache_key(
         owner=fn_node,

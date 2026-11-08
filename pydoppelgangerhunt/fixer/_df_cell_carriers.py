@@ -118,6 +118,40 @@ def _is_node_attached_to_tree(node: ast.AST, mod_tree: ast.AST) -> bool:
     return node is mod_tree or node in _get_scope_parent_map(mod_tree)
 
 
+def _compute_scope_ctx_aux_nodes(
+    scope_owner: Optional[ast.AST],
+    mod_tree: Optional[ast.AST],
+    enclosing_scopes: Tuple[ast.AST, ...],
+    has_parent_map: bool,
+) -> Tuple[ast.AST, ...]:
+    """Computes attached AST owner, module root, and enclosing scope nodes for _FnScopeContext."""
+    mod_pm = (
+        _get_scope_parent_map(mod_tree)
+        if isinstance(mod_tree, ast.AST)
+        else None
+    )
+    aux_nodes: List[ast.AST] = []
+    if isinstance(scope_owner, ast.AST) and not getattr(
+        scope_owner, "_is_ephemeral_unit_mod", False
+    ):
+        if mod_pm is not None:
+            if scope_owner is mod_tree or scope_owner in mod_pm:
+                aux_nodes.append(scope_owner)
+        elif not isinstance(scope_owner, ast.Module) or has_parent_map:
+            aux_nodes.append(scope_owner)
+    if isinstance(mod_tree, ast.AST) and not getattr(
+        mod_tree, "_is_ephemeral_unit_mod", False
+    ):
+        aux_nodes.append(mod_tree)
+    for enc in enclosing_scopes:
+        if isinstance(enc, ast.AST) and not getattr(
+            enc, "_is_ephemeral_unit_mod", False
+        ):
+            if mod_pm is None or enc is mod_tree or enc in mod_pm:
+                aux_nodes.append(enc)
+    return tuple(aux_nodes)
+
+
 class _FnScopeContext(NamedTuple):
     """Cached per-function lexical scope metadata for eager generator expression checks.
 
@@ -134,6 +168,7 @@ class _FnScopeContext(NamedTuple):
     scope_owner: Optional[ast.AST] = None
     mod_tree: Optional[ast.AST] = None
     enclosing_scopes: Tuple[ast.AST, ...] = ()
+    precomputed_aux_nodes: Optional[Tuple[ast.AST, ...]] = None
 
     def cache_fingerprint(self) -> Tuple[Any, ...]:
         """Returns the non-AST semantic fingerprint of this scope context."""
@@ -145,37 +180,15 @@ class _FnScopeContext(NamedTuple):
         )
 
     def cache_aux_nodes(self) -> Tuple[ast.AST, ...]:
-        """Returns attached AST owner and enclosing scope nodes referenced by this context."""
-        mod_pm = (
-            _get_scope_parent_map(self.mod_tree)
-            if isinstance(self.mod_tree, ast.AST)
-            else None
+        """Returns attached AST owner and enclosing scope nodes referenced by this context in O(1)."""
+        if self.precomputed_aux_nodes is not None:
+            return self.precomputed_aux_nodes
+        return _compute_scope_ctx_aux_nodes(
+            self.scope_owner,
+            self.mod_tree,
+            self.enclosing_scopes,
+            bool(self.parent_map),
         )
-        aux_nodes: List[ast.AST] = []
-        if isinstance(self.scope_owner, ast.AST) and not getattr(
-            self.scope_owner, "_is_ephemeral_unit_mod", False
-        ):
-            if mod_pm is not None:
-                if (
-                    self.scope_owner is self.mod_tree
-                    or self.scope_owner in mod_pm
-                ):
-                    aux_nodes.append(self.scope_owner)
-            elif not isinstance(self.scope_owner, ast.Module) or bool(
-                self.parent_map
-            ):
-                aux_nodes.append(self.scope_owner)
-        if isinstance(self.mod_tree, ast.AST) and not getattr(
-            self.mod_tree, "_is_ephemeral_unit_mod", False
-        ):
-            aux_nodes.append(self.mod_tree)
-        for enc in self.enclosing_scopes:
-            if isinstance(enc, ast.AST) and not getattr(
-                enc, "_is_ephemeral_unit_mod", False
-            ):
-                if mod_pm is None or enc is self.mod_tree or enc in mod_pm:
-                    aux_nodes.append(enc)
-        return tuple(aux_nodes)
 
     def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
         """Returns the scope owner, module root, and enclosing scope AST nodes for cache indexing."""
@@ -265,6 +278,7 @@ def _get_fn_scope_context_uncached(
         and not _is_node_attached_to_tree(eff_owner, mod_tree)
     ):
         eff_owner = None
+    enc_tuple = tuple(enclosing_scopes)
     return _FnScopeContext(
         fn_locals=frozenset(_extract_strict_fn_local_names(scope_node)),
         parent_map=eff_parent_map,
@@ -284,7 +298,10 @@ def _get_fn_scope_context_uncached(
         ),
         scope_owner=eff_owner,
         mod_tree=mod_tree,
-        enclosing_scopes=tuple(enclosing_scopes),
+        enclosing_scopes=enc_tuple,
+        precomputed_aux_nodes=_compute_scope_ctx_aux_nodes(
+            eff_owner, mod_tree, enc_tuple, bool(eff_parent_map)
+        ),
     )
 
 
@@ -1856,6 +1873,7 @@ def _make_nested_fn_scope_context(
         if scope_ctx is not None and include_prev_owner
         else (scope_ctx.enclosing_scopes if scope_ctx is not None else ())
     )
+    eff_mod_tree = scope_ctx.mod_tree if scope_ctx is not None else None
     return _FnScopeContext(
         fn_locals=(
             (scope_ctx.fn_locals if scope_ctx is not None else frozenset())
@@ -1870,8 +1888,11 @@ def _make_nested_fn_scope_context(
             scope_ctx.has_star_import if scope_ctx is not None else False
         ),
         scope_owner=fn_node,
-        mod_tree=scope_ctx.mod_tree if scope_ctx is not None else None,
+        mod_tree=eff_mod_tree,
         enclosing_scopes=enc_scopes,
+        precomputed_aux_nodes=_compute_scope_ctx_aux_nodes(
+            fn_node, eff_mod_tree, enc_scopes, bool(parent_map)
+        ),
     )
 
 

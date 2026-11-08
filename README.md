@@ -267,25 +267,31 @@ escaping callbacks across lexical scopes.
   (or `--skip-pre-unit-closures`, or setting `closure_strictness = "strict"|"pedantic"|"lenient"`
   and `non_suppressing_ctx_managers = [...]` in `pyproject.toml`):
   - `strict` (default, `strict_with_suppression = false`): Conservative closure mode that treats
-    pre-unit closures capturing candidate outputs as live escaping callbacks, while using a
-    name-and-provenance heuristic for `with` context managers: unknown context managers are treated
-    as non-suppressing unless their name matches known suppression idioms (`suppress`, `raises`,
-    `ignore`, `subTest`, `ExitStack`, `enter_context`) or is proven exception-suppressing via
-    local, function, or class `__exit__` provenance.
+    pre-unit closures capturing candidate outputs as live escaping callbacks and enforces all four
+    closure-cell hazard checks. For `with` / `async with` blocks, standard library non-suppressing
+    context managers (`open`, `io.*`, `tempfile.*`, `contextlib.nullcontext`, `contextlib.closing`,
+    `contextlib.redirect_stdout`, `contextlib.redirect_stderr`, `warnings.catch_warnings`,
+    `threading.Lock`/`RLock`/`Condition`/`Semaphore`/`BoundedSemaphore`, `asyncio.Lock`,
+    `decimal.localcontext`, `unittest.mock.patch`, `os.scandir`, `sqlite3.connect`, `zipfile.ZipFile`,
+    `tarfile.open`, `gzip.open`, `bz2.open`, `lzma.open`, `pathlib.Path`) and local classes whose
+    `__exit__`/`__aexit__` returns only `False`/`None` are proven non-suppressing; unproven context
+    managers use a name-and-provenance heuristic (treating managers as non-suppressing unless their
+    identifier matches suppression idioms such as `suppress`, `raises`, `ignore`, `subTest`,
+    `ExitStack`, `enter_context`, or is proven suppressing via local/function/class `__exit__`
+    provenance, and logging a diagnostic warning when the heuristic treats an unknown manager as
+    non-suppressing).
   - `pedantic` (aliases: `fail_closed`, `strict_with`; or `strict_with_suppression = true`): Fully
-    fail-closed mode that additionally treats all unproven unknown `with` context managers as
-    potentially exception-suppressing unless explicitly allowlisted via `--non-suppressing-ctx-managers`
+    fail-closed mode that treats all unproven unknown `with` context managers as potentially
+    exception-suppressing unless explicitly allowlisted via `--non-suppressing-ctx-managers`
     or `non_suppressing_ctx_managers` (merged across global config and per-unit overrides).
+    Allowlist entries support bare names (including locally defined classes and relative imports),
+    dotted paths (e.g., `pkg.tx.atomic`), and wildcard attribute suffixes (`*.atomic` or `.atomic`
+    matching `<any_receiver>.atomic(...)`).
   - `lenient` (aliases: `fast`, `skip`): Precision-oriented mode that skips pre-unit closure
-    scanning, reducing false-positive pair rejections in codebases where pre-unit closures never
-    escape, at the cost of potential callback capture hazards for escaping closures.
-  - **Deprecation & Migration Note (`strict_with_suppression`)**: The boolean `strict_with_suppression`
-    setting (in `pyproject.toml` and per-unit dicts) is retained for backward compatibility:
-    `strict_with_suppression = true` selects `pedantic` unknown-`with` handling and
-    `strict_with_suppression = false` selects `strict` heuristic handling when `closure_strictness`
-    is omitted. When both `closure_strictness` and `strict_with_suppression` are supplied,
-    `closure_strictness` takes precedence and logs a conflict warning. New configurations should
-    use the unified `closure_strictness = "strict" | "pedantic" | "lenient"` knob directly.
+    liveness scanning for generator subroutines and relaxes speculative unreferenced-sibling
+    closure checks, while still enforcing Checks 1–3 (unbound captured cells, externally mutated
+    captured cells, and intra-unit `nonlocal`/walrus mutator escapes) and Check 4 for sibling
+    closures explicitly referenced as unit inputs.
 
 #### Safety Model & Fail-Closed Refactoring Guarantees
 
@@ -384,9 +390,9 @@ pydoppelgangerhunt --init
 | `--method-binding` | `auto\|method\|module` | Target helper binding strategy (`auto`, `method`, or `module`) |
 | `--cross-file-strategy` | `auto\|shared_module\|host_module\|skip` | Cross-module deduplication strategy (`auto`, `shared_module`, `host_module`, or `skip`; default: `auto`) |
 | `--shared-module-name` | `FILENAME` | Target filename for shared utility extractions (default: `_common.py`) |
-| `--skip-pre-unit-closures` | Flag | Skip pre-unit closure scan during subroutine extraction |
-| `--closure-strictness` | `strict\|pedantic\|lenient\|fail_closed\|strict_with\|fast\|skip` | Closure strictness mode (`strict` [heuristic `with`-suppression, default], `pedantic` / `fail_closed` / `strict_with` [all unproven `with`-managers treated as potentially suppressing], or `lenient` / `fast` / `skip` [fewer rejections]) |
-| `--non-suppressing-ctx-managers` | `NAMES` | Context manager names or dotted paths proven not to suppress exceptions (comma-separated or repeatable) |
+| `--skip-pre-unit-closures` | Flag | Relax speculative unreferenced pre-unit closure checks (`lenient` mode) |
+| `--closure-strictness` | `strict\|pedantic\|lenient\|fail_closed\|strict_with\|fast\|skip` | Closure strictness mode (`strict` [heuristic `with`-suppression, default], `pedantic` / `fail_closed` / `strict_with` [all unproven `with`-managers treated as potentially suppressing], or `lenient` / `fast` / `skip` [relaxes speculative unreferenced-sibling closure checks while keeping Checks 1–3 and referenced-sibling Check 4]) |
+| `--non-suppressing-ctx-managers` | `NAMES` | Context manager names, dotted paths, or `*.attr` / `.attr` suffixes proven not to suppress exceptions (comma-separated or repeatable) |
 | `--sort-by` | `similarity\|priority\|sloc` | Sort clone hits (default: `similarity`) |
 | `--priority` | Flag | Sort clones by Priority score: $\text{Sim} \times \text{SLOC} \times \text{Complexity}$ |
 | `--top` | `INT` | Truncate report to top $N$ clone pairs |

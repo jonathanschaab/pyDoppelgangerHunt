@@ -195,7 +195,7 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
     parser.add_argument(
         "--skip-pre-unit-closures",
         action="store_true",
-        help="Skip scanning pre-unit closures for live variables during subroutine extraction",
+        help="Relax unreferenced pre-unit sibling closure checks during subroutine extraction",
     )
     parser.add_argument(
         "--closure-strictness",
@@ -213,7 +213,7 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         help=(
             "Closure strictness ('strict' [heuristic with-suppression, default], "
             "'pedantic'/'fail_closed'/'strict_with' [all unproven with-managers treated as potentially suppressing], "
-            "or 'lenient'/'fast'/'skip' [skip pre-unit closure scan]; takes precedence over --skip-pre-unit-closures)"
+            "or 'lenient'/'fast'/'skip' [relax unreferenced sibling closure checks]; takes precedence over --skip-pre-unit-closures)"
         ),
     )
     parser.add_argument(
@@ -403,14 +403,25 @@ def _render_pair_diff_and_suggestions(
     repo_root: Optional[str] = None,
     use_color: bool,
     indent: str = "    ",
+    closure_strictness: Optional[str] = None,
+    skip_pre_unit_closures: bool = False,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> List[str]:
     """Renders optional refactoring suggestion and unified diff for a pair of clone units."""
     effective_root = repo_root or target_repo_root
     lines: List[str] = []
     if args.suggest:
-        sug = synthesize_refactoring_suggestion(
-            u1, u2, repo_root=effective_root
-        )
+        sug_kwargs: Dict[str, Any] = {"repo_root": effective_root}
+        if closure_strictness is not None:
+            sug_kwargs["closure_strictness"] = closure_strictness
+            sug_kwargs["skip_pre_unit_closures"] = skip_pre_unit_closures
+        elif skip_pre_unit_closures:
+            sug_kwargs["skip_pre_unit_closures"] = skip_pre_unit_closures
+        if non_suppressing_ctx_managers is not None:
+            sug_kwargs["non_suppressing_ctx_managers"] = (
+                non_suppressing_ctx_managers
+            )
+        sug = synthesize_refactoring_suggestion(u1, u2, **sug_kwargs)
         sug_colored = colorize(sug, COLOR_YELLOW, use_color)
         print(indent + sug_colored.replace("\n", "\n" + indent))
         lines.append(indent + sug.replace("\n", "\n" + indent))
@@ -654,6 +665,9 @@ def _render_text_violations(
     target_repo_root: str = ".",
     repo_root: Optional[str] = None,
     audit_tests_enabled: bool = False,
+    closure_strictness: Optional[str] = None,
+    skip_pre_unit_closures: bool = False,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> List[str]:
     """Renders human-readable text output for clone violations (either clustered families or pairwise)."""
     effective_root = repo_root or target_repo_root
@@ -706,6 +720,9 @@ def _render_text_violations(
                         target_repo_root=effective_root,
                         use_color=use_color,
                         indent="      ",
+                        closure_strictness=closure_strictness,
+                        skip_pre_unit_closures=skip_pre_unit_closures,
+                        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
                     )
                 )
     else:
@@ -751,6 +768,9 @@ def _render_text_violations(
                     target_repo_root=effective_root,
                     use_color=use_color,
                     indent="    ",
+                    closure_strictness=closure_strictness,
+                    skip_pre_unit_closures=skip_pre_unit_closures,
+                    non_suppressing_ctx_managers=non_suppressing_ctx_managers,
                 )
             )
 
@@ -1152,6 +1172,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cfg_strictness = tool_cfg.get("closure_strictness")
     cfg_skip = _safe_bool(tool_cfg.get("skip_pre_unit_closures", False))
 
+    cfg_strict_with = (
+        _safe_bool(tool_cfg.get("strict_with_suppression"))
+        if "strict_with_suppression" in tool_cfg
+        and tool_cfg.get("strict_with_suppression") is not None
+        else None
+    )
     if args.closure_strictness is not None:
         cli_strictness: Optional[str] = args.closure_strictness
         cli_skip: bool = _safe_bool(args.skip_pre_unit_closures)
@@ -1180,31 +1206,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "configured closure_strictness='%s'",
                 cfg_strictness,
             )
+        elif cfg_strict_with:
+            logger.warning(
+                "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
+                "configured strict_with_suppression=True"
+            )
     else:
         cli_strictness = cfg_strictness
         cli_skip = cfg_skip
-        if (
-            cli_strictness is None
-            and not cli_skip
-            and _safe_bool(tool_cfg.get("strict_with_suppression", False))
-        ):
-            cli_strictness = "pedantic"
 
     if (
         args.closure_strictness is None
         and cfg_strictness is not None
-        and "strict_with_suppression" in tool_cfg
+        and cfg_strict_with is not None
     ):
         resolve_strict_with_suppression(
             closure_strictness=cfg_strictness,
-            strict_with_suppression=_safe_bool(
-                tool_cfg.get("strict_with_suppression")
-            ),
+            strict_with_suppression=cfg_strict_with,
         )
 
     closure_strictness, skip_pre_unit_closures = resolve_closure_strictness_mode(
         closure_strictness=cli_strictness,
         skip_pre_unit_closures=cli_skip,
+        strict_with_suppression=(
+            cfg_strict_with
+            if args.closure_strictness is None and not args.skip_pre_unit_closures
+            else None
+        ),
     )
     non_suppressing_ctx_managers = normalize_non_suppressing_ctx_managers(
         tool_cfg.get("non_suppressing_ctx_managers"),
@@ -1596,6 +1624,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         use_color=use_color,
         target_repo_root=git_worktree_root,
         audit_tests_enabled=audit_tests_enabled,
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
     )
 
     if args.output:

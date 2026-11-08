@@ -1903,8 +1903,18 @@ def test_resolve_clone_generator_subroutine_outputs_precomputed_definite_stores(
         "end": 2,
     }
     # Scope 1 only definitely assigns x, leaving unassigned lacking definite store
-    s1 = {"definite_stores": ["x"], "inputs": []}
-    s2 = {"definite_stores": ["a", "b"], "inputs": []}
+    s1 = {
+        "definite_stores": ["x"],
+        "inputs": [],
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": 2,
+    }
+    s2 = {
+        "definite_stores": ["a", "b"],
+        "inputs": [],
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": 2,
+    }
     res_rejected = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
     assert res_rejected is None
 
@@ -1912,6 +1922,8 @@ def test_resolve_clone_generator_subroutine_outputs_precomputed_definite_stores(
     s1_valid = {
         "definite_stores": ["x", "unassigned"],
         "inputs": [],
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": 2,
     }
     res_valid = resolve_clone_generator_subroutine_outputs(u1, u2, s1_valid, s2)
     assert res_valid == (["x", "unassigned"], ["a", "b"])
@@ -3945,8 +3957,20 @@ def test_resolve_clone_generator_subroutine_outputs_unflagged_sliced_lines() -> 
         "end": 12,
         "source_lines": ["    x = yield\n", "    total += x\n", "    yield total\n"],
     }
-    scope1 = {"inputs": ["total"], "outputs": ["total"], "definite_stores": ["total"]}
-    scope2 = {"inputs": ["total"], "outputs": ["total"], "definite_stores": ["total"]}
+    scope1 = {
+        "inputs": ["total"],
+        "outputs": ["total"],
+        "definite_stores": ["total"],
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": 2,
+    }
+    scope2 = {
+        "inputs": ["total"],
+        "outputs": ["total"],
+        "definite_stores": ["total"],
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": 2,
+    }
     # Sliced lines with len(source_lines) < end fail closed because full file text is unavailable
     res = resolve_clone_generator_subroutine_outputs(u1, u2, scope1, scope2)
     assert res is None

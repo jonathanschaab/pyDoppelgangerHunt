@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from collections import OrderedDict
+import contextlib
 import hashlib
 import logging
 import threading
@@ -13,6 +14,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterator,
     List,
     NamedTuple,
     Optional,
@@ -32,7 +34,16 @@ logger = logging.getLogger(__name__)
 _CacheValT = TypeVar("_CacheValT")
 
 _downstream_cache_lock: threading.RLock = threading.RLock()
+_syntax_warning_lock: threading.RLock = threading.RLock()
 _RLOCK_TYPE: type = type(_downstream_cache_lock)
+
+
+@contextlib.contextmanager
+def _suppress_syntax_warnings() -> Iterator[None]:
+    """Thread-safely suppresses SyntaxWarning during AST/symtable parsing via a dedicated RLock."""
+    with _syntax_warning_lock, warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        yield
 
 
 def _is_reentrant_cache_lock(lock: Any) -> bool:
@@ -41,7 +52,7 @@ def _is_reentrant_cache_lock(lock: Any) -> bool:
 
 
 _MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
-_MAX_SCOPE_CACHE_SIZE: int = 2048
+_MAX_SCOPE_CACHE_SIZE: int = 4096
 _MAX_PARSED_TREE_CACHE_SIZE: int = 128
 _SCOPE_CACHE_KIND_CAPS: Dict[str, int] = {
     "span_line_index": 128,
@@ -417,6 +428,9 @@ def _store_parent_map_locked(
     _scope_parent_maps[root_node] = parent_map
     _scope_parent_maps.move_to_end(root_node)
     scope_boundary_nodes = [root_node]
+    for top_stmt in getattr(root_node, "body", ()):
+        if isinstance(top_stmt, ast.AST):
+            scope_boundary_nodes.append(top_stmt)
     for child_node in parent_map:
         if isinstance(child_node, _SCOPE_ROOT_TYPES):
             scope_boundary_nodes.append(child_node)
@@ -696,8 +710,9 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
 
     Note:
         Uses ``_node_to_parent_map_roots`` and ``_scope_parent_maps`` to locate owning
-        trees and walk ancestor scopes in O(|tree_nodes|), and ``_scope_owner_keys_index``
-        to evict affected cache keys without flushing unrelated sibling scopes.
+        trees and walk ancestor scopes (proportional to ``|tree_nodes|`` plus the active
+        parent-map/statement-line root sets), and ``_scope_owner_keys_index`` to evict
+        affected cache keys without flushing unrelated sibling scopes.
     """
     if tree is None or not isinstance(tree, ast.AST):
         return
@@ -721,6 +736,11 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
                 candidate_roots.add(r_node)
         keys_to_remove: Set[Any] = set()
         for root_node in candidate_roots:
+            for rk in _scope_owner_keys_index.get(root_node, ()):
+                if rk is root_node or (
+                    isinstance(rk, _ScopeCacheKey) and rk.owner is root_node
+                ):
+                    keys_to_remove.add(rk)
             pmap = _scope_parent_maps.get(root_node)
             if pmap is None:
                 continue
@@ -754,12 +774,6 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
                 curr_anc = pmap.get(curr_anc)
             if not has_inner_scope_anc:
                 tree_nodes.add(root_node)
-            else:
-                for rk in _scope_owner_keys_index.get(root_node, ()):
-                    if rk is root_node or (
-                        isinstance(rk, _ScopeCacheKey) and rk.owner is root_node
-                    ):
-                        keys_to_remove.add(rk)
         for stmt_cache in (_scope_stmts_by_start, _scope_stmts_by_end):
             for s_owner, line_map in list(stmt_cache.items()):
                 if s_owner in scope_nodes:
@@ -826,13 +840,11 @@ def _store_lru_cache_entry(
         if key in cache:
             cache.move_to_end(key)
             return cache[key]
-        if (
-            isinstance(cache, _TrackedScopeCache)
-            and isinstance(key, _ScopeCacheKey)
-            and max_size == _MAX_SCOPE_CACHE_SIZE
+        if isinstance(cache, _TrackedScopeCache) and isinstance(
+            key, _ScopeCacheKey
         ):
             kind_cap = _SCOPE_CACHE_KIND_CAPS.get(key.kind)
-            if kind_cap is not None:
+            if kind_cap is not None and max_size > kind_cap:
                 kind_ring = cache.ensure_kind_keys().get(key.kind)
                 while kind_ring and len(kind_ring) >= kind_cap:
                     oldest_k, _ = kind_ring.popitem(last=False)
@@ -867,9 +879,16 @@ def _get_or_compute_scope_cached(
     # eliminate lock contention under multi-threading; transient duplicate computation during
     # concurrent misses is harmless because compute_fn is deterministic and pure.
     computed = compute_fn()
-    return _store_lru_cache_entry(
-        cache, scope_node, computed, _MAX_SCOPE_CACHE_SIZE
-    )
+    try:
+        return _store_lru_cache_entry(
+            cache, scope_node, computed, _MAX_SCOPE_CACHE_SIZE
+        )
+    except TypeError as exc:
+        logger.debug(
+            "Skipping scope cache insertion due to unhashable key or unindexed value: %s",
+            exc,
+        )
+        return computed
 
 
 def _split_source_lines_stripped(source_text: str) -> Tuple[str, ...]:
@@ -880,6 +899,16 @@ def _split_source_lines_stripped(source_text: str) -> Tuple[str, ...]:
         else source_text
     )
     return tuple(ln.rstrip("\r\n") for ln in split_source_lines(normalized))
+
+
+def _attach_tree_source_lines(
+    tree: ast.AST, source_lines: Tuple[str, ...]
+) -> None:
+    """Attaches _source_lines to root and decorated scope nodes for exact @-line lookup."""
+    setattr(tree, "_source_lines", source_lines)
+    for node in ast.walk(tree):
+        if getattr(node, "decorator_list", None):
+            setattr(node, "_source_lines", source_lines)
 
 
 def _get_or_parse_tree(
@@ -903,11 +932,10 @@ def _get_or_parse_tree(
 
     parsed: Optional[ast.AST] = None
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", SyntaxWarning)
+        with _suppress_syntax_warnings():
             parsed = ast.parse(source_text)
         setattr(parsed, "_immutable_cached", True)
-        setattr(parsed, "_source_lines", _split_source_lines_stripped(source_text))
+        _attach_tree_source_lines(parsed, _split_source_lines_stripped(source_text))
     except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
         parsed = None
 
@@ -925,7 +953,9 @@ def _parse_source_tree(
     """Parses Python source code into an AST tree if not already provided."""
     if tree is not None:
         if source_text and getattr(tree, "_source_lines", None) is None:
-            setattr(tree, "_source_lines", _split_source_lines_stripped(source_text))
+            _attach_tree_source_lines(
+                tree, _split_source_lines_stripped(source_text)
+            )
         return tree
     return _get_or_parse_tree(source_text, source_digest=source_digest)
 

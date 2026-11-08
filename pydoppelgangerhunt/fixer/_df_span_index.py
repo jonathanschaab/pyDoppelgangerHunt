@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 import symtable
-import warnings
 from typing import (
     Dict,
     List,
@@ -16,10 +15,18 @@ from typing import (
     cast,
 )
 
+from pydoppelgangerhunt.fixer._ast_compat import (
+    is_match_as_node,
+    is_match_case_node,
+    is_match_mapping_node,
+    is_match_star_node,
+    is_type_alias_node,
+)
 from pydoppelgangerhunt.fixer._df_cache import (
     _get_or_compute_scope_cached,
     _make_trusted_scope_cache_key,
     _scope_cell_info_cache,
+    _suppress_syntax_warnings,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
     _COMPREHENSION_TYPES,
@@ -190,8 +197,8 @@ class _IndexedSpanNode(NamedTuple):
     n_end_col: Optional[int]
 
     def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
-        """Returns the AST node retained by this span index entry."""
-        return (self.node,) if isinstance(self.node, ast.AST) else ()
+        """Returns empty tuple; root ownership is tracked at the _SpanLineIndex key level."""
+        return ()
 
 
 class _SpanLineIndex:
@@ -296,8 +303,8 @@ class _SpanLineIndex:
                             eff_header_line, []
                         ).append(node)
                     has_compound_child = eff_header_line < raw_end and any(
-                        isinstance(ch, ast.stmt)
-                        or type(ch).__name__ in ("ExceptHandler", "match_case")
+                        isinstance(ch, (ast.stmt, ast.ExceptHandler))
+                        or is_match_case_node(ch)
                         for ch in ast.iter_child_nodes(node)
                     )
                     self.stmts_by_end_line.setdefault(raw_end, []).append(
@@ -349,33 +356,8 @@ class _SpanLineIndex:
         return combined
 
     def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
-        """Returns all AST nodes retained across the span-line index maps."""
-        nodes: List[ast.AST] = []
-        seen_ids: Set[int] = set()
-        for entry_map in (self.by_start_line, self.by_end_line):
-            for entries in entry_map.values():
-                for entry in entries:
-                    if (
-                        isinstance(entry.node, ast.AST)
-                        and id(entry.node) not in seen_ids
-                    ):
-                        seen_ids.add(id(entry.node))
-                        nodes.append(entry.node)
-        for stmts in self.stmts_by_start_line.values():
-            for stmt in stmts:
-                if isinstance(stmt, ast.AST) and id(stmt) not in seen_ids:
-                    seen_ids.add(id(stmt))
-                    nodes.append(stmt)
-        for end_tuples in self.stmts_by_end_line.values():
-            for stmt, _, _ in end_tuples:
-                if isinstance(stmt, ast.AST) and id(stmt) not in seen_ids:
-                    seen_ids.add(id(stmt))
-                    nodes.append(stmt)
-        for c_node in self.closure_like_nodes:
-            if isinstance(c_node, ast.AST) and id(c_node) not in seen_ids:
-                seen_ids.add(id(c_node))
-                nodes.append(c_node)
-        return tuple(nodes)
+        """Returns empty tuple; root ownership is indexed on the owning _ScopeCacheKey(root_node, 'span_line_index')."""
+        return ()
 
 
 def _get_span_line_index(root_node: ast.AST) -> _SpanLineIndex:
@@ -664,11 +646,14 @@ def _extract_direct_nonlocals(
 
 def _extract_type_alias_or_pattern_name(node: ast.AST) -> Optional[str]:
     """Extracts the bound identifier from a TypeAlias or match pattern AST node."""
-    cls_name = type(node).__name__
-    if cls_name == "TypeAlias":
+    if is_type_alias_node(node):
         target_name = getattr(node, "name", None)
         return target_name.id if isinstance(target_name, ast.Name) else None
-    if cls_name in ("MatchAs", "MatchStar", "MatchMapping"):
+    if (
+        is_match_as_node(node)
+        or is_match_star_node(node)
+        or is_match_mapping_node(node)
+    ):
         return _extract_pattern_bound_name(node)
     return None
 
@@ -729,8 +714,7 @@ def _compute_scope_invalid_lexical_declarations(
         src_lines = getattr(root_scope, "_source_lines", None)
         if isinstance(src_lines, (list, tuple)) and src_lines:
             try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", SyntaxWarning)
+                with _suppress_syntax_warnings():
                     symtable.symtable("\n".join(src_lines), "<symtable>", "exec")
                 return False
             except SyntaxError:

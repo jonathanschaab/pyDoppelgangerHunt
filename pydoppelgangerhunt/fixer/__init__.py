@@ -80,8 +80,10 @@ from pydoppelgangerhunt.fixer.scope import (
     _walrus_assignment_in_expr,
     _walrus_in_sequence,
     analyze_unit_variable_scope,
+    ensure_unit_scope_closure_mode,
     inspect_single_unit_scope,
     is_subroutine_unit,
+    scope_matches_closure_mode,
 )
 from pydoppelgangerhunt.fixer.source import (
     _detect_indent_step,
@@ -98,6 +100,7 @@ from pydoppelgangerhunt.fixer.source import (
     _slice_unit_token_lines,
     ReplacementItem,
     UnitDict,
+    UnitSchema,
     UnitSpan,
     col_offset_to_char_offset,
     compute_line_offsets,
@@ -114,6 +117,7 @@ from pydoppelgangerhunt.fixer.source import (
     resolve_unit_replacement,
     slice_source_by_token_range,
     split_source_lines,
+    validate_unit_schema,
 )
 from pydoppelgangerhunt.fixer.synthesis import (
     TYPING_SYMBOLS,
@@ -132,6 +136,7 @@ __all__ = [
     "SCOPE_SCHEMA_VERSION",
     "UnitCollisionError",
     "UnitDict",
+    "UnitSchema",
     "UnitSpan",
     "analyze_unit_variable_scope",
     "build_module_graph",
@@ -148,6 +153,7 @@ __all__ = [
     "derive_module_import_path",
     "derive_shared_module_import",
     "detect_line_ending",
+    "ensure_unit_scope_closure_mode",
     "extract_unit_comments_and_pragmas",
     "filter_overlapping_clone_units",
     "find_enclosing_class",
@@ -170,8 +176,10 @@ __all__ = [
     "resolve_generator_subroutine_outputs",
     "resolve_shared_module_file",
     "resolve_unit_replacement",
+    "scope_matches_closure_mode",
     "slice_source_by_token_range",
     "split_source_lines",
     "synthesize_shared_helper_code",
     "validate_module_unit_replacements",
+    "validate_unit_schema",
 ]

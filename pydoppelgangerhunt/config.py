@@ -29,9 +29,19 @@ _CONFIG_KEY_NAMES: Tuple[str, ...] = (
 )
 
 
+def should_warn_closure_event(event_key: str) -> bool:
+    """Returns True the first time *event_key* is seen since cache reset."""
+    with _warned_closure_lock:
+        if event_key in _warned_closure_strictness_values:
+            return False
+        _warned_closure_strictness_values.add(event_key)
+        return True
+
+
 def resolve_closure_strictness_mode(
     closure_strictness: Optional[str] = None,
     skip_pre_unit_closures: Optional[bool] = False,
+    strict_with_suppression: Optional[bool] = None,
 ) -> Tuple[str, bool]:
     """Resolves canonical closure strictness mode ('strict', 'pedantic', or 'lenient') and boolean skip flag.
 
@@ -43,39 +53,53 @@ def resolve_closure_strictness_mode(
     'pedantic' (aliases 'fail_closed', 'strict_with') additionally treats all unproven
     unknown context managers as potentially exception-suppressing unless explicitly listed
     in non_suppressing_ctx_managers.
-    'lenient' (aliases 'fast', 'skip') reduces false-positive rejections by bypassing
-    pre-unit closure scanning, at the cost of soundness for escaping closures.
+    'lenient' (aliases 'fast', 'skip') relaxes speculative unreferenced-sibling closure
+    checks while still enforcing direct cell-capture, intra-unit nonlocal mutator, and
+    referenced-sibling closure checks.
     """
     if closure_strictness is not None:
         c_mode = str(closure_strictness).strip().lower()
-        if c_mode in ("lenient", "fast", "skip"):
-            return "lenient", True
-        if c_mode in ("pedantic", "strict_with", "strict", "fail_closed"):
-            if skip_pre_unit_closures:
-                conflict_key = f"conflict_skip:{closure_strictness}"
-                with _warned_closure_lock:
-                    should_warn_conflict = conflict_key not in _warned_closure_strictness_values
-                    if should_warn_conflict:
-                        _warned_closure_strictness_values.add(conflict_key)
-                if should_warn_conflict:
-                    logger.warning(
-                        "Conflicting configuration: closure_strictness '%s' takes precedence over "
-                        "skip_pre_unit_closures=True",
-                        closure_strictness,
-                    )
+        is_lenient_mode = c_mode in ("lenient", "fast", "skip")
+        if is_lenient_mode or c_mode in (
+            "pedantic",
+            "strict_with",
+            "strict",
+            "fail_closed",
+        ):
+            conflict_flag, conflict_key, overridden_setting = (
+                (
+                    bool(strict_with_suppression),
+                    f"conflict_strict_with:{closure_strictness}:True",
+                    "strict_with_suppression=True",
+                )
+                if is_lenient_mode
+                else (
+                    bool(skip_pre_unit_closures),
+                    f"conflict_skip:{closure_strictness}",
+                    "skip_pre_unit_closures=True",
+                )
+            )
+            if conflict_flag and should_warn_closure_event(conflict_key):
+                logger.warning(
+                    "Conflicting configuration: closure_strictness '%s' takes precedence over %s",
+                    closure_strictness,
+                    overridden_setting,
+                )
+            if is_lenient_mode:
+                return "lenient", True
             resolved_mode = (
                 "pedantic"
                 if c_mode in ("pedantic", "strict_with", "fail_closed")
                 else "strict"
             )
             return resolved_mode, False
-        fallback = "lenient" if skip_pre_unit_closures else "strict"
+        fallback = (
+            "lenient"
+            if skip_pre_unit_closures
+            else ("pedantic" if strict_with_suppression else "strict")
+        )
         raw_key = str(closure_strictness)
-        with _warned_closure_lock:
-            should_warn = raw_key not in _warned_closure_strictness_values
-            if should_warn:
-                _warned_closure_strictness_values.add(raw_key)
-        if should_warn:
+        if should_warn_closure_event(raw_key):
             logger.warning(
                 "Unrecognized closure_strictness '%s'; falling back to %s mode",
                 closure_strictness,
@@ -83,6 +107,16 @@ def resolve_closure_strictness_mode(
             )
         return fallback, bool(skip_pre_unit_closures)
     is_lenient = bool(skip_pre_unit_closures)
+    if is_lenient and strict_with_suppression:
+        if should_warn_closure_event("conflict_strict_with_and_skip:True:True"):
+            logger.warning(
+                "Conflicting configuration: strict_with_suppression=True and "
+                "skip_pre_unit_closures=True cannot both be active; "
+                "skip_pre_unit_closures=True takes precedence (using 'lenient' mode)"
+            )
+        return "lenient", True
+    if strict_with_suppression:
+        return "pedantic", False
     return ("lenient" if is_lenient else "strict"), is_lenient
 
 
@@ -92,8 +126,6 @@ def resolve_strict_with_suppression(
 ) -> bool:
     """Resolves whether unproven unknown context managers are treated as potentially suppressing.
 
-    ``strict_with_suppression`` is retained for backward compatibility; prefer configuring
-    the unified ``closure_strictness`` knob (``"strict"``, ``"pedantic"``, or ``"lenient"``).
     When both ``closure_strictness`` and ``strict_with_suppression`` are provided,
     ``closure_strictness`` takes precedence and logs a warning on conflict, matching
     ``resolve_closure_strictness_mode``.
@@ -116,11 +148,7 @@ def resolve_strict_with_suppression(
                 and bool(strict_with_suppression) != resolved_flag
             ):
                 conflict_key = f"conflict_strict_with:{closure_strictness}:{bool(strict_with_suppression)}"
-                with _warned_closure_lock:
-                    should_warn_conflict = conflict_key not in _warned_closure_strictness_values
-                    if should_warn_conflict:
-                        _warned_closure_strictness_values.add(conflict_key)
-                if should_warn_conflict:
+                if should_warn_closure_event(conflict_key):
                     logger.warning(
                         "Conflicting configuration: closure_strictness '%s' takes precedence over "
                         "strict_with_suppression=%s",
@@ -146,6 +174,11 @@ def resolve_unit_closure_flags(
         if closure_strictness is not None
         else unit.get("closure_strictness")
     )
+    eff_sw_input = (
+        strict_with_suppression
+        if strict_with_suppression is not None
+        else unit.get("strict_with_suppression")
+    )
     _, eff_skip = (
         (None, bool(skip_pre_unit_closures))
         if skip_pre_unit_closures is not None and closure_strictness is None
@@ -156,6 +189,7 @@ def resolve_unit_closure_flags(
                 if skip_pre_unit_closures is not None
                 else unit.get("skip_pre_unit_closures", False)
             ),
+            strict_with_suppression=eff_sw_input,
         )
     )
     eff_strict_with = (
@@ -163,13 +197,11 @@ def resolve_unit_closure_flags(
         if strict_with_suppression is not None and closure_strictness is None
         else resolve_strict_with_suppression(
             closure_strictness=eff_strictness,
-            strict_with_suppression=(
-                strict_with_suppression
-                if strict_with_suppression is not None
-                else unit.get("strict_with_suppression")
-            ),
+            strict_with_suppression=eff_sw_input,
         )
     )
+    if eff_skip and eff_strict_with and strict_with_suppression is None:
+        eff_strict_with = False
     return eff_skip, eff_strict_with
 
 
@@ -229,11 +261,7 @@ def normalize_non_suppressing_ctx_managers(*sources: Any) -> Tuple[str, ...]:
             stack.extend(item)
         else:
             invalid_key = f"invalid_non_sup_type:{type(item).__name__}"
-            with _warned_closure_lock:
-                should_warn = invalid_key not in _warned_closure_strictness_values
-                if should_warn:
-                    _warned_closure_strictness_values.add(invalid_key)
-            if should_warn:
+            if should_warn_closure_event(invalid_key):
                 logger.warning(
                     "Ignoring unsupported non_suppressing_ctx_managers value of type %s; "
                     "expected string or sequence of strings",
@@ -281,8 +309,7 @@ exclude = [
 call_sequences = true
 idioms = true
 # closure_strictness = "strict"  # Options: "strict", "pedantic", "lenient"
-# strict_with_suppression = false  # Deprecated compatibility alias; prefer closure_strictness = "pedantic"
-# non_suppressing_ctx_managers = ["mylib.SafeTransaction"]
+# non_suppressing_ctx_managers = ["mylib.SafeTransaction", "*.lock"]
 """
 
 

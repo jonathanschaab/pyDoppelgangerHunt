@@ -1431,20 +1431,20 @@ def synthesize_shared_helper_code(
         scope_matches_closure_mode(
             scope1,
             skip1,
-            expected_strict_with=effective_strict_with1,
-            expected_non_suppressing=eff_non_sup1,
+            strict_with_suppression=effective_strict_with1,
+            non_suppressing_ctx_managers=eff_non_sup1,
         )
         and scope_matches_closure_mode(
             scope2,
             skip2,
-            expected_strict_with=effective_strict_with2,
-            expected_non_suppressing=eff_non_sup2,
+            strict_with_suppression=effective_strict_with2,
+            non_suppressing_ctx_managers=eff_non_sup2,
         )
         and scope_matches_closure_mode(
             scope,
             effective_skip_closures,
-            expected_strict_with=effective_strict_with1 or effective_strict_with2,
-            expected_non_suppressing=sorted(set(eff_non_sup1) & set(eff_non_sup2)),
+            strict_with_suppression=effective_strict_with1 or effective_strict_with2,
+            non_suppressing_ctx_managers=sorted(set(eff_non_sup1) & set(eff_non_sup2)),
         )
     )
     can_skip_tree_parse = (

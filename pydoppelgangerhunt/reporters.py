@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
 from pydoppelgangerhunt.config import normalize_path_string
@@ -213,7 +213,13 @@ def generate_clone_diff(
 
 
 def synthesize_refactoring_suggestion(
-    u1: Dict[str, Any], u2: Dict[str, Any], repo_root: Optional[str] = None
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    repo_root: Optional[str] = None,
+    *,
+    closure_strictness: Optional[str] = None,
+    skip_pre_unit_closures: bool = False,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> str:
     """Synthesizes actionable refactoring recommendation and shared helper template."""
     lines1 = extract_unit_source_code(u1, repo_root)
@@ -246,6 +252,35 @@ def synthesize_refactoring_suggestion(
         if line.startswith("- ") or line.startswith("+ ")
     ]
     diff_summary = f"{len(diff_lines)} varying line(s) detected between clone blocks."
+
+    if (
+        closure_strictness is not None
+        or skip_pre_unit_closures
+        or non_suppressing_ctx_managers is not None
+    ):
+        from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+            synthesize_shared_helper_code,
+        )
+
+        helper_code = synthesize_shared_helper_code(
+            u1,
+            u2,
+            helper_name=helper_name,
+            repo_root=repo_root,
+            closure_strictness=closure_strictness,
+            skip_pre_unit_closures=skip_pre_unit_closures,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        )
+        if helper_code:
+            indented_helper = "\n".join(
+                f"    {ln}" if ln.strip() else ""
+                for ln in helper_code.rstrip("\n").splitlines()
+            )
+            return (
+                f"[REFACTOR SUGGESTION] Extract duplicated logic into common helper '{helper_name}':\n"
+                f"    # {diff_summary}\n"
+                f"{indented_helper}"
+            )
 
     return (
         f"[REFACTOR SUGGESTION] Extract duplicated logic into common helper '{helper_name}':\n"

@@ -10,7 +10,7 @@ import pytest
 
 from pydoppelgangerhunt.fixer import analyze_unit_variable_scope
 from pydoppelgangerhunt.fixer.dataflow import collect_downstream_read_names
-from tests.fixer.conftest import _run_differential_refactoring_case
+from tests.fixer._closure_test_helpers import _run_differential_refactoring_case
 
 
 _CLOSURE_CELL_SCENARIOS = [
@@ -2505,8 +2505,15 @@ def test_severed_closure_cell_scenarios(
     if expect_hazard:
         assert "severed_closure_cell" in scope["control_flow_hazards"]
         assert scope["is_control_flow_safe"] is False
+        reasons = scope.get("closure_hazard_reasons", [])
+        assert reasons, f"Expected specific closure_hazard_reasons for {scenario_id}"
+        assert "unresolved_span_bounds" not in reasons, (
+            f"Scenario {scenario_id} triggered unresolved_span_bounds instead of a semantic check"
+        )
+        assert "invalid_lexical_declaration" not in reasons
     else:
         assert "severed_closure_cell" not in scope["control_flow_hazards"]
+        assert not scope.get("closure_hazard_reasons", [])
 
     unit_lenient = dict(unit, skip_pre_unit_closures=True)
     scope_lenient = inspect_single_unit_scope(unit_lenient, tree=parsed_tree)

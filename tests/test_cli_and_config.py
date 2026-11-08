@@ -3007,5 +3007,153 @@ def test_cli_strict_with_suppression_config_and_ctx_manager_merging(
                 _, kwargs2 = mock_patch.call_args
                 assert kwargs2.get("closure_strictness") == "pedantic"
 
+            # Repeated --non-suppressing-ctx-managers flags merge with config list
+            (repo / "pyproject.toml").write_text(
+                '[tool.pydoppelgangerhunt]\nnon_suppressing_ctx_managers = ["CfgMgr"]\n',
+                encoding="utf-8",
+            )
+            mock_patch.reset_mock()
+            exit_code3 = main([
+                str(repo),
+                "--patch",
+                str(patch_out),
+                "--non-suppressing-ctx-managers",
+                "CliA,CliB",
+                "--non-suppressing-ctx-managers",
+                "CliC",
+            ])
+            assert exit_code3 == 1
+            _, kwargs3 = mock_patch.call_args
+            assert kwargs3.get("non_suppressing_ctx_managers") == (
+                "CfgMgr",
+                "CliA",
+                "CliB",
+                "CliC",
+            )
 
 
+def test_cli_suggest_plumbing_and_strict_with_vs_skip_config_conflict(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies --suggest forwards closure_strictness/non_suppressing_ctx_managers and config conflicts between strict_with_suppression and skip_pre_unit_closures warn."""
+    import logging  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.reporters import (  # pylint: disable=import-outside-toplevel
+        synthesize_refactoring_suggestion,
+    )
+
+    repo = tmp_path / "suggest_plumbing_repo"
+    repo.mkdir()
+    mod_src = (
+        "def run_a(items, compute):\n"
+        "    with CustomSafeMgr():\n"
+        "        val = compute(items)\n"
+        "    res = val + 1\n"
+        "    return res\n\n"
+        "def run_b(items, compute):\n"
+        "    with CustomSafeMgr():\n"
+        "        val = compute(items)\n"
+        "    res = val + 1\n"
+        "    return res\n"
+    )
+    f_path = repo / "svc.py"
+    f_path.write_text(mod_src, encoding="utf-8")
+    u1 = {
+        "name": "run_a:block",
+        "file": str(f_path),
+        "start": 2,
+        "end": 4,
+        "kind": "compound_block",
+        "source_text": mod_src,
+    }
+    u2 = {
+        "name": "run_b:block",
+        "file": str(f_path),
+        "start": 8,
+        "end": 10,
+        "kind": "compound_block",
+        "source_text": mod_src,
+    }
+
+    # synthesize_refactoring_suggestion forwards closure_strictness and non_suppressing_ctx_managers
+    sug_pedantic_allowed = synthesize_refactoring_suggestion(
+        u1,
+        u2,
+        repo_root=str(repo),
+        closure_strictness="pedantic",
+        non_suppressing_ctx_managers=("CustomSafeMgr",),
+    )
+    assert "def _shared_" in sug_pedantic_allowed
+
+    # CLI --suggest forwards closure_strictness, skip_pre_unit_closures, and non_suppressing_ctx_managers
+    dummy_clone = (0.98, u1, u2)
+    with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[dummy_clone]):
+        with mock.patch(
+            "pydoppelgangerhunt.cli.synthesize_refactoring_suggestion",
+            return_value="# suggestion",
+        ) as mock_suggest:
+            exit_code = main([
+                str(repo),
+                "--suggest",
+                "--closure-strictness",
+                "pedantic",
+                "--non-suppressing-ctx-managers",
+                "MgrOne,MgrTwo",
+                "--non-suppressing-ctx-managers",
+                "MgrThree",
+            ])
+            assert exit_code == 1
+            mock_suggest.assert_called_once()
+            _, sug_kwargs = mock_suggest.call_args
+            assert sug_kwargs.get("closure_strictness") == "pedantic"
+            assert sug_kwargs.get("skip_pre_unit_closures") is False
+            assert sug_kwargs.get("non_suppressing_ctx_managers") == (
+                "MgrOne",
+                "MgrThree",
+                "MgrTwo",
+            )
+
+        # Config strict_with_suppression = true combined with config skip_pre_unit_closures = true warns
+        (repo / "pyproject.toml").write_text(
+            "[tool.pydoppelgangerhunt]\nstrict_with_suppression = true\nskip_pre_unit_closures = true\n",
+            encoding="utf-8",
+        )
+        caplog.clear()
+        with mock.patch(
+            "pydoppelgangerhunt.cli.generate_refactoring_patch", return_value="# patch\n"
+        ) as mock_patch:
+            with caplog.at_level(logging.WARNING):
+                exit_code_conf = main([
+                    str(repo),
+                    "--patch",
+                    str(repo / "out.patch"),
+                ])
+            assert exit_code_conf == 1
+            _, conf_kwargs = mock_patch.call_args
+            assert conf_kwargs.get("closure_strictness") == "lenient"
+            assert conf_kwargs.get("skip_pre_unit_closures") is True
+            assert any(
+                "strict_with_suppression=True and skip_pre_unit_closures=True cannot both be active"
+                in r.message
+                for r in caplog.records
+            )
+
+            # Config strict_with_suppression = true overridden by CLI --skip-pre-unit-closures warns
+            (repo / "pyproject.toml").write_text(
+                "[tool.pydoppelgangerhunt]\nstrict_with_suppression = true\n",
+                encoding="utf-8",
+            )
+            caplog.clear()
+            with caplog.at_level(logging.WARNING):
+                exit_code_cli_override = main([
+                    str(repo),
+                    "--patch",
+                    str(repo / "out.patch"),
+                    "--skip-pre-unit-closures",
+                ])
+            assert exit_code_cli_override == 1
+            assert any(
+                "CLI flag --skip-pre-unit-closures overrides configured strict_with_suppression=True"
+                in r.message
+                for r in caplog.records
+            )

@@ -13,10 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   select closure strictness and context-manager suppression policy during subroutine refactoring:
   - `strict` (default, `strict_with_suppression = False`): enforces full pre-unit and sibling closure-cell hazard analysis while using a name-and-provenance heuristic for unknown `with` / `async with` context managers (treating unknown managers as non-suppressing unless their identifier matches suppression idioms such as `suppress`, `raises`, `ignore`, `subTest`, `ExitStack`, `enter_context`, or is proven exception-suppressing via local/function/class `__exit__` provenance).
   - `pedantic` (aliases: `fail_closed`, `strict_with`; or `strict_with_suppression = True`): treats all unproven unknown `with` / `async with` context managers as potentially exception-suppressing unless allowlisted via `non_suppressing_ctx_managers`. Note that `"fail_closed"` resolves to `"pedantic"` (`strict_with_suppression = True`).
-  - `lenient` (aliases: `fast`, `skip`; or `skip_pre_unit_closures = True`): skips pre-unit closure cell severing checks.
-  Emits a diagnostic warning when `--skip-pre-unit-closures` or `strict_with_suppression` conflicts with `closure_strictness`.
+  - `lenient` (aliases: `fast`, `skip`; or `skip_pre_unit_closures = True`): skips pre-unit closure liveness scanning for generator subroutines and relaxes speculative unreferenced-sibling closure checks while keeping Checks 1–3 and Check 4 for sibling closures explicitly referenced via unit inputs.
+  Emits a diagnostic warning when `--skip-pre-unit-closures` or `strict_with_suppression` conflicts with `closure_strictness` or with each other.
 - **`strict_with_suppression` & `non_suppressing_ctx_managers` Configuration**:
-  Added `--non-suppressing-ctx-managers` CLI flag and `strict_with_suppression` / `non_suppressing_ctx_managers` settings in `pyproject.toml` and `UnitSchema`. Global `non_suppressing_ctx_managers` and per-unit `unit["non_suppressing_ctx_managers"]` are union-merged consistently across `patch.py`, `_df_pairing.py`, `scope.py`, and `synthesis.py`.
+  Added `--non-suppressing-ctx-managers` CLI flag and `strict_with_suppression` / `non_suppressing_ctx_managers` settings in `pyproject.toml` and `UnitSchema` (supporting bare names, locally defined classes, relative imports, dotted module paths, and `*.attr` / `.attr` wildcard suffixes). Global `non_suppressing_ctx_managers` and per-unit `unit["non_suppressing_ctx_managers"]` are union-merged consistently across `patch.py`, `_df_pairing.py`, `scope.py`, `synthesis.py`, and `--suggest` reporting.
+- **Public Scope Mode Verification & Schema Helpers (`SCOPE_SCHEMA_VERSION`, `scope_matches_closure_mode`, `ensure_unit_scope_closure_mode`, `UnitSchema`, `validate_unit_schema`)**:
+  Exported `SCOPE_SCHEMA_VERSION = 2`, `scope_matches_closure_mode`, `ensure_unit_scope_closure_mode`, `UnitSchema`, and `validate_unit_schema` from `pydoppelgangerhunt` and `pydoppelgangerhunt.fixer` to validate unit dictionaries and verify or recompute precomputed scope dictionaries against active closure strictness settings.
 - **Distinct `stale_source_code` Control-Flow Hazard**:
   When a unit dictionary provides an explicit `source_code` snippet that diverges from the underlying file/AST at the unit's coordinates, `_inspect_unit_scope` records `"stale_source_code"` (surfaced as `"stale source code"` in patch skip reasons) instead of conflating it with `"pathological_ast"`. Comment-stripped and whitespace-normalized `source_code` snippets that are AST- or token-equivalent to the source slice are accepted without false-positive rejection.
 - **Granular Closure Hazard Telemetry**:
@@ -43,12 +45,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compiler stages.
 
 ### Changed
-- **BREAKING** - **Precomputed Scope Schema Version (`SCOPE_SCHEMA_VERSION = 2`)**:
-  `scope_matches_closure_mode` and `ensure_unit_scope_closure_mode` require `scope_schema_version == 2` and explicit boolean `skip_pre_unit_closures`, `strict_with_suppression`, and normalized `non_suppressing_ctx_managers` fields on precomputed scope dictionaries. Unmarked or legacy scope dictionaries are automatically recomputed when source/AST is available and fail closed when source is unavailable.
-- **BREAKING** - **`_extract_scope_local_names(..., include_classes=False)` Default**:
-  `_extract_scope_local_names` defaults to `include_classes=False` so nested `ClassDef` body attributes do not leak into enclosing function local sets; callers requiring class-level local extraction must pass `include_classes=True`.
-- **BREAKING** - **`_is_irrefutable_pattern(None)` Contract**:
-  `_is_irrefutable_pattern(None)` returns `False` rather than `True`. Bare wildcard `case _:` patterns (`ast.MatchAs(pattern=None, name=None)`) are handled directly on the `ast.MatchAs` node before recursing into `pattern`.
 - **Expression-Unit Closure & Control-Flow Hazard Enforcement**:
   `comprehension` and `complex_expr` units undergo full closure-cell severing and control-flow hazard checks during scope inspection, pair output resolution, and shared helper synthesis, while preserving LHS-pruned scope state across `pedantic` synthesis.
 - **Scoped Subroutine Colon Fallback**: Restricted colon detection in unit names to units with
@@ -124,9 +120,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Write-Only Dead Conditional Store Pruning**:
   In `_inspect_unit_scope` (`scope.py`), write-only conditional stores (`cond_assigned - def_assigned` that are not read inside the unit and do not mutate an enclosing `nonlocal`/`global` target) are only promoted to `inputs` / `read_before_write` when the variable is live after the unit (in declared `outputs`, captured by an enclosing closure cell, or read downstream).
 - **Global-Read Call Purity & Wildcard Import Helper Promotion Guards**:
-  Removed environment-dependent and side-effectful builtins (`dir`, `vars`, `print`, `input`, `open`, `breakpoint`, `help`, `eval`, `exec`, `compile`, `__import__`) from `_PURE_GLOBAL_SAFE_BUILTINS` in `_df_cell_hazards.py` when checking `_unit_has_global_mutating_call` on units reading enclosing globals, and rejected nested helper promotion in `patch.py` when enclosing scopes contain `from ... import *`.
-- **Lazy `_ScopeCacheKey` Hash Memoization & `SyntaxWarning` Isolation**:
-  Lazily memoized `_ScopeCacheKey._cached_hash` inside `__hash__` on first hash lookup to avoid repeated $O(n)$ `frozenset` hashing on cache accesses, and suppressed `SyntaxWarning` emissions around `symtable.symtable(...)` in `_compute_scope_invalid_lexical_declarations` (`_df_span_index.py`) and around `ast.parse(..., mode="eval")` in `_is_valid_eval_expr` (`source.py`).
+  Excluded environment-dependent and side-effectful builtins (`dir`, `vars`, `print`, `input`, `open`, `breakpoint`, `help`, `eval`, `exec`, `compile`, `__import__`, `ascii`) when checking whether units reading enclosing globals invoke potentially global-mutating calls, and rejected nested helper promotion in `patch.py` when enclosing scopes contain `from ... import *`.
+- **Thread-Safe `SyntaxWarning` Suppression During AST and Symbol-Table Parsing**:
+  Serialized `SyntaxWarning` suppression across `ast.parse` and `symtable.symtable` hot paths so concurrent scope analysis threads never race on process-wide `warnings.filters`.
 - **In-Memory Prioritized Unit Source Loading and Excerpt Slicing**: Prioritized in-memory unit
   source buffers (`source_text`, `file_source`, and non-sliced `source_lines`) before falling
   back to disk in `_load_unit_file_text` (`fixer/source.py`), eliminated duplicate fallback

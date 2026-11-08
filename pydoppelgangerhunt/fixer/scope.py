@@ -26,6 +26,14 @@ from pydoppelgangerhunt.config import (
     resolve_strict_with_suppression,
     resolve_unit_closure_flags,
 )
+from pydoppelgangerhunt.fixer._ast_compat import (
+    is_match_as_node,
+    is_match_mapping_node,
+    is_match_node,
+    is_match_star_node,
+    is_trystar_node,
+    is_type_alias_node,
+)
 from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
 from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context
 from pydoppelgangerhunt.fixer._df_cell_hazards import (
@@ -35,7 +43,7 @@ from pydoppelgangerhunt.fixer._df_cell_hazards import (
 from pydoppelgangerhunt.fixer._df_cell_traversal import (
     _find_enclosing_chain_definite_pre_bound,
 )
-from pydoppelgangerhunt.fixer._df_closures import (
+from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=unused-import
     _COMPREHENSION_TYPES,
     _extract_comprehension_walrus_names,
     _extract_scope_nonlocals_and_outer_globals,
@@ -54,7 +62,7 @@ from pydoppelgangerhunt.fixer._df_span_index import (
     _has_invalid_lexical_scope_declarations,
     _resolve_unit_col_bounds,
 )
-from pydoppelgangerhunt.fixer._df_with_provenance import (
+from pydoppelgangerhunt.fixer._df_with_provenance import (  # pylint: disable=unused-import
     _EMPTY_SUPPRESS_PROVENANCE,
     _SuppressProvenance,
     _analyze_block_assignment,
@@ -78,6 +86,7 @@ from pydoppelgangerhunt.fixer.source import (
     _SUBROUTINE_KINDS,
     _WHOLE_UNIT_KINDS,
     _get_tree_scope_intervals,
+    _is_valid_eval_expr,
     _load_unit_file_text,
     _slice_unit_token_lines,
     _slice_utf8_line,
@@ -92,23 +101,6 @@ from pydoppelgangerhunt.fixer.source import (
 __all__ = [
     "BUILTIN_NAMES",
     "SCOPE_SCHEMA_VERSION",
-    "_ScopeVisitor",
-    "_analyze_block_assignment",
-    "_block_terminates",
-    "_demote_deletions_to_conditional",
-    "_determine_binding_kind",
-    "_extract_deleted_names",
-    "_inspect_unit_scope",
-    "_is_irrefutable_case",
-    "_is_irrefutable_pattern",
-    "_is_mangled_name",
-    "_normalize_receiver_attr_name",
-    "_normalize_receiver_attrs",
-    "_normalize_receiver_order",
-    "_rank_param_kind",
-    "_unfold_receiver_attribute",
-    "_walrus_assignment_in_expr",
-    "_walrus_in_sequence",
     "analyze_unit_variable_scope",
     "ensure_unit_scope_closure_mode",
     "inspect_single_unit_scope",
@@ -1203,7 +1195,7 @@ def _find_enclosing_pre_bound_names(
                 if _is_before_unit(c_start, c_col) and not is_class_scope:
                     bound_before.update(_extract_comprehension_walrus_names(curr))
                 continue
-            if type(curr).__name__ == "TypeAlias":
+            if is_type_alias_node(curr):
                 if _is_before_unit(c_start, c_col):
                     alias_name = getattr(curr, "name", None)
                     if isinstance(alias_name, ast.Name):
@@ -1272,7 +1264,11 @@ def _find_enclosing_pre_bound_names(
                     )
                 ):
                     bound_before.add(curr.name)
-                elif type(curr).__name__ in ("MatchAs", "MatchStar", "MatchMapping"):
+                elif (
+                    is_match_as_node(curr)
+                    or is_match_star_node(curr)
+                    or is_match_mapping_node(curr)
+                ):
                     m_name = getattr(curr, "name", None) or getattr(curr, "rest", None)
                     if isinstance(m_name, str) and m_name != "_":
                         bound_before.add(m_name)
@@ -1288,7 +1284,8 @@ def _find_enclosing_pre_bound_names(
                         ast.ExceptHandler,
                     ),
                 )
-                or type(curr).__name__ in ("TryStar", "Match")
+                or is_trystar_node(curr)
+                or is_match_node(curr)
             )
             stack.extend(
                 (ch, child_branched)
@@ -1549,9 +1546,7 @@ def _is_ordered_contiguous_source_match(
         return False
     if k == 1:
         target = src_code_lines[0]
-        is_stmt_like = "=" in target and not target.startswith(
-            ("lambda", "(", "[", "{")
-        )
+        is_stmt_like = not _is_valid_eval_expr(target)
         return any(
             _has_token_boundary_subslice(
                 target,
@@ -1604,11 +1599,45 @@ def _parse_normalized_stmt_dumps(text: str) -> Optional[List[str]]:
     return None
 
 
+def _strip_unquoted_comment(line: str) -> str:
+    """Strips a trailing '#' comment outside of single, double, or triple-quoted strings."""
+    in_quote: Optional[str] = None
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if in_quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if line.startswith(in_quote, i):
+                i += len(in_quote)
+                in_quote = None
+                continue
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            triple = ch * 3
+            if line.startswith(triple, i):
+                in_quote = triple
+                i += 3
+            else:
+                in_quote = ch
+                i += 1
+            continue
+        if ch == "#":
+            return line[:i].strip()
+        i += 1
+    return line.strip()
+
+
 def _strip_inline_comment_line(line: str) -> str:
     """Strips trailing Python comments and normalizes intra-line token spacing."""
+    toks: List[str] = []
     try:
-        toks: List[str] = []
-        for tok in tokenize.generate_tokens(io.StringIO(line).readline):
+        for tok in tokenize.generate_tokens(
+            io.StringIO(line.lstrip(" \t")).readline
+        ):
             if tok.type in (
                 tokenize.COMMENT,
                 tokenize.NL,
@@ -1621,8 +1650,10 @@ def _strip_inline_comment_line(line: str) -> str:
                 continue
             toks.append(tok.string)
         return " ".join(toks)
-    except (tokenize.TokenError, IndentationError, SyntaxError):
-        return line.split("#", 1)[0].strip()
+    except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
+        if toks and "multi-line statement" in str(exc).lower():
+            return " ".join(toks)
+        return _strip_unquoted_comment(line)
 
 
 def _is_normalized_source_equivalent(
@@ -1741,11 +1772,14 @@ def _inspect_unit_scope(
                 raw_lines[-1] = _slice_utf8_line(
                     raw_lines[-1], 0, inferred_e_col
                 )
+    # Stale-source check: when both a backing module (file_tree or _get_full_source())
+    # and an embedded unit["source_code"] are present, verify that source_code matches
+    # the module lines at (start, end, start_col, end_col). When no backing module is
+    # available (e.g., an in-memory unit carrying only source_code), raw_lines falls
+    # back to unit["source_code"].
     stale_source_code_mismatch = False
     if (
         src_code_str
-        and inferred_s_col is None
-        and inferred_e_col is None
         and dedent_source_text("".join(raw_lines)).strip()
         != dedent_source_text(str(unit["source_code"])).strip()
     ):
@@ -1754,15 +1788,38 @@ def _inspect_unit_scope(
             for ln in split_source_lines(str(unit["source_code"]))
             if ln.strip()
         ]
+        candidate_line_windows: List[Sequence[str]] = [raw_lines]
+        if (
+            inferred_s_col is not None or inferred_e_col is not None
+        ) and raw_lines:
+            col_sliced = list(raw_lines)
+            first_b_len = len(col_sliced[0].rstrip("\r\n").encode("utf-8"))
+            if len(col_sliced) == 1:
+                s_c = inferred_s_col if inferred_s_col is not None and 0 <= inferred_s_col <= first_b_len else 0
+                e_c = (
+                    inferred_e_col
+                    if inferred_e_col is not None and s_c <= inferred_e_col <= first_b_len
+                    else None
+                )
+                col_sliced[0] = _slice_utf8_line(col_sliced[0], s_c, e_c)
+            else:
+                last_b_len = len(col_sliced[-1].rstrip("\r\n").encode("utf-8"))
+                if inferred_s_col is not None and 0 < inferred_s_col < first_b_len:
+                    col_sliced[0] = _slice_utf8_line(col_sliced[0], inferred_s_col, None)
+                if inferred_e_col is not None and 0 < inferred_e_col <= last_b_len:
+                    col_sliced[-1] = _slice_utf8_line(col_sliced[-1], 0, inferred_e_col)
+            candidate_line_windows.append(col_sliced)
+        matches_backing_source = any(
+            dedent_source_text("".join(win)).strip()
+            == dedent_source_text(str(unit["source_code"])).strip()
+            or _is_ordered_contiguous_source_match(src_code_lines, win)
+            or _is_normalized_source_equivalent(str(unit["source_code"]), win)
+            for win in candidate_line_windows
+        )
         if (
             (file_tree is not None or _get_full_source() is not None)
             and src_code_lines
-            and not _is_ordered_contiguous_source_match(
-                src_code_lines, raw_lines
-            )
-            and not _is_normalized_source_equivalent(
-                str(unit["source_code"]), raw_lines
-            )
+            and not matches_backing_source
         ):
             stale_source_code_mismatch = True
         else:
@@ -2798,9 +2855,7 @@ def scope_matches_closure_mode(
     scope: Optional[Dict[str, Any]],
     expected_skip: bool,
     *,
-    expected_strict_with: Optional[bool] = None,
     strict_with_suppression: Optional[bool] = None,
-    expected_non_suppressing: Optional[Sequence[str]] = None,
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> bool:
     """Checks whether a precomputed scope dictionary matches the current schema and mode.
@@ -2808,12 +2863,6 @@ def scope_matches_closure_mode(
     Requires ``scope_schema_version == SCOPE_SCHEMA_VERSION`` and an explicit boolean
     ``skip_pre_unit_closures`` matching ``expected_skip`` so unmarked or legacy
     serialized scopes are never trusted without recomputation.
-
-    Keyword argument precedence:
-        - ``strict_with_suppression`` takes precedence over its legacy alias
-          ``expected_strict_with`` when both are provided.
-        - ``non_suppressing_ctx_managers`` takes precedence over its legacy alias
-          ``expected_non_suppressing`` when both are provided.
     """
     if scope is None:
         return False
@@ -2821,14 +2870,9 @@ def scope_matches_closure_mode(
         return False
     if "skip_pre_unit_closures" not in scope:
         return False
-    eff_expected_with = (
-        strict_with_suppression
-        if strict_with_suppression is not None
-        else expected_strict_with
-    )
     for flag_key, expected_val in (
         ("skip_pre_unit_closures", bool(expected_skip)),
-        ("strict_with_suppression", eff_expected_with),
+        ("strict_with_suppression", strict_with_suppression),
     ):
         if expected_val is None:
             continue
@@ -2838,18 +2882,13 @@ def scope_matches_closure_mode(
                 return False
         elif bool(expected_val) is not False:
             return False
-    eff_expected_non_sup = (
-        non_suppressing_ctx_managers
-        if non_suppressing_ctx_managers is not None
-        else expected_non_suppressing
-    )
     scope_non_sup = frozenset(
         normalize_non_suppressing_ctx_managers(
             scope.get("non_suppressing_ctx_managers")
         )
     )
     target_non_sup = frozenset(
-        normalize_non_suppressing_ctx_managers(eff_expected_non_sup)
+        normalize_non_suppressing_ctx_managers(non_suppressing_ctx_managers)
     )
     if scope_non_sup != target_non_sup:
         return False
@@ -2889,8 +2928,8 @@ def ensure_unit_scope_closure_mode(
         scope_matches_closure_mode(
             scope,
             bool(skip_pre_unit_closures),
-            expected_strict_with=eff_strict_with,
-            expected_non_suppressing=eff_non_sup,
+            strict_with_suppression=eff_strict_with,
+            non_suppressing_ctx_managers=eff_non_sup,
         )
         or any(
             h in scope.get("control_flow_hazards", ())
@@ -2942,26 +2981,7 @@ def ensure_unit_scope_closure_mode(
                 "strict_with_suppression": eff_strict_with,
                 "non_suppressing_ctx_managers": list(eff_non_sup),
             }
-    fresh_scope = inspect_single_unit_scope(
-        u_copy, repo_root=repo_root, tree=tree
-    )
-    if scope is not None and "control_flow_hazards" not in scope:
-        return {
-            **fresh_scope,
-            **scope,
-            "control_flow_hazards": fresh_scope.get("control_flow_hazards", []),
-            "closure_hazard_reasons": fresh_scope.get(
-                "closure_hazard_reasons", []
-            ),
-            "is_control_flow_safe": fresh_scope.get(
-                "is_control_flow_safe", True
-            ),
-            "scope_schema_version": SCOPE_SCHEMA_VERSION,
-            "skip_pre_unit_closures": bool(skip_pre_unit_closures),
-            "strict_with_suppression": eff_strict_with,
-            "non_suppressing_ctx_managers": list(eff_non_sup),
-        }
-    return fresh_scope
+    return inspect_single_unit_scope(u_copy, repo_root=repo_root, tree=tree)
 
 
 def analyze_unit_variable_scope(

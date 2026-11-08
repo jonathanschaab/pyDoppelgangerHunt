@@ -12,6 +12,7 @@ from typing import (
     Any,
     Dict,
     List,
+    Mapping,
     NamedTuple,
     Optional,
     Sequence,
@@ -21,7 +22,11 @@ from typing import (
     Union,
 )
 
-from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
+from pydoppelgangerhunt.fixer._ast_compat import is_trystar_node
+from pydoppelgangerhunt.fixer._df_cache import (
+    _get_or_parse_tree,
+    _suppress_syntax_warnings,
+)
 from pydoppelgangerhunt.fixer._df_closures import _node_earliest_start_pos
 from pydoppelgangerhunt.source_lines import (
     count_physical_newlines,
@@ -62,6 +67,7 @@ __all__ = [
     "resolve_unit_replacement",
     "slice_source_by_token_range",
     "split_source_lines",
+    "validate_unit_schema",
 ]
 
 
@@ -148,6 +154,29 @@ class UnitSchema(TypedDict, total=False):
 
 
 UnitDict = Dict[str, Any]
+
+_UNIT_SCHEMA_KEYS: frozenset[str] = frozenset(UnitSchema.__annotations__.keys())
+
+
+def validate_unit_schema(
+    unit: Mapping[str, Any], *, strict: bool = False
+) -> Set[str]:
+    """Validates a unit dictionary against documented UnitSchema keys.
+
+    Returns the set of unrecognized keys not declared on ``UnitSchema``. When
+    ``strict=True``, raises ``ValueError`` if ``unit`` is not a mapping or
+    contains unrecognized keys.
+    """
+    if not isinstance(unit, Mapping):
+        if strict:
+            raise ValueError(f"Expected a unit mapping, got {type(unit).__name__}")
+        return set()
+    unknown = {str(k) for k in unit.keys() if k not in _UNIT_SCHEMA_KEYS}
+    if strict and unknown:
+        raise ValueError(
+            f"Unrecognized keys in unit dictionary: {sorted(unknown)}"
+        )
+    return unknown
 
 _parse_unit_coord = parse_unit_coord
 _resolve_safe_unit_file_path = resolve_safe_unit_file_path
@@ -616,7 +645,7 @@ def _find_module_helper_insertion_index(lines: List[str]) -> int:
             last_import_line = max(last_import_line, end_l)
         elif (
             isinstance(node, (ast.Try, ast.If, ast.With, ast.AsyncWith))
-            or type(node).__name__ == "TryStar"
+            or is_trystar_node(node)
         ):
             for sub in ast.walk(node):
                 if isinstance(sub, (ast.Import, ast.ImportFrom)):
@@ -666,8 +695,7 @@ def _is_valid_eval_expr(text: str) -> bool:
     if not stripped:
         return False
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", SyntaxWarning)
+        with _suppress_syntax_warnings():
             ast.parse(stripped, mode="eval")
         return True
     except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
@@ -745,39 +773,9 @@ def _slice_unit_token_lines(
             )
         ):
             return res
-        if (
-            effective_pre_sliced is None
-            and s_col > 0
-            and not res[0][:1].isspace()
-            and _is_valid_eval_expr(res[0])
-            and not _is_valid_eval_expr(_slice_utf8_line(res[0], s_col, e_col))
-        ):
-            return res
         res[0] = _slice_utf8_line(res[0], s_col, e_col)
     else:
         last_byte_len = len(res[-1].rstrip("\r\n").encode("utf-8"))
-        if effective_pre_sliced is None:
-            if e_col is not None and e_col > last_byte_len:
-                return res
-            if (
-                s_col > 0
-                and not res[0][:1].isspace()
-                and _is_valid_eval_expr("".join(res))
-            ):
-                cand_first = (
-                    _slice_utf8_line(res[0], s_col, None)
-                    if s_col < first_byte_len
-                    else res[0]
-                )
-                cand_last = (
-                    _slice_utf8_line(res[-1].rstrip("\r\n"), 0, e_col)
-                    if e_col is not None and e_col <= last_byte_len
-                    else res[-1]
-                )
-                if not _is_valid_eval_expr(
-                    cand_first + "".join(res[1:-1]) + cand_last
-                ):
-                    return res
         if 0 < s_col < first_byte_len:
             res[0] = _slice_utf8_line(res[0], s_col, None)
         if e_col is not None and e_col <= last_byte_len:
@@ -805,7 +803,7 @@ def _get_module_imported_names(
                 imported.add(alias.asname or alias.name)
         elif include_conditional and (
             isinstance(stmt, (ast.If, ast.Try, ast.With, ast.AsyncWith))
-            or type(stmt).__name__ == "TryStar"
+            or is_trystar_node(stmt)
         ):
             for sub in ast.walk(stmt):
                 if isinstance(sub, ast.Import):

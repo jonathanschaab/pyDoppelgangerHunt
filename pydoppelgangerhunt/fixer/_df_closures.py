@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import ast
 import builtins
-import symtable
 from typing import (
     AbstractSet,
     Any,
-    Dict,
     Iterable,
     List,
     Mapping,
@@ -21,6 +19,13 @@ from typing import (
     cast,
 )
 
+from pydoppelgangerhunt.fixer._ast_compat import (
+    is_match_as_node,
+    is_match_node,
+    is_match_or_node,
+    is_try_or_trystar_node,
+    is_type_alias_node,
+)
 from pydoppelgangerhunt.fixer._df_cache import (
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
@@ -338,7 +343,7 @@ def _extract_single_node_local_names(
             else:
                 global_names.update(curr.names)
             continue
-        elif type(curr).__name__ == "TypeAlias":
+        elif is_type_alias_node(curr):
             alias_name = getattr(curr, "name", None)
             if isinstance(alias_name, ast.Name):
                 names.add(alias_name.id)
@@ -567,40 +572,6 @@ def _resolve_enclosing_scopes_by_coords(
                 res_cls.append(module_tree)
             return res_cls
     return [module_tree] if isinstance(module_tree, ast.Module) else []
-
-
-def _extract_symtable_scope_info(
-    source_text: str,
-) -> Dict[Tuple[str, int], Dict[str, frozenset[str]]]:
-    """Computes C-level symtable locals, frees, globals, and cells keyed by (scope_name, lineno)."""
-    try:
-        root_table = symtable.symtable(source_text, "<symtable>", "exec")
-    except (SyntaxError, ValueError):
-        return {}
-    result: Dict[Tuple[str, int], Dict[str, frozenset[str]]] = {}
-    stack: List[symtable.SymbolTable] = [root_table]
-    while stack:
-        tbl = stack.pop()
-        if isinstance(tbl, symtable.Function):
-            descendant_frees: Set[str] = set()
-            desc_stack = list(tbl.get_children())
-            while desc_stack:
-                child_tbl = desc_stack.pop()
-                if isinstance(child_tbl, symtable.Function):
-                    descendant_frees.update(child_tbl.get_frees())
-                desc_stack.extend(child_tbl.get_children())
-            local_set = frozenset(tbl.get_locals())
-            global_set = frozenset(tbl.get_globals())
-            cells = (local_set - global_set) & frozenset(descendant_frees)
-            result[(tbl.get_name(), tbl.get_lineno())] = {
-                "locals": local_set,
-                "frees": frozenset(tbl.get_frees()),
-                "globals": global_set,
-                "parameters": frozenset(tbl.get_parameters()),
-                "cells": cells,
-            }
-        stack.extend(tbl.get_children())
-    return result
 
 
 def _extract_scope_local_names(
@@ -967,10 +938,10 @@ def _collect_scope_closures_uncached(
                 if item.optional_vars is not None:
                     headers.append(item.optional_vars)
             return headers
-        if isinstance(s, ast.Try) or type(s).__name__ == "TryStar":
+        if is_try_or_trystar_node(s):
             handlers = getattr(s, "handlers", [])
             return [h.type for h in handlers if getattr(h, "type", None) is not None]
-        if type(s).__name__ == "Match":
+        if is_match_node(s):
             return [getattr(s, "subject")]
         return [s]
 
@@ -1225,10 +1196,10 @@ def _is_irrefutable_pattern(
     """
     if pattern is None:
         return False
-    if type(pattern).__name__ == "MatchAs":
+    if is_match_as_node(pattern):
         sub_pat = getattr(pattern, "pattern", None)
         return sub_pat is None or _is_irrefutable_pattern(sub_pat)
-    if type(pattern).__name__ == "MatchOr":
+    if is_match_or_node(pattern):
         patterns = getattr(pattern, "patterns", [])
         return any(_is_irrefutable_pattern(p) for p in patterns)
     return False
@@ -1530,7 +1501,7 @@ def _has_escaped_intra_unit_global_declarations(
             and curr.name in intra_only_globals
         ):
             return True
-        elif type(curr).__name__ == "TypeAlias":
+        elif is_type_alias_node(curr):
             alias_name = getattr(curr, "name", None)
             if (
                 isinstance(alias_name, ast.Name)

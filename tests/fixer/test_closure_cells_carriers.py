@@ -835,25 +835,31 @@ def test_scope_preservation_carrier_shadowing_and_concurrency() -> None:
     assert isinstance(comp_c, ast.FunctionDef)
     chain = [(1, 9, outer_c), (4, 6, comp_c)]
 
+    errors: list[BaseException] = []
+
     def _worker(tid: int) -> bool:
-        for step in range(25):
-            infos = _build_enclosing_chain_cell_infos(
-                chain,
-                6,
-                6,
-                19,
-                41,
-                frozenset(),
-                mod_tree=conc_tree,
-            )
-            info_loop = _analyze_enclosing_fn_cells(
-                outer_c, (8, 8, 8, 23), mod_tree=conc_tree
-            )
-            if tid == 0 and step % 10 == 0:
-                _evict_tree_scopes(ast.parse("def ephemeral(): pass\n"))
-            if "scale" not in infos[0].pre_bound or "scale" not in info_loop.pre_bound:
-                return False
-        return True
+        try:
+            for step in range(25):
+                infos = _build_enclosing_chain_cell_infos(
+                    chain,
+                    6,
+                    6,
+                    19,
+                    41,
+                    frozenset(),
+                    mod_tree=conc_tree,
+                )
+                info_loop = _analyze_enclosing_fn_cells(
+                    outer_c, (8, 8, 8, 23), mod_tree=conc_tree
+                )
+                if tid == 0 and step % 10 == 0:
+                    _evict_tree_scopes(ast.parse("def ephemeral(): pass\n"))
+                if "scale" not in infos[0].pre_bound or "scale" not in info_loop.pre_bound:
+                    return False
+            return True
+        except BaseException as exc:  # pylint: disable=broad-exception-caught
+            errors.append(exc)
+            return False
 
     results: list[bool] = [False] * 6
     threads = [
@@ -864,6 +870,8 @@ def test_scope_preservation_carrier_shadowing_and_concurrency() -> None:
         t.start()
     for t in threads:
         t.join()
+    if errors:
+        raise errors[0]
     assert all(results)
 
 
@@ -1399,6 +1407,7 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
         _has_escaped_intra_unit_global_declarations,
     )
     from pydoppelgangerhunt.fixer.scope import (
+        SCOPE_SCHEMA_VERSION,
         _analyze_block_assignment,
         ensure_unit_scope_closure_mode,
     )
@@ -1744,7 +1753,7 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
     marked_v2_min = {
         **minimal_unmarked_scope,
         "skip_pre_unit_closures": False,
-        "scope_schema_version": 2,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
     }
     assert (
         ensure_unit_scope_closure_mode(
@@ -1755,7 +1764,7 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
     recomputed_unmarked_min = ensure_unit_scope_closure_mode(
         min_unit, minimal_unmarked_scope, False, tree=min_tree
     )
-    assert recomputed_unmarked_min["scope_schema_version"] == 2
+    assert recomputed_unmarked_min["scope_schema_version"] == SCOPE_SCHEMA_VERSION
     assert "severed_closure_cell" in recomputed_unmarked_min["control_flow_hazards"]
     recomputed_min = ensure_unit_scope_closure_mode(
         min_unit,
@@ -2333,7 +2342,10 @@ def test_span_line_index_performance_and_scale() -> None:
 
 def test_ensure_unit_scope_closure_mode_all_six_cases() -> None:
     """Verifies all 6 scope-mode and missing-file / source_text fallback cases."""
-    from pydoppelgangerhunt.fixer.scope import ensure_unit_scope_closure_mode
+    from pydoppelgangerhunt.fixer.scope import (
+        SCOPE_SCHEMA_VERSION,
+        ensure_unit_scope_closure_mode,
+    )
 
     src_with_pre_closure = (
         "def proc(items):\n"
@@ -2384,7 +2396,7 @@ def test_ensure_unit_scope_closure_mode_all_six_cases() -> None:
     }
     res_3_strict = ensure_unit_scope_closure_mode(base_unit, unmarked, False)
     assert res_3_strict is not unmarked
-    assert res_3_strict["scope_schema_version"] == 2
+    assert res_3_strict["scope_schema_version"] == SCOPE_SCHEMA_VERSION
     assert res_3_strict["skip_pre_unit_closures"] is False
     assert "severed_closure_cell" in res_3_strict["control_flow_hazards"]
     res_3 = ensure_unit_scope_closure_mode(base_unit, unmarked, True)
@@ -2505,7 +2517,7 @@ def test_utf8_source_slicing_multibyte_and_idempotence() -> None:
     unit1 = {"kind": "complex_expr", "start_col": s1, "end_col": e1}
     sliced1 = _slice_unit_token_lines(unit1, [line1])
     assert sliced1 == [expr1]
-    assert _slice_unit_token_lines(unit1, sliced1) == [expr1]
+    assert _slice_unit_token_lines(unit1, sliced1, is_pre_sliced=True) == [expr1]
 
     # 2. result = "é"; another = "世界"; final = 42
     line2 = 'result = "é"; another = "世界"; final = 42\n'
@@ -2517,7 +2529,7 @@ def test_utf8_source_slicing_multibyte_and_idempotence() -> None:
         u_t = {"kind": "complex_expr", "start_col": s_b, "end_col": e_b}
         out_t = _slice_unit_token_lines(u_t, [line2])
         assert out_t == [target]
-        assert _slice_unit_token_lines(u_t, out_t) == [target]
+        assert _slice_unit_token_lines(u_t, out_t, is_pre_sliced=True) == [target]
 
     # 3. Pre-sliced single-line expression where s_col < len(sliced) and source_code is omitted
     line3 = "x = [i + 1 for i in items]\n"
@@ -2525,7 +2537,7 @@ def test_utf8_source_slicing_multibyte_and_idempotence() -> None:
     u3 = {"kind": "comprehension", "start_col": 4, "end_col": 4 + len(expr3)}
     sliced3 = _slice_unit_token_lines(u3, [line3])
     assert sliced3 == [expr3]
-    assert _slice_unit_token_lines(u3, sliced3) == [expr3]
+    assert _slice_unit_token_lines(u3, sliced3, is_pre_sliced=True) == [expr3]
 
     # 4. Multiline UTF-8 expression slicing and pre-sliced idempotence
     ml_utf8 = [
@@ -2538,7 +2550,7 @@ def test_utf8_source_slicing_multibyte_and_idempotence() -> None:
     u_ml = {"kind": "complex_expr", "start_col": s_ml, "end_col": e_ml}
     sliced_ml = _slice_unit_token_lines(u_ml, ml_utf8)
     assert sliced_ml == ['(\n', '        café + "世界"\n', '    )']
-    assert _slice_unit_token_lines(u_ml, sliced_ml) == sliced_ml
+    assert _slice_unit_token_lines(u_ml, sliced_ml, is_pre_sliced=True) == sliced_ml
 
 
 def test_sibling_closure_ordinary_store_followed_by_call_or_mutation() -> None:
