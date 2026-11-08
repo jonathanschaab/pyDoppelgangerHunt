@@ -134,6 +134,8 @@ class UnitSchema(TypedDict, total=False):
             ``"fail_closed"``, ``"fast"``, ``"skip"``).
         skip_pre_unit_closures: Per-unit boolean fallback when ``closure_strictness`` is omitted
             (``False`` for strict/pedantic mode, ``True`` for lenient mode).
+        strict_with_suppression: Per-unit boolean override for conservative ``with``-statement
+            exception suppression treatment (``True`` in pedantic mode, ``False`` in strict/lenient).
         non_suppressing_ctx_managers: Optional iterable of context manager names/paths
             configured to be treated as non-suppressing in ``with`` statements.
         token_count: Number of normalized AST tokens in the unit.
@@ -189,6 +191,7 @@ class UnitSchema(TypedDict, total=False):
     has_await: Optional[bool]
     closure_strictness: Optional[str]
     skip_pre_unit_closures: Optional[bool]
+    strict_with_suppression: Optional[bool]
     non_suppressing_ctx_managers: Optional[Sequence[str]]
     token_count: Optional[int]
     tokens: Optional[Union[int, Sequence[str]]]

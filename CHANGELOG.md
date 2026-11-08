@@ -130,7 +130,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Global-Read Call Purity & Wildcard Import Guards**:
   Restricted calls allowed inside units that read an enclosing `global` variable to an explicit allowlist of 13 unshadowed pure built-ins (`_PURE_GLOBAL_SAFE_BUILTINS`: `bin`, `bool`, `callable`, `chr`, `hex`, `id`, `int`, `isinstance`, `issubclass`, `len`, `oct`, `ord`, `range`), and rejected all calls when `from ... import *` is present in the unit, module, or enclosing function/class scopes.
 - **Thread-Safe `SyntaxWarning` Suppression During AST and Symbol-Table Parsing**:
-  Serialized `SyntaxWarning` suppression across `ast.parse` and `symtable.symtable` hot paths so concurrent scope analysis threads never race on process-wide `warnings.filters`.
+  Reference-counted `SyntaxWarning` filter installation via copy-on-write `warnings.filters` replacement under `_syntax_warning_lock` across `ast.parse` and `symtable.symtable` hot paths so concurrent scope analysis threads never mutate `warnings.filters` in place or serialize parsing under a global lock.
 - **In-Memory Prioritized Unit Source Loading and Excerpt Slicing**: Prioritized in-memory unit
   source buffers (`source_text`, `file_source`, and non-sliced `source_lines`) before falling
   back to disk in `_load_unit_file_text` (`fixer/source.py`), eliminated duplicate fallback

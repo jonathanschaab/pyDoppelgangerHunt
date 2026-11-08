@@ -76,15 +76,12 @@ from pydoppelgangerhunt.fixer._df_visitors import (
 )
 from pydoppelgangerhunt.fixer._df_with_provenance import (
     _SuppressProvenance,
-    _clear_store_target_provenance,
     _coerce_suppress_provenance,
     _extract_block_definite_bindings,
     _extract_shallow_deleted_names,
-    _is_non_raising_store_target,
+    _iter_with_item_provenance_steps,
     _seed_scope_suppress_aliases,
-    _update_suppress_provenance_from_expr_walrus,
     _update_suppress_provenance_from_stmt,
-    _with_item_may_suppress_exceptions,
 )
 from pydoppelgangerhunt.parser import iter_nested_scope_header_nodes
 
@@ -172,9 +169,7 @@ def _record_binding_at_pos(
 ) -> None:
     """Records bound variable names into pre_bound, pre_mutated, post_mutated, and loop_mutated."""
     filtered = [
-        n
-        for n in names
-        if _can_bind_in_fn_scope(n, frame.active_nonlocals, state.fn_globals)
+        n for n in names if _can_bind_in_fn_scope(n, frame.active_nonlocals, state.fn_globals)
     ]
     if not filtered:
         return
@@ -200,9 +195,7 @@ def _record_deletion_at_pos(
     unconditional_post_del: bool = False,
 ) -> None:
     """Records a variable deletion or ExceptHandler unbinding relative to span."""
-    if not _can_bind_in_fn_scope(
-        name, frame.active_nonlocals, state.fn_globals
-    ):
+    if not _can_bind_in_fn_scope(name, frame.active_nonlocals, state.fn_globals):
         return
     is_after = _is_frame_after_span(line, col, span, frame)
     if (
@@ -250,9 +243,7 @@ def _maybe_push_pre_span_exhaustive_frame(
     state: _CellBindingState,
     stack: List[_StackFrame],
     *,
-    pre_stmt_suppress: Optional[
-        Union[_SuppressProvenance, AbstractSet[str]]
-    ] = None,
+    pre_stmt_suppress: Optional[Union[_SuppressProvenance, AbstractSet[str]]] = None,
 ) -> None:
     """Pushes a post_pre_bound frame when a non-enclosing compound statement precedes span."""
     if (
@@ -266,11 +257,7 @@ def _maybe_push_pre_span_exhaustive_frame(
             frame,
         )
     ):
-        active_sup = (
-            pre_stmt_suppress
-            if pre_stmt_suppress is not None
-            else state.suppress_aliases
-        )
+        active_sup = pre_stmt_suppress if pre_stmt_suppress is not None else state.suppress_aliases
         exh_bound = _extract_block_definite_bindings(
             (curr,),
             frame.active_nonlocals,
@@ -338,35 +325,24 @@ def _push_with_compound_children(
         force_after_span=f_after,
     )
     active_sup = _coerce_suppress_provenance(
-        pre_stmt_suppress
-        if pre_stmt_suppress is not None
-        else state.suppress_aliases
+        pre_stmt_suppress if pre_stmt_suppress is not None else state.suppress_aliases
     )
-    item_prov = active_sup
-    after_sup = False
     item_frames: List[_StackFrame] = []
-    for item in curr.items:
-        item_br = is_br or (after_sup and not encloses)
-        w_prov = _update_suppress_provenance_from_expr_walrus(
-            (item.context_expr,),
-            item_prov,
-            allow_positive=not item_br,
-        )
-        item_prov = (
-            item_prov.merge_branch_conservative(w_prov) if item_br else w_prov
-        )
-        item_may_sup = _with_item_may_suppress_exceptions(
-            item.context_expr,
-            item_prov,
-            strict_with_suppression=state.strict_with_suppression,
-            extra_non_suppressing_ctx_managers=state.extra_non_suppressing_ctx_managers,
-        )
+    for step in _iter_with_item_provenance_steps(
+        curr,
+        active_sup,
+        allow_positive=not is_br,
+        encloses_span=encloses,
+        extra_non_suppressing_ctx_managers=state.extra_non_suppressing_ctx_managers,
+        strict_with_suppression=state.strict_with_suppression,
+    ):
+        item = step.item
+        item_br = is_br or step.after_prior_sup
         if (
             not encloses
             and not item_br
-            and item_may_sup
+            and step.opt_vars_conditional
             and item.optional_vars is not None
-            and not _is_non_raising_store_target(item.optional_vars)
         ):
             item_frames.append(
                 _StackFrame(
@@ -396,16 +372,6 @@ def _push_with_compound_children(
                     force_after_span=f_after,
                 )
             )
-        if item.optional_vars is not None:
-            opt_cond = item_br or (
-                item_may_sup
-                and not _is_non_raising_store_target(item.optional_vars)
-            )
-            item_prov = _clear_store_target_provenance(
-                item.optional_vars, item_prov, is_conditional=opt_cond
-            )
-        if item_may_sup:
-            after_sup = True
     stack.extend(reversed(item_frames))
 
 
@@ -457,9 +423,7 @@ def _push_try_compound_children(
         force_after_span=f_after,
     )
     for h_node in reversed(handlers_l):
-        h_span = encloses and _block_contains_span(
-            getattr(h_node, "body", ()), span
-        )
+        h_span = encloses and _block_contains_span(getattr(h_node, "body", ()), span)
         stack.append(
             _StackFrame(
                 h_node,
@@ -506,11 +470,7 @@ def _push_match_compound_children(
     )
     for case in reversed(cases_l):
         case_body = getattr(case, "body", [])
-        c_br = (
-            is_br
-            if (encloses and _block_contains_span(case_body, span))
-            else True
-        )
+        c_br = is_br if (encloses and _block_contains_span(case_body, span)) else True
         _push_seq(
             stack,
             case_body,
@@ -532,9 +492,7 @@ def _push_match_compound_children(
             force_after_span=f_after,
         )
     if isinstance(subject := getattr(curr, "subject", None), ast.AST):
-        stack.append(
-            _StackFrame(subject, is_br, in_lp, act_nl, force_after_span=f_after)
-        )
+        stack.append(_StackFrame(subject, is_br, in_lp, act_nl, force_after_span=f_after))
 
 
 def _push_compound_children(
@@ -546,9 +504,7 @@ def _push_compound_children(
     stack: List[_StackFrame],
     *,
     unconditional_post_del: bool = False,
-    pre_stmt_suppress: Optional[
-        Union[_SuppressProvenance, AbstractSet[str]]
-    ] = None,
+    pre_stmt_suppress: Optional[Union[_SuppressProvenance, AbstractSet[str]]] = None,
 ) -> bool:
     """Pushes child nodes of compound control-flow statements with branch and loop state."""
     is_br = frame.is_branched
@@ -586,11 +542,7 @@ def _push_compound_children(
             act_nl,
             force_after_span=f_after,
         )
-        stack.append(
-            _StackFrame(
-                curr.test, is_br, in_lp, act_nl, force_after_span=f_after
-            )
-        )
+        stack.append(_StackFrame(curr.test, is_br, in_lp, act_nl, force_after_span=f_after))
         return True
 
     if isinstance(curr, (ast.For, ast.AsyncFor)):
@@ -635,17 +587,12 @@ def _push_compound_children(
                 force_after_span=after_iter,
             )
         )
-        stack.append(
-            _StackFrame(
-                curr.iter, is_br, in_lp, act_nl, force_after_span=f_after
-            )
-        )
+        stack.append(_StackFrame(curr.iter, is_br, in_lp, act_nl, force_after_span=f_after))
         return True
 
     if isinstance(curr, ast.While):
         body_span = encloses and (
-            _block_contains_span(curr.body, span)
-            or _is_node_inside_span(curr.test, span)
+            _block_contains_span(curr.body, span) or _is_node_inside_span(curr.test, span)
         )
         else_span = encloses and _block_contains_span(curr.orelse, span)
         if body_span:
@@ -678,15 +625,11 @@ def _push_compound_children(
         return True
 
     if isinstance(curr, (ast.With, ast.AsyncWith)):
-        _push_with_compound_children(
-            curr, encloses, span, frame, state, stack, pre_stmt_suppress
-        )
+        _push_with_compound_children(curr, encloses, span, frame, state, stack, pre_stmt_suppress)
         return True
 
     if is_try_or_trystar_node(curr):
-        _push_try_compound_children(
-            curr, encloses, span, frame, state, stack, pre_stmt_suppress
-        )
+        _push_try_compound_children(curr, encloses, span, frame, state, stack, pre_stmt_suppress)
         return True
 
     if isinstance(curr, ast.ExceptHandler):
@@ -715,33 +658,21 @@ def _push_compound_children(
                     state,
                     unconditional_post_del=unconditional_post_del,
                 )
-        _push_seq(
-            stack, curr.body, h_br, in_lp, act_nl, force_after_span=f_after
-        )
+        _push_seq(stack, curr.body, h_br, in_lp, act_nl, force_after_span=f_after)
         if curr.type is not None:
-            stack.append(
-                _StackFrame(
-                    curr.type, True, in_lp, act_nl, force_after_span=f_after
-                )
-            )
+            stack.append(_StackFrame(curr.type, True, in_lp, act_nl, force_after_span=f_after))
         return True
 
     if is_match_node(curr):
-        _push_match_compound_children(
-            curr, encloses, span, frame, state, stack, pre_stmt_suppress
-        )
+        _push_match_compound_children(curr, encloses, span, frame, state, stack, pre_stmt_suppress)
         return True
 
     if isinstance(curr, (ast.BoolOp, ast.Compare)):
         uncond_exprs: Sequence[ast.AST] = (
-            curr.values[:1]
-            if isinstance(curr, ast.BoolOp)
-            else (curr.left, *curr.comparators[:1])
+            curr.values[:1] if isinstance(curr, ast.BoolOp) else (curr.left, *curr.comparators[:1])
         )
         short_circuit_exprs: Sequence[ast.AST] = (
-            curr.values[1:]
-            if isinstance(curr, ast.BoolOp)
-            else curr.comparators[1:]
+            curr.values[1:] if isinstance(curr, ast.BoolOp) else curr.comparators[1:]
         )
         _push_seq(
             stack,
@@ -762,21 +693,9 @@ def _push_compound_children(
         return True
 
     if isinstance(curr, ast.IfExp):
-        stack.append(
-            _StackFrame(
-                curr.orelse, True, in_lp, act_nl, force_after_span=f_after
-            )
-        )
-        stack.append(
-            _StackFrame(
-                curr.body, True, in_lp, act_nl, force_after_span=f_after
-            )
-        )
-        stack.append(
-            _StackFrame(
-                curr.test, is_br, in_lp, act_nl, force_after_span=f_after
-            )
-        )
+        stack.append(_StackFrame(curr.orelse, True, in_lp, act_nl, force_after_span=f_after))
+        stack.append(_StackFrame(curr.body, True, in_lp, act_nl, force_after_span=f_after))
+        stack.append(_StackFrame(curr.test, is_br, in_lp, act_nl, force_after_span=f_after))
         return True
 
     return False
@@ -815,76 +734,52 @@ def _handle_nested_scope_node(
             and _strictly_encloses_span(curr, span)
         )
         if span_in_hdr or (enclosing_cls and is_direct_span):
-            if _can_bind_in_fn_scope(
-                curr.name, frame.active_nonlocals, state.fn_globals
-            ):
+            if _can_bind_in_fn_scope(curr.name, frame.active_nonlocals, state.fn_globals):
                 state.post_mutated.add(curr.name)
                 if frame.in_loop:
                     state.loop_mutated.add(curr.name)
         else:
-            _record_binding_at_pos(
-                (curr.name,), estart, ecol, span, frame, state
-            )
+            _record_binding_at_pos((curr.name,), estart, ecol, span, frame, state)
         if enclosing_cls and isinstance(curr, ast.ClassDef):
             for stmt in _iter_class_body_methods(curr):
-                if not (
-                    _is_node_inside_span(stmt, span)
-                    or _strictly_encloses_span(stmt, span)
-                ):
+                if not (_is_node_inside_span(stmt, span) or _strictly_encloses_span(stmt, span)):
                     s_reads = _extract_cached_scope_free_reads(stmt)
-                    s_muts, s_dels = (
-                        _extract_closure_nonlocal_mutations_and_deletions(stmt)
-                    )
+                    s_muts, s_dels = _extract_closure_nonlocal_mutations_and_deletions(stmt)
                     if sibling_nl_deletions is not None and s_dels:
                         sibling_nl_deletions.update(s_dels)
                     s_carriers = _extract_fn_outer_carrier_targets(
                         stmt, state.fn_globals, scope_ctx
                     )
                     if s_reads or s_muts:
-                        sibling_closures.append(
-                            (curr.name, set(s_reads), set(s_muts))
-                        )
+                        sibling_closures.append((curr.name, set(s_reads), set(s_muts)))
                         for oc_name in s_carriers:
-                            sibling_closures.append(
-                                (oc_name, set(s_reads), set(s_muts))
-                            )
+                            sibling_closures.append((oc_name, set(s_reads), set(s_muts)))
         elif not enclosing_cls:
             free_r = (
                 _extract_nested_scope_free_reads(curr, include_header=False)
                 if span_in_hdr
                 else _extract_cached_scope_free_reads(curr)
             )
-            nl_mut, nl_del = _extract_closure_nonlocal_mutations_and_deletions(
-                curr
-            )
+            nl_mut, nl_del = _extract_closure_nonlocal_mutations_and_deletions(curr)
             if sibling_nl_deletions is not None and nl_del:
                 sibling_nl_deletions.update(nl_del)
             sib_name = (
                 curr.name
-                if _can_bind_in_fn_scope(
-                    curr.name, frame.active_nonlocals, state.fn_globals
-                )
+                if _can_bind_in_fn_scope(curr.name, frame.active_nonlocals, state.fn_globals)
                 else None
             )
-            outer_carriers = _extract_fn_outer_carrier_targets(
-                curr, state.fn_globals, scope_ctx
-            )
+            outer_carriers = _extract_fn_outer_carrier_targets(curr, state.fn_globals, scope_ctx)
             if sib_name is not None:
                 if factory_names is not None and (
-                    outer_carriers
-                    or _is_closure_factory_scope(curr, scope_ctx)
+                    outer_carriers or _is_closure_factory_scope(curr, scope_ctx)
                 ):
                     factory_names.add(sib_name)
                 if fn_return_refs is not None and isinstance(
                     curr, (ast.FunctionDef, ast.AsyncFunctionDef)
                 ):
-                    ret_loads, ret_calls = _extract_fn_returned_closure_refs(
-                        curr, scope_ctx
-                    )
+                    ret_loads, ret_calls = _extract_fn_returned_closure_refs(curr, scope_ctx)
                     if ret_loads or ret_calls:
-                        entry = fn_return_refs.setdefault(
-                            sib_name, (set(), set())
-                        )
+                        entry = fn_return_refs.setdefault(sib_name, (set(), set()))
                         entry[0].update(ret_loads)
                         entry[1].update(ret_calls)
             sibling_closures.append((sib_name, free_r, nl_mut))
@@ -943,15 +838,11 @@ def _handle_nested_scope_node(
                 frame._replace(is_branched=True),
                 state,
             )
-        c_reads, c_muts = _extract_comprehension_deferred_closure_info(
-            curr, scope_ctx
-        )
+        c_reads, c_muts = _extract_comprehension_deferred_closure_info(curr, scope_ctx)
         if c_reads or c_muts:
             sibling_closures.append((None, c_reads, c_muts))
         if alias_edges is not None:
-            init_exprs, init_targets = (
-                _iter_comprehension_body_exprs_and_targets(curr)
-            )
+            init_exprs, init_targets = _iter_comprehension_body_exprs_and_targets(curr)
             base_targets = frozenset(init_targets)
             comp_sub_stack: List[Tuple[ast.AST, frozenset[str]]] = [
                 (expr, base_targets) for expr in init_exprs
@@ -962,17 +853,11 @@ def _handle_nested_scope_node(
                 if isinstance(sub, (ast.NamedExpr, ast.Call)):
                     comp_carriers.append((sub, active_targets))
                 if isinstance(sub, _COMPREHENSION_TYPES):
-                    sub_exprs, sub_targets = (
-                        _iter_comprehension_body_exprs_and_targets(sub)
-                    )
+                    sub_exprs, sub_targets = _iter_comprehension_body_exprs_and_targets(sub)
                     if sub.generators:
-                        comp_sub_stack.append(
-                            (sub.generators[0].iter, active_targets)
-                        )
+                        comp_sub_stack.append((sub.generators[0].iter, active_targets))
                     next_targets = active_targets | frozenset(sub_targets)
-                    comp_sub_stack.extend(
-                        (expr, next_targets) for expr in sub_exprs
-                    )
+                    comp_sub_stack.extend((expr, next_targets) for expr in sub_exprs)
                     continue
                 comp_sub_stack.extend(
                     (hdr, active_targets)
@@ -1002,9 +887,7 @@ def _handle_nested_scope_node(
                     fn_globals=state.fn_globals,
                 )
         if _is_frame_after_span(c_line, c_col, span, frame):
-            state.post_reads.update(
-                _extract_expr_scope_free_reads(curr, include_header=False)
-            )
+            state.post_reads.update(_extract_expr_scope_free_reads(curr, include_header=False))
         _push_seq(
             stack,
             [curr.generators[0].iter] if curr.generators else (),
@@ -1044,10 +927,8 @@ def _record_carrier_closures_and_aliases(
         if not valid_targets:
             continue
         c_calls: Set[str] = set()
-        c_reads, c_muts, c_loads = (
-            _extract_carrier_value_closure_and_load_info(
-                c_values, scope_ctx, called_names_out=c_calls
-            )
+        c_reads, c_muts, c_loads = _extract_carrier_value_closure_and_load_info(
+            c_values, scope_ctx, called_names_out=c_calls
         )
         if excluded_names:
             c_reads -= set(excluded_names)
@@ -1079,16 +960,13 @@ def _record_simple_node_bindings_and_reads(
     """Records bindings, deletions, and post-span reads for leaf/simple AST nodes."""
     if isinstance(curr, ast.AugAssign) and isinstance(curr.target, ast.Name):
         if _is_frame_after_span(c_line, c_col, span, frame) or (
-            curr.value is not None
-            and _node_contains_or_encloses_span(curr.value, span)
+            curr.value is not None and _node_contains_or_encloses_span(curr.value, span)
         ):
             state.post_reads.add(curr.target.id)
 
     if isinstance(curr, ast.Name):
         if isinstance(curr.ctx, ast.Store):
-            _record_binding_at_pos(
-                (curr.id,), c_line, c_col, span, frame, state
-            )
+            _record_binding_at_pos((curr.id,), c_line, c_col, span, frame, state)
         elif isinstance(curr.ctx, ast.Del):
             _record_deletion_at_pos(
                 curr.id,
@@ -1099,9 +977,7 @@ def _record_simple_node_bindings_and_reads(
                 state,
                 unconditional_post_del=unconditional_post_del,
             )
-        elif isinstance(curr.ctx, ast.Load) and _is_frame_after_span(
-            c_line, c_col, span, frame
-        ):
+        elif isinstance(curr.ctx, ast.Load) and _is_frame_after_span(c_line, c_col, span, frame):
             state.post_reads.add(curr.id)
     elif isinstance(curr, (ast.Import, ast.ImportFrom)):
         imp_names: Set[str] = set()
@@ -1110,9 +986,7 @@ def _record_simple_node_bindings_and_reads(
     else:
         bound_name = _extract_type_alias_or_pattern_name(curr)
         if bound_name is not None:
-            _record_binding_at_pos(
-                (bound_name,), c_line, c_col, span, frame, state
-            )
+            _record_binding_at_pos((bound_name,), c_line, c_col, span, frame, state)
 
 
 class _StmtCellDelta(NamedTuple):
@@ -1123,9 +997,7 @@ class _StmtCellDelta(NamedTuple):
     post_mutated: frozenset[str]
     post_reads: frozenset[str]
     loop_mutated: frozenset[str]
-    sibling_closures: Tuple[
-        Tuple[Optional[str], frozenset[str], frozenset[str]], ...
-    ]
+    sibling_closures: Tuple[Tuple[Optional[str], frozenset[str], frozenset[str]], ...]
     concurrent_sib_offsets: Tuple[int, ...]
     alias_edges: Tuple[Tuple[str, frozenset[str]], ...]
     call_edges: Tuple[Tuple[str, frozenset[str]], ...]
@@ -1158,9 +1030,7 @@ def _make_empty_traversal_buffers(
     scope_ctx: _FnScopeContext,
     pre_bound: Optional[Set[str]] = None,
     unit_mutations: AbstractSet[str] = frozenset(),
-    initial_suppress_aliases: Optional[
-        Union[_SuppressProvenance, AbstractSet[str]]
-    ] = None,
+    initial_suppress_aliases: Optional[Union[_SuppressProvenance, AbstractSet[str]]] = None,
     *,
     strict_with_suppression: bool = False,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
@@ -1177,13 +1047,9 @@ def _make_empty_traversal_buffers(
             loop_mutated=set(),
             pre_unbound=set(),
             fn_globals=fn_globals,
-            suppress_aliases=_coerce_suppress_provenance(
-                initial_suppress_aliases
-            ),
+            suppress_aliases=_coerce_suppress_provenance(initial_suppress_aliases),
             strict_with_suppression=strict_with_suppression,
-            extra_non_suppressing_ctx_managers=frozenset(
-                extra_non_suppressing_ctx_managers
-            ),
+            extra_non_suppressing_ctx_managers=frozenset(extra_non_suppressing_ctx_managers),
         ),
         sibling_closures=[],
         concurrent_sib_indices=set(),
@@ -1219,9 +1085,7 @@ def _apply_stmt_cell_delta(
     for name, reads, muts in delta.sibling_closures:
         bufs.sibling_closures.append((name, set(reads), set(muts)))
     if in_loop:
-        bufs.concurrent_sib_indices.update(
-            range(base_sib_len, len(bufs.sibling_closures))
-        )
+        bufs.concurrent_sib_indices.update(range(base_sib_len, len(bufs.sibling_closures)))
     else:
         for rel_idx in delta.concurrent_sib_offsets:
             bufs.concurrent_sib_indices.add(base_sib_len + rel_idx)
@@ -1323,11 +1187,7 @@ def _try_apply_cached_stmt_delta(
                     stmt_deltas.pop(next(iter(stmt_deltas)), None)
                 stmt_deltas.setdefault(key, None)
             return False
-        dummy_span = (
-            _SpanBounds(c_end + 1, c_end + 1)
-            if is_before
-            else _SpanBounds(0, 0)
-        )
+        dummy_span = _SpanBounds(c_end + 1, c_end + 1) if is_before else _SpanBounds(0, 0)
         sub_bufs = _make_empty_traversal_buffers(
             bufs.state.fn_globals,
             bufs.scope_ctx,
@@ -1357,17 +1217,9 @@ def _try_apply_cached_stmt_delta(
                 (name, frozenset(reads), frozenset(muts))
                 for name, reads, muts in sub_bufs.sibling_closures
             ),
-            concurrent_sib_offsets=tuple(
-                sorted(sub_bufs.concurrent_sib_indices)
-            ),
-            alias_edges=tuple(
-                (t_name, frozenset(srcs))
-                for t_name, srcs in sub_bufs.alias_edges
-            ),
-            call_edges=tuple(
-                (t_name, frozenset(calls))
-                for t_name, calls in sub_bufs.call_edges
-            ),
+            concurrent_sib_offsets=tuple(sorted(sub_bufs.concurrent_sib_indices)),
+            alias_edges=tuple((t_name, frozenset(srcs)) for t_name, srcs in sub_bufs.alias_edges),
+            call_edges=tuple((t_name, frozenset(calls)) for t_name, calls in sub_bufs.call_edges),
             factory_names=frozenset(sub_bufs.factory_names),
             fn_return_refs=tuple(
                 (fn_name, frozenset(r_loads), frozenset(r_calls))
@@ -1384,20 +1236,14 @@ def _try_apply_cached_stmt_delta(
             delta = stmt_deltas.setdefault(key, computed_delta)
     if delta is None:
         return False
-    if (
-        is_before
-        and not is_branched
-        and bufs.state.suppress_aliases is not None
-    ):
+    if is_before and not is_branched and bufs.state.suppress_aliases is not None:
         bufs.state.suppress_aliases = _update_suppress_provenance_from_stmt(
             stmt,
             pre_prov,
             strict_with_suppression=strict_w,
             extra_non_suppressing_ctx_managers=extra_non_sup,
         )
-    _apply_stmt_cell_delta(
-        bufs, delta, is_branched=is_branched, in_loop=in_loop
-    )
+    _apply_stmt_cell_delta(bufs, delta, is_branched=is_branched, in_loop=in_loop)
     return True
 
 
@@ -1406,9 +1252,7 @@ def _traverse_fn_cell_frames(
     span: _SpanBounds,
     bufs: _CellTraversalBuffers,
     enclosed_fn: Optional[ast.AST] = None,
-    stmt_deltas: Optional[
-        Dict[Tuple[Any, ...], Optional[_StmtCellDelta]]
-    ] = None,
+    stmt_deltas: Optional[Dict[Tuple[Any, ...], Optional[_StmtCellDelta]]] = None,
 ) -> bool:
     """Traverses AST frames to populate cell bindings, closures, and multi-invocation state."""
     enclosed_fn_name: Optional[str] = (
@@ -1463,9 +1307,7 @@ def _traverse_fn_cell_frames(
         if curr is enclosed_fn:
             if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 estart, ecol = _node_earliest_start_pos(curr)
-                _record_binding_at_pos(
-                    (curr.name,), estart, ecol, span, frame, bufs.state
-                )
+                _record_binding_at_pos((curr.name,), estart, ecol, span, frame, bufs.state)
                 if (
                     frame.in_loop
                     or frame.active_nonlocals is not None
@@ -1538,9 +1380,7 @@ def _traverse_fn_cell_frames(
             continue
 
         prev_sib_len = len(bufs.sibling_closures)
-        if isinstance(
-            curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-        ):
+        if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             eff_line, eff_col = _node_earliest_start_pos(curr)
         else:
             eff_line, eff_col = c_line, c_col
@@ -1560,19 +1400,12 @@ def _traverse_fn_cell_frames(
             is_direct_span=enclosed_fn is None,
         ):
             if is_conc_pos:
-                bufs.concurrent_sib_indices.update(
-                    range(prev_sib_len, len(bufs.sibling_closures))
-                )
+                bufs.concurrent_sib_indices.update(range(prev_sib_len, len(bufs.sibling_closures)))
             if enclosed_fn_name is not None and not enclosed_fn_multi_invoked:
-                if isinstance(
-                    curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-                ):
+                if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                     if not (
-                        isinstance(curr, ast.ClassDef)
-                        and _strictly_encloses_span(curr, span)
-                    ) and enclosed_fn_name in _extract_cached_scope_free_reads(
-                        curr
-                    ):
+                        isinstance(curr, ast.ClassDef) and _strictly_encloses_span(curr, span)
+                    ) and enclosed_fn_name in _extract_cached_scope_free_reads(curr):
                         enclosed_fn_multi_invoked = True
                 elif isinstance(curr, (ast.Lambda, *_COMPREHENSION_TYPES)):
                     if enclosed_fn_name in _extract_expr_scope_free_reads(
@@ -1583,10 +1416,7 @@ def _traverse_fn_cell_frames(
 
         if enclosed_fn_name is not None:
             if isinstance(curr, ast.Call):
-                if (
-                    isinstance(curr.func, ast.Name)
-                    and curr.func.id == enclosed_fn_name
-                ):
+                if isinstance(curr.func, ast.Name) and curr.func.id == enclosed_fn_name:
                     direct_enclosed_call_funcs.add(id(curr.func))
                     enclosed_fn_call_count += 1
                     if frame.in_loop or enclosed_fn_call_count >= 2:
@@ -1609,9 +1439,7 @@ def _traverse_fn_cell_frames(
             fn_globals=bufs.state.fn_globals,
         )
         if is_conc_pos:
-            bufs.concurrent_sib_indices.update(
-                range(prev_sib_len, len(bufs.sibling_closures))
-            )
+            bufs.concurrent_sib_indices.update(range(prev_sib_len, len(bufs.sibling_closures)))
 
         if _push_compound_children(
             curr,
@@ -1635,21 +1463,14 @@ def _traverse_fn_cell_frames(
             unconditional_post_del=enclosed_fn is not None,
         )
 
-        if isinstance(
-            curr, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)
-        ):
+        if isinstance(curr, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
             rhs_val = curr.value
-            if rhs_val is not None and _node_contains_or_encloses_span(
-                rhs_val, span
-            ):
+            if rhs_val is not None and _node_contains_or_encloses_span(rhs_val, span):
                 lhs_targets: Sequence[ast.AST] = (
-                    curr.targets
-                    if isinstance(curr, ast.Assign)
-                    else (curr.target,)
+                    curr.targets if isinstance(curr, ast.Assign) else (curr.target,)
                 )
                 target_after = not (
-                    isinstance(curr, ast.AugAssign)
-                    and not isinstance(curr.target, ast.Name)
+                    isinstance(curr, ast.AugAssign) and not isinstance(curr.target, ast.Name)
                 )
                 _push_seq(
                     stack,
@@ -1660,9 +1481,7 @@ def _traverse_fn_cell_frames(
                     force_after_span=frame.force_after_span or target_after,
                 )
                 rhs_seq: Sequence[ast.AST] = (
-                    (curr.annotation, rhs_val)
-                    if isinstance(curr, ast.AnnAssign)
-                    else (rhs_val,)
+                    (curr.annotation, rhs_val) if isinstance(curr, ast.AnnAssign) else (rhs_val,)
                 )
                 _push_seq(
                     stack,
@@ -1705,9 +1524,7 @@ def _analyze_enclosing_fn_cells_uncached(
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
 ) -> _EnclosingFnCellInfo:
     """Computes variable bindings, post-span mutations, loop mutations, and sibling closures."""
-    scope_ctx = _get_fn_scope_context(
-        fn_node, mod_tree=mod_tree, enclosing_scopes=enclosing_scopes
-    )
+    scope_ctx = _get_fn_scope_context(fn_node, mod_tree=mod_tree, enclosing_scopes=enclosing_scopes)
     fn_globals = _extract_direct_nonlocals(fn_node, is_global=True)
     tp_names = set(_extract_node_type_param_names(fn_node)) - fn_globals
     fn_locals = set(scope_ctx.fn_locals) | tp_names
@@ -1723,13 +1540,11 @@ def _analyze_enclosing_fn_cells_uncached(
             t_names = _extract_store_names_in_node(gen.target) - fn_globals
             comp_targets.update(t_names)
             t_line, t_col = _node_earliest_start_pos(gen.target)
-            if _is_pos_before_span(
-                t_line, t_col, span
-            ) or _node_contains_or_encloses_span(gen.target, span):
+            if _is_pos_before_span(t_line, t_col, span) or _node_contains_or_encloses_span(
+                gen.target, span
+            ):
                 pre_bound.update(t_names)
-        comp_walrus = (
-            _extract_comprehension_body_walrus_names(fn_node) - fn_globals
-        )
+        comp_walrus = _extract_comprehension_body_walrus_names(fn_node) - fn_globals
         fn_locals |= comp_targets | comp_walrus
 
     initial_sup = _seed_scope_suppress_aliases(fn_node, mod_tree, scope_ctx)
@@ -1743,15 +1558,9 @@ def _analyze_enclosing_fn_cells_uncached(
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
     )
     if isinstance(fn_node, _COMPREHENSION_TYPES):
-        bufs.state.loop_mutated.update(
-            comp_targets | comp_walrus | set(unit_mutations)
-        )
-    delta_aux_nodes = tuple(
-        n for n in scope_ctx.cache_aux_nodes() if n is not fn_node
-    )
-    stmt_deltas: Optional[
-        Dict[Tuple[Any, ...], Optional[_StmtCellDelta]]
-    ] = (
+        bufs.state.loop_mutated.update(comp_targets | comp_walrus | set(unit_mutations))
+    delta_aux_nodes = tuple(n for n in scope_ctx.cache_aux_nodes() if n is not fn_node)
+    stmt_deltas: Optional[Dict[Tuple[Any, ...], Optional[_StmtCellDelta]]] = (
         cast(
             Dict[Tuple[Any, ...], Optional[_StmtCellDelta]],
             _get_or_compute_scope_cached(
@@ -1791,25 +1600,20 @@ def _analyze_enclosing_fn_cells_uncached(
         else:
             comp_frames.append((fn_node.elt, has_ifs))
         stack = [
-            _StackFrame(expr_node, is_br, True, None)
-            for expr_node, is_br in reversed(comp_frames)
+            _StackFrame(expr_node, is_br, True, None) for expr_node, is_br in reversed(comp_frames)
         ]
     else:
         body_seq = getattr(fn_node, "body", ())
         stack = [
             _StackFrame(stmt, False, False, None)
-            for stmt in reversed(
-                body_seq if isinstance(body_seq, (list, tuple)) else ()
-            )
+            for stmt in reversed(body_seq if isinstance(body_seq, (list, tuple)) else ())
         ]
     enclosed_fn_multi_invoked = _traverse_fn_cell_frames(
         stack, span, bufs, enclosed_fn=enclosed_fn, stmt_deltas=stmt_deltas
     )
 
     if enclosed_fn is not None and enclosed_fn_multi_invoked:
-        enc_muts, enc_dels = _extract_closure_nonlocal_mutations_and_deletions(
-            enclosed_fn
-        )
+        enc_muts, enc_dels = _extract_closure_nonlocal_mutations_and_deletions(enclosed_fn)
         bufs.state.loop_mutated.update(unit_mutations)
         bufs.state.loop_mutated.update(enc_muts)
         if enc_dels:
@@ -1837,19 +1641,14 @@ def _analyze_enclosing_fn_cells_uncached(
             visited_fn_refs.add(fn_ref)
             if fn_ref in bufs.factory_names:
                 alias_targets.add(fn_ref)
-            ret_loads_set, ret_calls_set = bufs.fn_return_refs.get(
-                fn_ref, (set(), set())
-            )
+            ret_loads_set, ret_calls_set = bufs.fn_return_refs.get(fn_ref, (set(), set()))
             for ret_ref in ret_loads_set:
                 if ret_ref in closure_carrier_names:
                     alias_targets.add(ret_ref)
             for call_ref in ret_calls_set:
                 if call_ref in bufs.factory_names:
                     alias_targets.add(call_ref)
-                if (
-                    call_ref in bufs.fn_return_refs
-                    or call_ref in bufs.factory_names
-                ):
+                if call_ref in bufs.fn_return_refs or call_ref in bufs.factory_names:
                     pending_fn_refs.append(call_ref)
         if alias_targets:
             bufs.alias_edges.append((t_name, alias_targets))
@@ -1859,9 +1658,7 @@ def _analyze_enclosing_fn_cells_uncached(
         for t_name, srcs in bufs.alias_edges
     ]
     rebound_alias_edges: List[Tuple[str, Set[str]]] = [
-        (t_name, srcs)
-        for t_name, srcs in bufs.alias_edges
-        if not t_name.startswith("*")
+        (t_name, srcs) for t_name, srcs in bufs.alias_edges if not t_name.startswith("*")
     ]
     propagated_closures = _propagate_sibling_closures(
         bufs.sibling_closures,
@@ -1874,9 +1671,7 @@ def _analyze_enclosing_fn_cells_uncached(
         concurrent_sib_vars.update(s_reads)
         concurrent_sib_vars.update(s_muts)
     all_sib_nl = (
-        set().union(*(nl for _, _, nl in propagated_closures))
-        if propagated_closures
-        else set()
+        set().union(*(nl for _, _, nl in propagated_closures)) if propagated_closures else set()
     )
     return _EnclosingFnCellInfo(
         fn_locals=frozenset(fn_locals),
@@ -1886,13 +1681,10 @@ def _analyze_enclosing_fn_cells_uncached(
         post_reads=frozenset(bufs.state.post_reads),
         loop_mutated=frozenset(bufs.state.loop_mutated),
         sibling_closures=tuple(
-            (name, frozenset(reads), frozenset(muts))
-            for name, reads, muts in propagated_closures
+            (name, frozenset(reads), frozenset(muts)) for name, reads, muts in propagated_closures
         ),
         all_sibling_nonlocal_mutations=frozenset(all_sib_nl),
-        alias_edges=tuple(
-            (t_name, frozenset(srcs)) for t_name, srcs in rebound_alias_edges
-        ),
+        alias_edges=tuple((t_name, frozenset(srcs)) for t_name, srcs in rebound_alias_edges),
         pre_unbound=frozenset(bufs.state.pre_unbound),
         concurrent_sibling_vars=frozenset(concurrent_sib_vars),
     )
@@ -1912,9 +1704,7 @@ def _analyze_enclosing_fn_cells(
     """Analyzes and caches cell bindings, post-span mutations, loop mutations, and closures."""
     norm_span = span if isinstance(span, _SpanBounds) else _SpanBounds(*span)
     norm_enclosing = tuple(
-        n
-        for n in enclosing_scopes
-        if isinstance(n, ast.AST) and n is not fn_node
+        n for n in enclosing_scopes if isinstance(n, ast.AST) and n is not fn_node
     )
     aux_nodes: Tuple[ast.AST, ...] = (
         *(n for n in (enclosed_fn, mod_tree) if n is not None),
@@ -1958,6 +1748,7 @@ def _find_enclosing_method_class_names(
     enc_child: ast.AST,
 ) -> frozenset[str]:
     """Finds and caches class names in fn_node that directly define method enc_child."""
+
     def _compute() -> frozenset[str]:
         parent_map = _get_scope_parent_map(fn_node)
         curr_p = parent_map.get(enc_child)
@@ -2012,9 +1803,7 @@ def _build_enclosing_chain_cell_infos(
             first_stmt: ast.AST = (
                 next_body[0]
                 if isinstance(next_body, (list, tuple)) and next_body
-                else next_body
-                if isinstance(next_body, ast.AST)
-                else next_fn
+                else next_body if isinstance(next_body, ast.AST) else next_fn
             )
             f_line, f_col = _node_earliest_start_pos(first_stmt)
             span = _SpanBounds(
@@ -2048,9 +1837,7 @@ def _build_enclosing_chain_cell_infos(
             )
             if pos_args:
                 rec_param = pos_args[0].arg
-                enclosing_cls_names = _find_enclosing_method_class_names(
-                    fn_node, enc_child
-                )
+                enclosing_cls_names = _find_enclosing_method_class_names(fn_node, enc_child)
                 if enclosing_cls_names:
                     extra_sibs = tuple(
                         (rec_param, frozenset(s_reads), frozenset(s_muts))
@@ -2113,7 +1900,5 @@ def _find_enclosing_chain_definite_pre_bound(
     for idx in range(len(chain_infos) - 1, -1, -1):
         info = chain_infos[idx]
         acc_pre_bound.update(info.pre_bound - acc_pre_unbound)
-        acc_pre_unbound.update(
-            (set(info.pre_unbound) | info.fn_locals) - info.pre_bound
-        )
+        acc_pre_unbound.update((set(info.pre_unbound) | info.fn_locals) - info.pre_bound)
     return acc_pre_bound

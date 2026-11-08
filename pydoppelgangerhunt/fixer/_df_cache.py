@@ -30,7 +30,10 @@ from typing import (
 )
 
 from pydoppelgangerhunt.config import clear_closure_warning_cache
-from pydoppelgangerhunt.source_lines import parse_unit_coord, split_source_lines
+from pydoppelgangerhunt.source_lines import (
+    parse_unit_coord,
+    split_source_lines,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +68,9 @@ def _suppress_syntax_warnings() -> Iterator[None]:
     and ``symtable.symtable`` calls across worker threads without lock serialization.
     """
     with _syntax_warning_lock:
-        filters_list = cast(List[Any], warnings.filters)
-        if not filters_list or filters_list[0] is not _SYNTAX_WARNING_FILTER:
-            filters_list.insert(0, _SYNTAX_WARNING_FILTER)
+        cur_filters = list(warnings.filters)
+        if not cur_filters or cur_filters[0] is not _SYNTAX_WARNING_FILTER:
+            setattr(warnings, "filters", [_SYNTAX_WARNING_FILTER, *cur_filters])
             _notify_warnings_filters_mutated()
         _syntax_warning_active_count[0] += 1
     try:
@@ -76,10 +79,11 @@ def _suppress_syntax_warnings() -> Iterator[None]:
         with _syntax_warning_lock:
             _syntax_warning_active_count[0] -= 1
             if _syntax_warning_active_count[0] == 0:
-                filters_list = cast(List[Any], warnings.filters)
-                filters_list[:] = [
-                    f for f in filters_list if f is not _SYNTAX_WARNING_FILTER
-                ]
+                setattr(
+                    warnings,
+                    "filters",
+                    [f for f in warnings.filters if f is not _SYNTAX_WARNING_FILTER],
+                )
                 _notify_warnings_filters_mutated()
 
 
@@ -133,9 +137,7 @@ _PERMITTED_PARAM_SCALAR_TYPES: Tuple[type, ...] = (
 def _validate_scope_cache_params(params: Any) -> None:
     """Enforces that _ScopeCacheKey.params recursively contains only AST-free immutable values."""
     if not isinstance(params, tuple):
-        raise TypeError(
-            f"_ScopeCacheKey.params must be a tuple; got {type(params).__name__}"
-        )
+        raise TypeError(f"_ScopeCacheKey.params must be a tuple; got {type(params).__name__}")
     stack: List[Any] = list(params)
     seen: Set[int] = set()
     invalid_mutable_type: Optional[str] = None
@@ -193,7 +195,10 @@ def _canonical_param_type_key(obj: Any) -> Any:
     if isinstance(obj, tuple):
         return (tuple, tuple(_canonical_param_type_key(x) for x in obj))
     if isinstance(obj, frozenset):
-        return (frozenset, frozenset(_canonical_param_type_key(x) for x in obj))
+        return (
+            frozenset,
+            frozenset(_canonical_param_type_key(x) for x in obj),
+        )
     if isinstance(obj, float):
         if math.isnan(obj):
             return (float, "nan")
@@ -210,9 +215,7 @@ def _params_exact_types_match(a: Any, b: Any) -> bool:
     if type(a) is not type(b):
         return False
     if isinstance(a, tuple):
-        return len(a) == len(b) and all(
-            _params_exact_types_match(x, y) for x, y in zip(a, b)
-        )
+        return len(a) == len(b) and all(_params_exact_types_match(x, y) for x, y in zip(a, b))
     if isinstance(a, frozenset):
         if len(a) != len(b):
             return False
@@ -252,15 +255,11 @@ def _validate_scope_cache_key_header(
     if params:
         _validate_scope_cache_params(params)
     elif not isinstance(params, tuple):
-        raise TypeError(
-            f"_ScopeCacheKey.params must be a tuple; got {type(params).__name__}"
-        )
+        raise TypeError(f"_ScopeCacheKey.params must be a tuple; got {type(params).__name__}")
     if not isinstance(aux_ast_nodes, tuple) or not all(
         isinstance(n, ast.AST) for n in aux_ast_nodes
     ):
-        raise TypeError(
-            "_ScopeCacheKey.aux_ast_nodes must be a tuple of ast.AST nodes"
-        )
+        raise TypeError("_ScopeCacheKey.aux_ast_nodes must be a tuple of ast.AST nodes")
 
 
 class _ScopeCacheKey(_BaseScopeCacheKey):
@@ -305,9 +304,13 @@ class _ScopeCacheKey(_BaseScopeCacheKey):
             return True
         if not isinstance(other, _ScopeCacheKey):
             return False
-        if not tuple.__eq__(self, other):
+        if (
+            self.owner != other.owner
+            or self.kind != other.kind
+            or self.aux_ast_nodes != other.aux_ast_nodes
+        ):
             return False
-        if not self.params:
+        if not self.params and not other.params:
             return True
         return _params_exact_types_match(self.params, other.params)
 
@@ -318,12 +321,17 @@ class _ScopeCacheKey(_BaseScopeCacheKey):
         cached = self.__dict__.get("_cached_hash")
         if cached is not None:
             return int(cached)
-        base_h = tuple.__hash__(self)
-        res = (
-            base_h
-            if not self.params
-            else hash((base_h, _params_type_hash(self.params)))
-        )
+        if not self.params:
+            res = tuple.__hash__(self)
+        else:
+            res = hash(
+                (
+                    self.owner,
+                    self.kind,
+                    _params_type_hash(self.params),
+                    self.aux_ast_nodes,
+                )
+            )
         self.__dict__["_cached_hash"] = res
         return res
 
@@ -335,9 +343,7 @@ def _make_trusted_scope_cache_key(
     aux_ast_nodes: Tuple[ast.AST, ...] = (),
 ) -> _ScopeCacheKey:
     """Fast-path constructor for internal callers whose arguments are already trusted."""
-    return _BaseScopeCacheKey.__new__(
-        _ScopeCacheKey, owner, kind, params, aux_ast_nodes
-    )
+    return _BaseScopeCacheKey.__new__(_ScopeCacheKey, owner, kind, params, aux_ast_nodes)
 
 
 def _extract_key_ast_nodes(key: Any) -> Tuple[ast.AST, ...]:
@@ -370,9 +376,7 @@ def _extract_key_ast_nodes(key: Any) -> Tuple[ast.AST, ...]:
 
 def _extract_value_ast_nodes(value: Any) -> Tuple[ast.AST, ...]:
     """Extracts ast.AST nodes held inside a cached value via mandatory cached_ast_nodes() or container traversal."""
-    if value is None or isinstance(
-        value, (bool, int, str, float, bytes, *_SINGLETON_AST_TYPES)
-    ):
+    if value is None or isinstance(value, (bool, int, str, float, bytes, *_SINGLETON_AST_TYPES)):
         return ()
     if isinstance(value, ast.AST):
         return (value,)
@@ -392,9 +396,7 @@ def _extract_value_ast_nodes(value: Any) -> Tuple[ast.AST, ...]:
         cached_nodes_fn = getattr(curr, "cached_ast_nodes", None)
         if callable(cached_nodes_fn):
             for n in cached_nodes_fn():
-                if isinstance(n, ast.AST) and not isinstance(
-                    n, _SINGLETON_AST_TYPES
-                ):
+                if isinstance(n, ast.AST) and not isinstance(n, _SINGLETON_AST_TYPES):
                     found.append(n)
             continue
         curr_type = type(curr)
@@ -412,7 +414,16 @@ def _extract_value_ast_nodes(value: Any) -> Tuple[ast.AST, ...]:
                 if not isinstance(elem, _SINGLETON_AST_TYPES):
                     found.append(elem)
             elif not isinstance(
-                elem, (bool, int, str, float, bytes, type(None), *_SINGLETON_AST_TYPES)
+                elem,
+                (
+                    bool,
+                    int,
+                    str,
+                    float,
+                    bytes,
+                    type(None),
+                    *_SINGLETON_AST_TYPES,
+                ),
             ):
                 elem_id = id(elem)
                 if elem_id not in seen:
@@ -436,9 +447,7 @@ def _index_entry_ast_nodes(
     """Registers AST nodes for entry in forward_index and reverse_index."""
     entry_nodes = forward_index.setdefault(entry, set())
     for node in nodes:
-        if isinstance(node, ast.AST) and not isinstance(
-            node, _SINGLETON_AST_TYPES
-        ):
+        if isinstance(node, ast.AST) and not isinstance(node, _SINGLETON_AST_TYPES):
             entry_nodes.add(node)
             reverse_index.setdefault(node, set()).add(entry)
 
@@ -491,9 +500,7 @@ def _pop_parent_map_locked(root_node: ast.AST) -> None:
     """Removes root_node from _scope_parent_maps and prunes its reverse node-to-root index entries."""
     if root_node in _scope_parent_maps:
         _scope_parent_maps.pop(root_node, None)
-    _prune_reverse_index_buckets(
-        root_node, _parent_map_root_nodes, _node_to_parent_map_roots
-    )
+    _prune_reverse_index_buckets(root_node, _parent_map_root_nodes, _node_to_parent_map_roots)
 
 
 def _ensure_scope_owner_parent_map_locked(owner: ast.AST) -> None:
@@ -515,18 +522,12 @@ def _ensure_scope_owner_parent_map_locked(owner: ast.AST) -> None:
 def _register_key_ast_nodes(key: Any, nodes: Sequence[ast.AST]) -> None:
     """Incrementally registers AST nodes for key in _scope_owner_keys_index in O(|nodes|)."""
     if nodes:
-        _index_entry_ast_nodes(
-            key, nodes, _scope_key_nodes_index, _scope_owner_keys_index
-        )
+        _index_entry_ast_nodes(key, nodes, _scope_key_nodes_index, _scope_owner_keys_index)
 
 
-def _resync_key_ast_nodes_locked(
-    key: Any, extra_caches: Iterable[Mapping[Any, Any]] = ()
-) -> None:
+def _resync_key_ast_nodes_locked(key: Any, extra_caches: Iterable[Mapping[Any, Any]] = ()) -> None:
     """Rebuilds reverse AST node index entries for key across all active scope caches."""
-    _prune_reverse_index_buckets(
-        key, _scope_key_nodes_index, _scope_owner_keys_index
-    )
+    _prune_reverse_index_buckets(key, _scope_key_nodes_index, _scope_owner_keys_index)
     active_caches: List[Mapping[Any, Any]] = [
         _scope_closures_cache,
         _scope_cell_info_cache,
@@ -549,9 +550,7 @@ def _resync_key_ast_nodes_locked(
 def _unregister_key_if_absent(key: Any) -> None:
     """Removes or resynchronizes key in _scope_owner_keys_index across active scope caches."""
     if key not in _scope_closures_cache and key not in _scope_cell_info_cache:
-        _prune_reverse_index_buckets(
-            key, _scope_key_nodes_index, _scope_owner_keys_index
-        )
+        _prune_reverse_index_buckets(key, _scope_key_nodes_index, _scope_owner_keys_index)
     else:
         _resync_key_ast_nodes_locked(key)
 
@@ -579,7 +578,10 @@ class _TrackedCachedDict(Dict[Any, Any]):
 
     def bind_owner(self, cache: Any, cache_key: Any) -> None:
         """Registers an owning (_TrackedScopeCache, key) pair for incremental node registration."""
-        self._ensure_bound_owners()[(id(cache), cache_key)] = (cache, cache_key)
+        self._ensure_bound_owners()[(id(cache), cache_key)] = (
+            cache,
+            cache_key,
+        )
 
     def unbind_owner(self, cache: Any, cache_key: Any) -> None:
         """Unregisters an owning (_TrackedScopeCache, key) pair."""
@@ -767,11 +769,7 @@ class _TrackedScopeCache(OrderedDict[Any, _CacheValT]):
                 prev_val.unbind_owner(self, k)
         self.ensure_kind_keys().clear()
         super().clear()
-        other = (
-            _scope_cell_info_cache
-            if self is _scope_closures_cache
-            else _scope_closures_cache
-        )
+        other = _scope_cell_info_cache if self is _scope_closures_cache else _scope_closures_cache
         if not other:
             _scope_owner_keys_index.clear()
             _scope_key_nodes_index.clear()
@@ -795,9 +793,7 @@ def _key_references_scope_nodes(
 ) -> bool:
     """Returns True if a cache key references any AST node in tree_nodes."""
     if isinstance(key, _ScopeCacheKey):
-        return key.owner in tree_nodes or any(
-            n in tree_nodes for n in key.aux_ast_nodes
-        )
+        return key.owner in tree_nodes or any(n in tree_nodes for n in key.aux_ast_nodes)
     if isinstance(key, ast.AST):
         return key in tree_nodes
     if not isinstance(key, (tuple, frozenset)):
@@ -827,9 +823,7 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
     tree_nodes: Set[ast.AST] = {
         n for n in ast.walk(tree) if not isinstance(n, _SINGLETON_AST_TYPES)
     }
-    scope_nodes: Set[ast.AST] = {
-        node for node in tree_nodes if isinstance(node, _SCOPE_ROOT_TYPES)
-    }
+    scope_nodes: Set[ast.AST] = {node for node in tree_nodes if isinstance(node, _SCOPE_ROOT_TYPES)}
     scope_nodes.add(tree)
     with _downstream_cache_lock:
         candidate_roots: Set[ast.AST] = set()
@@ -863,13 +857,16 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
             scope_nodes.add(root_node)
             has_inner_scope_anc = isinstance(
                 matched_child,
-                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+                (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.ClassDef,
+                    ast.Lambda,
+                ),
             )
             curr_anc: Optional[ast.AST] = pmap.get(matched_child)
             while curr_anc is not None:
-                if curr_anc is not root_node or not isinstance(
-                    root_node, ast.Module
-                ):
+                if curr_anc is not root_node or not isinstance(root_node, ast.Module):
                     tree_nodes.add(curr_anc)
                 if isinstance(curr_anc, _SCOPE_ROOT_TYPES):
                     scope_nodes.add(curr_anc)
@@ -883,9 +880,7 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
                 if s_owner in scope_nodes:
                     continue
                 t_lineno = getattr(tree, "lineno", 0) or 0
-                if t_lineno > 0 and any(
-                    s in tree_nodes for s in line_map.get(t_lineno, ())
-                ):
+                if t_lineno > 0 and any(s in tree_nodes for s in line_map.get(t_lineno, ())):
                     scope_nodes.add(s_owner)
                     tree_nodes.add(s_owner)
         for node in tree_nodes:
@@ -937,18 +932,12 @@ def _store_lru_cache_entry(
     """
     evicted_trees: List[ast.AST] = []
     with _downstream_cache_lock:
-        if (
-            cache is _scope_parent_maps
-            and isinstance(key, ast.AST)
-            and isinstance(value, dict)
-        ):
+        if cache is _scope_parent_maps and isinstance(key, ast.AST) and isinstance(value, dict):
             return cast(_CacheValT, _store_parent_map_locked(key, value))
         if key in cache:
             cache.move_to_end(key)
             return cache[key]
-        if isinstance(cache, _TrackedScopeCache) and isinstance(
-            key, _ScopeCacheKey
-        ):
+        if isinstance(cache, _TrackedScopeCache) and isinstance(key, _ScopeCacheKey):
             kind_cap = _SCOPE_CACHE_KIND_CAPS.get(key.kind)
             if kind_cap is not None and max_size > kind_cap:
                 kind_ring = cache.ensure_kind_keys().get(key.kind)
@@ -986,9 +975,7 @@ def _get_or_compute_scope_cached(
     # concurrent misses is harmless because compute_fn is deterministic and pure.
     computed = compute_fn()
     try:
-        return _store_lru_cache_entry(
-            cache, scope_node, computed, _MAX_SCOPE_CACHE_SIZE
-        )
+        return _store_lru_cache_entry(cache, scope_node, computed, _MAX_SCOPE_CACHE_SIZE)
     except TypeError as exc:
         if "cached_ast_nodes()" in str(exc):
             raise
@@ -1033,7 +1020,13 @@ def _get_or_parse_tree(
         with _suppress_syntax_warnings():
             parsed = ast.parse(source_text)
         setattr(parsed, "_immutable_cached", True)
-    except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
+    except (
+        SyntaxError,
+        ValueError,
+        UnicodeDecodeError,
+        RecursionError,
+        MemoryError,
+    ):
         parsed = None
 
     stored_tree = _store_lru_cache_entry(
@@ -1067,9 +1060,7 @@ def _get_valid_unit_bounds(unit: Any) -> Optional[Tuple[int, int]]:
     return u_start, u_end
 
 
-def _extract_first_unit_coord(
-    unit: Dict[str, Any], keys: Sequence[str]
-) -> Optional[int]:
+def _extract_first_unit_coord(unit: Dict[str, Any], keys: Sequence[str]) -> Optional[int]:
     """Returns the first successfully parsed coordinate among candidate keys."""
     if not isinstance(unit, dict):
         return None
@@ -1089,9 +1080,7 @@ def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
     return _extract_first_unit_coord(unit, ("end_col", "end_col_offset"))
 
 
-def _get_scope_parent_map(
-    scope_node: ast.AST, *, use_cache: bool = True
-) -> Dict[ast.AST, ast.AST]:
+def _get_scope_parent_map(scope_node: ast.AST, *, use_cache: bool = True) -> Dict[ast.AST, ast.AST]:
     """Retrieves or builds cached parent map for AST nodes within the scope.
 
     Note:
@@ -1100,6 +1089,7 @@ def _get_scope_parent_map(
         contexts). Callers must treat the underlying dictionary as strictly
         read-only and never mutate it after construction.
     """
+
     def _compute() -> Dict[ast.AST, ast.AST]:
         parent_map: Dict[ast.AST, ast.AST] = {}
         for parent in ast.walk(scope_node):
@@ -1110,25 +1100,17 @@ def _get_scope_parent_map(
 
     if not use_cache:
         return _compute()
-    return _get_or_compute_scope_cached(
-        _scope_parent_maps, scope_node, _compute
-    )
+    return _get_or_compute_scope_cached(_scope_parent_maps, scope_node, _compute)
 
 
-def _index_scope_stmts(
-    scope_node: ast.AST, *, use_end_lineno: bool
-) -> Dict[int, List[ast.stmt]]:
+def _index_scope_stmts(scope_node: ast.AST, *, use_end_lineno: bool) -> Dict[int, List[ast.stmt]]:
     """Indexes statement nodes within a scope by start or end line number."""
     m: Dict[int, List[ast.stmt]] = {}
     for node in ast.walk(scope_node):
         if node is scope_node or not isinstance(node, ast.stmt):
             continue
         lineno = getattr(node, "lineno", 0) or 0
-        line_key = (
-            (getattr(node, "end_lineno", None) or lineno)
-            if use_end_lineno
-            else lineno
-        )
+        line_key = (getattr(node, "end_lineno", None) or lineno) if use_end_lineno else lineno
         if line_key > 0:
             m.setdefault(line_key, []).append(node)
     return m
@@ -1156,9 +1138,7 @@ def _get_scope_stmts_by_start_lineno(
     )
 
 
-def _resolve_unit_ast_end_col(
-    scope_node: ast.AST, unit: Dict[str, Any]
-) -> Optional[int]:
+def _resolve_unit_ast_end_col(scope_node: ast.AST, unit: Dict[str, Any]) -> Optional[int]:
     """Resolves end column offset from statement boundaries within the enclosing scope."""
     bounds = _get_valid_unit_bounds(unit)
     if bounds is None:
@@ -1212,8 +1192,7 @@ def _resolve_unit_ast_end_col(
         matched = [
             s
             for s in inner_stmts
-            if getattr(s, "lineno", 0) == u_start
-            and getattr(s, "col_offset", 0) >= start_col
+            if getattr(s, "lineno", 0) == u_start and getattr(s, "col_offset", 0) >= start_col
         ]
         if len(matched) == 1:
             target_stmt = matched[0]
@@ -1235,9 +1214,7 @@ def _resolve_unit_ast_end_col(
                     not isinstance(s, ast.Expr)
                     and getattr(s, "lineno", 0) == u_start
                     and getattr(s, "col_offset", 0) == start_col
-                    for s in _get_scope_stmts_by_start_lineno(scope_node).get(
-                        u_start, []
-                    )
+                    for s in _get_scope_stmts_by_start_lineno(scope_node).get(u_start, [])
                 )
             )
         )
@@ -1313,15 +1290,9 @@ def _coerce_string_frozenset(raw_items: Any) -> Optional[frozenset[str]]:
     """Safely coerces strings and ints from arbitrary raw inputs into a frozenset."""
     if raw_items is None:
         return None
-    iterable = (
-        [raw_items]
-        if isinstance(raw_items, (str, bytes, int))
-        else raw_items
-    )
+    iterable = [raw_items] if isinstance(raw_items, (str, bytes, int)) else raw_items
     try:
-        return frozenset(
-            str(x) for x in iterable if isinstance(x, (str, int))
-        )
+        return frozenset(str(x) for x in iterable if isinstance(x, (str, int)))
     except (TypeError, ValueError):
         return None
 
@@ -1353,16 +1324,10 @@ def _build_downstream_cache_key(
     if source_digest is not None:
         content_digest = str(source_digest)
     else:
-        content_digest = hashlib.sha256(
-            source_text.encode("utf-8", errors="replace")
-        ).hexdigest()
+        content_digest = hashlib.sha256(source_text.encode("utf-8", errors="replace")).hexdigest()
 
     start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
-    end_col = (
-        resolved_end_col
-        if resolved_end_col is not None
-        else _extract_unit_end_col(unit)
-    )
+    end_col = resolved_end_col if resolved_end_col is not None else _extract_unit_end_col(unit)
     cands_key = _coerce_string_frozenset(candidates)
 
     unit_inputs_val = unit_inputs
@@ -1379,7 +1344,11 @@ def _build_downstream_cache_key(
     )
     raw_src_code = unit.get("source_code")
     unit_source_hash: Optional[str] = None
-    if (start_col is None or end_col is None) and isinstance(raw_src_code, str) and raw_src_code.strip():
+    if (
+        (start_col is None or end_col is None)
+        and isinstance(raw_src_code, str)
+        and raw_src_code.strip()
+    ):
         unit_source_hash = hashlib.sha256(
             raw_src_code.strip().encode("utf-8", errors="replace")
         ).hexdigest()[:16]

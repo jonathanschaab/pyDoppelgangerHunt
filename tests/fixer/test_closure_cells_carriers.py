@@ -1,4 +1,5 @@
 """Tests for closure-cell carriers, scope modes, UTF-8 slicing, and span indexing."""
+
 from __future__ import annotations
 
 import ast
@@ -18,44 +19,13 @@ from pydoppelgangerhunt.fixer import (
 )
 
 
-def test_builtin_call_loads_target_rebinding_vs_mutation_and_hazard_matrix(
-    tmp_path: Path,
-) -> None:
-    """Covers built-in call load/closure preservation, rebound vs mutated targets, and differential execution."""
-    import subprocess
-
-    from pydoppelgangerhunt.fixer import _slice_unit_token_lines
-    from pydoppelgangerhunt.fixer.scope import (
-        ensure_unit_scope_closure_mode,
-        scope_matches_closure_mode,
-    )
-    from pydoppelgangerhunt.fixer.source import _slice_utf8_line
-    from pydoppelgangerhunt.fixer._df_cache import (
-        _evict_tree_scopes,
-        _scope_cell_info_cache,
-    )
+def test_builtin_call_loads_and_closure_extraction() -> None:
+    """Covers built-in call load, inline closure read/mutation, and called_names_out extraction."""
     from pydoppelgangerhunt.fixer._df_cell_carriers import (
         _FnScopeContext,
-        _SpanBounds,
-        _extract_cached_scope_free_reads,
-        _extract_closure_carrier_mutation_targets_and_values,
-        _extract_closure_carrier_targets_and_values,
-        _extract_closure_nonlocal_mutations_and_deletions,
         _extract_expr_closure_and_load_info,
-        _extract_fn_outer_carrier_targets,
-        _extract_fn_returned_closure_refs,
-        _extract_mutated_target_names,
-        _extract_root_target_names,
-    )
-    from pydoppelgangerhunt.fixer._df_cell_traversal import (
-        _analyze_enclosing_fn_cells,
-    )
-    from pydoppelgangerhunt.fixer._df_span_index import (
-        _find_enclosing_function_chain,
-        _resolve_unit_col_bounds,
     )
 
-    # 1. Built-in call handling preserves loaded_names, inline_reads, inline_muts, and called_names_out
     unshadowed_ctx = _FnScopeContext(
         fn_locals=frozenset(),
         parent_map={},
@@ -105,7 +75,19 @@ def test_builtin_call_loads_target_rebinding_vs_mutation_and_hazard_matrix(
     assert l_shad == {"items"}
     assert called_shadowed == {"len"}
 
-    # 2. Rebound target names vs mutated attribute/subscript target names
+
+def test_rebound_target_names_vs_mutated_attribute_and_subscript_targets() -> None:
+    """Covers rebound target names vs mutated attribute/subscript target names and alias edges."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _extract_closure_carrier_mutation_targets_and_values,
+        _extract_closure_carrier_targets_and_values,
+        _extract_mutated_target_names,
+        _extract_root_target_names,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _analyze_enclosing_fn_cells,
+    )
+
     stmt_rebind = ast.parse("cb = make_callback()\n").body[0]
     stmt_destruct = ast.parse("first, (second, *rest) = make_callbacks()\n").body[0]
     stmt_attr = ast.parse("obj.callback = make_callback()\n").body[0]
@@ -134,12 +116,8 @@ def test_builtin_call_loads_target_rebinding_vs_mutation_and_hazard_matrix(
 
     assert _extract_closure_carrier_targets_and_values(stmt_attr) is None
     assert _extract_closure_carrier_targets_and_values(stmt_sub) is None
-    attr_mut_carrier = _extract_closure_carrier_mutation_targets_and_values(
-        stmt_attr
-    )
-    sub_mut_carrier = _extract_closure_carrier_mutation_targets_and_values(
-        stmt_sub
-    )
+    attr_mut_carrier = _extract_closure_carrier_mutation_targets_and_values(stmt_attr)
+    sub_mut_carrier = _extract_closure_carrier_mutation_targets_and_values(stmt_sub)
     assert attr_mut_carrier is not None and attr_mut_carrier[0] == {"obj"}
     assert sub_mut_carrier is not None and sub_mut_carrier[0] == {"mapping"}
 
@@ -162,7 +140,9 @@ def test_builtin_call_loads_target_rebinding_vs_mutation_and_hazard_matrix(
     assert alias_dict.get("left_a") == frozenset({"source_cb"})
     assert alias_dict.get("right_b") == frozenset({"source_cb"})
 
-    # 3. Paired positive (rebind captured cell) vs negative (mutate referenced object) hazard checks
+
+def test_rebind_captured_cell_vs_mutate_referenced_object_hazard() -> None:
+    """Verifies rebinding a captured cell raises severed_closure_cell while mutating the referenced object is safe."""
     src_rebind_captured = (
         "def outer(items):\n"
         "    value = 1\n"
@@ -204,7 +184,21 @@ def test_builtin_call_loads_target_rebinding_vs_mutation_and_hazard_matrix(
     assert "severed_closure_cell" not in sc_mutate_obj["control_flow_hazards"]
     assert sc_mutate_obj["is_control_flow_safe"] is True
 
-    # 4. Cache eviction across NamedTuple/frozenset keys, statement nodes, and defensive copy immutability
+
+def test_cache_eviction_and_defensive_copy_immutability() -> None:
+    """Verifies cache eviction across NamedTuple/frozenset keys and defensive copy immutability."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _evict_tree_scopes,
+        _scope_cell_info_cache,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _SpanBounds,
+        _extract_cached_scope_free_reads,
+        _extract_closure_nonlocal_mutations_and_deletions,
+        _extract_fn_outer_carrier_targets,
+        _extract_fn_returned_closure_refs,
+    )
+
     cache_tree = ast.parse(
         "def outer(x):\n"
         "    def inner():\n"
@@ -245,7 +239,17 @@ def test_builtin_call_loads_target_rebinding_vs_mutation_and_hazard_matrix(
     _evict_tree_scopes(cache_tree)
     assert nt_key not in _scope_cell_info_cache
 
-    # 5. Column bounds resolution: two statements on one line, Unicode prefix, and ambiguous fail-closed
+
+def test_unit_column_bounds_resolution_and_lexical_scope_barriers() -> None:
+    """Covers column bounds resolution on multi-statement lines and PEP 3104 global/nonlocal barriers."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _extract_closure_nonlocal_mutations_and_deletions,
+    )
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _find_enclosing_function_chain,
+        _resolve_unit_col_bounds,
+    )
+
     two_stmt_src = (
         "def f(xs, ys):\n"
         "    a = [x + 1 for x in xs]; b = [y + 2 for y in ys]\n"
@@ -253,37 +257,22 @@ def test_builtin_call_loads_target_rebinding_vs_mutation_and_hazard_matrix(
     )
     two_stmt_tree = ast.parse(two_stmt_src)
     cand_b = ast.parse("[y + 2 for y in ys]\n").body
-    s_col_b, e_col_b = _resolve_unit_col_bounds(
-        cand_b, two_stmt_tree, 2, 2, None, None
-    )
+    s_col_b, e_col_b = _resolve_unit_col_bounds(cand_b, two_stmt_tree, 2, 2, None, None)
     assert s_col_b == 33
     assert e_col_b == 52
 
-    ambig_src = (
-        "def f(xs):\n"
-        "    return ([x for x in xs], [x for x in xs])\n"
-    )
+    ambig_src = "def f(xs):\n" "    return ([x for x in xs], [x for x in xs])\n"
     ambig_tree = ast.parse(ambig_src)
     cand_ambig = ast.parse("[x for x in xs]\n").body
-    s_ambig, e_ambig = _resolve_unit_col_bounds(
-        cand_ambig, ambig_tree, 2, 2, None, None
-    )
+    s_ambig, e_ambig = _resolve_unit_col_bounds(cand_ambig, ambig_tree, 2, 2, None, None)
     assert s_ambig is None
     assert e_ambig is None
 
-    dec_src = (
-        "@dec1(\n"
-        "    arg1\n"
-        ")\n"
-        "def f(xs):\n"
-        "    return [x for x in xs]\n"
-    )
+    dec_src = "@dec1(\n" "    arg1\n" ")\n" "def f(xs):\n" "    return [x for x in xs]\n"
     dec_tree = ast.parse(dec_src)
     assert _find_enclosing_function_chain(dec_tree, 2, 2) == []
     assert len(_find_enclosing_function_chain(dec_tree, 5, 5)) == 1
 
-    # 6. Lexical scope: intermediate function declaring `global x` is a PEP 3104 SyntaxError
-    # when nested `inner` declares `nonlocal x`, and fails closed if constructed synthetically.
     invalid_lexical_src = (
         "def outer():\n"
         "    x = 1\n"
@@ -319,7 +308,16 @@ def test_builtin_call_loads_target_rebinding_vs_mutation_and_hazard_matrix(
     assert "severed_closure_cell" in sc_invalid_lex["control_flow_hazards"]
     assert sc_invalid_lex["is_control_flow_safe"] is False
 
-    # 7. UTF-8 byte offsets and _slice_unit_token_lines with accented and CJK characters and CRLF
+
+def test_utf8_byte_offsets_and_closure_strictness_mode_transitions() -> None:
+    """Covers UTF-8 byte offsets with CRLF and closure-strictness mode transitions."""
+    from pydoppelgangerhunt.fixer import _slice_unit_token_lines
+    from pydoppelgangerhunt.fixer.scope import (
+        ensure_unit_scope_closure_mode,
+        scope_matches_closure_mode,
+    )
+    from pydoppelgangerhunt.fixer.source import _slice_utf8_line
+
     line_accent = '    result = "é" + value\r\n'
     line_cjk = '    result = "界" + value\r\n'
     tree_accent = ast.parse(line_accent.strip())
@@ -355,7 +353,6 @@ def test_builtin_call_loads_target_rebinding_vs_mutation_and_hazard_matrix(
     )
     assert sliced_multi == ["(\r\n", "    value_a + value_b\r\n", ")"]
 
-    # 8 & 9. Closure-strictness mode transitions and hazard propagation across refactoring entry points
     lenient_src = (
         "def outer(items):\n"
         "    cbs = [lambda: acc]\n"
@@ -398,7 +395,13 @@ def test_builtin_call_loads_target_rebinding_vs_mutation_and_hazard_matrix(
     assert scope_matches_closure_mode(sc_back_to_strict, False) is True
     assert "severed_closure_cell" in sc_back_to_strict["control_flow_hazards"]
 
-    # Returned closure hazard cannot be bypassed even when skip_pre_unit_closures=True
+
+def test_returned_closure_hazard_and_captured_mutable_differential_execution(
+    tmp_path: Path,
+) -> None:
+    """Verifies returned closure hazards are rejected even in lenient mode and safe mutable capture executes identically."""
+    import subprocess
+
     ret_hazard_src = (
         "def outer1(items):\n"
         "    cbs = [lambda: acc]\n"
@@ -436,18 +439,12 @@ def test_builtin_call_loads_target_rebinding_vs_mutation_and_hazard_matrix(
     sc_u1_ret = inspect_single_unit_scope(u1_ret, repo_root=str(tmp_path))
     sc_u2_ret = inspect_single_unit_scope(u2_ret, repo_root=str(tmp_path))
     assert resolve_clone_pair_outputs(u1_ret, u2_ret, sc_u1_ret, sc_u2_ret) is None
-    assert (
-        resolve_clone_generator_subroutine_outputs(
-            u1_ret, u2_ret, sc_u1_ret, sc_u2_ret
-        )
-        is None
-    )
+    assert resolve_clone_generator_subroutine_outputs(u1_ret, u2_ret, sc_u1_ret, sc_u2_ret) is None
     patch_res = generate_refactoring_patch(
         [(1.0, u1_ret, u2_ret)], repo_root=str(tmp_path), replace_clones=True
     )
     assert patch_res == ""
 
-    # 10. Differential execution verifying captured mutable side effects and pre/post callback observations
     safe_mut_src = (
         "def run_first(items):\n"
         "    history = []\n"
@@ -509,9 +506,7 @@ def test_builtin_call_loads_target_rebinding_vs_mutation_and_hazard_matrix(
     exec(  # pylint: disable=exec-used
         compile(safe_mut_src, "<orig>", "exec"), ns_orig
     )  # nosec B102
-    exec(  # pylint: disable=exec-used
-        compile(patched_src, "<ref>", "exec"), ns_ref
-    )  # nosec B102
+    exec(compile(patched_src, "<ref>", "exec"), ns_ref)  # pylint: disable=exec-used  # nosec B102
     b_o, a_o, snap_o = ns_orig["run_first"]([-1, 2, 4])
     b_r, a_r, snap_r = ns_ref["run_first"]([-1, 2, 4])
     assert (b_o, a_o, snap_o(), snap_o()) == (b_r, a_r, snap_r(), snap_r())
@@ -544,9 +539,7 @@ def test_is_ast_node_within_unit_bounds_and_visitors_column_filtering(
     assert len(stmts) == 3
 
     actual = [
-        _is_ast_node_within_unit_bounds(
-            s, 2, 2, u_end_col=u_end_col, u_start_col=u_start_col
-        )
+        _is_ast_node_within_unit_bounds(s, 2, 2, u_end_col=u_end_col, u_start_col=u_start_col)
         for s in stmts
     ]
     assert actual == expected_in_bounds
@@ -573,9 +566,7 @@ def test_unit_live_in_and_downstream_read_visitors_column_filtering() -> None:
     live_in_vis.visit(fn_node)
     assert live_in_vis.live_ins == {"x", "b"}
 
-    ds_vis = _DownstreamReadVisitor(
-        2, 2, u_end_col=mid_end, u_start_col=mid_start
-    )
+    ds_vis = _DownstreamReadVisitor(2, 2, u_end_col=mid_end, u_start_col=mid_start)
     for s in stmts:
         ds_vis.visit(s)
     assert "y" in ds_vis.loaded
@@ -632,9 +623,7 @@ def test_scope_preservation_carrier_shadowing_and_concurrency() -> None:
         "scope_schema_version": 2,
     }
     assert (
-        ensure_unit_scope_closure_mode(
-            {"start": 1, "end": 1}, marked_hand_built, True
-        )
+        ensure_unit_scope_closure_mode({"start": 1, "end": 1}, marked_hand_built, True)
         is marked_hand_built
     )
     marked_strict_hand_built = {
@@ -643,20 +632,13 @@ def test_scope_preservation_carrier_shadowing_and_concurrency() -> None:
         "scope_schema_version": 2,
     }
     assert (
-        ensure_unit_scope_closure_mode(
-            {"start": 1, "end": 1}, marked_strict_hand_built, False
-        )
+        ensure_unit_scope_closure_mode({"start": 1, "end": 1}, marked_strict_hand_built, False)
         is marked_strict_hand_built
     )
-    unmarked_fallback = ensure_unit_scope_closure_mode(
-        {"start": 1, "end": 1}, hand_built, True
-    )
+    unmarked_fallback = ensure_unit_scope_closure_mode({"start": 1, "end": 1}, hand_built, True)
     assert unmarked_fallback["is_control_flow_safe"] is False
     assert "severed_closure_cell" in unmarked_fallback["control_flow_hazards"]
-    assert (
-        "unavailable_source_for_closure_mode"
-        in unmarked_fallback["closure_hazard_reasons"]
-    )
+    assert "unavailable_source_for_closure_mode" in unmarked_fallback["closure_hazard_reasons"]
     pathological_scope: dict[str, Any] = {
         **hand_built,
         "skip_pre_unit_closures": False,
@@ -665,9 +647,7 @@ def test_scope_preservation_carrier_shadowing_and_concurrency() -> None:
         "is_control_flow_safe": False,
     }
     assert (
-        ensure_unit_scope_closure_mode(
-            {"start": 1, "end": 1}, pathological_scope, True
-        )
+        ensure_unit_scope_closure_mode({"start": 1, "end": 1}, pathological_scope, True)
         is pathological_scope
     )
     combined_scope = analyze_unit_variable_scope(
@@ -688,10 +668,7 @@ def test_scope_preservation_carrier_shadowing_and_concurrency() -> None:
 
     # 3. _extract_fn_returned_closure_refs respects local parameter shadowing built-in `len`
     shad_ret_tree = ast.parse(
-        "def outer(cb):\n"
-        "    def helper(len):\n"
-        "        return len(cb)\n"
-        "    return helper\n"
+        "def outer(cb):\n" "    def helper(len):\n" "        return len(cb)\n" "    return helper\n"
     )
     outer_fn = shad_ret_tree.body[0]
     assert isinstance(outer_fn, ast.FunctionDef)
@@ -741,9 +718,7 @@ def test_scope_preservation_carrier_shadowing_and_concurrency() -> None:
         "        return 42\n"
         "builder()\n"
     ).body
-    g_names, g_ids = _collect_escaped_intra_unit_defs(
-        global_def_stmts, frozenset()
-    )
+    g_names, g_ids = _collect_escaped_intra_unit_defs(global_def_stmts, frozenset())
     assert "exported_fn" in g_names
     assert len(g_ids) == 1
 
@@ -780,9 +755,7 @@ def test_scope_preservation_carrier_shadowing_and_concurrency() -> None:
 
     # 6. _unit_cols requires exact match when one endpoint is already provided
     line_dup = ["    x = foo(1); y = foo(1)\n"]
-    s_exact, e_exact = _unit_cols(
-        {"source_code": "foo(1)", "start_col": 8}, line_dup
-    )
+    s_exact, e_exact = _unit_cols({"source_code": "foo(1)", "start_col": 8}, line_dup)
     assert (s_exact, e_exact) == (8, 14)
 
     # 7. Eviction work check on 5,000 composite keys with 300-name frozensets
@@ -800,12 +773,10 @@ def test_scope_preservation_carrier_shadowing_and_concurrency() -> None:
     big_names = frozenset(f"var_name_{i}" for i in range(300))
     other_big_names = _CountingFrozenset(big_names)
     for i in range(2500):
-        _scope_cell_info_cache[
-            (evict_tree.body[0], "outer_carriers", big_names, i)
-        ] = frozenset()
-        _scope_cell_info_cache[
-            (other_tree.body[0], "outer_carriers", other_big_names, i)
-        ] = frozenset()
+        _scope_cell_info_cache[(evict_tree.body[0], "outer_carriers", big_names, i)] = frozenset()
+        _scope_cell_info_cache[(other_tree.body[0], "outer_carriers", other_big_names, i)] = (
+            frozenset()
+        )
     assert len(_scope_cell_info_cache) == 5000
     probe_iters = 0
     _evict_tree_scopes(evict_tree)
@@ -849,9 +820,7 @@ def test_scope_preservation_carrier_shadowing_and_concurrency() -> None:
                     frozenset(),
                     mod_tree=conc_tree,
                 )
-                info_loop = _analyze_enclosing_fn_cells(
-                    outer_c, (8, 8, 8, 23), mod_tree=conc_tree
-                )
+                info_loop = _analyze_enclosing_fn_cells(outer_c, (8, 8, 8, 23), mod_tree=conc_tree)
                 if tid == 0 and step % 10 == 0:
                     _evict_tree_scopes(ast.parse("def ephemeral(): pass\n"))
                 if "scale" not in infos[0].pre_bound or "scale" not in info_loop.pre_bound:
@@ -953,21 +922,12 @@ def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
     unmarked_strict2.pop("skip_pre_unit_closures", None)
     assert scope_matches_closure_mode(unmarked_strict1, False) is False
     assert scope_matches_closure_mode(unmarked_strict1, True) is False
+    assert scope_matches_closure_mode({**strict_sc1, "scope_schema_version": 1}, False) is False
+    assert scope_matches_closure_mode(strict_sc1, False, strict_with_suppression=True) is False
     assert (
-        scope_matches_closure_mode(
-            {**strict_sc1, "scope_schema_version": 1}, False
-        )
+        scope_matches_closure_mode({**unmarked_strict1, "skip_pre_unit_closures": None}, False)
         is False
     )
-    assert (
-        scope_matches_closure_mode(
-            strict_sc1, False, strict_with_suppression=True
-        )
-        is False
-    )
-    assert scope_matches_closure_mode(
-        {**unmarked_strict1, "skip_pre_unit_closures": None}, False
-    ) is False
 
     # Passing unmarked strict scopes into lenient mode recomputes to lenient
     recomputed_lenient = ensure_unit_scope_closure_mode(
@@ -985,9 +945,7 @@ def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
         return_details=True,
     )
     assert res_gen_lenient.outputs is not None
-    unmarked_comb_strict = analyze_unit_variable_scope(
-        u_g1, u_g2, repo_root=str(tmp_path)
-    )
+    unmarked_comb_strict = analyze_unit_variable_scope(u_g1, u_g2, repo_root=str(tmp_path))
     unmarked_comb_strict.pop("skip_pre_unit_closures", None)
     synth_from_unmarked_strict = synthesize_shared_helper_code(
         u_g1,
@@ -1089,9 +1047,7 @@ def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
         "                return MethodCls\n"
     )
     outer_cls_node = cls_prop_tree.body[0].body[4]  # type: ignore[attr-defined]
-    muts_cls, dels_cls = _extract_closure_nonlocal_mutations_and_deletions(
-        outer_cls_node
-    )
+    muts_cls, dels_cls = _extract_closure_nonlocal_mutations_and_deletions(outer_cls_node)
     assert muts_cls == {"x", "y", "z", "w"}
     assert dels_cls == {"w"}
     assert "g_var" not in muts_cls
@@ -1206,17 +1162,15 @@ def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
     )
     f_prec_fn = factory_prec_tree.body[0]
     f_prec_ctx = _get_fn_scope_context(f_prec_fn, mod_tree=factory_prec_tree)
-    body_nodes = {
-        getattr(n, "name", ""): n for n in f_prec_fn.body  # type: ignore[attr-defined]
-    }
+    body_nodes = {getattr(n, "name", ""): n for n in f_prec_fn.body}  # type: ignore[attr-defined]
     assert _is_closure_factory_scope(body_nodes["PureRecord"], f_prec_ctx) is False
     assert _is_closure_factory_scope(body_nodes["PureService"], f_prec_ctx) is False
     assert _is_closure_factory_scope(body_nodes["CapturingCls"], f_prec_ctx) is True
     assert _is_closure_factory_scope(body_nodes["MutatingCls"], f_prec_ctx) is True
     assert _is_closure_factory_scope(body_nodes["FactoryCls"], f_prec_ctx) is True
-    assert _extract_fn_outer_carrier_targets(
-        body_nodes["CarrierCls"], frozenset(), f_prec_ctx
-    ) == {"reg"}
+    assert _extract_fn_outer_carrier_targets(body_nodes["CarrierCls"], frozenset(), f_prec_ctx) == {
+        "reg"
+    }
     assert _is_closure_factory_scope(body_nodes["pure_async"], f_prec_ctx) is False
     assert _is_closure_factory_scope(body_nodes["capturing_async"], f_prec_ctx) is True
     assert _is_closure_factory_scope(body_nodes["mutating_async"], f_prec_ctx) is True
@@ -1420,20 +1374,10 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
 
     # Global declarations inside extracted unit escaping to outer statements
     global_escape_assign_src = (
-        "x = 0\n"
-        "def process():\n"
-        "    global x\n"
-        "    x = 1\n"
-        "    x = 2\n"
-        "    return x\n"
+        "x = 0\n" "def process():\n" "    global x\n" "    x = 1\n" "    x = 2\n" "    return x\n"
     )
     ge_tree = ast.parse(global_escape_assign_src)
-    assert (
-        _has_escaped_intra_unit_global_declarations(
-            ge_tree.body[1], 3, 4
-        )
-        is True
-    )
+    assert _has_escaped_intra_unit_global_declarations(ge_tree.body[1], 3, 4) is True
     sc_global_escape = inspect_single_unit_scope(
         {
             "start": 3,
@@ -1544,9 +1488,7 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
     ds_outer = ds_tree.body[0]
     assert isinstance(ds_outer, ast.FunctionDef)
     detached_mod = ast.Module(body=[ds_outer.body[2]], type_ignores=[])
-    assert "list" in _extract_scope_local_names(
-        detached_mod, module_tree=ds_tree
-    )
+    assert "list" in _extract_scope_local_names(detached_mod, module_tree=ds_tree)
     detached_closures = _collect_scope_closures_uncached(
         detached_mod,
         module_tree=ds_tree,
@@ -1577,9 +1519,7 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
     dw_tree = ast.parse(detached_walrus_shadow_src)
     dw_outer = dw_tree.body[0]
     assert isinstance(dw_outer, ast.FunctionDef)
-    dw_muts = _collect_unit_nonlocal_mutators(
-        [dw_outer.body[2]], mod_tree=dw_tree
-    )
+    dw_muts = _collect_unit_nonlocal_mutators([dw_outer.body[2]], mod_tree=dw_tree)
     assert any("w" in m.mutated_vars for m in dw_muts)
     sc_detached_walrus = inspect_single_unit_scope(
         {
@@ -1756,9 +1696,7 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
         "scope_schema_version": SCOPE_SCHEMA_VERSION,
     }
     assert (
-        ensure_unit_scope_closure_mode(
-            min_unit, marked_v2_min, False, tree=min_tree
-        )
+        ensure_unit_scope_closure_mode(min_unit, marked_v2_min, False, tree=min_tree)
         is marked_v2_min
     )
     recomputed_unmarked_min = ensure_unit_scope_closure_mode(
@@ -1778,11 +1716,7 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
 
     # Exception-handler termination & unexported conditional rebinding
     term_handler_stmts = ast.parse(
-        "e = 1\n"
-        "try:\n"
-        "    x = 2\n"
-        "except Exception as e:\n"
-        "    return 0\n"
+        "e = 1\n" "try:\n" "    x = 2\n" "except Exception as e:\n" "    return 0\n"
     ).body
     def_th: set[str] = set()
     cond_th: set[str] = set()
@@ -1791,11 +1725,7 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
     assert "e" not in cond_th
 
     nonterm_handler_stmts = ast.parse(
-        "e = 1\n"
-        "try:\n"
-        "    x = 2\n"
-        "except Exception as e:\n"
-        "    x = 0\n"
+        "e = 1\n" "try:\n" "    x = 2\n" "except Exception as e:\n" "    x = 0\n"
     ).body
     def_nth: set[str] = set()
     cond_nth: set[str] = set()
@@ -1843,10 +1773,7 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
             "kind": "compound_block",
             "source_text": except_clobber_prebound_src,
             "source_code": (
-                "try:\n"
-                "    res = a * 2\n"
-                "except Exception as e:\n"
-                "    res = 0\n"
+                "try:\n" "    res = a * 2\n" "except Exception as e:\n" "    res = 0\n"
             ),
         }
     )
@@ -1876,53 +1803,36 @@ def test_suppress_with_termination_and_definite_bindings() -> None:
     )
 
     # return inside with suppress(Exception) CANNOT be suppressed by __exit__
-    ret_in_suppress_src = (
-        "with suppress(Exception):\n"
-        "    return 42\n"
-        "x = 1\n"
-    )
+    ret_in_suppress_src = "with suppress(Exception):\n" "    return 42\n" "x = 1\n"
     ret_stmts = ast.parse(ret_in_suppress_src).body
     assert _block_terminates([ret_stmts[0]]) is True
     assert _block_terminates(ret_stmts) is True
     def_ret, cond_ret = _analyze_block_assignment(ret_stmts)
-    bound_ret, term_ret = _extract_block_definite_bindings_and_term(
-        ret_stmts, None
-    )
+    bound_ret, term_ret = _extract_block_definite_bindings_and_term(ret_stmts, None)
     assert def_ret == set()
     assert "x" not in cond_ret
     assert bound_ret == set()
     assert term_ret is True
 
     # Conversely, raise inside with suppress(Exception) CAN be suppressed by __exit__
-    raise_in_suppress_src = (
-        "with suppress(Exception):\n"
-        "    raise ValueError('boom')\n"
-        "x = 1\n"
-    )
+    raise_in_suppress_src = "with suppress(Exception):\n" "    raise ValueError('boom')\n" "x = 1\n"
     raise_stmts = ast.parse(raise_in_suppress_src).body
     assert _block_terminates([raise_stmts[0]]) is False
     assert _block_terminates(raise_stmts) is False
     def_raise, _ = _analyze_block_assignment(raise_stmts)
-    bound_raise, term_raise = _extract_block_definite_bindings_and_term(
-        raise_stmts, None
-    )
+    bound_raise, term_raise = _extract_block_definite_bindings_and_term(raise_stmts, None)
     assert def_raise == {"x"}
     assert bound_raise == {"x"}
     assert term_raise is False
 
     # Return after a potentially-raising statement inside with suppress(...) does NOT guarantee termination
     risky_before_ret_src = (
-        "with suppress(KeyError):\n"
-        "    scale = d['x']\n"
-        "    return 42\n"
-        "x = 1\n"
+        "with suppress(KeyError):\n" "    scale = d['x']\n" "    return 42\n" "x = 1\n"
     )
     risky_ret_stmts = ast.parse(risky_before_ret_src).body
     assert _block_terminates([risky_ret_stmts[0]]) is False
     def_rret, cond_rret = _analyze_block_assignment(risky_ret_stmts)
-    bound_rret, term_rret = _extract_block_definite_bindings_and_term(
-        risky_ret_stmts, None
-    )
+    bound_rret, term_rret = _extract_block_definite_bindings_and_term(risky_ret_stmts, None)
     assert def_rret == {"x"}
     assert "scale" in cond_rret
     assert bound_rret == {"x"}
@@ -1940,9 +1850,9 @@ def test_suppress_with_termination_and_definite_bindings() -> None:
     )
     if_ret_stmts = ast.parse(if_ret_suppress_src).body
     assert _block_terminates([if_ret_stmts[0]]) is True
-    assert (
-        _extract_block_definite_bindings_and_term(if_ret_stmts, None)
-        == ({"flag"}, True)
+    assert _extract_block_definite_bindings_and_term(if_ret_stmts, None) == (
+        {"flag"},
+        True,
     )
 
     # Non-raising prefix statements inside with suppress(...) bind definitely
@@ -1955,9 +1865,7 @@ def test_suppress_with_termination_and_definite_bindings() -> None:
     )
     mixed_stmts = ast.parse(mixed_suppress_src).body
     def_mix, cond_mix = _analyze_block_assignment(mixed_stmts)
-    bound_mix, term_mix = _extract_block_definite_bindings_and_term(
-        mixed_stmts, None
-    )
+    bound_mix, term_mix = _extract_block_definite_bindings_and_term(mixed_stmts, None)
     assert def_mix == {"value", "pair_a", "pair_b"}
     assert bound_mix == {"value", "pair_a", "pair_b"}
     assert {"scale", "after_risky"} <= cond_mix
@@ -1985,16 +1893,12 @@ def test_closure_escape_analysis_edge_cases() -> None:
     assert isinstance(if_node, ast.If)
     f_then = if_node.body[0]
     f_else = if_node.orelse[0]
-    _, esc_ids_br, exec_ids_br = _collect_escaped_and_executed_intra_unit_defs(
-        branch_stmts, set()
-    )
+    _, esc_ids_br, exec_ids_br = _collect_escaped_and_executed_intra_unit_defs(branch_stmts, set())
     assert id(f_then) in exec_ids_br and id(f_else) in exec_ids_br
     assert id(f_then) not in esc_ids_br and id(f_else) not in esc_ids_br
 
     # Definition followed by ordinary assignment (rebound after alias vs rebound without escape)
-    rebound_alias_stmts = ast.parse(
-        "def f():\n    return a\nsaved = f\nf = 123\n"
-    ).body
+    rebound_alias_stmts = ast.parse("def f():\n    return a\nsaved = f\nf = 123\n").body
     _, esc_ids_ra, exec_ids_ra = _collect_escaped_and_executed_intra_unit_defs(
         rebound_alias_stmts, {"saved"}
     )
@@ -2003,10 +1907,7 @@ def test_closure_escape_analysis_edge_cases() -> None:
 
     # Definitions inside nested classes
     nested_cls_stmts = ast.parse(
-        "class Outer:\n"
-        "    class Inner:\n"
-        "        def method(self):\n"
-        "            return x\n"
+        "class Outer:\n" "    class Inner:\n" "        def method(self):\n" "            return x\n"
     ).body
     outer_cls = nested_cls_stmts[0]
     assert isinstance(outer_cls, ast.ClassDef)
@@ -2039,13 +1940,11 @@ def test_closure_escape_analysis_edge_cases() -> None:
     ).body
     dead_fn = nl_rebind_stmts[0]
     live_fn = nl_rebind_stmts[1]
-    assert isinstance(dead_fn, ast.FunctionDef) and isinstance(
-        live_fn, ast.FunctionDef
-    )
+    assert isinstance(dead_fn, ast.FunctionDef) and isinstance(live_fn, ast.FunctionDef)
     dead_cb = dead_fn.body[1]
     live_cb = live_fn.body[1]
-    esc_names_nl, esc_ids_nl, exec_ids_nl = (
-        _collect_escaped_and_executed_intra_unit_defs(nl_rebind_stmts, set())
+    esc_names_nl, esc_ids_nl, exec_ids_nl = _collect_escaped_and_executed_intra_unit_defs(
+        nl_rebind_stmts, set()
     )
     assert id(dead_cb) not in esc_ids_nl
     assert id(dead_cb) not in exec_ids_nl
@@ -2102,17 +2001,11 @@ def test_closure_escape_analysis_edge_cases() -> None:
 
     # Decorator on uncalled function executes at definition time
     dec_exec_stmts = ast.parse(
-        "def my_dec(fn):\n"
-        "    return fn\n"
-        "@my_dec\n"
-        "def uncalled():\n"
-        "    return 1\n"
+        "def my_dec(fn):\n" "    return fn\n" "@my_dec\n" "def uncalled():\n" "    return 1\n"
     ).body
     dec_fn = dec_exec_stmts[0]
     uncalled_fn = dec_exec_stmts[1]
-    _, esc_dec, exec_dec = _collect_escaped_and_executed_intra_unit_defs(
-        dec_exec_stmts, set()
-    )
+    _, esc_dec, exec_dec = _collect_escaped_and_executed_intra_unit_defs(dec_exec_stmts, set())
     assert id(dec_fn) in exec_dec
     assert id(uncalled_fn) in esc_dec
 
@@ -2144,9 +2037,7 @@ def test_generator_expression_eager_vs_lazy_table_and_nested_walrus() -> None:
         fn_node = mod.body[0]
         assert isinstance(fn_node, ast.FunctionDef)
         ctx = _get_fn_scope_context(fn_node, mod_tree=mod)
-        genexp_nodes = [
-            n for n in ast.walk(fn_node) if isinstance(n, ast.GeneratorExp)
-        ]
+        genexp_nodes = [n for n in ast.walk(fn_node) if isinstance(n, ast.GeneratorExp)]
         assert len(genexp_nodes) == 1
         assert _is_lazy_genexp(genexp_nodes[0], ctx) is expected_lazy, body_line
 
@@ -2163,13 +2054,9 @@ def test_generator_expression_eager_vs_lazy_table_and_nested_walrus() -> None:
     assert isinstance(fn1, ast.FunctionDef)
     ctx1 = _get_fn_scope_context(fn1, mod_tree=mod1)
     assign1 = fn1.body[1]
-    assert isinstance(assign1, ast.Assign) and isinstance(
-        assign1.value, ast.GeneratorExp
-    )
+    assert isinstance(assign1, ast.Assign) and isinstance(assign1.value, ast.GeneratorExp)
     assert _extract_lazy_genexp_walrus_names(assign1, ctx1) == {"count"}
-    _, def_muts1 = _extract_comprehension_deferred_closure_info(
-        assign1.value, ctx1
-    )
+    _, def_muts1 = _extract_comprehension_deferred_closure_info(assign1.value, ctx1)
     assert "count" in def_muts1
     sc_w1 = inspect_single_unit_scope(
         {
@@ -2177,10 +2064,7 @@ def test_generator_expression_eager_vs_lazy_table_and_nested_walrus() -> None:
             "end": 3,
             "kind": "basic_block",
             "source_text": walrus_gen1_src,
-            "source_code": (
-                "count = 0\n"
-                "gen = ((count := count + x) for x in values)\n"
-            ),
+            "source_code": ("count = 0\n" "gen = ((count := count + x) for x in values)\n"),
         },
         tree=mod1,
     )
@@ -2208,9 +2092,7 @@ def test_generator_expression_eager_vs_lazy_table_and_nested_walrus() -> None:
     assert _is_lazy_genexp(outer_gen, ctx2) is True
     assert _is_lazy_genexp(inner_gen, ctx2) is False
     assert _extract_lazy_genexp_walrus_names(assign2, ctx2) == {"count"}
-    _, def_muts2 = _extract_comprehension_deferred_closure_info(
-        outer_gen, ctx2
-    )
+    _, def_muts2 = _extract_comprehension_deferred_closure_info(outer_gen, ctx2)
     assert "count" in def_muts2
     sc_w2 = inspect_single_unit_scope(
         {
@@ -2259,12 +2141,14 @@ def test_span_line_index_performance_and_scale() -> None:
 
     setattr(_df_span_index, "_SpanLineIndex", _CountingSpanLineIndex)
     try:
-        assert _resolve_unit_col_bounds(
-            cand_5000, large_mod_tree, 5001, 5001, None, None
-        ) == (0, len("v_5000 = 5000"))
-        assert _resolve_unit_col_bounds(
-            cand_9999, large_mod_tree, 10000, 10000, None, None
-        ) == (0, len("v_9999 = 9999"))
+        assert _resolve_unit_col_bounds(cand_5000, large_mod_tree, 5001, 5001, None, None) == (
+            0,
+            len("v_5000 = 5000"),
+        )
+        assert _resolve_unit_col_bounds(cand_9999, large_mod_tree, 10000, 10000, None, None) == (
+            0,
+            len("v_9999 = 9999"),
+        )
         assert (
             _has_unresolved_span_bounds(
                 large_mod_tree, 5001, 5001, 0, len("v_5000 = 5000"), cand_5000
@@ -2291,9 +2175,10 @@ def test_span_line_index_performance_and_scale() -> None:
     cand_leaf = ast.parse("target = x + 1\n").body
     expected_s_col = len(leaf_indent)
     expected_e_col = len(leaf_indent) + len("target = x + 1")
-    assert _resolve_unit_col_bounds(
-        cand_leaf, deep_tree, 16, 16, None, None
-    ) == (expected_s_col, expected_e_col)
+    assert _resolve_unit_col_bounds(cand_leaf, deep_tree, 16, 16, None, None) == (
+        expected_s_col,
+        expected_e_col,
+    )
 
     # 3. Many candidate units on the same source line (20 semicolon-separated statements)
     semi_parts = [f"s_{i} = {i}" for i in range(20)]
@@ -2302,42 +2187,27 @@ def test_span_line_index_performance_and_scale() -> None:
     for i in (0, 7, 19):
         part_cand = ast.parse(f"s_{i} = {i}\n").body
         pos = semi_line.index(f"s_{i} = {i}")
-        assert _resolve_unit_col_bounds(
-            part_cand, semi_tree, 2, 2, None, None
-        ) == (pos, pos + len(f"s_{i} = {i}"))
-    assert (
-        _has_unresolved_span_bounds(semi_tree.body[0], 2, 2, None, None)
-        is True
-    )
+        assert _resolve_unit_col_bounds(part_cand, semi_tree, 2, 2, None, None) == (
+            pos,
+            pos + len(f"s_{i} = {i}"),
+        )
+    assert _has_unresolved_span_bounds(semi_tree.body[0], 2, 2, None, None) is True
 
     # 4. Hundreds of candidate units within one large function + repeated inspection of same AST tree
-    big_fn_lines = ["def big_fn(x):\n"] + [
-        f"    step_{i} = x + {i}\n" for i in range(300)
-    ]
+    big_fn_lines = ["def big_fn(x):\n"] + [f"    step_{i} = x + {i}\n" for i in range(300)]
     big_fn_tree = ast.parse("".join(big_fn_lines))
     for i in range(0, 300, 3):
         c_stmt = [big_fn_tree.body[0].body[i]]  # type: ignore[attr-defined]
         ln = i + 2
-        s_c, e_c = _resolve_unit_col_bounds(
-            c_stmt, big_fn_tree, ln, ln, None, None
-        )
+        s_c, e_c = _resolve_unit_col_bounds(c_stmt, big_fn_tree, ln, ln, None, None)
         assert (s_c, e_c) == (4, 4 + len(f"step_{i} = x + {i}"))
-        assert (
-            _has_unresolved_span_bounds(
-                big_fn_tree.body[0], ln, ln, s_c, e_c, c_stmt
-            )
-            is False
-        )
+        assert _has_unresolved_span_bounds(big_fn_tree.body[0], ln, ln, s_c, e_c, c_stmt) is False
 
     assert any(
-        k.owner is big_fn_tree and k.kind == "span_line_index"
-        for k in _scope_cell_info_cache
+        k.owner is big_fn_tree and k.kind == "span_line_index" for k in _scope_cell_info_cache
     )
     _evict_tree_scopes(big_fn_tree)
-    assert not any(
-        k.owner is big_fn_tree
-        for k in _scope_cell_info_cache
-    )
+    assert not any(k.owner is big_fn_tree for k in _scope_cell_info_cache)
 
 
 def test_ensure_unit_scope_closure_mode_all_six_cases() -> None:
@@ -2362,12 +2232,8 @@ def test_ensure_unit_scope_closure_mode_all_six_cases() -> None:
         "source_text": src_with_pre_closure,
         "source_code": "for x in items:\n    acc = x + 1\n",
     }
-    strict_scope = inspect_single_unit_scope(
-        {**base_unit, "skip_pre_unit_closures": False}
-    )
-    lenient_scope = inspect_single_unit_scope(
-        {**base_unit, "skip_pre_unit_closures": True}
-    )
+    strict_scope = inspect_single_unit_scope({**base_unit, "skip_pre_unit_closures": False})
+    lenient_scope = inspect_single_unit_scope({**base_unit, "skip_pre_unit_closures": True})
     assert strict_scope["skip_pre_unit_closures"] is False
     assert "severed_closure_cell" in strict_scope["control_flow_hazards"]
     assert lenient_scope["skip_pre_unit_closures"] is True
@@ -2409,13 +2275,9 @@ def test_ensure_unit_scope_closure_mode_all_six_cases() -> None:
         "control_flow_hazards": ["pathological_ast"],
         "is_control_flow_safe": False,
     }
+    assert ensure_unit_scope_closure_mode(base_unit, pathological_scope, True) is pathological_scope
     assert (
-        ensure_unit_scope_closure_mode(base_unit, pathological_scope, True)
-        is pathological_scope
-    )
-    assert (
-        ensure_unit_scope_closure_mode(base_unit, pathological_scope, False)
-        is pathological_scope
+        ensure_unit_scope_closure_mode(base_unit, pathological_scope, False) is pathological_scope
     )
 
     # 5. Missing source file with unmarked or mismatched scope and no source_text fails closed
@@ -2428,30 +2290,14 @@ def test_ensure_unit_scope_closure_mode_all_six_cases() -> None:
     res_5 = ensure_unit_scope_closure_mode(no_src_unit, unmarked, False)
     assert res_5["is_control_flow_safe"] is False
     assert "severed_closure_cell" in res_5["control_flow_hazards"]
-    assert (
-        "unavailable_source_for_closure_mode"
-        in res_5["closure_hazard_reasons"]
-    )
-    res_5_lenient_unmarked = ensure_unit_scope_closure_mode(
-        no_src_unit, unmarked, True
-    )
+    assert "unavailable_source_for_closure_mode" in res_5["closure_hazard_reasons"]
+    res_5_lenient_unmarked = ensure_unit_scope_closure_mode(no_src_unit, unmarked, True)
     assert res_5_lenient_unmarked["is_control_flow_safe"] is False
-    assert (
-        ensure_unit_scope_closure_mode(no_src_unit, strict_scope, False)
-        is strict_scope
-    )
-    assert (
-        ensure_unit_scope_closure_mode(no_src_unit, lenient_scope, True)
-        is lenient_scope
-    )
-    res_5_strict_from_lenient = ensure_unit_scope_closure_mode(
-        no_src_unit, lenient_scope, False
-    )
+    assert ensure_unit_scope_closure_mode(no_src_unit, strict_scope, False) is strict_scope
+    assert ensure_unit_scope_closure_mode(no_src_unit, lenient_scope, True) is lenient_scope
+    res_5_strict_from_lenient = ensure_unit_scope_closure_mode(no_src_unit, lenient_scope, False)
     assert res_5_strict_from_lenient["is_control_flow_safe"] is False
-    assert (
-        "severed_closure_cell"
-        in res_5_strict_from_lenient["control_flow_hazards"]
-    )
+    assert "severed_closure_cell" in res_5_strict_from_lenient["control_flow_hazards"]
 
     # 6. Valid source_text supplied alongside a missing file (and source_text: None + source_code fallback without AttributeError)
     unit_with_none_src = {
@@ -2541,15 +2387,15 @@ def test_utf8_source_slicing_multibyte_and_idempotence() -> None:
 
     # 4. Multiline UTF-8 expression slicing and pre-sliced idempotence
     ml_utf8 = [
-        '    résultat = (\n',
+        "    résultat = (\n",
         '        café + "世界"\n',
-        '    )\n',
+        "    )\n",
     ]
     s_ml = len("    résultat = ".encode("utf-8"))
     e_ml = len("    )".encode("utf-8"))
     u_ml = {"kind": "complex_expr", "start_col": s_ml, "end_col": e_ml}
     sliced_ml = _slice_unit_token_lines(u_ml, ml_utf8)
-    assert sliced_ml == ['(\n', '        café + "世界"\n', '    )']
+    assert sliced_ml == ["(\n", '        café + "世界"\n', "    )"]
     assert _slice_unit_token_lines(u_ml, sliced_ml, is_pre_sliced=True) == sliced_ml
 
 
@@ -2732,12 +2578,7 @@ def test_span_line_index_missing_end_positions_and_duplicate_boundary_statements
     assert isinstance(outer_fn, ast.FunctionDef)
     early_stmt = outer_fn.body[0]
     early_stmt.end_lineno = None
-    assert (
-        _has_unresolved_span_bounds(
-            outer_fn, 4, 4, 4, 16, [outer_fn.body[2]]
-        )
-        is True
-    )
+    assert _has_unresolved_span_bounds(outer_fn, 4, 4, 4, 16, [outer_fn.body[2]]) is True
 
     # 2. iter_boundary_entries deduplicates by node identity when u_start == u_end
     clear_dataflow_cache()
@@ -2753,13 +2594,6 @@ def test_span_line_index_missing_end_positions_and_duplicate_boundary_statements
     ambig_fn = ambig_tree.body[0]
     assert isinstance(ambig_fn, ast.FunctionDef)
     cand_stmt = [ast.parse("x = 1\n").body[0]]
-    s_col, e_col = _resolve_unit_col_bounds(
-        cand_stmt, ambig_tree, 2, 2, None, None
-    )
+    s_col, e_col = _resolve_unit_col_bounds(cand_stmt, ambig_tree, 2, 2, None, None)
     assert (s_col, e_col) == (None, None)
-    assert (
-        _has_unresolved_span_bounds(
-            ambig_fn, 2, 2, s_col, e_col, cand_stmt
-        )
-        is True
-    )
+    assert _has_unresolved_span_bounds(ambig_fn, 2, 2, s_col, e_col, cand_stmt) is True

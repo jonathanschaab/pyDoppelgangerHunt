@@ -7,9 +7,23 @@ import os
 from pathlib import Path
 import sys
 import threading
-from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
-from pydoppelgangerhunt.canonical_path import normalize_lexical_posix, parse_notebook_cell_anchor
+from pydoppelgangerhunt.canonical_path import (
+    normalize_lexical_posix,
+    parse_notebook_cell_anchor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -124,11 +138,7 @@ def resolve_closure_strictness_mode(
             resolved_mode = (
                 "lenient"
                 if is_lenient_mode
-                else (
-                    "pedantic"
-                    if c_mode in ("pedantic", "fail_closed")
-                    else "strict"
-                )
+                else ("pedantic" if c_mode in ("pedantic", "fail_closed") else "strict")
             )
             if c_mode in ("fail_closed", "fast", "skip"):
                 _warn_closure_event_once(
@@ -231,38 +241,40 @@ def resolve_unit_closure_flags(
     strict_with_suppression: Optional[bool] = None,
 ) -> UnitClosureFlags:
     """Resolves (skip_pre_unit_closures, strict_with_suppression) for a unit with optional overrides."""
+    has_explicit_flag_override = closure_strictness is None and (
+        skip_pre_unit_closures is not None or strict_with_suppression is not None
+    )
     eff_strictness = (
         closure_strictness
         if closure_strictness is not None
-        else unit.get("closure_strictness")
+        else (None if has_explicit_flag_override else unit.get("closure_strictness"))
+    )
+    eff_skip_input = (
+        skip_pre_unit_closures
+        if skip_pre_unit_closures is not None
+        else unit.get("skip_pre_unit_closures", False)
     )
     eff_sw_input = (
         strict_with_suppression
         if strict_with_suppression is not None
-        else unit.get("strict_with_suppression")
-    )
-    _, eff_skip = (
-        (None, bool(skip_pre_unit_closures))
-        if skip_pre_unit_closures is not None and closure_strictness is None
-        else resolve_closure_strictness_mode(
-            closure_strictness=eff_strictness,
-            skip_pre_unit_closures=(
-                skip_pre_unit_closures
-                if skip_pre_unit_closures is not None
-                else unit.get("skip_pre_unit_closures", False)
-            ),
-            strict_with_suppression=eff_sw_input,
+        else (
+            None
+            if skip_pre_unit_closures is not None and closure_strictness is None
+            else unit.get("strict_with_suppression")
         )
     )
-    eff_strict_with = (
-        bool(strict_with_suppression)
-        if strict_with_suppression is not None and closure_strictness is None
-        else resolve_strict_with_suppression(
-            closure_strictness=eff_strictness,
-            strict_with_suppression=eff_sw_input,
-        )
+    _, eff_skip = resolve_closure_strictness_mode(
+        closure_strictness=eff_strictness,
+        skip_pre_unit_closures=bool(eff_skip_input),
+        strict_with_suppression=eff_sw_input,
     )
-    if eff_skip and eff_strict_with and strict_with_suppression is None:
+    eff_strict_with = resolve_strict_with_suppression(
+        closure_strictness=eff_strictness,
+        strict_with_suppression=(
+            False if eff_skip and strict_with_suppression is None else eff_sw_input
+        ),
+    )
+    if eff_skip and eff_strict_with and eff_strictness is None:
         eff_strict_with = False
     return UnitClosureFlags(eff_skip, eff_strict_with)
 
@@ -272,20 +284,19 @@ def resolve_pair_closure_flags(
     u2: Mapping[str, Any],
     *,
     closure_strictness: Optional[str] = None,
-    skip_pre_unit_closures: bool = False,
+    skip_pre_unit_closures: Optional[bool] = None,
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> PairClosureFlags:
     """Resolves per-unit and pair-level closure and context-manager flags for two clone units."""
-    explicit_skip = True if skip_pre_unit_closures else None
     skip1, strict_with1 = resolve_unit_closure_flags(
         u1,
         closure_strictness=closure_strictness,
-        skip_pre_unit_closures=explicit_skip,
+        skip_pre_unit_closures=skip_pre_unit_closures,
     )
     skip2, strict_with2 = resolve_unit_closure_flags(
         u2,
         closure_strictness=closure_strictness,
-        skip_pre_unit_closures=explicit_skip,
+        skip_pre_unit_closures=skip_pre_unit_closures,
     )
     eff_non_sup1 = normalize_non_suppressing_ctx_managers(
         non_suppressing_ctx_managers,
@@ -385,8 +396,6 @@ def canonical_path_key(path_str: Optional[str], strip_anchor: bool = False) -> s
     return norm
 
 
-
-
 def paths_match_boundary(
     p1: Optional[str],
     p2: Optional[str],
@@ -438,7 +447,9 @@ def find_matching_path_value(
             key_stripped = canonical_path_key(target_stripped, strip_anchor=False)
             for k, val in path_map.items():
                 k_clean = normalize_path_string(k, strip_anchor=False)
-                if target_stripped == k_clean or key_stripped == canonical_path_key(k_clean, strip_anchor=False):
+                if target_stripped == k_clean or key_stripped == canonical_path_key(
+                    k_clean, strip_anchor=False
+                ):
                     return val
             for k, val in path_map.items():
                 if paths_match_boundary(target_stripped, k, strip_anchor=False):
@@ -463,7 +474,8 @@ def find_python_files(
 
     target_clean = str(target_path).replace("\\", "/").strip("./")
     active_excludes = [
-        ex for ex in exclude_patterns
+        ex
+        for ex in exclude_patterns
         if ex.strip("./\\") and ex.replace("\\", "/").strip("./") not in target_clean
     ]
     if audit_tests:
@@ -721,10 +733,12 @@ def load_tool_config(
     if config_path:
         candidates.append(Path(config_path))
     else:
-        candidates.extend([
-            root / "pyproject.toml",
-            root / ".pydoppelgangerhunt.toml",
-        ])
+        candidates.extend(
+            [
+                root / "pyproject.toml",
+                root / ".pydoppelgangerhunt.toml",
+            ]
+        )
 
     for candidate in candidates:
         if candidate.is_file():

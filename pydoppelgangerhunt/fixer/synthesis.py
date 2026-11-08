@@ -1301,7 +1301,7 @@ def synthesize_shared_helper_code(
     source_text2: Optional[str] = None,
     tree1: Optional[ast.AST] = None,
     tree2: Optional[ast.AST] = None,
-    skip_pre_unit_closures: bool = False,
+    skip_pre_unit_closures: Optional[bool] = None,
     closure_strictness: Optional[str] = None,
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
     outputs: Optional[List[str]] = None,

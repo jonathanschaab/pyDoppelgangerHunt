@@ -3180,7 +3180,7 @@ def _generate_refactoring_patch_impl(
     cross_file_strategy: str = "auto",
     shared_module_name: str = "_common.py",
     depgraph: Optional[ModuleDependencyGraph] = None,
-    skip_pre_unit_closures: bool = False,
+    skip_pre_unit_closures: Optional[bool] = None,
     closure_strictness: Optional[str] = None,
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> str:
@@ -3212,7 +3212,7 @@ def _generate_refactoring_patch_impl(
         method_binding = "auto"
     _, effective_skip_closures = resolve_closure_strictness_mode(
         closure_strictness=closure_strictness,
-        skip_pre_unit_closures=skip_pre_unit_closures,
+        skip_pre_unit_closures=bool(skip_pre_unit_closures),
     )
     eff_non_sup = normalize_non_suppressing_ctx_managers(
         non_suppressing_ctx_managers
@@ -3489,14 +3489,13 @@ def _generate_refactoring_patch_impl(
                     (fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static"))
                 )
 
-            explicit_skip = True if skip_pre_unit_closures else None
             (
                 u1_eff["skip_pre_unit_closures"],
                 u1_eff["strict_with_suppression"],
             ) = resolve_unit_closure_flags(
                 u1,
                 closure_strictness=closure_strictness,
-                skip_pre_unit_closures=explicit_skip,
+                skip_pre_unit_closures=skip_pre_unit_closures,
             )
             (
                 u2_eff["skip_pre_unit_closures"],
@@ -3504,7 +3503,7 @@ def _generate_refactoring_patch_impl(
             ) = resolve_unit_closure_flags(
                 u2,
                 closure_strictness=closure_strictness,
-                skip_pre_unit_closures=explicit_skip,
+                skip_pre_unit_closures=skip_pre_unit_closures,
             )
             u1_eff.pop("closure_strictness", None)
             u2_eff.pop("closure_strictness", None)
@@ -4457,7 +4456,7 @@ def generate_refactoring_patch(
     cross_file_strategy: str = "auto",
     shared_module_name: str = "_common.py",
     depgraph: Optional[ModuleDependencyGraph] = None,
-    skip_pre_unit_closures: bool = False,
+    skip_pre_unit_closures: Optional[bool] = None,
     closure_strictness: Optional[str] = None,
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> str:

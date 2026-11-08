@@ -2518,7 +2518,7 @@ def _inspect_unit_scope(
                                 live_write_only_cond = (
                                     write_only_cond_cands & set(pre_outs_decl)
                                 )
-                            elif visitor.returns:
+                            elif visitor.returns and not is_subroutine:
                                 live_write_only_cond = (
                                     write_only_cond_cands & set(visitor.returns)
                                 )

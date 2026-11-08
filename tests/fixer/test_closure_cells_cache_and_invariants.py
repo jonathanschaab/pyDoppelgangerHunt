@@ -1,4 +1,5 @@
 """Tests for dataflow cache invariants, indexed eviction, lexical scope rules, and architectural guarantees."""
+
 from __future__ import annotations
 
 import ast
@@ -63,7 +64,10 @@ def test_heterogeneous_frozenset_eviction_and_scope_cache_key() -> None:
         frozenset({"metadata", outer_fn}),
         frozenset({"alpha", "beta", "gamma", 42, inner_fn}),
         ("composite", frozenset({"tag_a", "tag_b", lambda_node})),
-        ("nested_comp", (_SpanBounds(1, 4), frozenset({"meta", listcomp_node}))),
+        (
+            "nested_comp",
+            (_SpanBounds(1, 4), frozenset({"meta", listcomp_node})),
+        ),
         _ScopeCacheKey(
             owner=keep_mod,
             kind="cross_ref",
@@ -92,13 +96,9 @@ def test_heterogeneous_frozenset_eviction_and_scope_cache_key() -> None:
         assert hk not in _scope_closures_cache
     assert _scope_cell_info_cache.get(keep_key) == "keep_val"
 
-    info_before = _analyze_enclosing_fn_cells(
-        outer_fn, (2, 3, 4, 54), mod_tree=evict_mod
-    )
+    info_before = _analyze_enclosing_fn_cells(outer_fn, (2, 3, 4, 54), mod_tree=evict_mod)
     _evict_tree_scopes(evict_mod)
-    info_after = _analyze_enclosing_fn_cells(
-        outer_fn, (2, 3, 4, 54), mod_tree=evict_mod
-    )
+    info_after = _analyze_enclosing_fn_cells(outer_fn, (2, 3, 4, 54), mod_tree=evict_mod)
     assert info_before == info_after
 
 
@@ -117,22 +117,11 @@ def test_fail_closed_policy_for_unresolved_source_spans() -> None:
         _resolve_unit_col_bounds,
     )
 
-    dup_line_src = (
-        "def f(xs):\n"
-        "    a = 1; a = 1\n"
-        "    return [lambda: a for _ in xs]\n"
-    )
+    dup_line_src = "def f(xs):\n" "    a = 1; a = 1\n" "    return [lambda: a for _ in xs]\n"
     dup_line_tree = ast.parse(dup_line_src)
     cand_assign = ast.parse("a = 1\n").body
-    assert _resolve_unit_col_bounds(
-        cand_assign, dup_line_tree, 2, 2, None, None
-    ) == (None, None)
-    assert (
-        _has_unresolved_span_bounds(
-            dup_line_tree.body[0], 2, 2, None, None
-        )
-        is True
-    )
+    assert _resolve_unit_col_bounds(cand_assign, dup_line_tree, 2, 2, None, None) == (None, None)
+    assert _has_unresolved_span_bounds(dup_line_tree.body[0], 2, 2, None, None) is True
     sc_dup_line = inspect_single_unit_scope(
         {
             "start": 2,
@@ -147,15 +136,11 @@ def test_fail_closed_policy_for_unresolved_source_spans() -> None:
     assert sc_dup_line["is_control_flow_safe"] is False
 
     subexpr_line_src = (
-        "def f(xs):\n"
-        "    res = [x + 1 for x in xs] + [x + 1 for x in xs]\n"
-        "    return res\n"
+        "def f(xs):\n" "    res = [x + 1 for x in xs] + [x + 1 for x in xs]\n" "    return res\n"
     )
     subexpr_tree = ast.parse(subexpr_line_src)
     cand_comp_expr = ast.parse("[x + 1 for x in xs]\n").body
-    assert _resolve_unit_col_bounds(
-        cand_comp_expr, subexpr_tree, 2, 2, None, None
-    ) == (None, None)
+    assert _resolve_unit_col_bounds(cand_comp_expr, subexpr_tree, 2, 2, None, None) == (None, None)
     sc_ambig_comp = inspect_single_unit_scope(
         {
             "start": 2,
@@ -169,19 +154,14 @@ def test_fail_closed_policy_for_unresolved_source_spans() -> None:
     assert "severed_closure_cell" in sc_ambig_comp["control_flow_hazards"]
 
     corrupt_tree = ast.parse(
-        "def f(xs):\n"
-        "    a = 1\n"
-        "    b = a + 2\n"
-        "    return [lambda: b for _ in xs]\n"
+        "def f(xs):\n" "    a = 1\n" "    b = a + 2\n" "    return [lambda: b for _ in xs]\n"
     )
     corrupt_fn = corrupt_tree.body[0]
     assert isinstance(corrupt_fn, ast.FunctionDef)
     corrupt_stmt = corrupt_fn.body[1]
     corrupt_stmt.end_lineno = None
     assert _is_node_inside_span(corrupt_stmt, _SpanBounds(3, 3, 4, 13)) is False
-    assert (
-        _has_unresolved_span_bounds(corrupt_fn, 3, 3, 4, 13) is True
-    )
+    assert _has_unresolved_span_bounds(corrupt_fn, 3, 3, 4, 13) is True
     assert (
         _has_severed_closure_cell_hazard(
             _UnitClosureHazardContext(
@@ -204,21 +184,11 @@ def test_fail_closed_policy_for_unresolved_source_spans() -> None:
         is True
     )
 
-    corrupt_col_tree = ast.parse(
-        "def f(xs):\n"
-        "    a = 1\n"
-        "    b = a + 2\n"
-        "    return b\n"
-    )
+    corrupt_col_tree = ast.parse("def f(xs):\n" "    a = 1\n" "    b = a + 2\n" "    return b\n")
     corrupt_col_fn = corrupt_col_tree.body[0]
     assert isinstance(corrupt_col_fn, ast.FunctionDef)
     corrupt_col_fn.body[1].end_col_offset = None
-    assert (
-        _is_node_inside_span(
-            corrupt_col_fn.body[1], _SpanBounds(3, 3, 4, 13)
-        )
-        is False
-    )
+    assert _is_node_inside_span(corrupt_col_fn.body[1], _SpanBounds(3, 3, 4, 13)) is False
     assert _has_unresolved_span_bounds(corrupt_col_fn, 3, 3, 4, 13) is True
 
 
@@ -244,12 +214,7 @@ def test_pep3104_and_pep227_lexical_scope_rules() -> None:
         with pytest.raises(SyntaxError):
             symtable.symtable(inv_src, "<sym>", "exec")
         inv_tree = ast.parse(inv_src)
-        assert (
-            _has_invalid_lexical_scope_declarations(
-                inv_tree.body, mod_tree=inv_tree
-            )
-            is True
-        )
+        assert _has_invalid_lexical_scope_declarations(inv_tree.body, mod_tree=inv_tree) is True
         sc_inv = inspect_single_unit_scope(
             {
                 "start": 1,
@@ -284,9 +249,7 @@ def test_pep3104_and_pep227_lexical_scope_rules() -> None:
     assert isinstance(v1_mid, ast.FunctionDef)
     v1_inner = v1_mid.body[1]
     assert isinstance(v1_inner, ast.FunctionDef)
-    assert _has_invalid_lexical_scope_declarations(
-        v1_tree.body, mod_tree=v1_tree
-    ) is False
+    assert _has_invalid_lexical_scope_declarations(v1_tree.body, mod_tree=v1_tree) is False
     assert _extract_closure_nonlocal_mutations_and_deletions(v1_inner) == (
         {"x"},
         set(),
@@ -324,10 +287,7 @@ def test_pep3104_and_pep227_lexical_scope_rules() -> None:
     )
     symtable.symtable(valid_between_src, "<valid2>", "exec")
     v2_tree = ast.parse(valid_between_src)
-    assert (
-        _has_invalid_lexical_scope_declarations(v2_tree.body, mod_tree=v2_tree)
-        is False
-    )
+    assert _has_invalid_lexical_scope_declarations(v2_tree.body, mod_tree=v2_tree) is False
 
     valid_chained_nl_src = (
         "def outer():\n"
@@ -375,10 +335,7 @@ def test_pep3104_and_pep227_lexical_scope_rules() -> None:
     )
     symtable.symtable(valid_cls_global_src, "<valid4>", "exec")
     v4_tree = ast.parse(valid_cls_global_src)
-    assert (
-        _has_invalid_lexical_scope_declarations(v4_tree.body, mod_tree=v4_tree)
-        is False
-    )
+    assert _has_invalid_lexical_scope_declarations(v4_tree.body, mod_tree=v4_tree) is False
     v4_cls = v4_tree.body[1].body[1]  # type: ignore[attr-defined]
     assert _extract_closure_nonlocal_mutations_and_deletions(v4_cls) == (
         {"x"},
@@ -428,19 +385,13 @@ def test_lazy_genexp_scalar_builtins_and_carrier_mutation_summaries(
     assert c_reads_eager == set()
     assert c_muts_eager == set()
 
-    top_eager_sum = ast.parse(
-        "sum((w := x) + a for x in items)", mode="eval"
-    ).body
+    top_eager_sum = ast.parse("sum((w := x) + a for x in items)", mode="eval").body
     assert _extract_lazy_genexp_walrus_names(top_eager_sum, None) == set()
 
-    nested_lazy_comp = ast.parse(
-        "[((w := x) + a for x in row) for row in rows]", mode="eval"
-    ).body
+    nested_lazy_comp = ast.parse("[((w := x) + a for x in row) for row in rows]", mode="eval").body
     assert isinstance(nested_lazy_comp, ast.ListComp)
     assert _extract_lazy_genexp_walrus_names(nested_lazy_comp, None) == {"w"}
-    c_reads_lazy, c_muts_lazy = _extract_comprehension_deferred_closure_info(
-        nested_lazy_comp, None
-    )
+    c_reads_lazy, c_muts_lazy = _extract_comprehension_deferred_closure_info(nested_lazy_comp, None)
     assert "a" in c_reads_lazy
     assert "w" in c_muts_lazy
 
@@ -451,12 +402,7 @@ def test_lazy_genexp_scalar_builtins_and_carrier_mutation_summaries(
         shadowed_names=frozenset(),
         has_star_import=False,
     )
-    assert (
-        _is_non_closure_scalar_expr(
-            ast.parse("len(items)", mode="eval").body, None
-        )
-        is False
-    )
+    assert _is_non_closure_scalar_expr(ast.parse("len(items)", mode="eval").body, None) is False
     for scalar_code in (
         "len(items)",
         "int(x)",
@@ -472,9 +418,7 @@ def test_lazy_genexp_scalar_builtins_and_carrier_mutation_summaries(
         "len(items) == 0",
     ):
         expr_node = ast.parse(scalar_code, mode="eval").body
-        assert (
-            _is_non_closure_scalar_expr(expr_node, unshadowed_scope_ctx) is True
-        ), scalar_code
+        assert _is_non_closure_scalar_expr(expr_node, unshadowed_scope_ctx) is True, scalar_code
 
     for non_scalar_code in (
         "abs(custom_obj)",
@@ -603,9 +547,7 @@ def test_lazy_genexp_scalar_builtins_and_carrier_mutation_summaries(
         "    return after_var, loop_var\n"
     )
     cf_tree = ast.parse(cf_summary_src)
-    cf_info = _analyze_enclosing_fn_cells(
-        cf_tree.body[0], (13, 13, 8, 35), mod_tree=cf_tree
-    )
+    cf_info = _analyze_enclosing_fn_cells(cf_tree.body[0], (13, 13, 8, 35), mod_tree=cf_tree)
     assert {"flag", "items", "uncond", "both", "item"} <= cf_info.pre_bound
     assert "only_then" not in cf_info.pre_bound
     assert "only_then" in cf_info.pre_mutated
@@ -652,9 +594,7 @@ def test_lazy_genexp_scalar_builtins_and_carrier_mutation_summaries(
     )
     assert "severed_closure_cell" in comb_e2e["control_flow_hazards"]
     assert comb_e2e["is_control_flow_safe"] is False
-    res_pair = resolve_clone_pair_outputs(
-        u1_e2e, u2_e2e, sc1_e2e, sc2_e2e, return_details=True
-    )
+    res_pair = resolve_clone_pair_outputs(u1_e2e, u2_e2e, sc1_e2e, sc2_e2e, return_details=True)
     assert res_pair.outputs is None
     assert res_pair.skip_reason == "severed closure cell"
     res_gen = resolve_clone_generator_subroutine_outputs(
@@ -664,7 +604,9 @@ def test_lazy_genexp_scalar_builtins_and_carrier_mutation_summaries(
     assert res_gen.skip_reason == "severed closure cell"
     assert (
         generate_refactoring_patch(
-            [(1.0, u1_e2e, u2_e2e)], repo_root=str(tmp_path), replace_clones=True
+            [(1.0, u1_e2e, u2_e2e)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
         )
         == ""
     )
@@ -741,19 +683,19 @@ def test_multilevel_concurrent_sibling_closure_sharing() -> None:
         "end": 9,
         "kind": "compound_block",
         "source_text": p1_shadowed_src,
-        "source_code": (
-            "for step in (1, 2):\n"
-            "    value += step\n"
-            "    yield value\n"
-        ),
+        "source_code": ("for step in (1, 2):\n" "    value += step\n" "    yield value\n"),
     }
-    p1_shadowed_scope = inspect_single_unit_scope(
-        p1_shadowed_unit, tree=p1_shadowed_tree
-    )
+    p1_shadowed_scope = inspect_single_unit_scope(p1_shadowed_unit, tree=p1_shadowed_tree)
     assert "severed_closure_cell" not in p1_shadowed_scope["control_flow_hazards"]
     p1_sh_chain = _find_enclosing_function_chain(p1_shadowed_tree, 7, 9)
     p1_sh_infos = _build_enclosing_chain_cell_infos(
-        p1_sh_chain, 7, 9, None, None, frozenset({"value"}), mod_tree=p1_shadowed_tree
+        p1_sh_chain,
+        7,
+        9,
+        None,
+        None,
+        frozenset({"value"}),
+        mod_tree=p1_shadowed_tree,
     )
     assert (
         _check_sibling_closure_sharing(
@@ -884,9 +826,7 @@ def test_with_and_async_with_definite_bindings() -> None:
     for code_str, expected_bound, expected_term in with_cases:
         parsed = ast.parse(code_str)
         stmts = (
-            parsed.body[0].body
-            if isinstance(parsed.body[0], ast.AsyncFunctionDef)
-            else parsed.body
+            parsed.body[0].body if isinstance(parsed.body[0], ast.AsyncFunctionDef) else parsed.body
         )
         got_bound, got_term = _extract_block_definite_bindings_and_term(
             stmts, None, strict_with_suppression=True
@@ -935,16 +875,9 @@ def test_class_definitions_escape_and_shared_ast_context_cache() -> None:
             "res = count + len(items)\n"
         ),
     }
-    muts_unref = _collect_unit_nonlocal_mutators(
-        ast.parse(str(cls_unref_unit["source_code"])).body
-    )
-    assert any(
-        m.name == "LocalHelper" and m.is_escaped_def is False
-        for m in muts_unref
-    )
-    sc_cls_unref = inspect_single_unit_scope(
-        cls_unref_unit, tree=cls_unref_tree
-    )
+    muts_unref = _collect_unit_nonlocal_mutators(ast.parse(str(cls_unref_unit["source_code"])).body)
+    assert any(m.name == "LocalHelper" and m.is_escaped_def is False for m in muts_unref)
+    sc_cls_unref = inspect_single_unit_scope(cls_unref_unit, tree=cls_unref_tree)
     assert "severed_closure_cell" not in sc_cls_unref["control_flow_hazards"]
 
     escaping_cls_tails = [
@@ -982,9 +915,9 @@ def test_class_definitions_escape_and_shared_ast_context_cache() -> None:
             },
             tree=ast.parse(esc_src),
         )
-        assert "severed_closure_cell" in sc_esc["control_flow_hazards"], (
-            f"Expected hazard for: {extra_stmt}"
-        )
+        assert (
+            "severed_closure_cell" in sc_esc["control_flow_hazards"]
+        ), f"Expected hazard for: {extra_stmt}"
 
     for cls_header_or_body in [
         "@dec\nclass LocalHelper:\n    def mutate(self):\n        nonlocal count\n        count += 1\n",
@@ -994,17 +927,9 @@ def test_class_definitions_escape_and_shared_ast_context_cache() -> None:
     ]:
         c5_stmts = ast.parse("count = 0\n" + cls_header_or_body).body
         c5_muts = _collect_unit_nonlocal_mutators(c5_stmts)
-        assert any(
-            m.name == "LocalHelper" and m.is_escaped_def is True
-            for m in c5_muts
-        )
-        _, c5_esc_ids, _ = _collect_escaped_and_executed_intra_unit_defs(
-            c5_stmts, frozenset()
-        )
-        assert any(
-            isinstance(s, ast.ClassDef) and id(s) in c5_esc_ids
-            for s in c5_stmts
-        )
+        assert any(m.name == "LocalHelper" and m.is_escaped_def is True for m in c5_muts)
+        _, c5_esc_ids, _ = _collect_escaped_and_executed_intra_unit_defs(c5_stmts, frozenset())
+        assert any(isinstance(s, ast.ClassDef) and id(s) in c5_esc_ids for s in c5_stmts)
 
     # 4. Cached closure metadata context validation on shared AST nodes
     clear_dataflow_cache()
@@ -1053,7 +978,10 @@ def test_class_definitions_escape_and_shared_ast_context_cache() -> None:
     assert _is_closure_factory_scope(shared_fn, ctx_detached) is False
     assert _extract_fn_outer_carrier_targets(shared_fn, frozenset(), ctx_a) == set()
     assert _extract_fn_outer_carrier_targets(shared_fn, frozenset(), ctx_b) == {"box"}
-    assert _extract_fn_returned_closure_refs(shared_fn, ctx_a) == (set(), set())
+    assert _extract_fn_returned_closure_refs(shared_fn, ctx_a) == (
+        set(),
+        set(),
+    )
     assert _extract_fn_returned_closure_refs(shared_fn, ctx_b) == (
         set(),
         {"any"},
@@ -1178,9 +1106,7 @@ def test_definite_binding_oracle_and_rebinding_matrix() -> None:
     ]
     for src_a, expected_invalid in lex_cases:
         tree_a = ast.parse(src_a)
-        got_invalid = _has_invalid_lexical_scope_declarations(
-            tree_a.body, mod_tree=tree_a
-        )
+        got_invalid = _has_invalid_lexical_scope_declarations(tree_a.body, mod_tree=tree_a)
         assert got_invalid is expected_invalid
         try:
             compile(src_a, "<lex_case>", "exec")
@@ -1209,16 +1135,12 @@ def test_definite_binding_oracle_and_rebinding_matrix() -> None:
     assert isinstance(rebinding_fn, ast.FunctionDef)
     expected_rebind_muts = {"a", "b", "d", "e", "h"}
     if sys.version_info >= (3, 10):
-        rebinding_fn.body.append(
-            ast.parse("match a:\n    case f:\n        pass\n").body[0]
-        )
+        rebinding_fn.body.append(ast.parse("match a:\n    case f:\n        pass\n").body[0])
         expected_rebind_muts.add("f")
     if sys.version_info >= (3, 12):
         rebinding_fn.body.append(ast.parse("type g = int\n").body[0])
         expected_rebind_muts.add("g")
-    b_muts, b_dels = _extract_closure_nonlocal_mutations_and_deletions_uncached(
-        rebinding_fn
-    )
+    b_muts, b_dels = _extract_closure_nonlocal_mutations_and_deletions_uncached(rebinding_fn)
     assert b_muts == frozenset(expected_rebind_muts)
     assert b_dels == frozenset({"b", "e"})
 
@@ -1252,9 +1174,7 @@ def test_definite_binding_oracle_and_rebinding_matrix() -> None:
     )
     chain_col_tree = ast.parse(chain_col_src)
     assert _find_enclosing_function_chain(chain_col_tree, 1, 1) == []
-    chain_d = _find_enclosing_function_chain(
-        chain_col_tree, 3, 3, u_start_col=23, u_end_col=35
-    )
+    chain_d = _find_enclosing_function_chain(chain_col_tree, 3, 3, u_start_col=23, u_end_col=35)
     assert [getattr(n, "name", "") for _, _, n in chain_d] == [
         "outer",
         "single_line",
@@ -1337,9 +1257,7 @@ def test_pep227_class_level_global_isolation_and_sibling_carriers() -> None:
     cls_c = outer_fn.body[2]
     assert isinstance(cls_c, ast.ClassDef)
     outer_ctx = _get_fn_scope_context(outer_fn, mod_tree=pep227_tree)
-    c_targets = _extract_fn_outer_carrier_targets_uncached(
-        cls_c, frozenset(), outer_ctx
-    )
+    c_targets = _extract_fn_outer_carrier_targets_uncached(cls_c, frozenset(), outer_ctx)
     assert "items" in c_targets
     cls_vis = _ClassScopeVisitor()
     for s_node in cls_c.body:
@@ -1412,10 +1330,7 @@ def test_ensure_unit_scope_closure_mode_legacy_and_explicit_contracts() -> None:
     )
     assert unmarked_no_source["is_control_flow_safe"] is False
     assert "severed_closure_cell" in unmarked_no_source["control_flow_hazards"]
-    assert (
-        "unavailable_source_for_closure_mode"
-        in unmarked_no_source["closure_hazard_reasons"]
-    )
+    assert "unavailable_source_for_closure_mode" in unmarked_no_source["closure_hazard_reasons"]
     assert unmarked_no_source["scope_schema_version"] == SCOPE_SCHEMA_VERSION
 
     # Empty source_lines: [] must not count as having source
@@ -1640,7 +1555,9 @@ def test_comprehension_filter_walrus_async_for_and_three_level_class_closures() 
 
 def test_try_del_return_fallthrough_and_iter_class_body_methods() -> None:
     """Verifies try-del-return handler fallthrough and _iter_class_body_methods."""
-    from pydoppelgangerhunt.fixer._df_cell_carriers import _iter_class_body_methods
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _iter_class_body_methods,
+    )
     from pydoppelgangerhunt.fixer.scope import _analyze_block_assignment
 
     try_del_ret_src = (
@@ -1660,9 +1577,7 @@ def test_try_del_return_fallthrough_and_iter_class_body_methods() -> None:
     try_del_fn = try_del_tree.body[0]
     assert isinstance(try_del_fn, ast.FunctionDef)
     may_d: set[str] = set()
-    def_s, cond_s = _analyze_block_assignment(
-        try_del_fn.body[:2], may_deleted=may_d
-    )
+    def_s, cond_s = _analyze_block_assignment(try_del_fn.body[:2], may_deleted=may_d)
     assert "x" not in def_s
     assert "x" in cond_s
     assert "x" in may_d
@@ -1701,9 +1616,7 @@ def test_try_del_return_fallthrough_and_iter_class_body_methods() -> None:
     )
     if sys.version_info >= (3, 10):
         cls_methods_src += (
-            "    match 1:\n"
-            "        case 1:\n"
-            "            def m_match(self): pass\n"
+            "    match 1:\n" "        case 1:\n" "            def m_match(self): pass\n"
         )
     cls_methods_node = ast.parse(cls_methods_src).body[0]
     assert isinstance(cls_methods_node, ast.ClassDef)
@@ -1828,7 +1741,9 @@ def test_stmt_delta_equivalence_and_shared_definite_binding_corpus() -> None:
         def_a, _ = _analyze_block_assignment(stmts)
         def_b, _ = _extract_block_definite_bindings_and_term(stmts, None)
         assert def_a == expected_def_set, f"_analyze_block_assignment mismatch on:\n{snippet}"
-        assert def_b == expected_def_set, f"_extract_block_definite_bindings_and_term mismatch on:\n{snippet}"
+        assert (
+            def_b == expected_def_set
+        ), f"_extract_block_definite_bindings_and_term mismatch on:\n{snippet}"
         assert def_a == def_b
 
     if sys.version_info >= (3, 11):
@@ -1867,12 +1782,20 @@ def test_slice_unit_token_lines_multiline_and_utf8_boundaries() -> None:
     assert sliced_inside[0] == "(\n"
     assert sliced_inside[-1] == "    )"
     sliced_exact_first = _slice_unit_token_lines(
-        {"kind": "complex_expr", "start_col": first_bytes_len, "end_col": last_bytes_len},
+        {
+            "kind": "complex_expr",
+            "start_col": first_bytes_len,
+            "end_col": last_bytes_len,
+        },
         ml_lines,
     )
     assert sliced_exact_first[0] == ml_lines[0]
     sliced_beyond_first = _slice_unit_token_lines(
-        {"kind": "complex_expr", "start_col": first_bytes_len + 10, "end_col": last_bytes_len},
+        {
+            "kind": "complex_expr",
+            "start_col": first_bytes_len + 10,
+            "end_col": last_bytes_len,
+        },
         ml_lines,
     )
     assert sliced_beyond_first[0] == ml_lines[0]
@@ -1933,26 +1856,22 @@ def test_cached_vs_uncached_helper_equivalence_and_multipath_runtime_oracle() ->
     eq_ctx = _get_fn_scope_context(outer_eq, mod_tree=helper_eq_tree)
     assert _extract_closure_nonlocal_mutations_and_deletions(
         inner_eq, use_cache=True
-    ) == _extract_closure_nonlocal_mutations_and_deletions(
-        inner_eq, use_cache=False
-    )
+    ) == _extract_closure_nonlocal_mutations_and_deletions(inner_eq, use_cache=False)
     assert _extract_cached_scope_free_reads(
         inner_eq, use_cache=True
     ) == _extract_cached_scope_free_reads(inner_eq, use_cache=False)
-    assert _is_self_escaping_def_node(
-        inner_eq, use_cache=True
-    ) == _is_self_escaping_def_node(inner_eq, use_cache=False)
-    assert _is_closure_factory_scope(
-        inner_eq, eq_ctx, use_cache=True
-    ) == _is_closure_factory_scope(inner_eq, eq_ctx, use_cache=False)
+    assert _is_self_escaping_def_node(inner_eq, use_cache=True) == _is_self_escaping_def_node(
+        inner_eq, use_cache=False
+    )
+    assert _is_closure_factory_scope(inner_eq, eq_ctx, use_cache=True) == _is_closure_factory_scope(
+        inner_eq, eq_ctx, use_cache=False
+    )
     assert _extract_fn_returned_closure_refs(
         inner_eq, eq_ctx, use_cache=True
     ) == _extract_fn_returned_closure_refs(inner_eq, eq_ctx, use_cache=False)
     assert _extract_fn_outer_carrier_targets(
         inner_eq, frozenset(), eq_ctx, use_cache=True
-    ) == _extract_fn_outer_carrier_targets(
-        inner_eq, frozenset(), eq_ctx, use_cache=False
-    )
+    ) == _extract_fn_outer_carrier_targets(inner_eq, frozenset(), eq_ctx, use_cache=False)
 
     multipath_snippet = (
         "def _probe(cond, fail):\n"
@@ -2006,7 +1925,14 @@ def test_cached_vs_uncached_helper_equivalence_and_multipath_runtime_oracle() ->
         "    return [cb(3) for cb in cbs]\n"
     )
     ns_neg_ctrl: dict[str, Any] = {}
-    exec(compile(orig_hazard_fn_src + "\n" + forced_extracted_src, "<neg_ctrl>", "exec"), ns_neg_ctrl)  # noqa: S102
+    exec(
+        compile(
+            orig_hazard_fn_src + "\n" + forced_extracted_src,
+            "<neg_ctrl>",
+            "exec",
+        ),
+        ns_neg_ctrl,
+    )  # noqa: S102
     assert ns_neg_ctrl["run_orig"]([1, 2]) == [31, 32]
     assert ns_neg_ctrl["run_forced"]([1, 2]) == [7, 8]
     assert ns_neg_ctrl["run_orig"]([1, 2]) != ns_neg_ctrl["run_forced"]([1, 2])
@@ -2094,9 +2020,7 @@ def test_detached_unit_ast_isolation_and_stale_source_code_fail_closed() -> None
         "source_text": lenient_unit_src,
         "source_code": "for x in items:\n    acc = x * 2\n",
     }
-    comb_lenient = analyze_unit_variable_scope(
-        u_len, dict(u_len), skip_pre_unit_closures=True
-    )
+    comb_lenient = analyze_unit_variable_scope(u_len, dict(u_len), skip_pre_unit_closures=True)
     assert comb_lenient["skip_pre_unit_closures"] is True
     assert "severed_closure_cell" not in comb_lenient["control_flow_hazards"]
 
@@ -2129,9 +2053,7 @@ def test_scope_cache_key_permitted_parameter_types() -> None:
     assert valid_key.aux_ast_nodes == (stmt,)
 
     assert not hasattr(_ScopeCacheKey, "make_trusted")
-    trusted_key = _make_trusted_scope_cache_key(
-        mod, "trusted_kind", params=("ok", 1)
-    )
+    trusted_key = _make_trusted_scope_cache_key(mod, "trusted_kind", params=("ok", 1))
     assert trusted_key.kind == "trusted_kind"
     assert trusted_key == _ScopeCacheKey(mod, "trusted_kind", params=("ok", 1))
 
@@ -2164,9 +2086,7 @@ def test_scope_cache_key_permitted_parameter_types() -> None:
         ({"a", "b"},),
         (object(),),
     ):
-        with pytest.raises(
-            TypeError, match="only permits immutable"
-        ):
+        with pytest.raises(TypeError, match="only permits immutable"):
             _ScopeCacheKey(mod, "bad_type", params=bad_type_params)
 
 
@@ -2185,10 +2105,7 @@ def test_structural_invariants_across_deterministic_corpus() -> None:
 
     corpus_programs = [
         (
-            "def f1(xs):\n"
-            "    a = 1\n"
-            "    res = [x + a for x in xs]\n"
-            "    return res\n",
+            "def f1(xs):\n" "    a = 1\n" "    res = [x + a for x in xs]\n" "    return res\n",
             3,
             3,
             "comprehension",
@@ -2273,13 +2190,9 @@ def test_structural_invariants_across_deterministic_corpus() -> None:
         # 3. Defensive copies (mutating returned dict/lists does not corrupt cache)
         res_warm["inputs"].append("__mutated_input__")
         res_warm["control_flow_hazards"].append("__mutated_hazard__")
-        res_after_mut = inspect_single_unit_scope(
-            dict(unit_explicit), tree=tree
-        )
+        res_after_mut = inspect_single_unit_scope(dict(unit_explicit), tree=tree)
         assert "__mutated_input__" not in res_after_mut["inputs"]
-        assert (
-            "__mutated_hazard__" not in res_after_mut["control_flow_hazards"]
-        )
+        assert "__mutated_hazard__" not in res_after_mut["control_flow_hazards"]
 
         # 4. AST isolation (only nodes belonging to `tree` are retained in caches)
         for p_node in _scope_parent_maps:
@@ -2310,23 +2223,27 @@ def test_structural_invariants_across_deterministic_corpus() -> None:
         # 2. Cache eviction (evicting tree removes all entries referencing tree_nodes)
         _evict_tree_scopes(tree)
         assert not any(p in tree_nodes for p in _scope_parent_maps)
-        assert not any(
-            _key_references_scope_nodes(k, tree_nodes)
-            for k in _scope_cell_info_cache
-        )
+        assert not any(_key_references_scope_nodes(k, tree_nodes) for k in _scope_cell_info_cache)
 
     # 7. Lexical equivalence against Python's symtable/compile
     lexical_samples = [
-        ("def f():\n    x = 1\n    def g():\n        nonlocal x\n        x = 2\n", False),
-        ("def f():\n    global x\n    def g():\n        nonlocal x\n        x = 2\n", True),
+        (
+            "def f():\n    x = 1\n    def g():\n        nonlocal x\n        x = 2\n",
+            False,
+        ),
+        (
+            "def f():\n    global x\n    def g():\n        nonlocal x\n        x = 2\n",
+            True,
+        ),
         ("def f(x):\n    nonlocal x\n", True),
-        ("def f():\n    class C:\n        global x\n        def m(self):\n            return x\n", False),
+        (
+            "def f():\n    class C:\n        global x\n        def m(self):\n            return x\n",
+            False,
+        ),
     ]
     for lex_src, expected_invalid in lexical_samples:
         lex_tree = ast.parse(lex_src)
-        got_invalid = _has_invalid_lexical_scope_declarations(
-            lex_tree.body, mod_tree=lex_tree
-        )
+        got_invalid = _has_invalid_lexical_scope_declarations(lex_tree.body, mod_tree=lex_tree)
         symtable_rejected = False
         try:
             symtable.symtable(lex_src, "<lex_test>", "exec")
@@ -2375,7 +2292,9 @@ def test_indexed_cache_eviction_multi_owner_node_reuse_and_central_invariant() -
         _scope_closures_cache,
         _scope_owner_keys_index,
     )
-    from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _get_fn_scope_context,
+    )
     from pydoppelgangerhunt.fixer._df_closures import _FrozenClosureList
 
     clear_dataflow_cache()
@@ -2405,14 +2324,11 @@ def test_indexed_cache_eviction_multi_owner_node_reuse_and_central_invariant() -
     assert ctx_before.mod_tree is tree_a
     _evict_tree_scopes(tree_a)
     assert not any(
-        _key_references_scope_nodes(k, {reused_fn, tree_a})
-        for k in _scope_cell_info_cache
+        _key_references_scope_nodes(k, {reused_fn, tree_a}) for k in _scope_cell_info_cache
     )
     new_wrapper_tree = ast.Module(
         body=[
-            ast.ImportFrom(
-                module="math", names=[ast.alias(name="*")], level=0
-            ),
+            ast.ImportFrom(module="math", names=[ast.alias(name="*")], level=0),
             reused_fn,
         ],
         type_ignores=[],
@@ -2422,10 +2338,7 @@ def test_indexed_cache_eviction_multi_owner_node_reuse_and_central_invariant() -
     assert ctx_after.has_star_import is True
 
     clear_dataflow_cache()
-    trees = [
-        ast.parse(f"def fn_{i}(x):\n    y = x + {i}\n    return y\n")
-        for i in range(4)
-    ]
+    trees = [ast.parse(f"def fn_{i}(x):\n    y = x + {i}\n    return y\n") for i in range(4)]
     tree_node_sets = [set(ast.walk(t)) for t in trees]
     all_supported_keys: list[Any] = []
     for idx, t in enumerate(trees):
@@ -2434,9 +2347,7 @@ def test_indexed_cache_eviction_multi_owner_node_reuse_and_central_invariant() -
         stmt_node = fn_node.body[0]
         next_t = trees[(idx + 1) % len(trees)]
         k_ast = fn_node
-        k_sck_single = _ScopeCacheKey(
-            owner=fn_node, kind="single", params=(idx, ("nested", True))
-        )
+        k_sck_single = _ScopeCacheKey(owner=fn_node, kind="single", params=(idx, ("nested", True)))
         k_sck_multi = _ScopeCacheKey(
             owner=stmt_node,
             kind="multi",
@@ -2485,9 +2396,7 @@ def test_scope_cache_key_kind_validation_cross_cache_eviction_and_detached_subtr
     )
 
     def _assert_central_index_invariant() -> None:
-        all_cached_keys = set(_scope_closures_cache.keys()) | set(
-            _scope_cell_info_cache.keys()
-        )
+        all_cached_keys = set(_scope_closures_cache.keys()) | set(_scope_cell_info_cache.keys())
         for cache in (_scope_closures_cache, _scope_cell_info_cache):
             for k, val in cache.items():
                 for node in (
@@ -2703,24 +2612,16 @@ def test_fn_scope_context_parent_map_immutability_and_enclosing_scope_key_isolat
 
     with pytest.raises(TypeError):
         ctx_a.parent_map[target_a] = enc_b  # type: ignore[index]
-    nested_ctx_a = _make_nested_fn_scope_context(
-        target_a, frozenset(), scope_ctx=ctx_a
-    )
-    nested_ctx_b = _make_nested_fn_scope_context(
-        target_b, frozenset(), scope_ctx=ctx_b
-    )
+    nested_ctx_a = _make_nested_fn_scope_context(target_a, frozenset(), scope_ctx=ctx_a)
+    nested_ctx_b = _make_nested_fn_scope_context(target_b, frozenset(), scope_ctx=ctx_b)
     with pytest.raises(TypeError):
         nested_ctx_a.parent_map[target_a] = enc_b  # type: ignore[index]
 
     assert nested_ctx_a.cache_fingerprint() == nested_ctx_b.cache_fingerprint()
     assert nested_ctx_a.enclosing_scopes != nested_ctx_b.enclosing_scopes
     shared_expr = target_a.body[0]
-    key_a = _make_scope_ctx_cache_key(
-        shared_expr, "expr_free_reads", nested_ctx_a
-    )
-    key_b = _make_scope_ctx_cache_key(
-        shared_expr, "expr_free_reads", nested_ctx_b
-    )
+    key_a = _make_scope_ctx_cache_key(shared_expr, "expr_free_reads", nested_ctx_a)
+    key_b = _make_scope_ctx_cache_key(shared_expr, "expr_free_reads", nested_ctx_b)
     assert key_a != key_b
     assert hash(key_a) != hash(key_b) or key_a.aux_ast_nodes != key_b.aux_ast_nodes
 
@@ -2767,9 +2668,7 @@ def test_async_subroutine_without_await_suspension_precision_and_monotonicity() 
     )
     assert _has_severed_closure_cell_hazard(ctx_async_no_await) is False
 
-    ctx_async_with_await = ctx_async_no_await._replace(
-        candidate_stmts=await_stmts
-    )
+    ctx_async_with_await = ctx_async_no_await._replace(candidate_stmts=await_stmts)
     assert _has_severed_closure_cell_hazard(ctx_async_with_await) is True
 
     ctx_sync_gen = ctx_async_no_await._replace(
@@ -2858,7 +2757,9 @@ def test_span_line_index_detached_subtree_eviction_and_recomputation() -> None:
 
 def test_coordinate_enclosing_scope_recovery_and_symtable_cross_check() -> None:
     """Verifies coordinate-based enclosing-scope resolution, explicit enclosing_scopes propagation, and symtable scope analysis."""
-    from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context_uncached
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _get_fn_scope_context_uncached,
+    )
     from pydoppelgangerhunt.fixer._df_closures import (
         _collect_scope_closures_uncached,
         _extract_scope_local_names,
@@ -2866,9 +2767,7 @@ def test_coordinate_enclosing_scope_recovery_and_symtable_cross_check() -> None:
     )
     from tests.fixer._closure_test_helpers import _extract_symtable_scope_info
 
-    mod_one_line = ast.parse(
-        "def outer(items): sum = custom_sum; return sum(x for x in items)\n"
-    )
+    mod_one_line = ast.parse("def outer(items): sum = custom_sum; return sum(x for x in items)\n")
     outer_one = mod_one_line.body[0]
     assert isinstance(outer_one, ast.FunctionDef)
     ret_one = outer_one.body[1]
@@ -2876,9 +2775,7 @@ def test_coordinate_enclosing_scope_recovery_and_symtable_cross_check() -> None:
     assert outer_one in enc_one_line
     locals_one_line = _extract_scope_local_names(ret_one, module_tree=mod_one_line)
     assert "sum" in locals_one_line
-    closures_one_line = _collect_scope_closures_uncached(
-        outer_one, module_tree=mod_one_line
-    )
+    closures_one_line = _collect_scope_closures_uncached(outer_one, module_tree=mod_one_line)
     assert any("items" in reads for _, reads in closures_one_line)
 
     mod_async_one_line = ast.parse(
@@ -2887,17 +2784,11 @@ def test_coordinate_enclosing_scope_recovery_and_symtable_cross_check() -> None:
     outer_async = mod_async_one_line.body[0]
     assert isinstance(outer_async, ast.AsyncFunctionDef)
     ret_async = outer_async.body[1]
-    enc_async = _resolve_enclosing_scopes_by_coords(
-        ret_async, mod_async_one_line
-    )
+    enc_async = _resolve_enclosing_scopes_by_coords(ret_async, mod_async_one_line)
     assert outer_async in enc_async
-    locals_async = _extract_scope_local_names(
-        ret_async, module_tree=mod_async_one_line
-    )
+    locals_async = _extract_scope_local_names(ret_async, module_tree=mod_async_one_line)
     assert "sum" in locals_async
-    closures_async = _collect_scope_closures_uncached(
-        outer_async, module_tree=mod_async_one_line
-    )
+    closures_async = _collect_scope_closures_uncached(outer_async, module_tree=mod_async_one_line)
     assert any("items" in reads for _, reads in closures_async)
 
     mod_multiline = ast.parse(
@@ -2941,9 +2832,7 @@ def test_coordinate_enclosing_scope_recovery_and_symtable_cross_check() -> None:
     assert isinstance(outer_cls_fn, ast.FunctionDef)
     inner_cls = outer_cls_fn.body[1]
     assert isinstance(inner_cls, ast.ClassDef)
-    detached_cls_unit = ast.parse(
-        "r1 = sum(x for x in items)\nr2 = max(y for y in items)\n"
-    )
+    detached_cls_unit = ast.parse("r1 = sum(x for x in items)\nr2 = max(y for y in items)\n")
     locals_cls = _extract_scope_local_names(
         detached_cls_unit,
         module_tree=mod_nested_cls,
@@ -2989,7 +2878,9 @@ def test_tracked_scope_cache_stmt_deltas_incremental_mutation_indexing() -> None
         _scope_cell_info_cache,
         _scope_owner_keys_index,
     )
-    from pydoppelgangerhunt.fixer._df_cell_traversal import _analyze_enclosing_fn_cells
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _analyze_enclosing_fn_cells,
+    )
 
     clear_dataflow_cache()
     src = (
@@ -3006,12 +2897,8 @@ def test_tracked_scope_cache_stmt_deltas_incremental_mutation_indexing() -> None
     stmt_x = outer_fn.body[0]
     stmt_y = outer_fn.body[1]
 
-    _analyze_enclosing_fn_cells(
-        outer_fn, (4, 5, 4, 16), mod_tree=tree
-    )
-    deltas_key = _ScopeCacheKey(
-        owner=outer_fn, kind="stmt_deltas", aux_ast_nodes=(tree,)
-    )
+    _analyze_enclosing_fn_cells(outer_fn, (4, 5, 4, 16), mod_tree=tree)
+    deltas_key = _ScopeCacheKey(owner=outer_fn, kind="stmt_deltas", aux_ast_nodes=(tree,))
     assert deltas_key in _scope_cell_info_cache
     cached_deltas = _scope_cell_info_cache[deltas_key]
     assert isinstance(cached_deltas, _TrackedCachedDict)
@@ -3076,9 +2963,7 @@ def test_extract_unit_source_code_empty_and_whitespace_source_text_fallback(
         "def example():\n",
         "    return 42\n",
     ]
-    lines_with_state, is_pre_sliced = extract_unit_source_lines_with_state(
-        unit_empty_src
-    )
+    lines_with_state, is_pre_sliced = extract_unit_source_lines_with_state(unit_empty_src)
     assert lines_with_state == ["def example():\n", "    return 42\n"]
     assert bool(is_pre_sliced) is False
     assert is_pre_sliced.is_placeholder is False
@@ -3161,9 +3046,7 @@ def test_trusted_scope_cache_key_immutability_and_enclosing_chain_and_modes() ->
         "    return mid(a)\n"
     )
     chain_tree = ast.parse(chain_src)
-    chain = _find_enclosing_function_chain(
-        chain_tree, 9, 9, u_start_col=34, u_end_col=54
-    )
+    chain = _find_enclosing_function_chain(chain_tree, 9, 9, u_start_col=34, u_end_col=54)
     assert [getattr(n, "name", "") for _, _, n in chain] == [
         "outer",
         "mid",
@@ -3212,19 +3095,31 @@ def test_trusted_scope_cache_key_immutability_and_enclosing_chain_and_modes() ->
 
     s2_lenient = inspect_single_unit_scope({**u2, "skip_pre_unit_closures": True})
     pair_strict = analyze_unit_variable_scope(
-        u1, u2, scope1=s1_lenient, scope2=s2_lenient, skip_pre_unit_closures=False
+        u1,
+        u2,
+        scope1=s1_lenient,
+        scope2=s2_lenient,
+        skip_pre_unit_closures=False,
     )
     assert pair_strict["skip_pre_unit_closures"] is False
     assert "severed_closure_cell" in pair_strict["control_flow_hazards"]
 
     assert (
         resolve_clone_pair_outputs(
-            u1, u2, scope1=s1_lenient, scope2=s2_lenient, closure_strictness="strict"
+            u1,
+            u2,
+            scope1=s1_lenient,
+            scope2=s2_lenient,
+            closure_strictness="strict",
         )
         is None
     )
     outs_lenient = resolve_clone_pair_outputs(
-        u1, u2, scope1=s1_strict, scope2=s2_strict, closure_strictness="lenient"
+        u1,
+        u2,
+        scope1=s1_strict,
+        scope2=s2_strict,
+        closure_strictness="lenient",
     )
     assert outs_lenient == (["x"], ["x"])
 
@@ -3239,7 +3134,11 @@ def test_trusted_scope_cache_key_immutability_and_enclosing_chain_and_modes() ->
     assert helper_strict == ""
 
     pair_lenient = analyze_unit_variable_scope(
-        u1, u2, scope1=s1_lenient, scope2=s2_lenient, skip_pre_unit_closures=True
+        u1,
+        u2,
+        scope1=s1_lenient,
+        scope2=s2_lenient,
+        skip_pre_unit_closures=True,
     )
     helper_lenient = synthesize_shared_helper_code(
         u1,
@@ -3309,18 +3208,14 @@ def test_collect_unit_nonlocal_mutators_ephemeral_module_isolation() -> None:
     assert isinstance(outer_fn, ast.FunctionDef)
     for_stmt = outer_fn.body[1]
     assert isinstance(for_stmt, ast.For)
-    mutators = _collect_unit_nonlocal_mutators(
-        [for_stmt], mod_tree=mod_tree
-    )
+    mutators = _collect_unit_nonlocal_mutators([for_stmt], mod_tree=mod_tree)
     assert any(m.name == "outer_helper" for m in mutators)
     for c_key in _scope_cell_info_cache:
         for ast_n in (c_key.owner, *c_key.aux_ast_nodes):
             assert ast_n in mod_nodes
 
     keys_before = set(_scope_cell_info_cache.keys())
-    mutators_warm = _collect_unit_nonlocal_mutators(
-        [for_stmt], mod_tree=mod_tree
-    )
+    mutators_warm = _collect_unit_nonlocal_mutators([for_stmt], mod_tree=mod_tree)
     assert mutators_warm == mutators
     assert set(_scope_cell_info_cache.keys()) == keys_before
 
@@ -3404,7 +3299,9 @@ def test_enclosing_scope_sensitivity_and_parent_map_reverse_index_eviction() -> 
         _scope_key_nodes_index,
         _scope_parent_maps,
     )
-    from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _get_fn_scope_context,
+    )
     from pydoppelgangerhunt.fixer._df_closures import (
         _collect_scope_closures,
     )
@@ -3429,23 +3326,15 @@ def test_enclosing_scope_sensitivity_and_parent_map_reverse_index_eviction() -> 
     shared_inner = outer_sh.body[0]
     assert isinstance(shared_inner, ast.FunctionDef)
 
-    ctx_sh = _get_fn_scope_context(
-        shared_inner, mod_tree=None, enclosing_scopes=(outer_sh,)
-    )
-    ctx_cl = _get_fn_scope_context(
-        shared_inner, mod_tree=None, enclosing_scopes=(outer_cl,)
-    )
+    ctx_sh = _get_fn_scope_context(shared_inner, mod_tree=None, enclosing_scopes=(outer_sh,))
+    ctx_cl = _get_fn_scope_context(shared_inner, mod_tree=None, enclosing_scopes=(outer_cl,))
     assert "list" in ctx_sh.shadowed_names
     assert "list" not in ctx_cl.shadowed_names
     # _FnScopeContext.cached_ast_nodes() only indexes cache_aux_nodes, not every AST node in parent_map
     assert set(ctx_sh.cached_ast_nodes()) == set(ctx_sh.cache_aux_nodes())
 
-    clos_sh = _collect_scope_closures(
-        shared_inner, module_tree=None, enclosing_scopes=(outer_sh,)
-    )
-    clos_cl = _collect_scope_closures(
-        shared_inner, module_tree=None, enclosing_scopes=(outer_cl,)
-    )
+    clos_sh = _collect_scope_closures(shared_inner, module_tree=None, enclosing_scopes=(outer_sh,))
+    clos_cl = _collect_scope_closures(shared_inner, module_tree=None, enclosing_scopes=(outer_cl,))
     assert len(clos_sh) == 1  # shadowed list -> lazy genexp closure
     assert len(clos_cl) == 0  # unshadowed list -> eager genexp
 
@@ -3542,8 +3431,7 @@ def test_suppress_provenance_set_algebra_and_with_classification_modes() -> None
     assert "m" not in bound_prov
 
     custom_safe_stmts = ast.parse(
-        "with SafeTransaction():\n"
-        "    committed = compute_value()\n"
+        "with SafeTransaction():\n" "    committed = compute_value()\n"
     ).body
     # Default heuristic mode treats non-suppress-named managers as non-suppressing
     def_heur, cond_heur = _analyze_block_assignment(
@@ -3574,21 +3462,11 @@ def test_fn_scope_context_fingerprint_downstream_cache_key_and_multiline_decorat
     from pydoppelgangerhunt.fixer._df_closures import _node_earliest_start_pos
 
     ml_dec_src = (
-        "x = 1\n"
-        "@(\n"
-        "    decorator_factory\n"
-        ")\n"
-        "def decorated_fn():\n"
-        "    return 1\n"
+        "x = 1\n" "@(\n" "    decorator_factory\n" ")\n" "def decorated_fn():\n" "    return 1\n"
     )
     ml_dec_tree = ast.parse(ml_dec_src)
     dec_fn_node = ml_dec_tree.body[1]
-    assert (
-        _node_earliest_start_pos(
-            dec_fn_node, source_lines=ml_dec_src.splitlines()
-        )
-        == (2, 0)
-    )
+    assert _node_earliest_start_pos(dec_fn_node, source_lines=ml_dec_src.splitlines()) == (2, 0)
 
     fp_empty = _FnScopeContext(
         fn_locals=frozenset({"x"}),
@@ -3698,7 +3576,7 @@ def test_branch_merged_suppress_provenance_and_with_splitting_strict_names() -> 
     assert "cm" in prov_seeded.suppress_names
     def_if, cond_if = _analyze_block_assignment(
         if_fn.body[:-1],
-        suppress_aliases= _seed_scope_suppress_aliases(if_fn, if_tree, u_start=2),
+        suppress_aliases=_seed_scope_suppress_aliases(if_fn, if_tree, u_start=2),
         strict_with_suppression=False,
     )
     assert "x" not in def_if
@@ -3713,18 +3591,13 @@ def test_branch_merged_suppress_provenance_and_with_splitting_strict_names() -> 
 
     # 2. If/else where BOTH branches overwrite suppressor -> suppressor is cleared
     both_clear_stmts = ast.parse(
-        "if cond:\n"
-        "    cm = nullcontext\n"
-        "else:\n"
-        "    cm = closing\n"
+        "if cond:\n" "    cm = nullcontext\n" "else:\n" "    cm = closing\n"
     ).body
     prov_init = _SuppressProvenance(
         suppressors=frozenset({"cm"}),
         non_suppressors=frozenset({"nullcontext", "closing"}),
     )
-    prov_after_both = _update_suppress_provenance_from_stmt(
-        both_clear_stmts[0], prov_init
-    )
+    prov_after_both = _update_suppress_provenance_from_stmt(both_clear_stmts[0], prov_init)
     assert "cm" not in prov_after_both.suppress_names
     assert "cm" in prov_after_both.non_suppress_names
 
@@ -3742,18 +3615,14 @@ def test_branch_merged_suppress_provenance_and_with_splitting_strict_names() -> 
         "    cm4 = other_factory()\n"
     )
     comp_stmts = ast.parse(compound_branch_src).body
-    prov_comp = _SuppressProvenance(
-        suppressors=frozenset({"cm1", "cm2", "cm3", "cm4"})
-    )
+    prov_comp = _SuppressProvenance(suppressors=frozenset({"cm1", "cm2", "cm3", "cm4"}))
     for st in comp_stmts:
         prov_comp = _update_suppress_provenance_from_stmt(st, prov_comp)
     assert {"cm1", "cm2", "cm3", "cm4"} <= prov_comp.suppress_names
 
     # 4. _split_with_body_by_mode forwards strict_names for proven suppressor aliases and rejects bare strings
     with_suppress_unknown_name = ast.parse(
-        "with custom_suppressor(NameError):\n"
-        "    y = possibly_unbound_name\n"
-        "    return 1\n"
+        "with custom_suppressor(NameError):\n" "    y = possibly_unbound_name\n" "    return 1\n"
     ).body[0]
     assert isinstance(with_suppress_unknown_name, ast.With)
     sup_prov = _SuppressProvenance(suppressors=frozenset({"custom_suppressor"}))
@@ -3803,7 +3672,9 @@ def test_form_feed_source_lines_ifexp_walrus_and_stmt_delta_with_suppress() -> N
         _get_or_parse_tree,
         _split_source_lines_stripped,
     )
-    from pydoppelgangerhunt.fixer._df_cell_traversal import _analyze_enclosing_fn_cells
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _analyze_enclosing_fn_cells,
+    )
     from pydoppelgangerhunt.fixer._df_closures import _node_earliest_start_pos
     from pydoppelgangerhunt.fixer._df_with_provenance import (
         _analyze_block_assignment,
@@ -3858,15 +3729,9 @@ def test_form_feed_source_lines_ifexp_walrus_and_stmt_delta_with_suppress() -> N
     sp_fn = sp_tree.body[1]
     assert isinstance(sp_fn, ast.FunctionDef)
     clear_dataflow_cache()
-    info_cached_1 = _analyze_enclosing_fn_cells(
-        sp_fn, (8, 8, 4, 17), mod_tree=sp_tree
-    )
-    info_cached_2 = _analyze_enclosing_fn_cells(
-        sp_fn, (8, 8, 4, 17), mod_tree=sp_tree
-    )
-    info_uncached = _analyze_enclosing_fn_cells(
-        sp_fn, (8, 8, 4, 17), mod_tree=None
-    )
+    info_cached_1 = _analyze_enclosing_fn_cells(sp_fn, (8, 8, 4, 17), mod_tree=sp_tree)
+    info_cached_2 = _analyze_enclosing_fn_cells(sp_fn, (8, 8, 4, 17), mod_tree=sp_tree)
+    info_uncached = _analyze_enclosing_fn_cells(sp_fn, (8, 8, 4, 17), mod_tree=None)
     assert info_cached_1.pre_bound == info_cached_2.pre_bound
     assert info_cached_1.pre_bound == info_uncached.pre_bound
     assert "x" in info_cached_1.pre_bound
@@ -3882,11 +3747,16 @@ def test_closure_strictness_precedence_ctx_managers_and_global_pure_builtins(
         resolve_closure_strictness_mode,
         resolve_strict_with_suppression,
     )
-    from pydoppelgangerhunt.fixer.scope import _is_ordered_contiguous_source_match
+    from pydoppelgangerhunt.fixer.scope import (
+        _is_ordered_contiguous_source_match,
+    )
     from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
 
     # 1. fail_closed maps to pedantic and explicit closure_strictness overrides conflicting strict_with_suppression
-    assert resolve_closure_strictness_mode("fail_closed") == ("pedantic", False)
+    assert resolve_closure_strictness_mode("fail_closed") == (
+        "pedantic",
+        False,
+    )
     assert resolve_strict_with_suppression(closure_strictness="fail_closed") is True
     with caplog.at_level(logging.WARNING):
         resolved_conflict = resolve_strict_with_suppression(
@@ -3913,9 +3783,7 @@ def test_closure_strictness_precedence_ctx_managers_and_global_pure_builtins(
             _analyze_block_assignment,
         )
 
-        defs, conds = _analyze_block_assignment(
-            stmts, strict_with_suppression=False
-        )
+        defs, conds = _analyze_block_assignment(stmts, strict_with_suppression=False)
         assert "v" not in defs
         assert "v" in conds
 
@@ -4019,12 +3887,8 @@ def test_closure_strictness_precedence_ctx_managers_and_global_pure_builtins(
     assert not _is_ordered_contiguous_source_match(["a = 1"], ["data = 100"])
     assert not _is_ordered_contiguous_source_match(["a = 1"], ["a = 10"])
     assert not _is_ordered_contiguous_source_match(["a = 1"], ["a = 1 + 2"])
-    assert _is_ordered_contiguous_source_match(
-        ["a = 1"], ["x = 0; a = 1; y = 2"]
-    )
-    assert _is_ordered_contiguous_source_match(
-        ["(a + b)"], ["res = (a + b) * 2"]
-    )
+    assert _is_ordered_contiguous_source_match(["a = 1"], ["x = 0; a = 1; y = 2"])
+    assert _is_ordered_contiguous_source_match(["(a + b)"], ["res = (a + b) * 2"])
 
     # 6. _slice_unit_token_lines honors explicit is_pre_sliced=False even on column-0 expressions
     col0_lines = ["(a + b) + c\n"]
@@ -4080,9 +3944,7 @@ def test_granular_closure_hazard_skip_reasons_and_symtable_fuzzer(
         }
     )
     assert "severed_closure_cell" in sc_missing["control_flow_hazards"]
-    assert (
-        "unavailable_source_placeholder" in sc_missing["closure_hazard_reasons"]
-    )
+    assert "unavailable_source_placeholder" in sc_missing["closure_hazard_reasons"]
 
     # 2. Patch generation logs specific closure_hazard sub-reason in skip summary
     hazard_src = (
@@ -4151,9 +4013,7 @@ def test_granular_closure_hazard_skip_reasons_and_symtable_fuzzer(
         sym_nested = sym_map[("nested_cb", 9)]
         # Exclude PEP 709 inlined comprehension loop target 'z' while keeping PEP 572 walrus 'w_leaked'
         expected_locals = (
-            (sym_outer["locals"] | sym_outer["parameters"])
-            - sym_outer["globals"]
-            - {"z"}
+            (sym_outer["locals"] | sym_outer["parameters"]) - sym_outer["globals"] - {"z"}
         )
         assert expected_locals <= ast_locals
         assert "w_leaked" in ast_locals
@@ -4187,7 +4047,9 @@ def test_unit_closure_strictness_override_and_ctx_manager_merging() -> None:
         ensure_unit_scope_closure_mode,
         scope_matches_closure_mode,
     )
-    from pydoppelgangerhunt.fixer.synthesis import synthesize_shared_helper_code
+    from pydoppelgangerhunt.fixer.synthesis import (
+        synthesize_shared_helper_code,
+    )
 
     src = (
         "def outer(a):\n"
@@ -4219,7 +4081,10 @@ def test_unit_closure_strictness_override_and_ctx_manager_merging() -> None:
     )
     assert sc_lenient["skip_pre_unit_closures"] is True
     assert sc_lenient["strict_with_suppression"] is False
-    assert sc_lenient["non_suppressing_ctx_managers"] == ["GlobalCtx", "UnitCtx"]
+    assert sc_lenient["non_suppressing_ctx_managers"] == [
+        "GlobalCtx",
+        "UnitCtx",
+    ]
     assert scope_matches_closure_mode(
         sc_lenient,
         True,
@@ -4237,7 +4102,10 @@ def test_unit_closure_strictness_override_and_ctx_manager_merging() -> None:
         tree=tree,
     )
     assert sc_pedantic["strict_with_suppression"] is True
-    assert sc_pedantic["non_suppressing_ctx_managers"] == ["CustomCtx", "UnitCtx"]
+    assert sc_pedantic["non_suppressing_ctx_managers"] == [
+        "CustomCtx",
+        "UnitCtx",
+    ]
     assert "y" in sc_pedantic["definite_stores"]
 
     sc_marked = {**sc_pedantic, "_lhs_pruned": True}
@@ -4291,10 +4159,7 @@ def test_multi_item_with_subsequent_targets_and_walrus_after_suppressor() -> Non
     from pydoppelgangerhunt.fixer.scope import _analyze_block_assignment
 
     # 1. Intra-unit _analyze_block_assignment: item 1 suppresses, item 2 has `as res` and `(w := ...)`
-    unit_src = (
-        "with suppress(ValueError), (w := acquire()) as res:\n"
-        "    body_var = 1\n"
-    )
+    unit_src = "with suppress(ValueError), (w := acquire()) as res:\n" "    body_var = 1\n"
     stmts = ast.parse(unit_src).body
     def_assigned, cond_assigned = _analyze_block_assignment(stmts)
     assert "res" not in def_assigned
@@ -4365,9 +4230,7 @@ def test_enclosing_global_read_pure_builtin_allowlist_and_star_import_rejection(
         assert "severed_closure_cell" not in sc_pure["control_flow_hazards"]
         assert "global_escape" not in sc_pure["closure_hazard_reasons"]
         assert (
-            _unit_has_global_mutating_call(
-                ast.parse(f"x = {pure_call}\n").body, frozenset()
-            )
+            _unit_has_global_mutating_call(ast.parse(f"x = {pure_call}\n").body, frozenset())
             is False
         )
 
@@ -4399,9 +4262,7 @@ def test_enclosing_global_read_pure_builtin_allowlist_and_star_import_rejection(
         assert "severed_closure_cell" in sc_impure["control_flow_hazards"]
         assert "global_escape" in sc_impure["closure_hazard_reasons"]
         assert (
-            _unit_has_global_mutating_call(
-                ast.parse(f"x = (g, {impure_call})\n").body, frozenset()
-            )
+            _unit_has_global_mutating_call(ast.parse(f"x = (g, {impure_call})\n").body, frozenset())
             is True
         )
 
@@ -4525,7 +4386,10 @@ def test_slice_unit_token_lines_and_compile_warning_suppression() -> None:
             "source_lines": ["    a = 1; b + a\n"],
         }
     )
-    assert sc_col["inputs"] == ["b", "a"] or set(sc_col["inputs"]) == {"a", "b"}
+    assert sc_col["inputs"] == ["b", "a"] or set(sc_col["inputs"]) == {
+        "a",
+        "b",
+    }
 
     # 3. Pre-sliced multi-line snippet with start_col/end_col is not double-sliced
     pre_sliced_multi = ["x = (\n", "    a + 1\n", ")"]
@@ -4543,9 +4407,7 @@ def test_slice_unit_token_lines_and_compile_warning_suppression() -> None:
         warn_mod = ast.parse('def f():\n    s = "\\d+"\n    return 1 is 1\n')
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        is_invalid = _has_invalid_lexical_scope_declarations(
-            [warn_mod.body[0]], mod_tree=warn_mod
-        )
+        is_invalid = _has_invalid_lexical_scope_declarations([warn_mod.body[0]], mod_tree=warn_mod)
     assert is_invalid is False
     assert not [w for w in caught if issubclass(w.category, SyntaxWarning)]
 
@@ -4688,9 +4550,7 @@ def test_nested_raises_and_nested_safe_return_inside_suppress() -> None:
     )
     raises_in_sup_stmts = ast.parse(raises_in_sup_src).body
     assert _block_terminates([raises_in_sup_stmts[0]]) is False
-    bound_ris, term_ris = _extract_block_definite_bindings_and_term(
-        raises_in_sup_stmts, None
-    )
+    bound_ris, term_ris = _extract_block_definite_bindings_and_term(raises_in_sup_stmts, None)
     assert bound_ris == {"after"}
     assert term_ris is False
 
@@ -4703,16 +4563,16 @@ def test_nested_raises_and_nested_safe_return_inside_suppress() -> None:
     )
     nested_safe_ret_stmts = ast.parse(nested_safe_ret_src).body
     assert _block_terminates([nested_safe_ret_stmts[0]]) is True
-    bound_nsr, term_nsr = _extract_block_definite_bindings_and_term(
-        nested_safe_ret_stmts, None
-    )
+    bound_nsr, term_nsr = _extract_block_definite_bindings_and_term(nested_safe_ret_stmts, None)
     assert bound_nsr == {"x"}
     assert term_nsr is True
 
 
 def test_pedantic_expr_unit_lhs_pruning_preserved_during_synthesis() -> None:
     """Verifies pedantic synthesize_shared_helper_code preserves LHS-pruned expression scopes."""
-    from pydoppelgangerhunt.fixer.synthesis import synthesize_shared_helper_code
+    from pydoppelgangerhunt.fixer.synthesis import (
+        synthesize_shared_helper_code,
+    )
 
     expr_mod_src = (
         "def run_a(items, offset):\n"
@@ -4741,9 +4601,7 @@ def test_pedantic_expr_unit_lhs_pruning_preserved_during_synthesis() -> None:
         "source_text": expr_mod_src,
         "source_code": "    res = [x + offset for x in items if x > 0]\n",
     }
-    helper_ped = synthesize_shared_helper_code(
-        u1_expr, u2_expr, closure_strictness="pedantic"
-    )
+    helper_ped = synthesize_shared_helper_code(u1_expr, u2_expr, closure_strictness="pedantic")
     assert "def _shared_comp_a_comp_b(" in helper_ped
     assert "res" not in helper_ped.split("):", 1)[0]
 
@@ -4783,9 +4641,7 @@ def test_per_unit_closure_strictness_honored_when_top_level_none() -> None:
     sc_strict = _inspect_unit_scope(u1_strict_unit)
     assert sc_strict["strict_with_suppression"] is False
     assert "severed_closure_cell" not in sc_strict["control_flow_hazards"]
-    res_ped = resolve_clone_pair_outputs(
-        u1_ped_unit, u2_ped_unit, sc_strict, sc_strict
-    )
+    res_ped = resolve_clone_pair_outputs(u1_ped_unit, u2_ped_unit, sc_strict, sc_strict)
     assert res_ped is None
 
 
@@ -4845,10 +4701,7 @@ def test_syntax_warning_suppressed_across_parse_and_inference_paths() -> None:
     )
 
     escape_src = (
-        'PAT = "\\d+\\s+"\n'
-        "def match_fn(x):\n"
-        '    y = ("\\d+" + str(x))\n'
-        "    return y\n"
+        'PAT = "\\d+\\s+"\n' "def match_fn(x):\n" '    y = ("\\d+" + str(x))\n' "    return y\n"
     )
     with warnings.catch_warnings():
         warnings.simplefilter("error", SyntaxWarning)
@@ -5163,9 +5016,7 @@ def test_local_class_allowlist_and_nested_function_seeding() -> None:
     defs_with_allow, conds_with_allow = _analyze_block_assignment(
         tx_fn.body[:-1],
         suppress_aliases=prov_tx,
-        extra_non_suppressing_ctx_managers=frozenset(
-            {"DynamicTransaction", ".RelativeTx"}
-        ),
+        extra_non_suppressing_ctx_managers=frozenset({"DynamicTransaction", ".RelativeTx"}),
         strict_with_suppression=True,
     )
     assert {"auto_proven", "allowlisted"} <= defs_with_allow
@@ -5186,12 +5037,8 @@ def test_local_class_allowlist_and_nested_function_seeding() -> None:
     assert isinstance(outer_seed_fn, ast.FunctionDef)
     inner_seed_fn = outer_seed_fn.body[0]
     assert isinstance(inner_seed_fn, ast.FunctionDef)
-    prov_outer = _seed_scope_suppress_aliases(
-        outer_seed_fn, mod_tree=nested_seed_tree
-    )
-    prov_inner = _seed_scope_suppress_aliases(
-        inner_seed_fn, mod_tree=nested_seed_tree
-    )
+    prov_outer = _seed_scope_suppress_aliases(outer_seed_fn, mod_tree=nested_seed_tree)
+    prov_inner = _seed_scope_suppress_aliases(inner_seed_fn, mod_tree=nested_seed_tree)
     assert prov_inner.non_suppressors == prov_outer.non_suppressors
     assert "nc" not in prov_inner.non_suppressors
 
@@ -5380,13 +5227,7 @@ def test_pre_try_and_pre_match_bindings_survive_loop_control_termination() -> No
         _analyze_block_assignment_impl,
     )
 
-    try_loop_src = (
-        "x = 1\n"
-        "try:\n"
-        "    break\n"
-        "except RuntimeError:\n"
-        "    continue\n"
-    )
+    try_loop_src = "x = 1\n" "try:\n" "    break\n" "except RuntimeError:\n" "    continue\n"
     defs_try, conds_try, term_try, _ = _analyze_block_assignment_impl(
         ast.parse(try_loop_src).body,
         loop_control_terminates=True,
@@ -5415,10 +5256,7 @@ def test_pre_try_and_pre_match_bindings_survive_loop_control_termination() -> No
 def test_placeholder_origin_vs_real_comment_and_source_code_only_unit() -> None:
     """Verifies real comments starting with '# Source for ' are not treated as placeholders and source_code + tree units are not falsely flagged stale."""
     mod_with_comment = (
-        "def f(a, b):\n"
-        "    # Source for custom step\n"
-        "    res = a + b\n"
-        "    return res\n"
+        "def f(a, b):\n" "    # Source for custom step\n" "    res = a + b\n" "    return res\n"
     )
     tree_comment = ast.parse(mod_with_comment)
     sc_comment_mismatch = inspect_single_unit_scope(
@@ -5557,9 +5395,7 @@ def test_walrus_left_to_right_order_and_compare_short_circuit_provenance() -> No
     assert "x" not in prov_rtl.non_suppressors
 
     # 3. ast.Compare: first comparator executes unconditionally, subsequent comparators may short-circuit
-    stmt_cmp = ast.parse(
-        "_ = a < (first_c := nullcontext) < (second_c := nullcontext)\n"
-    ).body[0]
+    stmt_cmp = ast.parse("_ = a < (first_c := nullcontext) < (second_c := nullcontext)\n").body[0]
     prov_cmp = _update_suppress_provenance_from_stmt(stmt_cmp, prov_base)
     assert "first_c" in prov_cmp.non_suppressors
     assert "second_c" not in prov_cmp.non_suppressors
@@ -5567,9 +5403,7 @@ def test_walrus_left_to_right_order_and_compare_short_circuit_provenance() -> No
 
     # 4. Short-circuited comparator rebinding an existing non-suppressor to an unknown call invalidates it
     stmt_cmp_rebind = ast.parse("_ = a < b < (x := unknown_factory())\n").body[0]
-    prov_cmp_rebind = _update_suppress_provenance_from_stmt(
-        stmt_cmp_rebind, prov_with_x_safe
-    )
+    prov_cmp_rebind = _update_suppress_provenance_from_stmt(stmt_cmp_rebind, prov_with_x_safe)
     assert "x" not in prov_cmp_rebind.non_suppressors
     assert "x" in prov_cmp_rebind.shadowed_names
 
@@ -5642,8 +5476,7 @@ def test_walrus_left_to_right_order_and_compare_short_circuit_provenance() -> No
             True,
         ),
         (
-            "class AssignedLambdaExit:\n"
-            "    __exit__ = lambda self, *a: True\n",
+            "class AssignedLambdaExit:\n" "    __exit__ = lambda self, *a: True\n",
             False,
             True,
         ),
@@ -5664,10 +5497,7 @@ def test_class_def_exit_adversarial_bypasses_and_shallow_scope_walk(
     cls_node = ast.parse(cls_src).body[0]
     assert isinstance(cls_node, ast.ClassDef)
     prov = _SuppressProvenance()
-    assert (
-        _class_def_is_proven_non_suppressing_in_exit(cls_node, prov)
-        is expect_proven_safe
-    )
+    assert _class_def_is_proven_non_suppressing_in_exit(cls_node, prov) is expect_proven_safe
     assert _class_def_may_suppress_in_exit(cls_node) is expect_may_suppress
 
 
@@ -5684,11 +5514,7 @@ def test_func_def_generator_contextmanager_try_and_with_around_yield() -> None:
     )
 
     gen_try_src = (
-        "def cm_try():\n"
-        "    try:\n"
-        "        yield\n"
-        "    except Exception:\n"
-        "        pass\n"
+        "def cm_try():\n" "    try:\n" "        yield\n" "    except Exception:\n" "        pass\n"
     )
     fn_try = ast.parse(gen_try_src).body[0]
     assert isinstance(fn_try, ast.FunctionDef)
@@ -5704,11 +5530,7 @@ def test_func_def_generator_contextmanager_try_and_with_around_yield() -> None:
     assert isinstance(fn_local, ast.FunctionDef)
     assert _func_def_may_return_suppressor(fn_local, prov) is True
 
-    gen_clean_src = (
-        "def cm_clean():\n"
-        "    setup = 1\n"
-        "    yield setup\n"
-    )
+    gen_clean_src = "def cm_clean():\n" "    setup = 1\n" "    yield setup\n"
     fn_clean = ast.parse(gen_clean_src).body[0]
     assert isinstance(fn_clean, ast.FunctionDef)
     assert _func_def_may_return_suppressor(fn_clean, prov) is False
@@ -5725,9 +5547,7 @@ def test_walrus_side_effects_in_non_raising_expressions_inside_suppress() -> Non
         "    a = (w_safe := 10, w_bool := True)\n"
         "    b = (w_safe, not w_bool, 1 if w_bool else 2)\n"
     )
-    defs_safe, conds_safe = _analyze_block_assignment(
-        ast.parse(src_safe_walrus).body
-    )
+    defs_safe, conds_safe = _analyze_block_assignment(ast.parse(src_safe_walrus).body)
     assert {"a", "w_safe", "w_bool", "b"} <= defs_safe
     assert not ({"a", "w_safe", "w_bool", "b"} & conds_safe)
 
@@ -5736,9 +5556,7 @@ def test_walrus_side_effects_in_non_raising_expressions_inside_suppress() -> Non
         "    _ = True or (w_short := True)\n"
         "    b = (not w_short, 1 if w_short else 2)\n"
     )
-    defs_short, conds_short = _analyze_block_assignment(
-        ast.parse(src_short_circuit_walrus).body
-    )
+    defs_short, conds_short = _analyze_block_assignment(ast.parse(src_short_circuit_walrus).body)
     assert "b" not in defs_short
     assert "b" in conds_short
 
@@ -5776,9 +5594,7 @@ def test_cross_cache_reverse_index_sync_and_aux_ast_node_eviction() -> None:
     assert shared_key not in _scope_owner_keys_index.get(stmt_y, set())
 
     # Key owned by mod_a with aux_ast_nodes in mod_b must be evicted when mod_b is evicted
-    aux_key = _ScopeCacheKey(
-        fn_a, "aux_evict_test", aux_ast_nodes=(fn_b,)
-    )
+    aux_key = _ScopeCacheKey(fn_a, "aux_evict_test", aux_ast_nodes=(fn_b,))
     _scope_cell_info_cache[aux_key] = ("ok",)
     assert aux_key in _scope_owner_keys_index.get(fn_b, set())
     _evict_tree_scopes(mod_b)
@@ -5803,7 +5619,9 @@ def test_scope_cache_key_frozenset_and_nested_int_float_bool_non_collision() -> 
 
 def test_unit_has_global_mutating_call_enclosing_class_and_nested_shadowing() -> None:
     """Verifies _unit_has_global_mutating_call detects pure-builtin shadowing in class bodies, comprehensions, and walrus targets."""
-    from pydoppelgangerhunt.fixer._df_cell_hazards import _unit_has_global_mutating_call
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _unit_has_global_mutating_call,
+    )
 
     unshadowed_src = (
         "g_val = 1\n"
@@ -5841,10 +5659,7 @@ def test_unit_has_global_mutating_call_enclosing_class_and_nested_shadowing() ->
             "end": 5,
             "kind": "compound_block",
             "source_text": comp_shadow_src,
-            "source_code": (
-                "    res = [len(items) for len in items]\n"
-                "    out = g_val\n"
-            ),
+            "source_code": ("    res = [len(items) for len in items]\n" "    out = g_val\n"),
         },
         tree=comp_tree,
     )
@@ -5865,10 +5680,7 @@ def test_unit_has_global_mutating_call_enclosing_class_and_nested_shadowing() ->
             "end": 5,
             "kind": "compound_block",
             "source_text": walrus_shadow_src,
-            "source_code": (
-                "    res = ((len := cb), len(items))\n"
-                "    out = g_val\n"
-            ),
+            "source_code": ("    res = ((len := cb), len(items))\n" "    out = g_val\n"),
         },
         tree=walrus_tree,
     )
@@ -5974,9 +5786,7 @@ def test_synthesize_refactoring_suggestion_unconditional_delegation_and_hazard_w
         "kind": "compound_block",
         "source_text": safe_src,
     }
-    sug_default = synthesize_refactoring_suggestion(
-        u_safe_1, u_safe_2, repo_root=str(tmp_path)
-    )
+    sug_default = synthesize_refactoring_suggestion(u_safe_1, u_safe_2, repo_root=str(tmp_path))
     assert "def _shared_block(" in sug_default
     assert "return step, out" in sug_default
     assert "(*args, **kwargs)" not in sug_default
@@ -6013,9 +5823,7 @@ def test_synthesize_refactoring_suggestion_unconditional_delegation_and_hazard_w
         "kind": "compound_block",
         "source_text": hazard_src,
     }
-    sug_hazard = synthesize_refactoring_suggestion(
-        u_haz_1, u_haz_2, repo_root=str(tmp_path)
-    )
+    sug_hazard = synthesize_refactoring_suggestion(u_haz_1, u_haz_2, repo_root=str(tmp_path))
     assert "rejected as unsafe" in sug_hazard
     assert "WARNING: Automatic helper synthesis was skipped" in sug_hazard
     assert "(*args, **kwargs)" not in sug_hazard
@@ -6047,14 +5855,14 @@ def test_concurrent_suppress_syntax_warnings_and_stmt_deltas_cap() -> None:
         for f in futs:
             f.result(timeout=10.0)
 
-    assert not any(
-        f[0] == "ignore" and f[2] is SyntaxWarning for f in warnings.filters
-    )
+    assert not any(f[0] == "ignore" and f[2] is SyntaxWarning for f in warnings.filters)
 
     clear_dataflow_cache()
-    many_lines = ["def big_fn(x):\n"] + [
-        f"    v_{i} = x + {i}\n" for i in range(_MAX_STMT_DELTAS_PER_FN + 20)
-    ] + ["    return v_0\n"]
+    many_lines = (
+        ["def big_fn(x):\n"]
+        + [f"    v_{i} = x + {i}\n" for i in range(_MAX_STMT_DELTAS_PER_FN + 20)]
+        + ["    return v_0\n"]
+    )
     big_tree = ast.parse("".join(many_lines))
     big_fn = big_tree.body[0]
     assert isinstance(big_fn, ast.FunctionDef)
@@ -6065,3 +5873,299 @@ def test_concurrent_suppress_syntax_warnings_and_stmt_deltas_cap() -> None:
         use_stmt_deltas=True,
     )
     assert info is not None
+
+
+def test_validate_unit_schema_strict_accepts_strict_with_suppression() -> None:
+    """Verifies UnitSchema and validate_unit_schema(strict=True) accept strict_with_suppression."""
+    from pydoppelgangerhunt.fixer.source import validate_unit_schema
+
+    unit_with_flag = {
+        "start": 1,
+        "end": 2,
+        "kind": "compound_block",
+        "strict_with_suppression": True,
+        "skip_pre_unit_closures": False,
+        "closure_strictness": "pedantic",
+    }
+    assert validate_unit_schema(unit_with_flag, strict=True) == set()
+
+    with pytest.raises(ValueError, match="Unrecognized keys"):
+        validate_unit_schema(
+            {**unit_with_flag, "unrecognized_extra_field": 123},
+            strict=True,
+        )
+
+
+def test_module_compound_statement_suppressor_alias_propagation_and_linear_seed() -> None:
+    """Verifies suppressor imports inside module-level compound blocks propagate into nested functions."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _build_module_suppress_seed,
+        _extract_block_definite_bindings_and_term,
+        _seed_scope_suppress_aliases,
+    )
+
+    nested_mod_src = (
+        "if True:\n"
+        "    from contextlib import suppress as sup\n"
+        "    def target_fn(d, items):\n"
+        "        with sup(KeyError):\n"
+        "            val = d['k']\n"
+        "        return [val for _ in items]\n"
+    )
+    mod_tree = ast.parse(nested_mod_src)
+    if_stmt = mod_tree.body[0]
+    assert isinstance(if_stmt, ast.If)
+    target_fn = if_stmt.body[1]
+    assert isinstance(target_fn, ast.FunctionDef)
+
+    seeded_prov = _seed_scope_suppress_aliases(target_fn, mod_tree, u_start=target_fn.lineno)
+    assert "sup" in seeded_prov.suppressors
+
+    bound, _ = _extract_block_definite_bindings_and_term(
+        target_fn.body[:1],
+        None,
+        strict_with_suppression=False,
+        suppress_aliases=seeded_prov,
+    )
+    assert "val" not in bound
+
+    many_mod_src = "".join(
+        [
+            "from contextlib import suppress as s0\n",
+            *[f"s{i} = s{i - 1}\n" for i in range(1, 50)],
+            "def f(x):\n    return x\n",
+            "from contextlib import suppress as post_sup\n",
+        ]
+    )
+    many_tree = ast.parse(many_mod_src)
+    seed = _build_module_suppress_seed(many_tree)
+    f_stmt = many_tree.body[-2]
+    assert len(seed.by_top_stmt_id) == len(many_tree.body)
+    assert "s49" in seed.prefix_by_top_stmt_id[id(f_stmt)].suppressors
+    assert "post_sup" in seed.suffix_delta_by_top_stmt_id[id(f_stmt)].suppressors
+    assert {"s49", "post_sup"} <= seed.by_top_stmt_id[id(f_stmt)].suppressors
+
+
+@pytest.mark.parametrize(
+    "assign_src,cond_var,expected_x_definite",
+    [
+        ("pair_a, pair_b = (1, custom_obj)", "pair_a", True),
+        ("pair_a, pair_b = (1, custom_obj)", "pair_b", False),
+        ("pair_a, pair_b = [True, custom_obj]", "pair_a", True),
+        ("pair_a, pair_b = [True, custom_obj]", "pair_b", False),
+        ("a, b = (1, a)", "b", False),
+    ],
+)
+def test_unpacking_assignment_elementwise_bool_safety_in_suppressing_with(
+    assign_src: str,
+    cond_var: str,
+    expected_x_definite: bool,
+) -> None:
+    """Verifies tuple/list unpacking inside a suppressing with block only marks proven bool-safe elements."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _extract_block_definite_bindings_and_term,
+        _seed_scope_suppress_aliases,
+    )
+
+    fn_src = (
+        "from contextlib import suppress\n"
+        "def run(custom_obj, a):\n"
+        "    with suppress(Exception):\n"
+        f"        {assign_src}\n"
+        f"        if {cond_var}:\n"
+        "            y = 1\n"
+        "        x = 1\n"
+    )
+    mod_tree = ast.parse(fn_src)
+    fn_node = mod_tree.body[1]
+    assert isinstance(fn_node, ast.FunctionDef)
+    prov = _seed_scope_suppress_aliases(fn_node, mod_tree)
+    bound, _ = _extract_block_definite_bindings_and_term(
+        fn_node.body,
+        None,
+        frozenset({"custom_obj", "a"}),
+        strict_with_suppression=True,
+        suppress_aliases=prov,
+    )
+    assert ("x" in bound) is expected_x_definite
+
+
+def test_subroutine_early_return_prunes_dead_conditional_outputs() -> None:
+    """Verifies a subroutine with an early return queries downstream reads for pre-bound write-only conditional stores."""
+    src = (
+        "def compute(abort, cond, x):\n"
+        "    dead_tmp = 0\n"
+        "    live_tmp = 0\n"
+        "    if abort:\n"
+        "        return 99\n"
+        "    if cond:\n"
+        "        dead_tmp = x + 1\n"
+        "        live_tmp = x + 2\n"
+        "    res = x * 3\n"
+        "    return res + live_tmp\n"
+    )
+    unit_src = (
+        "    if abort:\n"
+        "        return 99\n"
+        "    if cond:\n"
+        "        dead_tmp = x + 1\n"
+        "        live_tmp = x + 2\n"
+        "    res = x * 3\n"
+    )
+    scope = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 9,
+            "kind": "compound_block",
+            "source_text": src,
+            "source_code": unit_src,
+        },
+        tree=ast.parse(src),
+    )
+    assert "dead_tmp" not in scope["inputs"]
+    assert "live_tmp" in scope["inputs"]
+    assert "res" in scope["outputs"]
+
+
+@pytest.mark.parametrize(
+    "cls_header,expected_suppressor",
+    [
+        ("class LocalMgr(contextlib.suppress):\n    pass\n", True),
+        ("class LocalMgr(suppress):\n    pass\n", True),
+        (
+            "class BaseSup:\n    def __exit__(self, *a):\n        return True\n"
+            "class LocalMgr(BaseSup):\n    pass\n",
+            True,
+        ),
+        ("class LocalMgr(contextlib.nullcontext):\n    pass\n", False),
+    ],
+)
+def test_local_subclass_of_suppressor_tracked_in_with_provenance(
+    cls_header: str,
+    expected_suppressor: bool,
+) -> None:
+    """Verifies local classes inheriting from suppressing context managers are tracked as suppressors."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _extract_block_definite_bindings_and_term,
+        _seed_scope_suppress_aliases,
+    )
+
+    indented_cls = "".join(f"    {line}" for line in cls_header.splitlines(keepends=True))
+    src = (
+        "import contextlib\n"
+        "from contextlib import suppress\n"
+        "def run(d):\n"
+        f"{indented_cls}"
+        "    with LocalMgr():\n"
+        "        val = d['k']\n"
+        "    return val\n"
+    )
+    mod_tree = ast.parse(src)
+    fn_node = mod_tree.body[2]
+    assert isinstance(fn_node, ast.FunctionDef)
+    prov = _seed_scope_suppress_aliases(fn_node, mod_tree, u_start=len(src.splitlines()))
+    assert ("LocalMgr" in prov.suppressors) is expected_suppressor
+
+    bound, _ = _extract_block_definite_bindings_and_term(
+        fn_node.body,
+        None,
+        frozenset({"d"}),
+        strict_with_suppression=False,
+        suppress_aliases=_seed_scope_suppress_aliases(fn_node, mod_tree),
+    )
+    assert ("val" not in bound) is expected_suppressor
+
+
+def test_seed_scope_suppress_aliases_clears_function_locals_at_entry() -> None:
+    """Verifies function-local assignments shadow module-level non-suppressor imports even when u_start=0."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _extract_block_definite_bindings_and_term,
+        _seed_scope_suppress_aliases,
+    )
+
+    src = (
+        "from contextlib import nullcontext\n"
+        "def run(custom_cm, d):\n"
+        "    nullcontext = custom_cm\n"
+        "    with nullcontext():\n"
+        "        val = d['k']\n"
+        "    from contextlib import suppress as late_sup\n"
+        "    return val, late_sup\n"
+    )
+    mod_tree = ast.parse(src)
+    fn_node = mod_tree.body[1]
+    assert isinstance(fn_node, ast.FunctionDef)
+
+    prov_zero = _seed_scope_suppress_aliases(fn_node, mod_tree, u_start=0)
+    assert "nullcontext" not in prov_zero.non_suppressors
+    assert "nullcontext" in prov_zero.shadowed_names
+
+    prov_mid = _seed_scope_suppress_aliases(fn_node, mod_tree, u_start=3)
+    assert "nullcontext" not in prov_mid.non_suppressors
+    assert "late_sup" in prov_mid.suppressors
+
+    bound, _ = _extract_block_definite_bindings_and_term(
+        fn_node.body[:2],
+        None,
+        frozenset({"custom_cm", "d"}),
+        strict_with_suppression=True,
+        suppress_aliases=prov_zero,
+    )
+    assert "val" not in bound
+
+
+def test_suppress_syntax_warnings_copy_on_write_and_nan_cache_key_equality() -> None:
+    """Verifies _suppress_syntax_warnings uses copy-on-write on warnings.filters and _ScopeCacheKey handles NaN."""
+    import warnings
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _ScopeCacheKey,
+        _suppress_syntax_warnings,
+    )
+
+    outer_filters_ref = warnings.filters
+    outer_snapshot = list(outer_filters_ref)
+    with _suppress_syntax_warnings():
+        inner_filters_ref = warnings.filters
+        assert inner_filters_ref is not outer_filters_ref
+        assert outer_filters_ref == outer_snapshot
+    assert warnings.filters is not inner_filters_ref
+    assert outer_filters_ref == outer_snapshot
+
+    owner = ast.parse("x = 1\n")
+    k_nan_1 = _ScopeCacheKey(owner, "nan_test", (float("nan"), ("nested", float("nan"))))
+    k_nan_2 = _ScopeCacheKey(owner, "nan_test", (float("nan"), ("nested", float("nan"))))
+    assert k_nan_1 == k_nan_2
+    assert hash(k_nan_1) == hash(k_nan_2)
+    cache_probe = {k_nan_1: "hit"}
+    assert cache_probe.get(k_nan_2) == "hit"
+
+
+def test_resolve_unit_and_pair_closure_flags_conflict_warning_and_explicit_override(
+    caplog: Any,
+) -> None:
+    """Verifies resolve_unit_closure_flags logs conflict warnings and resolve_pair_closure_flags honors explicit overrides."""
+    import logging
+    from pydoppelgangerhunt.config import (
+        resolve_pair_closure_flags,
+        resolve_unit_closure_flags,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt.config"):
+        skip_flag, strict_with_flag = resolve_unit_closure_flags(
+            {"start": 1, "end": 2},
+            skip_pre_unit_closures=True,
+            strict_with_suppression=True,
+        )
+    assert (skip_flag, strict_with_flag) == (True, False)
+    assert any("Conflicting configuration" in rec.message for rec in caplog.records)
+
+    u1 = {"start": 1, "end": 2, "skip_pre_unit_closures": True}
+    u2 = {"start": 3, "end": 4, "skip_pre_unit_closures": False}
+    preserved = resolve_pair_closure_flags(u1, u2)
+    assert preserved.unit1.skip_pre_unit_closures is True
+    assert preserved.unit2.skip_pre_unit_closures is False
+
+    overridden = resolve_pair_closure_flags(u1, u2, skip_pre_unit_closures=False)
+    assert overridden.unit1.skip_pre_unit_closures is False
+    assert overridden.unit2.skip_pre_unit_closures is False
+    assert overridden.effective_skip_pre_unit_closures is False
