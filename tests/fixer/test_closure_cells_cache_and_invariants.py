@@ -5485,3 +5485,583 @@ def test_tracked_cached_dict_prunes_reverse_index_and_missing_cached_ast_nodes_r
             _ScopeCacheKey(fn, "unit_test_bad_box_cache"),
             _UnindexedCustomBox,
         )
+
+
+def test_source_lines_origin_equality_and_hash_contract() -> None:
+    """Verifies SourceLinesOrigin preserves reflexive, symmetric, transitive equality and hash consistency."""
+    from pydoppelgangerhunt.source_lines import SourceLinesOrigin
+
+    origins = (
+        SourceLinesOrigin.PRE_SLICED,
+        SourceLinesOrigin.FULL_BUFFER,
+        SourceLinesOrigin.DISK,
+        SourceLinesOrigin.PLACEHOLDER,
+    )
+    assert len(set(origins)) == 4
+    for a in origins:
+        assert a == a
+        assert hash(a) == hash(a)
+        assert a != a.name
+        assert a != bool(a)
+        assert a != True  # noqa: E712
+        assert a != False  # noqa: E712
+        for b in origins:
+            if a is b:
+                assert a == b
+                assert hash(a) == hash(b)
+            else:
+                assert a != b
+
+    mixed_set = {
+        SourceLinesOrigin.PRE_SLICED,
+        SourceLinesOrigin.PLACEHOLDER,
+        True,
+        "PRE_SLICED",
+        "PLACEHOLDER",
+    }
+    assert len(mixed_set) == 5
+    assert SourceLinesOrigin.PRE_SLICED.is_pre_sliced is True
+    assert SourceLinesOrigin.PLACEHOLDER.is_placeholder is True
+    assert SourceLinesOrigin.DISK.is_pre_sliced is False
+    assert SourceLinesOrigin.DISK.is_placeholder is False
+
+
+def test_walrus_left_to_right_order_and_compare_short_circuit_provenance() -> None:
+    """Verifies left-to-right walrus evaluation order and ast.Compare short-circuit provenance merging."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _SuppressProvenance,
+        _update_suppress_provenance_from_stmt,
+    )
+
+    # 1. Left-to-right sibling walrus: (x := suppress, y := x) -> both x and y are suppressors
+    prov_base = _SuppressProvenance(
+        suppressors=frozenset({"suppress"}),
+        non_suppressors=frozenset({"nullcontext"}),
+    )
+    stmt_ltr = ast.parse("_ = (x := suppress, y := x)\n").body[0]
+    prov_ltr = _update_suppress_provenance_from_stmt(stmt_ltr, prov_base)
+    assert "x" in prov_ltr.suppressors
+    assert "y" in prov_ltr.suppressors
+
+    # 2. Reverse order when x starts as nullcontext: (y := x, x := suppress)
+    # y reads x before x is rebound to suppress
+    prov_with_x_safe = _SuppressProvenance(
+        suppressors=frozenset({"suppress"}),
+        non_suppressors=frozenset({"nullcontext", "x"}),
+    )
+    stmt_rtl = ast.parse("_ = (y := x, x := suppress)\n").body[0]
+    prov_rtl = _update_suppress_provenance_from_stmt(stmt_rtl, prov_with_x_safe)
+    assert "y" in prov_rtl.non_suppressors
+    assert "y" not in prov_rtl.suppressors
+    assert "x" in prov_rtl.suppressors
+    assert "x" not in prov_rtl.non_suppressors
+
+    # 3. ast.Compare: first comparator executes unconditionally, subsequent comparators may short-circuit
+    stmt_cmp = ast.parse(
+        "_ = a < (first_c := nullcontext) < (second_c := nullcontext)\n"
+    ).body[0]
+    prov_cmp = _update_suppress_provenance_from_stmt(stmt_cmp, prov_base)
+    assert "first_c" in prov_cmp.non_suppressors
+    assert "second_c" not in prov_cmp.non_suppressors
+    assert "second_c" in prov_cmp.shadowed_names
+
+    # 4. Short-circuited comparator rebinding an existing non-suppressor to an unknown call invalidates it
+    stmt_cmp_rebind = ast.parse("_ = a < b < (x := unknown_factory())\n").body[0]
+    prov_cmp_rebind = _update_suppress_provenance_from_stmt(
+        stmt_cmp_rebind, prov_with_x_safe
+    )
+    assert "x" not in prov_cmp_rebind.non_suppressors
+    assert "x" in prov_cmp_rebind.shadowed_names
+
+
+@pytest.mark.parametrize(
+    ("cls_src", "expect_proven_safe", "expect_may_suppress"),
+    [
+        (
+            "class CleanExit:\n"
+            "    def __enter__(self):\n        return self\n"
+            "    def __exit__(self, exc_type, exc, tb):\n"
+            "        helper = lambda: True\n"
+            "        return False\n",
+            True,
+            False,
+        ),
+        (
+            "class MetaExit(metaclass=CustomMeta):\n"
+            "    def __enter__(self):\n        return self\n"
+            "    def __exit__(self, exc_type, exc, tb):\n"
+            "        return False\n",
+            False,
+            False,
+        ),
+        (
+            "class CustomNewExit:\n"
+            "    def __new__(cls):\n        return other()\n"
+            "    def __exit__(self, exc_type, exc, tb):\n"
+            "        return False\n",
+            False,
+            False,
+        ),
+        (
+            "class CustomGetattrExit:\n"
+            "    def __getattribute__(self, name):\n        return object.__getattribute__(self, name)\n"
+            "    def __exit__(self, exc_type, exc, tb):\n"
+            "        return False\n",
+            False,
+            False,
+        ),
+        (
+            "class ConditionalExit:\n"
+            "    if flag:\n"
+            "        def __exit__(self, exc_type, exc, tb):\n            return True\n"
+            "    def __exit__(self, exc_type, exc, tb):\n"
+            "        return False\n",
+            False,
+            True,
+        ),
+        (
+            "class DuplicateExit:\n"
+            "    def __exit__(self, exc_type, exc, tb):\n        return True\n"
+            "    def __exit__(self, exc_type, exc, tb):\n        return False\n",
+            False,
+            True,
+        ),
+        (
+            "class GeneratorExit:\n"
+            "    def __exit__(self, exc_type, exc, tb):\n"
+            "        yield False\n"
+            "        return False\n",
+            False,
+            True,
+        ),
+        (
+            "class AsyncDefSyncExit:\n"
+            "    async def __exit__(self, exc_type, exc, tb):\n"
+            "        return False\n",
+            False,
+            True,
+        ),
+        (
+            "class AssignedLambdaExit:\n"
+            "    __exit__ = lambda self, *a: True\n",
+            False,
+            True,
+        ),
+    ],
+)
+def test_class_def_exit_adversarial_bypasses_and_shallow_scope_walk(
+    cls_src: str,
+    expect_proven_safe: bool,
+    expect_may_suppress: bool,
+) -> None:
+    """Verifies class __exit__ proof rejects metaclass/descriptor/generator/async/conditional bypasses."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _SuppressProvenance,
+        _class_def_is_proven_non_suppressing_in_exit,
+        _class_def_may_suppress_in_exit,
+    )
+
+    cls_node = ast.parse(cls_src).body[0]
+    assert isinstance(cls_node, ast.ClassDef)
+    prov = _SuppressProvenance()
+    assert (
+        _class_def_is_proven_non_suppressing_in_exit(cls_node, prov)
+        is expect_proven_safe
+    )
+    assert _class_def_may_suppress_in_exit(cls_node) is expect_may_suppress
+
+
+def test_func_def_generator_contextmanager_try_and_with_around_yield() -> None:
+    """Verifies _func_def_may_return_suppressor detects yield wrapped in try or with blocks and local imports."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _SuppressProvenance,
+        _func_def_may_return_suppressor,
+    )
+
+    prov = _SuppressProvenance(
+        suppressors=frozenset({"suppress"}),
+        non_suppressors=frozenset({"nullcontext"}),
+    )
+
+    gen_try_src = (
+        "def cm_try():\n"
+        "    try:\n"
+        "        yield\n"
+        "    except Exception:\n"
+        "        pass\n"
+    )
+    fn_try = ast.parse(gen_try_src).body[0]
+    assert isinstance(fn_try, ast.FunctionDef)
+    assert _func_def_may_return_suppressor(fn_try, prov) is True
+
+    gen_with_local_import_src = (
+        "def cm_local_suppress():\n"
+        "    from contextlib import suppress as local_sup\n"
+        "    with local_sup(ValueError):\n"
+        "        yield\n"
+    )
+    fn_local = ast.parse(gen_with_local_import_src).body[0]
+    assert isinstance(fn_local, ast.FunctionDef)
+    assert _func_def_may_return_suppressor(fn_local, prov) is True
+
+    gen_clean_src = (
+        "def cm_clean():\n"
+        "    setup = 1\n"
+        "    yield setup\n"
+    )
+    fn_clean = ast.parse(gen_clean_src).body[0]
+    assert isinstance(fn_clean, ast.FunctionDef)
+    assert _func_def_may_return_suppressor(fn_clean, prov) is False
+
+
+def test_walrus_side_effects_in_non_raising_expressions_inside_suppress() -> None:
+    """Verifies walrus bindings in non-raising expressions inside suppress() propagate safe/nonzero state."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _analyze_block_assignment,
+    )
+
+    src_safe_walrus = (
+        "with suppress(ZeroDivisionError):\n"
+        "    a = (w_safe := 10, w_bool := True)\n"
+        "    b = (w_safe, not w_bool, 1 if w_bool else 2)\n"
+    )
+    defs_safe, conds_safe = _analyze_block_assignment(
+        ast.parse(src_safe_walrus).body
+    )
+    assert {"a", "w_safe", "w_bool", "b"} <= defs_safe
+    assert not ({"a", "w_safe", "w_bool", "b"} & conds_safe)
+
+    src_short_circuit_walrus = (
+        "with suppress(ZeroDivisionError):\n"
+        "    _ = True or (w_short := True)\n"
+        "    b = (not w_short, 1 if w_short else 2)\n"
+    )
+    defs_short, conds_short = _analyze_block_assignment(
+        ast.parse(src_short_circuit_walrus).body
+    )
+    assert "b" not in defs_short
+    assert "b" in conds_short
+
+
+def test_cross_cache_reverse_index_sync_and_aux_ast_node_eviction() -> None:
+    """Verifies sibling cache reverse-index synchronization and aux_ast_nodes eviction."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _ScopeCacheKey,
+        _evict_tree_scopes,
+        _scope_cell_info_cache,
+        _scope_closures_cache,
+        _scope_owner_keys_index,
+    )
+
+    clear_dataflow_cache()
+    mod_a = ast.parse("def fa():\n    x = 1\n    y = 2\n")
+    mod_b = ast.parse("def fb():\n    z = 3\n")
+    fn_a = mod_a.body[0]
+    stmt_x = fn_a.body[0]  # type: ignore[attr-defined]
+    stmt_y = fn_a.body[1]  # type: ignore[attr-defined]
+    fn_b = mod_b.body[0]
+
+    shared_key = _ScopeCacheKey(fn_a, "shared_cross_cache_test")
+    _scope_closures_cache[shared_key] = (stmt_x,)
+    _scope_cell_info_cache[shared_key] = {}
+    tracked_dict = _scope_cell_info_cache[shared_key]
+    tracked_dict["node"] = stmt_y
+
+    assert shared_key in _scope_owner_keys_index.get(stmt_x, set())
+    assert shared_key in _scope_owner_keys_index.get(stmt_y, set())
+
+    # Deleting from _scope_cell_info_cache must keep stmt_x indexed for _scope_closures_cache
+    del _scope_cell_info_cache[shared_key]
+    assert shared_key in _scope_owner_keys_index.get(stmt_x, set())
+    assert shared_key not in _scope_owner_keys_index.get(stmt_y, set())
+
+    # Key owned by mod_a with aux_ast_nodes in mod_b must be evicted when mod_b is evicted
+    aux_key = _ScopeCacheKey(
+        fn_a, "aux_evict_test", aux_ast_nodes=(fn_b,)
+    )
+    _scope_cell_info_cache[aux_key] = ("ok",)
+    assert aux_key in _scope_owner_keys_index.get(fn_b, set())
+    _evict_tree_scopes(mod_b)
+    assert aux_key not in _scope_cell_info_cache
+    assert aux_key not in _scope_owner_keys_index.get(fn_a, set())
+
+
+def test_scope_cache_key_frozenset_and_nested_int_float_bool_non_collision() -> None:
+    """Verifies _ScopeCacheKey distinguishes int, float, and bool inside frozensets and nested tuples."""
+    from pydoppelgangerhunt.fixer._df_cache import _ScopeCacheKey
+
+    mod = ast.parse("x = 1\n")
+    k_int = _ScopeCacheKey(mod, "fs", params=(frozenset({2}),))
+    k_float = _ScopeCacheKey(mod, "fs", params=(frozenset({2.0}),))
+    k_nested_int = _ScopeCacheKey(mod, "fs", params=(frozenset({(1, "a")}),))
+    k_nested_bool = _ScopeCacheKey(mod, "fs", params=(frozenset({(True, "a")}),))
+
+    assert k_int != k_float
+    assert k_nested_int != k_nested_bool
+    assert len({k_int, k_float, k_nested_int, k_nested_bool}) == 4
+
+
+def test_unit_has_global_mutating_call_enclosing_class_and_nested_shadowing() -> None:
+    """Verifies _unit_has_global_mutating_call detects pure-builtin shadowing in class bodies, comprehensions, and walrus targets."""
+    from pydoppelgangerhunt.fixer._df_cell_hazards import _unit_has_global_mutating_call
+
+    unshadowed_src = (
+        "g_val = 1\n"
+        "def run_pure(items):\n"
+        "    global g_val\n"
+        "    n = len(items)\n"
+        "    out = n + g_val\n"
+        "    return out\n"
+    )
+    unshadowed_tree = ast.parse(unshadowed_src)
+    sc_unshadow = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 5,
+            "kind": "compound_block",
+            "source_text": unshadowed_src,
+            "source_code": "    n = len(items)\n    out = n + g_val\n",
+        },
+        tree=unshadowed_tree,
+    )
+    assert "global_escape" not in sc_unshadow.get("closure_hazard_reasons", ())
+
+    comp_shadow_src = (
+        "g_val = 1\n"
+        "def run_comp(items):\n"
+        "    global g_val\n"
+        "    res = [len(items) for len in items]\n"
+        "    out = g_val\n"
+        "    return res, out\n"
+    )
+    comp_tree = ast.parse(comp_shadow_src)
+    sc_comp_shadow = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 5,
+            "kind": "compound_block",
+            "source_text": comp_shadow_src,
+            "source_code": (
+                "    res = [len(items) for len in items]\n"
+                "    out = g_val\n"
+            ),
+        },
+        tree=comp_tree,
+    )
+    assert "global_escape" in sc_comp_shadow.get("closure_hazard_reasons", ())
+
+    walrus_shadow_src = (
+        "g_val = 1\n"
+        "def run_walrus(cb, items):\n"
+        "    global g_val\n"
+        "    res = ((len := cb), len(items))\n"
+        "    out = g_val\n"
+        "    return res, out\n"
+    )
+    walrus_tree = ast.parse(walrus_shadow_src)
+    sc_walrus_shadow = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 5,
+            "kind": "compound_block",
+            "source_text": walrus_shadow_src,
+            "source_code": (
+                "    res = ((len := cb), len(items))\n"
+                "    out = g_val\n"
+            ),
+        },
+        tree=walrus_tree,
+    )
+    assert "global_escape" in sc_walrus_shadow.get("closure_hazard_reasons", ())
+
+    cls_shadow_src = (
+        "g_val = 1\n"
+        "def outer(items):\n"
+        "    class LocalHolder:\n"
+        "        global g_val\n"
+        "        def len(seq):\n"
+        "            return 0\n"
+        "        n = len(items)\n"
+        "        out = n + g_val\n"
+        "    return LocalHolder.out\n"
+    )
+    cls_tree = ast.parse(cls_shadow_src)
+    sc_cls_shadow = inspect_single_unit_scope(
+        {
+            "start": 7,
+            "end": 8,
+            "kind": "compound_block",
+            "source_text": cls_shadow_src,
+            "source_code": "        n = len(items)\n        out = n + g_val\n",
+        },
+        tree=cls_tree,
+    )
+    assert "global_escape" in sc_cls_shadow.get("closure_hazard_reasons", ())
+
+    lambda_stmts = ast.parse("res = (lambda len: len(items))(cb)\n").body
+    assert _unit_has_global_mutating_call(lambda_stmts, set()) is True
+
+
+def test_clause_header_source_code_normalization_and_multiline_string_comments() -> None:
+    """Verifies leading elif/else/except/finally headers and multiline string '#' literals do not trigger stale_source_code."""
+    from pydoppelgangerhunt.fixer.scope import _strip_comments_from_lines
+
+    elif_mod_src = (
+        "def classify(x):\n"
+        "    if x > 10:\n"
+        "        out = 'high'\n"
+        "    elif x > 0:  # positive branch\n"
+        "        out = 'pos'\n"
+        "    else:\n"
+        "        out = 'neg'\n"
+        "    return out\n"
+    )
+    elif_tree = ast.parse(elif_mod_src)
+    sc_elif = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 5,
+            "kind": "clause",
+            "source_text": elif_mod_src,
+            "source_code": "elif x > 0:\n    out = 'pos'\n",
+        },
+        tree=elif_tree,
+    )
+    assert "stale_source_code" not in sc_elif["control_flow_hazards"]
+
+    multiline_lines = [
+        'msg = """first line\n',
+        "# interior hash inside multiline string\n",
+        'last line"""  # trailing comment\n',
+    ]
+    stripped_ml = _strip_comments_from_lines(multiline_lines)
+    assert "# interior hash inside multiline string" in stripped_ml[1]
+    assert "trailing comment" not in stripped_ml[2]
+    assert 'last line"""' in stripped_ml[2]
+
+
+def test_synthesize_refactoring_suggestion_unconditional_delegation_and_hazard_warning(
+    tmp_path: Any,
+) -> None:
+    """Verifies synthesize_refactoring_suggestion delegates with default args and emits a hazard warning when rejected."""
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    safe_src = (
+        "def calc_a(x, y):\n"
+        "    step = x * 2 + y\n"
+        "    out = step + 10\n"
+        "    return out\n\n"
+        "def calc_b(x, y):\n"
+        "    step = x * 2 + y\n"
+        "    out = step + 10\n"
+        "    return out\n"
+    )
+    safe_file = tmp_path / "safe_mod.py"
+    safe_file.write_text(safe_src, encoding="utf-8")
+    u_safe_1 = {
+        "name": "calc_a:block",
+        "file": str(safe_file),
+        "start": 2,
+        "end": 3,
+        "kind": "compound_block",
+        "source_text": safe_src,
+    }
+    u_safe_2 = {
+        "name": "calc_b:block",
+        "file": str(safe_file),
+        "start": 7,
+        "end": 8,
+        "kind": "compound_block",
+        "source_text": safe_src,
+    }
+    sug_default = synthesize_refactoring_suggestion(
+        u_safe_1, u_safe_2, repo_root=str(tmp_path)
+    )
+    assert "def _shared_block(" in sug_default
+    assert "return step, out" in sug_default
+    assert "(*args, **kwargs)" not in sug_default
+
+    hazard_src = (
+        "def run_a(items):\n"
+        "    scale = 2\n"
+        "    cbs = [lambda v: v * scale for _ in items]\n"
+        "    out = len(cbs)\n"
+        "    scale = 10\n"
+        "    return cbs[0](out)\n\n"
+        "def run_b(items):\n"
+        "    scale = 2\n"
+        "    cbs = [lambda v: v * scale for _ in items]\n"
+        "    out = len(cbs)\n"
+        "    scale = 10\n"
+        "    return cbs[0](out)\n"
+    )
+    hazard_file = tmp_path / "hazard_mod.py"
+    hazard_file.write_text(hazard_src, encoding="utf-8")
+    u_haz_1 = {
+        "name": "run_a:block",
+        "file": str(hazard_file),
+        "start": 3,
+        "end": 4,
+        "kind": "compound_block",
+        "source_text": hazard_src,
+    }
+    u_haz_2 = {
+        "name": "run_b:block",
+        "file": str(hazard_file),
+        "start": 10,
+        "end": 11,
+        "kind": "compound_block",
+        "source_text": hazard_src,
+    }
+    sug_hazard = synthesize_refactoring_suggestion(
+        u_haz_1, u_haz_2, repo_root=str(tmp_path)
+    )
+    assert "rejected as unsafe" in sug_hazard
+    assert "WARNING: Automatic helper synthesis was skipped" in sug_hazard
+    assert "(*args, **kwargs)" not in sug_hazard
+
+
+def test_concurrent_suppress_syntax_warnings_and_stmt_deltas_cap() -> None:
+    """Verifies reference-counted _suppress_syntax_warnings concurrency and _MAX_STMT_DELTAS_PER_FN bound."""
+    import concurrent.futures
+    import threading
+    import warnings
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _MAX_STMT_DELTAS_PER_FN,
+        _suppress_syntax_warnings,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import _SpanBounds
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _analyze_enclosing_fn_cells_uncached,
+    )
+
+    barrier = threading.Barrier(4)
+
+    def _worker() -> None:
+        with _suppress_syntax_warnings():
+            barrier.wait(timeout=5.0)
+            ast.parse(r"s = '\d+'")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futs = [pool.submit(_worker) for _ in range(4)]
+        for f in futs:
+            f.result(timeout=10.0)
+
+    assert not any(
+        f[0] == "ignore" and f[2] is SyntaxWarning for f in warnings.filters
+    )
+
+    clear_dataflow_cache()
+    many_lines = ["def big_fn(x):\n"] + [
+        f"    v_{i} = x + {i}\n" for i in range(_MAX_STMT_DELTAS_PER_FN + 20)
+    ] + ["    return v_0\n"]
+    big_tree = ast.parse("".join(many_lines))
+    big_fn = big_tree.body[0]
+    assert isinstance(big_fn, ast.FunctionDef)
+    info = _analyze_enclosing_fn_cells_uncached(
+        big_fn,
+        _SpanBounds(2, 5),
+        mod_tree=big_tree,
+        use_stmt_deltas=True,
+    )
+    assert info is not None

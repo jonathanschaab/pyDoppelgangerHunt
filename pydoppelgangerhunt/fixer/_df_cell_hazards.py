@@ -461,14 +461,24 @@ def _unit_has_global_mutating_call(
     to observe the stale parameter rather than the updated global. Calls to
     unshadowed pure builtins cannot rebind module globals and are safe to allow.
     """
-    all_builtins_shadowed = has_star_import or ("*" in shadowed_names)
+    effective_shadowed: Set[str] = set(shadowed_names)
+    for st in candidate_stmts:
+        for node in ast.walk(st):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                effective_shadowed.add(node.id)
+            elif isinstance(
+                node,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+            ):
+                effective_shadowed.update(_extract_single_node_local_names(node))
+    all_builtins_shadowed = has_star_import or ("*" in effective_shadowed)
     for st in candidate_stmts:
         for node in ast.walk(st):
             if isinstance(node, ast.Call):
                 if all_builtins_shadowed or not (
                     isinstance(node.func, ast.Name)
                     and node.func.id in _PURE_GLOBAL_SAFE_BUILTINS
-                    and node.func.id not in shadowed_names
+                    and node.func.id not in effective_shadowed
                 ):
                     return True
     return False
@@ -736,9 +746,9 @@ def _evaluate_severed_closure_cell_hazard(
             shadowed_builtin_names.update(
                 _extract_single_node_local_names(ctx.mod_tree)
             )
-        for _, _, enc_fn_node in enclosing_chain:
+        for enc_scope_node in unit_enclosing_scopes:
             shadowed_builtin_names.update(
-                _extract_single_node_local_names(enc_fn_node)
+                _extract_single_node_local_names(enc_scope_node)
             )
         has_star = _has_wildcard_star_import(
             unit_mod,

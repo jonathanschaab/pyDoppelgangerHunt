@@ -259,41 +259,35 @@ def synthesize_refactoring_suggestion(
     ]
     diff_summary = f"{len(diff_lines)} varying line(s) detected between clone blocks."
 
-    if (
-        closure_strictness is not None
-        or skip_pre_unit_closures
-        or non_suppressing_ctx_managers is not None
-    ):
-        from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
-            synthesize_shared_helper_code,
-        )
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        synthesize_shared_helper_code,
+    )
 
-        helper_code = synthesize_shared_helper_code(
-            u1,
-            u2,
-            helper_name=helper_name,
-            repo_root=repo_root,
-            closure_strictness=closure_strictness,
-            skip_pre_unit_closures=skip_pre_unit_closures,
-            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+    helper_code = synthesize_shared_helper_code(
+        u1,
+        u2,
+        helper_name=helper_name,
+        repo_root=repo_root,
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+    )
+    if helper_code:
+        indented_helper = "\n".join(
+            f"    {ln}" if ln.strip() else ""
+            for ln in helper_code.rstrip("\n").splitlines()
         )
-        if helper_code:
-            indented_helper = "\n".join(
-                f"    {ln}" if ln.strip() else ""
-                for ln in helper_code.rstrip("\n").splitlines()
-            )
-            return (
-                f"[REFACTOR SUGGESTION] Extract duplicated logic into common helper '{helper_name}':\n"
-                f"    # {diff_summary}\n"
-                f"{indented_helper}"
-            )
+        return (
+            f"[REFACTOR SUGGESTION] Extract duplicated logic into common helper '{helper_name}':\n"
+            f"    # {diff_summary}\n"
+            f"{indented_helper}"
+        )
 
     return (
-        f"[REFACTOR SUGGESTION] Extract duplicated logic into common helper '{helper_name}':\n"
+        f"[REFACTOR SUGGESTION] Automatic extraction into '{helper_name}' rejected as unsafe "
+        f"(closure, control-flow, or source hazard detected for {n1} and {n2}); manual review required:\n"
         f"    # {diff_summary}\n"
-        f"    def {helper_name}(*args, **kwargs):\n"
-        f"        \"\"\"Extracted common implementation for {n1} and {n2}.\"\"\"\n"
-        f"        # Place common block here and parameterize differing inputs."
+        f"    # WARNING: Automatic helper synthesis was skipped due to a safety hazard."
     )
 
 

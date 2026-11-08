@@ -48,6 +48,11 @@ class SourceLinesOrigin:
         self._is_placeholder = is_placeholder
 
     @property
+    def name(self) -> str:
+        """Canonical variant name of this origin."""
+        return self._name
+
+    @property
     def is_pre_sliced(self) -> bool:
         """True if lines are already pre-sliced (or a placeholder)."""
         return self._is_pre_sliced
@@ -63,14 +68,10 @@ class SourceLinesOrigin:
     def __eq__(self, other: object) -> bool:
         if isinstance(other, SourceLinesOrigin):
             return self._name == other._name
-        if isinstance(other, bool):
-            return self._is_pre_sliced == other
-        if isinstance(other, str):
-            return self._name == other
         return NotImplemented
 
     def __hash__(self) -> int:
-        return hash(self._is_pre_sliced)
+        return hash((SourceLinesOrigin, self._name))
 
     def __repr__(self) -> str:
         return f"SourceLinesOrigin.{self._name}"

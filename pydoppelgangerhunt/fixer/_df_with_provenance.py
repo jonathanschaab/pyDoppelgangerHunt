@@ -10,6 +10,7 @@ from typing import (
     AbstractSet,
     Any,
     Iterable,
+    Iterator,
     List,
     Mapping,
     Optional,
@@ -50,6 +51,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _INNER_SCOPE_TYPES,
     _extract_node_type_param_names,
     _extract_scope_local_names,
+    _extract_single_node_local_names,
     _is_irrefutable_case,
     _node_has_star_import,
 )
@@ -686,66 +688,200 @@ _SAFE_EXIT_BASE_CLASS_NAMES: frozenset[str] = frozenset(
         "ContextManager",
     }
 )
+_CLASS_DISALLOWED_META_DUNDERS: frozenset[str] = frozenset(
+    {
+        "__new__",
+        "__getattribute__",
+        "__getattr__",
+    }
+)
+
+
+def _iter_shallow_scope_body_nodes(scope_node: ast.AST) -> Iterator[ast.AST]:
+    """Yields AST nodes in scope_node.body without descending into nested _INNER_SCOPE_TYPES bodies."""
+    body_attr = getattr(scope_node, "body", ())
+    if not isinstance(body_attr, (list, tuple)):
+        return
+    stack: List[ast.AST] = list(reversed(body_attr))
+    while stack:
+        curr = stack.pop()
+        yield curr
+        if isinstance(curr, _INNER_SCOPE_TYPES):
+            for hdr in reversed(tuple(iter_nested_scope_header_nodes(curr))):
+                stack.append(hdr)
+            continue
+        for ch in reversed(tuple(ast.iter_child_nodes(curr))):
+            stack.append(ch)
 
 
 def _class_def_may_suppress_in_exit(cls_node: ast.ClassDef) -> bool:
-    """Returns True if a ClassDef defines an __exit__/__aexit__ method that can return truthy."""
-    for item in cls_node.body:
-        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
-            item.name in ("__exit__", "__aexit__")
+    """Returns True if a ClassDef defines or binds an __exit__/__aexit__ that may return truthy."""
+    for sub in _iter_shallow_scope_body_nodes(cls_node):
+        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+            sub.name in ("__exit__", "__aexit__")
         ):
-            for sub in ast.walk(item):
-                if isinstance(sub, ast.Return) and sub.value is not None:
+            if sub.decorator_list:
+                return True
+            if sub.name == "__exit__" and isinstance(
+                sub, ast.AsyncFunctionDef
+            ):
+                return True
+            for m_node in _iter_shallow_scope_body_nodes(sub):
+                if isinstance(m_node, (ast.Yield, ast.YieldFrom)):
+                    return True
+                if isinstance(m_node, ast.Return) and m_node.value is not None:
                     if not (
-                        isinstance(sub.value, ast.Constant)
-                        and not bool(sub.value.value)
+                        isinstance(m_node.value, ast.Constant)
+                        and not bool(m_node.value.value)
                     ):
                         return True
+        elif (
+            isinstance(sub, ast.Name)
+            and isinstance(sub.ctx, (ast.Store, ast.Del))
+            and sub.id in ("__exit__", "__aexit__")
+        ):
+            return True
+        elif isinstance(sub, (ast.Import, ast.ImportFrom)) and any(
+            (alias.asname or alias.name.split(".", 1)[0])
+            in ("__exit__", "__aexit__")
+            for alias in sub.names
+        ):
+            return True
+        elif (
+            isinstance(sub, ast.ClassDef)
+            and sub.name in ("__exit__", "__aexit__")
+        ):
+            return True
+        elif (
+            isinstance(sub, ast.ExceptHandler)
+            and sub.name in ("__exit__", "__aexit__")
+        ):
+            return True
+        elif _extract_pattern_bound_name(sub) in ("__exit__", "__aexit__"):
+            return True
     return False
 
 
-def _is_safe_context_manager_base_expr(base: ast.AST) -> bool:
-    """Returns True if a class base expression is object or an abstract context-manager protocol base."""
+def _is_safe_context_manager_base_expr(
+    base: ast.AST,
+    prov: _SuppressProvenance = _EMPTY_SUPPRESS_PROVENANCE,
+) -> bool:
+    """Returns True if a class base expression is an unshadowed object or abstract context-manager protocol base."""
+    if prov.has_star_import:
+        return False
     if isinstance(base, ast.Subscript):
         base = base.value
     if isinstance(base, ast.Name):
-        return base.id in _SAFE_EXIT_BASE_CLASS_NAMES
+        return (
+            base.id in _SAFE_EXIT_BASE_CLASS_NAMES
+            and base.id not in prov.shadowed_names
+            and base.id not in prov.shadowed_builtins
+        )
     if isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name):
         return (
             base.value.id in ("contextlib", "typing")
             and base.attr in _SAFE_EXIT_BASE_CLASS_NAMES
+            and base.value.id not in prov.shadowed_names
         )
     return False
 
 
-def _class_def_is_proven_non_suppressing_in_exit(cls_node: ast.ClassDef) -> bool:
-    """Returns True if a ClassDef defines __exit__/__aexit__ that only returns falsy constants and has no unknown bases."""
-    if cls_node.decorator_list or not all(
-        _is_safe_context_manager_base_expr(b) for b in cls_node.bases
+def _class_def_is_proven_non_suppressing_in_exit(
+    cls_node: ast.ClassDef,
+    prov: _SuppressProvenance = _EMPTY_SUPPRESS_PROVENANCE,
+) -> bool:
+    """Returns True if a ClassDef defines __exit__/__aexit__ that only returns falsy constants and has no unknown bases or metaclasses."""
+    if (
+        cls_node.decorator_list
+        or cls_node.keywords
+        or prov.has_star_import
+        or not all(
+            _is_safe_context_manager_base_expr(b, prov) for b in cls_node.bases
+        )
     ):
         return False
-    has_exit_method = any(
-        isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and item.name in ("__exit__", "__aexit__")
-        and not item.decorator_list
+    cls_locals = _extract_single_node_local_names(cls_node)
+    if bool(cls_locals & _CLASS_DISALLOWED_META_DUNDERS) or _scope_has_direct_star_import(
+        cls_node
+    ):
+        return False
+    top_exit_defs = [
+        item
         for item in cls_node.body
-    )
-    return has_exit_method and not _class_def_may_suppress_in_exit(cls_node)
+        if isinstance(item, ast.FunctionDef)
+        and item.name == "__exit__"
+        and not item.decorator_list
+    ]
+    top_aexit_defs = [
+        item
+        for item in cls_node.body
+        if isinstance(item, ast.AsyncFunctionDef)
+        and item.name == "__aexit__"
+        and not item.decorator_list
+    ]
+    all_exit_fn_defs = [
+        sub
+        for sub in _iter_shallow_scope_body_nodes(cls_node)
+        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and sub.name in ("__exit__", "__aexit__")
+    ]
+    if (
+        len(top_exit_defs) > 1
+        or len(top_aexit_defs) > 1
+        or (len(top_exit_defs) + len(top_aexit_defs)) == 0
+        or len(all_exit_fn_defs) != (len(top_exit_defs) + len(top_aexit_defs))
+    ):
+        return False
+    return not _class_def_may_suppress_in_exit(cls_node)
 
 
 def _func_def_may_return_suppressor(
     fn_stmt: Union[ast.FunctionDef, ast.AsyncFunctionDef],
     prov: _SuppressProvenance,
 ) -> bool:
-    """Returns True if a function definition returns a call or reference to a known suppressor."""
-    for sub in ast.walk(fn_stmt):
-        if isinstance(sub, ast.Return) and sub.value is not None:
-            if _is_suppress_alias_target_expr(sub.value, prov):
-                return True
-            if isinstance(sub.value, ast.Call) and _is_suppress_alias_target_expr(
-                sub.value.func, prov
-            ):
-                return True
+    """Returns True if a function definition may return a suppressor or suppress exceptions around yield."""
+    local_prov = prov
+    for p_name in _extract_arg_names(fn_stmt.args):
+        local_prov = local_prov.clear_name(p_name)
+    for tp_name in _extract_node_type_param_names(fn_stmt):
+        local_prov = local_prov.clear_name(tp_name)
+    body_prov = _update_suppress_provenance_from_stmts(
+        fn_stmt.body, local_prov, in_branch=True
+    )
+    fn_prov = local_prov.merge_branch_conservative(body_prov)
+
+    stack: List[Tuple[ast.AST, bool]] = [
+        (stmt, False) for stmt in reversed(fn_stmt.body)
+    ]
+    while stack:
+        curr, in_try_or_with = stack.pop()
+        if isinstance(curr, _INNER_SCOPE_TYPES):
+            for hdr in reversed(tuple(iter_nested_scope_header_nodes(curr))):
+                stack.append((hdr, in_try_or_with))
+            continue
+        if isinstance(curr, (ast.Yield, ast.YieldFrom)) and in_try_or_with:
+            return True
+        if isinstance(curr, ast.Return) and curr.value is not None:
+            val_stack: List[ast.AST] = [curr.value]
+            while val_stack:
+                v_curr = val_stack.pop()
+                if _is_suppress_alias_target_expr(v_curr, fn_prov):
+                    return True
+                if isinstance(v_curr, _INNER_SCOPE_TYPES):
+                    val_stack.extend(iter_nested_scope_header_nodes(v_curr))
+                    continue
+                val_stack.extend(ast.iter_child_nodes(v_curr))
+        next_in_try_or_with = in_try_or_with or isinstance(
+            curr, (ast.With, ast.AsyncWith)
+        ) or (
+            is_try_or_trystar_node(curr)
+            and bool(
+                getattr(curr, "handlers", None)
+                or getattr(curr, "finalbody", None)
+            )
+        )
+        for ch in reversed(tuple(ast.iter_child_nodes(curr))):
+            stack.append((ch, next_in_try_or_with))
     return False
 
 
@@ -771,53 +907,79 @@ def _update_suppress_provenance_from_expr_walrus(
     prov: _SuppressProvenance,
     *,
     allow_positive: bool = True,
+    extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
 ) -> _SuppressProvenance:
-    """Updates provenance from NamedExpr (walrus) bindings inside expression trees."""
-    w_stack: List[Tuple[ast.AST, bool]] = [
-        (root, allow_positive) for root in expr_roots
+    """Updates provenance from NamedExpr (walrus) bindings inside expression trees in left-to-right order."""
+    w_stack: List[Tuple[ast.AST, bool, bool]] = [
+        (root, allow_positive, False) for root in reversed(tuple(expr_roots))
     ]
     while w_stack:
-        w_curr, cur_allow_pos = w_stack.pop()
+        w_curr, cur_allow_pos, is_post_bind = w_stack.pop()
+        if is_post_bind:
+            if isinstance(w_curr, ast.NamedExpr) and isinstance(
+                w_curr.target, ast.Name
+            ):
+                bound_prov = _bind_expr_target_provenance(
+                    prov,
+                    w_curr.target.id,
+                    w_curr.value,
+                    allow_positive=cur_allow_pos,
+                    extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                )
+                prov = (
+                    bound_prov
+                    if cur_allow_pos
+                    else prov.merge_branch_conservative(bound_prov)
+                )
+            continue
         if isinstance(w_curr, _INNER_SCOPE_TYPES):
-            for hdr in iter_nested_scope_header_nodes(w_curr):
-                w_stack.append((hdr, cur_allow_pos))
+            for hdr in reversed(tuple(iter_nested_scope_header_nodes(w_curr))):
+                w_stack.append((hdr, cur_allow_pos, False))
             continue
         if isinstance(w_curr, _COMPREHENSION_TYPES):
-            if w_curr.generators:
-                w_stack.append((w_curr.generators[0].iter, cur_allow_pos))
-                for gen in w_curr.generators[1:]:
-                    w_stack.append((gen.iter, False))
-                for gen in w_curr.generators:
-                    for if_e in gen.ifs:
-                        w_stack.append((if_e, False))
             if isinstance(w_curr, ast.DictComp):
-                w_stack.append((w_curr.key, False))
-                w_stack.append((w_curr.value, False))
+                w_stack.append((w_curr.value, False, False))
+                w_stack.append((w_curr.key, False, False))
             else:
-                w_stack.append((w_curr.elt, False))
+                w_stack.append((w_curr.elt, False, False))
+            if w_curr.generators:
+                for gen in reversed(w_curr.generators):
+                    for if_e in reversed(gen.ifs):
+                        w_stack.append((if_e, False, False))
+                for gen in reversed(w_curr.generators[1:]):
+                    w_stack.append((gen.iter, False, False))
+                w_stack.append((w_curr.generators[0].iter, cur_allow_pos, False))
             continue
-        if isinstance(w_curr, ast.NamedExpr) and isinstance(
-            w_curr.target, ast.Name
-        ):
-            prov = _bind_expr_target_provenance(
-                prov,
-                w_curr.target.id,
-                w_curr.value,
-                allow_positive=cur_allow_pos,
-            )
+        if isinstance(w_curr, ast.NamedExpr):
+            if isinstance(w_curr.target, ast.Name):
+                w_stack.append((w_curr, cur_allow_pos, True))
+            w_stack.append((w_curr.value, cur_allow_pos, False))
+            continue
         if isinstance(w_curr, ast.BoolOp):
-            for idx, val in enumerate( reversed(w_curr.values) ):
-                orig_idx = len(w_curr.values) - 1 - idx
-                w_stack.append((val, cur_allow_pos and orig_idx == 0))
+            for idx in range(len(w_curr.values) - 1, -1, -1):
+                w_stack.append(
+                    (w_curr.values[idx], cur_allow_pos and idx == 0, False)
+                )
+            continue
+        if isinstance(w_curr, ast.Compare):
+            for idx in range(len(w_curr.comparators) - 1, -1, -1):
+                w_stack.append(
+                    (
+                        w_curr.comparators[idx],
+                        cur_allow_pos and idx == 0,
+                        False,
+                    )
+                )
+            w_stack.append((w_curr.left, cur_allow_pos, False))
             continue
         if isinstance(w_curr, ast.IfExp):
-            w_stack.append((w_curr.orelse, False))
-            w_stack.append((w_curr.body, False))
-            w_stack.append((w_curr.test, cur_allow_pos))
+            w_stack.append((w_curr.orelse, False, False))
+            w_stack.append((w_curr.body, False, False))
+            w_stack.append((w_curr.test, cur_allow_pos, False))
             continue
-        for ch in ast.iter_child_nodes(w_curr):
+        for ch in reversed(tuple(ast.iter_child_nodes(w_curr))):
             if not isinstance(ch, ast.stmt):
-                w_stack.append((ch, cur_allow_pos))
+                w_stack.append((ch, cur_allow_pos, False))
     return prov
 
 
@@ -1019,7 +1181,10 @@ def _update_suppress_provenance_from_stmt(
 
     if isinstance(stmt, ast.Assign):
         prov = _update_suppress_provenance_from_expr_walrus(
-            (stmt.value, *stmt.targets), prov, allow_positive=allow_pos
+            (stmt.value, *stmt.targets),
+            prov,
+            allow_positive=allow_pos,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         )
         for tgt in stmt.targets:
             for t_name in _extract_store_names_in_node(tgt):
@@ -1047,7 +1212,10 @@ def _update_suppress_provenance_from_stmt(
             if isinstance(e, ast.AST)
         ]
         prov = _update_suppress_provenance_from_expr_walrus(
-            exprs, prov, allow_positive=allow_pos
+            exprs,
+            prov,
+            allow_positive=allow_pos,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         )
         if stmt.value is not None:
             for t_name in _extract_store_names_in_node(stmt.target):
@@ -1067,7 +1235,10 @@ def _update_suppress_provenance_from_stmt(
 
     if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
         prov = _update_suppress_provenance_from_expr_walrus(
-            iter_nested_scope_header_nodes(stmt), prov, allow_positive=allow_pos
+            iter_nested_scope_header_nodes(stmt),
+            prov,
+            allow_positive=allow_pos,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         )
         if _func_def_may_return_suppressor(stmt, prov):
             return prov.with_suppressor(stmt.name)
@@ -1075,12 +1246,15 @@ def _update_suppress_provenance_from_stmt(
 
     if isinstance(stmt, ast.ClassDef):
         prov = _update_suppress_provenance_from_expr_walrus(
-            iter_nested_scope_header_nodes(stmt), prov, allow_positive=allow_pos
+            iter_nested_scope_header_nodes(stmt),
+            prov,
+            allow_positive=allow_pos,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         )
         if _class_def_may_suppress_in_exit(stmt):
             return prov.with_suppressor(stmt.name)
         if (
-            _class_def_is_proven_non_suppressing_in_exit(stmt)
+            _class_def_is_proven_non_suppressing_in_exit(stmt, prov)
             and stmt.name not in _SUPPRESSING_CTX_MANAGER_NAMES
         ):
             return prov.with_non_suppressor(
@@ -1096,7 +1270,10 @@ def _update_suppress_provenance_from_stmt(
 
     if isinstance(stmt, ast.Delete):
         prov = _update_suppress_provenance_from_expr_walrus(
-            stmt.targets, prov, allow_positive=allow_pos
+            stmt.targets,
+            prov,
+            allow_positive=allow_pos,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         )
         for d_name in _extract_shallow_deleted_names(stmt):
             prov = prov.clear_name(d_name)
@@ -1106,7 +1283,10 @@ def _update_suppress_provenance_from_stmt(
         ta_val = getattr(stmt, "value", None)
         if isinstance(ta_val, ast.AST):
             prov = _update_suppress_provenance_from_expr_walrus(
-                (ta_val,), prov, allow_positive=allow_pos
+                (ta_val,),
+                prov,
+                allow_positive=allow_pos,
+                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
             )
         ta_name = _extract_type_alias_or_pattern_name(stmt)
         if ta_name is not None:
@@ -1116,7 +1296,10 @@ def _update_suppress_provenance_from_stmt(
     if isinstance(stmt, (ast.If, ast.While)):
         is_while = isinstance(stmt, ast.While)
         prov = _update_suppress_provenance_from_expr_walrus(
-            (stmt.test,), prov, allow_positive=allow_pos
+            (stmt.test,),
+            prov,
+            allow_positive=allow_pos,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         )
         branch_flag = True if is_while else in_branch
         b_prov = _update_suppress_provenance_from_stmts(
@@ -1143,10 +1326,16 @@ def _update_suppress_provenance_from_stmt(
 
     if isinstance(stmt, (ast.For, ast.AsyncFor)):
         prov = _update_suppress_provenance_from_expr_walrus(
-            (stmt.iter,), prov, allow_positive=allow_pos
+            (stmt.iter,),
+            prov,
+            allow_positive=allow_pos,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         )
         iter_prov = _update_suppress_provenance_from_expr_walrus(
-            (stmt.target,), prov, allow_positive=False
+            (stmt.target,),
+            prov,
+            allow_positive=False,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         )
         for t_name in _extract_store_names_in_node(stmt.target):
             iter_prov = iter_prov.clear_name(t_name)
@@ -1183,6 +1372,7 @@ def _update_suppress_provenance_from_stmt(
                 (item.context_expr,),
                 item_prov,
                 allow_positive=allow_pos and not after_sup,
+                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
             )
             item_prov = (
                 item_prov.merge_branch_conservative(w_prov)
@@ -1958,6 +2148,168 @@ def _is_non_raising_bool_expr(
     )
 
 
+def _apply_non_raising_if_branch_updates(
+    node: Union[ast.If, ast.IfExp],
+    cur_safe: Set[str],
+    cur_bool: Set[str],
+    *,
+    strict_names: bool,
+    is_conditional: bool = False,
+) -> None:
+    """Applies walrus/statement safe updates across test, body, and orelse of If/IfExp."""
+    _apply_non_raising_expr_walrus_updates(
+        node.test,
+        cur_safe,
+        cur_bool,
+        strict_names=strict_names,
+        is_conditional=is_conditional,
+    )
+    then_safe, then_bool = set(cur_safe), set(cur_bool)
+    else_safe, else_bool = set(cur_safe), set(cur_bool)
+    if isinstance(node, ast.IfExp):
+        _apply_non_raising_expr_walrus_updates(
+            node.body,
+            then_safe,
+            then_bool,
+            strict_names=strict_names,
+            is_conditional=is_conditional,
+        )
+        _apply_non_raising_expr_walrus_updates(
+            node.orelse,
+            else_safe,
+            else_bool,
+            strict_names=strict_names,
+            is_conditional=is_conditional,
+        )
+    else:
+        _apply_non_raising_seq_safe_updates(
+            node.body, then_safe, then_bool, strict_names=strict_names
+        )
+        _apply_non_raising_seq_safe_updates(
+            node.orelse, else_safe, else_bool, strict_names=strict_names
+        )
+    cur_safe.clear()
+    cur_safe.update(then_safe & else_safe)
+    cur_bool.clear()
+    cur_bool.update(then_bool & else_bool)
+
+
+def _apply_non_raising_expr_walrus_updates(
+    expr: Optional[ast.AST],
+    cur_safe: Set[str],
+    cur_bool: Set[str],
+    *,
+    strict_names: bool,
+    is_conditional: bool = False,
+) -> None:
+    """Applies left-to-right cur_safe and cur_bool updates from NamedExpr nodes in a non-raising expr."""
+    if expr is None or isinstance(expr, ast.Constant):
+        return
+    if isinstance(expr, ast.IfExp):
+        _apply_non_raising_if_branch_updates(
+            expr,
+            cur_safe,
+            cur_bool,
+            strict_names=strict_names,
+            is_conditional=is_conditional,
+        )
+        return
+    if isinstance(expr, ast.NamedExpr):
+        _apply_non_raising_expr_walrus_updates(
+            expr.value,
+            cur_safe,
+            cur_bool,
+            strict_names=strict_names,
+            is_conditional=is_conditional,
+        )
+        if isinstance(expr.target, ast.Name):
+            t_name = expr.target.id
+            val_bool = _is_non_raising_bool_expr(
+                expr.value, cur_safe, cur_bool, strict_names=strict_names
+            )
+            if not is_conditional:
+                cur_safe.add(t_name)
+                if val_bool:
+                    cur_bool.add(t_name)
+                else:
+                    cur_bool.discard(t_name)
+            elif not val_bool:
+                cur_bool.discard(t_name)
+        return
+    sub_exprs: Sequence[Tuple[ast.AST, bool]] = ()
+    if isinstance(expr, ast.Lambda):
+        sub_exprs = tuple(
+            (d, is_conditional)
+            for d in (
+                *expr.args.defaults,
+                *(d for d in expr.args.kw_defaults if d is not None),
+            )
+        )
+    elif isinstance(expr, (ast.Tuple, ast.List)):
+        sub_exprs = tuple((elt, is_conditional) for elt in expr.elts)
+    elif isinstance(expr, ast.UnaryOp):
+        sub_exprs = ((expr.operand, is_conditional),)
+    elif isinstance(expr, ast.BoolOp):
+        sub_exprs = tuple(
+            (val, is_conditional or idx > 0)
+            for idx, val in enumerate(expr.values)
+        )
+    elif isinstance(expr, ast.Compare):
+        sub_exprs = (
+            (expr.left, is_conditional),
+            *(
+                (comp, is_conditional or idx > 0)
+                for idx, comp in enumerate(expr.comparators)
+            ),
+        )
+    elif isinstance(expr, ast.Call):
+        sub_exprs = (
+            (expr.func, is_conditional),
+            *((arg, is_conditional) for arg in expr.args),
+            *((kw.value, is_conditional) for kw in expr.keywords),
+        )
+    for sub_node, sub_cond in sub_exprs:
+        _apply_non_raising_expr_walrus_updates(
+            sub_node, cur_safe, cur_bool, strict_names=strict_names, is_conditional=sub_cond
+        )
+
+
+def _check_and_advance_non_raising_seq(
+    nodes: Sequence[ast.AST],
+    safe_names: AbstractSet[str],
+    safe_bool_names: AbstractSet[str],
+    *,
+    strict_names: bool,
+    require_bool_safe: bool = False,
+    conditional_from_idx: Optional[int] = None,
+) -> Optional[Tuple[Set[str], Set[str]]]:
+    """Verifies each node in nodes is non-raising left-to-right and returns updated (safe, bool) sets."""
+    cur_safe = set(safe_names)
+    cur_bool = set(safe_bool_names)
+    for idx, node in enumerate(nodes):
+        ok = (
+            _is_non_raising_bool_expr(
+                node, cur_safe, cur_bool, strict_names=strict_names
+            )
+            if require_bool_safe
+            else _is_non_raising_expr(
+                node, cur_safe, cur_bool, strict_names=strict_names
+            )
+        )
+        if not ok:
+            return None
+        _apply_non_raising_expr_walrus_updates(
+            node,
+            cur_safe,
+            cur_bool,
+            strict_names=strict_names,
+            is_conditional=(
+                conditional_from_idx is not None and idx >= conditional_from_idx
+            ),
+        )
+    return cur_safe, cur_bool
+
+
 def _is_non_raising_expr(
     expr: Optional[ast.AST],
     safe_names: AbstractSet[str] = frozenset(),
@@ -1974,21 +2326,24 @@ def _is_non_raising_expr(
             return expr.id in safe_bool_names
         return (not strict_names) or (expr.id in safe_names)
     if isinstance(expr, ast.Lambda):
-        return all(
-            _is_non_raising_expr(
-                d, safe_names, safe_bool_names, strict_names=strict_names
+        defaults = (
+            *expr.args.defaults,
+            *(d for d in expr.args.kw_defaults if d is not None),
+        )
+        return (
+            _check_and_advance_non_raising_seq(
+                defaults, safe_names, safe_bool_names, strict_names=strict_names
             )
-            for d in (
-                *expr.args.defaults,
-                *(d for d in expr.args.kw_defaults if d is not None),
-            )
+            is not None
         )
     if isinstance(expr, (ast.Tuple, ast.List)):
-        return not any(isinstance(e, ast.Starred) for e in expr.elts) and all(
-            _is_non_raising_expr(
-                e, safe_names, safe_bool_names, strict_names=strict_names
+        if any(isinstance(e, ast.Starred) for e in expr.elts):
+            return False
+        return (
+            _check_and_advance_non_raising_seq(
+                expr.elts, safe_names, safe_bool_names, strict_names=strict_names
             )
-            for e in expr.elts
+            is not None
         )
     if isinstance(expr, ast.UnaryOp):
         if isinstance(expr.op, ast.Not):
@@ -2008,49 +2363,53 @@ def _is_non_raising_expr(
             and isinstance(expr.operand.value, (int, float, bool))
         )
     if isinstance(expr, ast.BoolOp):
-        return bool(expr.values) and (
-            all(
-                _is_non_raising_bool_expr(
-                    v, safe_names, safe_bool_names, strict_names=strict_names
-                )
-                for v in expr.values[:-1]
-            )
-            and _is_non_raising_expr(
-                expr.values[-1],
-                safe_names,
-                safe_bool_names,
-                require_bool_safe=require_bool_safe,
-                strict_names=strict_names,
-            )
+        if not expr.values:
+            return False
+        advanced = _check_and_advance_non_raising_seq(
+            expr.values[:-1],
+            safe_names,
+            safe_bool_names,
+            strict_names=strict_names,
+            require_bool_safe=True,
+            conditional_from_idx=1,
+        )
+        return advanced is not None and _is_non_raising_expr(
+            expr.values[-1],
+            advanced[0],
+            advanced[1],
+            require_bool_safe=require_bool_safe,
+            strict_names=strict_names,
         )
     if isinstance(expr, ast.IfExp):
-        return _is_non_raising_bool_expr(
-            expr.test, safe_names, safe_bool_names, strict_names=strict_names
-        ) and all(
+        advanced = _check_and_advance_non_raising_seq(
+            (expr.test,),
+            safe_names,
+            safe_bool_names,
+            strict_names=strict_names,
+            require_bool_safe=True,
+        )
+        return advanced is not None and all(
             _is_non_raising_expr(
                 b,
-                safe_names,
-                safe_bool_names,
+                advanced[0],
+                advanced[1],
                 require_bool_safe=require_bool_safe,
                 strict_names=strict_names,
             )
             for b in (expr.body, expr.orelse)
         )
     if isinstance(expr, ast.Compare):
+        if not all(isinstance(op, (ast.Is, ast.IsNot)) for op in expr.ops):
+            return False
         return (
-            all(isinstance(op, (ast.Is, ast.IsNot)) for op in expr.ops)
-            and _is_non_raising_expr(
-                expr.left,
+            _check_and_advance_non_raising_seq(
+                (expr.left, *expr.comparators),
                 safe_names,
                 safe_bool_names,
                 strict_names=strict_names,
+                conditional_from_idx=2,
             )
-            and all(
-                _is_non_raising_expr(
-                    c, safe_names, safe_bool_names, strict_names=strict_names
-                )
-                for c in expr.comparators
-            )
+            is not None
         )
     if isinstance(expr, ast.NamedExpr):
         return isinstance(expr.target, ast.Name) and _is_non_raising_expr(
@@ -2175,52 +2534,61 @@ def _stmt_cannot_raise_in_suppress(
             )
         )
     if isinstance(stmt, ast.AnnAssign):
-        return _is_non_raising_expr(
-            stmt.annotation,
+        ann_sets = _check_and_advance_non_raising_seq(
+            (stmt.annotation,),
             safe_names,
             safe_bool_names,
             strict_names=strict_names,
-        ) and (
-            stmt.value is None
-            or (
-                _is_non_raising_expr(
-                    stmt.value,
-                    safe_names,
-                    safe_bool_names,
-                    strict_names=strict_names,
-                )
-                and _is_non_raising_store_target(stmt.target, stmt.value)
+        )
+        if ann_sets is None:
+            return False
+        return stmt.value is None or (
+            _is_non_raising_expr(
+                stmt.value,
+                ann_sets[0],
+                ann_sets[1],
+                strict_names=strict_names,
             )
+            and _is_non_raising_store_target(stmt.target, stmt.value)
         )
     if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        return not stmt.decorator_list and all(
-            _is_non_raising_expr(
-                h, safe_names, safe_bool_names, strict_names=strict_names
-            )
-            for h in iter_nested_scope_header_nodes(stmt)
-        )
-    if isinstance(stmt, ast.If):
-        test_prov = _update_suppress_provenance_from_expr_walrus(
-            (stmt.test,), _coerce_suppress_provenance(suppress_aliases)
-        )
+        if stmt.decorator_list:
+            return False
         return (
-            _is_non_raising_bool_expr(
-                stmt.test,
+            _check_and_advance_non_raising_seq(
+                tuple(iter_nested_scope_header_nodes(stmt)),
                 safe_names,
                 safe_bool_names,
                 strict_names=strict_names,
             )
-            and not _split_suppress_with_body(
+            is not None
+        )
+    if isinstance(stmt, ast.If):
+        test_sets = _check_and_advance_non_raising_seq(
+            (stmt.test,),
+            safe_names,
+            safe_bool_names,
+            strict_names=strict_names,
+            require_bool_safe=True,
+        )
+        if test_sets is None:
+            return False
+        test_safe, test_bool = test_sets
+        test_prov = _update_suppress_provenance_from_expr_walrus(
+            (stmt.test,), _coerce_suppress_provenance(suppress_aliases)
+        )
+        return (
+            not _split_suppress_with_body(
                 stmt.body,
-                safe_names=safe_names,
-                safe_bool_names=safe_bool_names,
+                safe_names=test_safe,
+                safe_bool_names=test_bool,
                 strict_names=strict_names,
                 suppress_aliases=test_prov,
             )[1]
             and not _split_suppress_with_body(
                 stmt.orelse,
-                safe_names=safe_names,
-                safe_bool_names=safe_bool_names,
+                safe_names=test_safe,
+                safe_bool_names=test_bool,
                 strict_names=strict_names,
                 suppress_aliases=test_prov,
             )[1]
@@ -2255,20 +2623,28 @@ def _stmt_cannot_raise_in_suppress(
             for item in stmt.items
         ):
             inner_safe = set(safe_names)
+            inner_bool = set(safe_bool_names)
             inner_prov = prov
             for item in stmt.items:
+                _apply_non_raising_expr_walrus_updates(
+                    item.context_expr,
+                    inner_safe,
+                    inner_bool,
+                    strict_names=strict_names,
+                )
                 inner_prov = _update_suppress_provenance_from_expr_walrus(
                     (item.context_expr,), inner_prov
                 )
                 if isinstance(item.optional_vars, ast.Name):
                     inner_safe.add(item.optional_vars.id)
+                    inner_bool.discard(item.optional_vars.id)
                     inner_prov = _clear_store_target_provenance(
                         item.optional_vars, inner_prov
                     )
             return not _split_suppress_with_body(
                 stmt.body,
                 safe_names=inner_safe,
-                safe_bool_names=safe_bool_names,
+                safe_bool_names=inner_bool,
                 strict_names=strict_names,
                 suppress_aliases=inner_prov,
             )[1]
@@ -2289,7 +2665,14 @@ def _apply_non_raising_stmt_safe_updates(
             if isinstance(tgt, ast.Name):
                 cur_safe.discard(tgt.id)
                 cur_bool.discard(tgt.id)
+    elif isinstance(b_stmt, (ast.Return, ast.Expr)):
+        _apply_non_raising_expr_walrus_updates(
+            b_stmt.value, cur_safe, cur_bool, strict_names=strict_names
+        )
     elif isinstance(b_stmt, ast.Assign):
+        _apply_non_raising_expr_walrus_updates(
+            b_stmt.value, cur_safe, cur_bool, strict_names=strict_names
+        )
         val_bool = _is_non_raising_bool_expr(
             b_stmt.value, cur_safe, cur_bool, strict_names=strict_names
         )
@@ -2300,20 +2683,37 @@ def _apply_non_raising_stmt_safe_updates(
                 cur_bool.update(t_names)
             else:
                 cur_bool.difference_update(t_names)
-    elif isinstance(b_stmt, ast.AnnAssign) and b_stmt.value is not None:
-        t_names = _extract_definite_target_names(b_stmt.target)
-        cur_safe.update(t_names)
-        if _is_non_raising_bool_expr(
-            b_stmt.value, cur_safe, cur_bool, strict_names=strict_names
-        ):
-            cur_bool.update(t_names)
-        else:
-            cur_bool.difference_update(t_names)
+    elif isinstance(b_stmt, ast.AnnAssign):
+        _apply_non_raising_expr_walrus_updates(
+            b_stmt.annotation, cur_safe, cur_bool, strict_names=strict_names
+        )
+        if b_stmt.value is not None:
+            _apply_non_raising_expr_walrus_updates(
+                b_stmt.value, cur_safe, cur_bool, strict_names=strict_names
+            )
+            t_names = _extract_definite_target_names(b_stmt.target)
+            cur_safe.update(t_names)
+            if _is_non_raising_bool_expr(
+                b_stmt.value, cur_safe, cur_bool, strict_names=strict_names
+            ):
+                cur_bool.update(t_names)
+            else:
+                cur_bool.difference_update(t_names)
     elif isinstance(b_stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        for h in iter_nested_scope_header_nodes(b_stmt):
+            _apply_non_raising_expr_walrus_updates(
+                h, cur_safe, cur_bool, strict_names=strict_names
+            )
         cur_safe.add(b_stmt.name)
         cur_bool.add(b_stmt.name)
     elif isinstance(b_stmt, ast.With):
         for item in b_stmt.items:
+            _apply_non_raising_expr_walrus_updates(
+                item.context_expr,
+                cur_safe,
+                cur_bool,
+                strict_names=strict_names,
+            )
             if isinstance(item.optional_vars, ast.Name):
                 cur_safe.add(item.optional_vars.id)
                 cur_bool.discard(item.optional_vars.id)
@@ -2321,20 +2721,9 @@ def _apply_non_raising_stmt_safe_updates(
             b_stmt.body, cur_safe, cur_bool, strict_names=strict_names
         )
     elif isinstance(b_stmt, ast.If):
-        then_safe = set(cur_safe)
-        then_bool = set(cur_bool)
-        _apply_non_raising_seq_safe_updates(
-            b_stmt.body, then_safe, then_bool, strict_names=strict_names
+        _apply_non_raising_if_branch_updates(
+            b_stmt, cur_safe, cur_bool, strict_names=strict_names
         )
-        else_safe = set(cur_safe)
-        else_bool = set(cur_bool)
-        _apply_non_raising_seq_safe_updates(
-            b_stmt.orelse, else_safe, else_bool, strict_names=strict_names
-        )
-        cur_safe.clear()
-        cur_safe.update(then_safe & else_safe)
-        cur_bool.clear()
-        cur_bool.update(then_bool & else_bool)
 
 
 def _apply_non_raising_seq_safe_updates(

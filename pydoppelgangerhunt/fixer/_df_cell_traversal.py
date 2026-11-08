@@ -24,6 +24,7 @@ from pydoppelgangerhunt.fixer._ast_compat import (
     is_try_or_trystar_node,
 )
 from pydoppelgangerhunt.fixer._df_cache import (
+    _MAX_STMT_DELTAS_PER_FN,
     _downstream_cache_lock,
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
@@ -1318,6 +1319,8 @@ def _try_apply_cached_stmt_delta(
     if not has_key:
         if _extract_shallow_deleted_names(stmt):
             with _downstream_cache_lock:
+                if key not in stmt_deltas and len(stmt_deltas) >= _MAX_STMT_DELTAS_PER_FN:
+                    stmt_deltas.pop(next(iter(stmt_deltas)), None)
                 stmt_deltas.setdefault(key, None)
             return False
         dummy_span = (
@@ -1376,6 +1379,8 @@ def _try_apply_cached_stmt_delta(
             sibling_nl_deletions=frozenset(sub_bufs.sibling_nl_deletions),
         )
         with _downstream_cache_lock:
+            if key not in stmt_deltas and len(stmt_deltas) >= _MAX_STMT_DELTAS_PER_FN:
+                stmt_deltas.pop(next(iter(stmt_deltas)), None)
             delta = stmt_deltas.setdefault(key, computed_delta)
     if delta is None:
         return False

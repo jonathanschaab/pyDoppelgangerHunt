@@ -7,6 +7,7 @@ from collections import OrderedDict
 import contextlib
 import hashlib
 import logging
+import math
 import threading
 from types import MappingProxyType
 import warnings
@@ -14,8 +15,10 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterable,
     Iterator,
     List,
+    Mapping,
     NamedTuple,
     Optional,
     Sequence,
@@ -36,25 +39,61 @@ _CacheValT = TypeVar("_CacheValT")
 _downstream_cache_lock: threading.RLock = threading.RLock()
 _syntax_warning_lock: threading.RLock = threading.RLock()
 _RLOCK_TYPE: type = type(_downstream_cache_lock)
+_SYNTAX_WARNING_FILTER: Tuple[Any, ...] = (
+    "ignore",
+    None,
+    SyntaxWarning,
+    None,
+    0,
+)
+_syntax_warning_active_count: List[int] = [0]
+
+
+def _notify_warnings_filters_mutated() -> None:
+    """Notifies the warnings module that warnings.filters was updated in place."""
+    mutated = getattr(warnings, "_filters_mutated", None)
+    if callable(mutated):
+        mutated()
 
 
 @contextlib.contextmanager
 def _suppress_syntax_warnings() -> Iterator[None]:
-    """Suppresses SyntaxWarning during AST/symtable parsing, serializing callers of this helper via _syntax_warning_lock."""
-    with _syntax_warning_lock, warnings.catch_warnings():
-        warnings.simplefilter("ignore", SyntaxWarning)
+    """Suppresses SyntaxWarning during AST/symtable parsing via a reference-counted filter rule.
+
+    Acquires ``_syntax_warning_lock`` only when incrementing/decrementing the active
+    reference count and updating ``warnings.filters``, allowing concurrent ``ast.parse``
+    and ``symtable.symtable`` calls across worker threads without lock serialization.
+    """
+    with _syntax_warning_lock:
+        filters_list = cast(List[Any], warnings.filters)
+        if not filters_list or filters_list[0] is not _SYNTAX_WARNING_FILTER:
+            filters_list.insert(0, _SYNTAX_WARNING_FILTER)
+            _notify_warnings_filters_mutated()
+        _syntax_warning_active_count[0] += 1
+    try:
         yield
+    finally:
+        with _syntax_warning_lock:
+            _syntax_warning_active_count[0] -= 1
+            if _syntax_warning_active_count[0] == 0:
+                filters_list = cast(List[Any], warnings.filters)
+                filters_list[:] = [
+                    f for f in filters_list if f is not _SYNTAX_WARNING_FILTER
+                ]
+                _notify_warnings_filters_mutated()
 
 
 _MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
 _MAX_SCOPE_CACHE_SIZE: int = 4096
 _MAX_PARSED_TREE_CACHE_SIZE: int = 128
+_MAX_STMT_DELTAS_PER_FN: int = 512
 _SCOPE_CACHE_KIND_CAPS: Dict[str, int] = {
     "span_line_index": 128,
     "fn_scope_ctx": 512,
     "stmt_deltas": 512,
     "enclosing_fn_cells": 512,
     "suppress_seed": 256,
+    "tree_sha256_digest": 256,
 }
 _downstream_reads_cache: OrderedDict[Tuple[Any, ...], frozenset[str]] = OrderedDict()
 _parsed_tree_cache: OrderedDict[Tuple[str, int], Optional[ast.AST]] = OrderedDict()
@@ -149,8 +188,23 @@ def _params_contain_ast(params: Tuple[Any, ...]) -> bool:
         return False
 
 
+def _canonical_param_type_key(obj: Any) -> Any:
+    """Builds a canonical structural and exact-type key for params so 1, True, and 1.0 never collide at any depth."""
+    if isinstance(obj, tuple):
+        return (tuple, tuple(_canonical_param_type_key(x) for x in obj))
+    if isinstance(obj, frozenset):
+        return (frozenset, frozenset(_canonical_param_type_key(x) for x in obj))
+    if isinstance(obj, float):
+        if math.isnan(obj):
+            return (float, "nan")
+        if obj == 0.0:
+            return (float, 0.0, math.copysign(1.0, obj) < 0.0)
+        return (float, obj)
+    return (type(obj), obj)
+
+
 def _params_exact_types_match(a: Any, b: Any) -> bool:
-    """Checks that equal parameter structures also match exact scalar types (distinguishing 1 from True)."""
+    """Checks that equal parameter structures also match exact scalar types at all nesting depths."""
     if a is b:
         return True
     if type(a) is not type(b):
@@ -162,23 +216,15 @@ def _params_exact_types_match(a: Any, b: Any) -> bool:
     if isinstance(a, frozenset):
         if len(a) != len(b):
             return False
-        if 1 not in a and 0 not in a and 1 not in b and 0 not in b:
-            return True
-        return {(type(x), x) for x in a} == {(type(y), y) for y in b}
-    return True
+        return bool(_canonical_param_type_key(a) == _canonical_param_type_key(b))
+    if isinstance(a, float):
+        return bool(_canonical_param_type_key(a) == _canonical_param_type_key(b))
+    return bool(a == b)
 
 
 def _params_type_hash(obj: Any) -> int:
-    """Computes a structural type hash for params so 1 and True do not hash-collide."""
-    if isinstance(obj, tuple):
-        return hash((tuple, tuple(_params_type_hash(x) for x in obj)))
-    if isinstance(obj, frozenset):
-        if 1 not in obj and 0 not in obj:
-            return hash((frozenset, obj))
-        return hash((frozenset, frozenset((type(x), x) for x in obj)))
-    if isinstance(obj, (bool, int, float)):
-        return hash((type(obj), obj))
-    return hash(type(obj))
+    """Computes a structural type hash for params so 1, True, and 1.0 do not hash-collide at any depth."""
+    return hash(_canonical_param_type_key(obj))
 
 
 class _BaseScopeCacheKey(NamedTuple):
@@ -474,12 +520,40 @@ def _register_key_ast_nodes(key: Any, nodes: Sequence[ast.AST]) -> None:
         )
 
 
+def _resync_key_ast_nodes_locked(
+    key: Any, extra_caches: Iterable[Mapping[Any, Any]] = ()
+) -> None:
+    """Rebuilds reverse AST node index entries for key across all active scope caches."""
+    _prune_reverse_index_buckets(
+        key, _scope_key_nodes_index, _scope_owner_keys_index
+    )
+    active_caches: List[Mapping[Any, Any]] = [
+        _scope_closures_cache,
+        _scope_cell_info_cache,
+    ]
+    for ec in extra_caches:
+        if all(ec is not c for c in active_caches):
+            active_caches.append(ec)
+    present_in_any = False
+    combined_nodes: List[ast.AST] = []
+    for c in active_caches:
+        if key in c:
+            present_in_any = True
+            val = dict.__getitem__(c, key) if isinstance(c, dict) else c[key]
+            combined_nodes.extend(_extract_value_ast_nodes(val))
+    if present_in_any:
+        key_nodes = _extract_key_ast_nodes(key)
+        _register_key_ast_nodes(key, (*key_nodes, *combined_nodes))
+
+
 def _unregister_key_if_absent(key: Any) -> None:
-    """Removes key from _scope_owner_keys_index when no longer held in any scope cache."""
+    """Removes or resynchronizes key in _scope_owner_keys_index across active scope caches."""
     if key not in _scope_closures_cache and key not in _scope_cell_info_cache:
         _prune_reverse_index_buckets(
             key, _scope_key_nodes_index, _scope_owner_keys_index
         )
+    else:
+        _resync_key_ast_nodes_locked(key)
 
 
 class _TrackedCachedDict(Dict[Any, Any]):
@@ -528,14 +602,12 @@ class _TrackedCachedDict(Dict[Any, Any]):
         owners = getattr(self, "_bound_owners", None)
         if not owners:
             return
-        dict_nodes = _extract_value_ast_nodes(dict(self))
+        owner_caches = [cache for cache, _ in owners.values()]
+        seen_keys: Set[Any] = set()
         for cache, ck in list(owners.values()):
-            if ck in cache:
-                _prune_reverse_index_buckets(
-                    ck, _scope_key_nodes_index, _scope_owner_keys_index
-                )
-                key_nodes = _extract_key_ast_nodes(ck)
-                _register_key_ast_nodes(ck, (*key_nodes, *dict_nodes))
+            if ck in cache and ck not in seen_keys:
+                seen_keys.add(ck)
+                _resync_key_ast_nodes_locked(ck, extra_caches=owner_caches)
 
     def __setitem__(self, k: Any, v: Any) -> None:
         with _downstream_cache_lock:
@@ -624,7 +696,8 @@ class _TrackedScopeCache(OrderedDict[Any, _CacheValT]):
         key_nodes = _extract_key_ast_nodes(key)
         if isinstance(value, dict) and not isinstance(value, _TrackedCachedDict):
             value = cast(_CacheValT, _TrackedCachedDict(cast(Dict[Any, Any], value)))
-        if key in self:
+        was_present = key in self
+        if was_present:
             prev_val = dict.__getitem__(self, key)
             if isinstance(prev_val, _TrackedCachedDict) and prev_val is not value:
                 prev_val.unbind_owner(self, key)
@@ -637,7 +710,10 @@ class _TrackedScopeCache(OrderedDict[Any, _CacheValT]):
             kind_ring.move_to_end(key)
             if not val_nodes and isinstance(key.owner, _SCOPE_ROOT_TYPES):
                 _ensure_scope_owner_parent_map_locked(key.owner)
-        _register_key_ast_nodes(key, (*key_nodes, *val_nodes))
+        if was_present:
+            _resync_key_ast_nodes_locked(key, extra_caches=(self,))
+        else:
+            _register_key_ast_nodes(key, (*key_nodes, *val_nodes))
 
     def move_to_end(self, key: Any, last: bool = True) -> None:
         super().move_to_end(key, last=last)
@@ -768,11 +844,7 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
                 candidate_roots.add(r_node)
         keys_to_remove: Set[Any] = set()
         for root_node in candidate_roots:
-            for rk in _scope_owner_keys_index.get(root_node, ()):
-                if rk is root_node or (
-                    isinstance(rk, _ScopeCacheKey) and rk.owner is root_node
-                ):
-                    keys_to_remove.add(rk)
+            keys_to_remove.update(_scope_owner_keys_index.get(root_node, ()))
             pmap = _scope_parent_maps.get(root_node)
             if pmap is None:
                 continue
@@ -822,7 +894,7 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
                 keys_to_remove.update(node_keys)
         for k in keys_to_remove:
             for knode in _extract_key_ast_nodes(k):
-                if isinstance(knode, _SCOPE_ROOT_TYPES):
+                if isinstance(knode, _SCOPE_ROOT_TYPES) and knode in tree_nodes:
                     scope_nodes.add(knode)
             _scope_closures_cache.pop(k, None)
             _scope_cell_info_cache.pop(k, None)

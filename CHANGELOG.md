@@ -47,8 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **BREAKING** - **`fail_closed` Alias Maps to `pedantic` & Legacy Alias Deprecation**:
   `closure_strictness="fail_closed"` now resolves to `"pedantic"` (treating all unproven unknown `with` / `async with` context managers as potentially exception-suppressing) rather than `"strict"`. Legacy aliases `"fail_closed"`, `"fast"`, and `"skip"` emit a deprecation warning in favor of `"pedantic"` and `"lenient"`.
-- **BREAKING** - **`--suggest` Full Helper Synthesis Delegation**:
-  `synthesize_refactoring_suggestion` now delegates to `synthesize_shared_helper_code` whenever `closure_strictness`, `skip_pre_unit_closures`, or `non_suppressing_ctx_managers` is supplied (which the CLI always provides for `--suggest`), performing backing-file I/O and returning full synthesized helper definitions rather than signature-only strings.
+- **BREAKING** - **`--suggest` Full Helper Synthesis Delegation & Hazard Rejection Warning**:
+  `synthesize_refactoring_suggestion` now always delegates to `synthesize_shared_helper_code` for non-test clone pairs, performing backing-file I/O and returning full synthesized helper definitions when safe or an explicit safety-hazard warning (instead of an unsafe `def _shared_...(*args, **kwargs):` extraction stub) when automatic extraction is rejected.
 - **BREAKING** - **Precomputed Scope Schema Version & Mode Verification**:
   Precomputed or serialized scope dictionaries passed to `ensure_unit_scope_closure_mode`, `analyze_unit_variable_scope`, `resolve_clone_pair_outputs`, and `resolve_clone_generator_subroutine_outputs` now require `scope_schema_version == SCOPE_SCHEMA_VERSION` (`2`) and an explicit boolean `skip_pre_unit_closures` matching the active mode; unmarked or mismatched scopes are recomputed when source/AST is available and fail closed otherwise.
 - **BREAKING** - **`--skip-pre-unit-closures` (`lenient`) Scope**:

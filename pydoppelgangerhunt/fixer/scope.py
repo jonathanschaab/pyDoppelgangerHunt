@@ -19,6 +19,7 @@ from typing import (
     Set,
     Tuple,
     Union,
+    cast,
 )
 
 from pydoppelgangerhunt.config import (
@@ -34,7 +35,10 @@ from pydoppelgangerhunt.fixer._ast_compat import (
     is_type_alias_node,
 )
 from pydoppelgangerhunt.fixer._df_cache import (
+    _ScopeCacheKey,
+    _get_or_compute_scope_cached,
     _get_or_parse_tree,
+    _scope_cell_info_cache,
     _suppress_syntax_warnings,
 )
 from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context
@@ -1587,11 +1591,26 @@ def _is_ordered_contiguous_source_match(
     return False
 
 
+def _normalize_clause_header_snippet(dedented: str) -> str:
+    """Normalizes standalone elif/else/except/finally/case clause headers into parseable statements."""
+    stripped = dedented.lstrip(" \t")
+    if re.match(r"^elif(?:\s|\(|\[|:)", stripped):
+        return "if" + stripped[4:]
+    if re.match(r"^else\s*:", stripped):
+        return "if 1" + stripped[4:]
+    if re.match(r"^(?:except(?:\*|\s|\(|:)|finally\s*:)", stripped):
+        return f"try:\n    pass\n{stripped}"
+    if re.match(r"^case(?:\s|\(|\[)", stripped):
+        return f"match 0:\n{textwrap.indent(stripped, '    ')}"
+    return dedented
+
+
 def _parse_normalized_stmt_dumps(text: str) -> Optional[List[str]]:
     """Parses a code snippet into position-independent AST statement dumps."""
-    dedented = dedent_source_text(text).strip()
-    if not dedented:
+    raw_dedented = dedent_source_text(text).strip()
+    if not raw_dedented:
         return None
+    dedented = _normalize_clause_header_snippet(raw_dedented)
     for cand in (
         dedented,
         f"if 1:\n{textwrap.indent(dedented, '    ')}",
@@ -1612,9 +1631,11 @@ def _parse_normalized_stmt_dumps(text: str) -> Optional[List[str]]:
     return None
 
 
-def _strip_unquoted_comment(line: str) -> str:
-    """Strips a trailing '#' comment outside of single, double, or triple-quoted strings."""
-    in_quote: Optional[str] = None
+def _scan_line_unquoted_comment(
+    line: str,
+    in_quote: Optional[str] = None,
+) -> Tuple[str, Optional[str]]:
+    """Strips an unquoted trailing '#' comment while tracking triple-quote state across lines."""
     i = 0
     n = len(line)
     while i < n:
@@ -1639,9 +1660,17 @@ def _strip_unquoted_comment(line: str) -> str:
                 i += 1
             continue
         if ch == "#":
-            return line[:i].strip()
+            return line[:i].strip(), None
         i += 1
-    return line.strip()
+    if in_quote in ("'", '"') and not line.rstrip("\r\n").endswith("\\"):
+        in_quote = None
+    return line.strip(), in_quote
+
+
+def _strip_unquoted_comment(line: str) -> str:
+    """Strips a trailing '#' comment outside of single, double, or triple-quoted strings."""
+    stripped, _ = _scan_line_unquoted_comment(line, None)
+    return stripped
 
 
 def _strip_inline_comment_line(line: str) -> str:
@@ -1669,6 +1698,23 @@ def _strip_inline_comment_line(line: str) -> str:
         return _strip_unquoted_comment(line)
 
 
+def _strip_comments_from_lines(lines: Sequence[str]) -> List[str]:
+    """Strips comments across a sequence of lines while preserving '#' inside multiline strings."""
+    result: List[str] = []
+    in_quote: Optional[str] = None
+    for ln in lines:
+        prev_quote = in_quote
+        stripped_ln, next_quote = _scan_line_unquoted_comment(ln, prev_quote)
+        in_quote = next_quote
+        if prev_quote is None and next_quote is None:
+            norm = _strip_inline_comment_line(ln)
+        else:
+            norm = stripped_ln
+        if norm:
+            result.append(norm)
+    return result
+
+
 def _is_normalized_source_equivalent(
     src_code: str,
     raw_lines: Sequence[str],
@@ -1683,17 +1729,27 @@ def _is_normalized_source_equivalent(
             for i in range(len(raw_dumps) - k + 1)
         ):
             return True
-    norm_src_lines = [
-        s
-        for s in (_strip_inline_comment_line(ln) for ln in split_source_lines(src_code))
-        if s
-    ]
-    norm_raw_lines = [
-        s for s in (_strip_inline_comment_line(ln) for ln in raw_lines) if s
-    ]
+    norm_src_lines = _strip_comments_from_lines(split_source_lines(src_code))
+    norm_raw_lines = _strip_comments_from_lines(raw_lines)
     if norm_src_lines and norm_raw_lines:
         return _is_ordered_contiguous_source_match(norm_src_lines, norm_raw_lines)
     return False
+
+
+def _get_tree_sha256_digest(mod_tree: ast.AST) -> str:
+    """Returns a cached SHA-256 hex digest of mod_tree for downstream cache keys when source_text is absent."""
+    def _compute() -> str:
+        return hashlib.sha256(
+            ast.dump(mod_tree, include_attributes=True).encode("utf-8")
+        ).hexdigest()
+
+    if getattr(mod_tree, "_is_ephemeral_unit_mod", False):
+        return _compute()
+    cache_key = _ScopeCacheKey(mod_tree, "tree_sha256_digest")
+    return cast(
+        str,
+        _get_or_compute_scope_cached(_scope_cell_info_cache, cache_key, _compute),
+    )
 
 
 def _unit_source_code_matches_tree(
@@ -1708,7 +1764,7 @@ def _unit_source_code_matches_tree(
     if src_dumps:
         tree_stmt_dumps: Set[str] = set()
         for node in ast.walk(file_tree):
-            if isinstance(node, ast.stmt):
+            if isinstance(node, (ast.stmt, ast.ExceptHandler)):
                 n_s = getattr(node, "lineno", None)
                 n_e = getattr(node, "end_lineno", n_s)
                 if (
@@ -1722,6 +1778,29 @@ def _unit_source_code_matches_tree(
                     )
         if all(d in tree_stmt_dumps for d in src_dumps):
             return True
+        raw_dedented = dedent_source_text(src_code).strip()
+        norm_dedented = _normalize_clause_header_snippet(raw_dedented)
+        if norm_dedented != raw_dedented:
+            try:
+                with _suppress_syntax_warnings():
+                    norm_mod = ast.parse(norm_dedented)
+                inner_nodes: List[ast.AST] = []
+                for top_s in norm_mod.body:
+                    if isinstance(top_s, ast.If):
+                        inner_nodes.extend(top_s.body)
+                    elif isinstance(top_s, ast.Try):
+                        inner_nodes.extend(top_s.handlers)
+                        inner_nodes.extend(top_s.finalbody)
+                    elif is_match_node(top_s):
+                        for c_node in getattr(top_s, "cases", ()):
+                            inner_nodes.extend(getattr(c_node, "body", ()))
+                if inner_nodes and all(
+                    ast.dump(n, include_attributes=False) in tree_stmt_dumps
+                    for n in inner_nodes
+                ):
+                    return True
+            except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
+                pass
     dedented = dedent_source_text(src_code).strip()
     if dedented:
         try:
@@ -1981,12 +2060,28 @@ def _inspect_unit_scope(
     tree: Optional[ast.AST] = None
     loop_offset = 0
     candidate_stmts: List[ast.stmt] = []
+    clause_dedented = _normalize_clause_header_snippet(dedented)
 
     parse_candidates = [
         (dedented, 0),
+        *([(clause_dedented, 0)] if clause_dedented != dedented else []),
         (f"if 1:\n{dedented}", 0),
         (f"def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
         (f"async def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
+        *(
+            [
+                (
+                    f"def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(clause_dedented, '    ')}",
+                    0,
+                ),
+                (
+                    f"async def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(clause_dedented, '    ')}",
+                    0,
+                ),
+            ]
+            if clause_dedented != dedented
+            else []
+        ),
         (
             f"def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
             f"{textwrap.indent(dedented, '        ')}",
@@ -1997,15 +2092,32 @@ def _inspect_unit_scope(
             f"{textwrap.indent(dedented, '        ')}",
             1,
         ),
+        *(
+            [
+                (
+                    f"def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
+                    f"{textwrap.indent(clause_dedented, '        ')}",
+                    1,
+                ),
+                (
+                    f"async def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
+                    f"{textwrap.indent(clause_dedented, '        ')}",
+                    1,
+                ),
+            ]
+            if clause_dedented != dedented
+            else []
+        ),
     ]
 
     had_resource_error = False
+    cand_text = dedented
     for cand_text, offset in parse_candidates:
         try:
             with _suppress_syntax_warnings():
                 tree = ast.parse(cand_text)
             loop_offset = offset
-            if cand_text == dedented:
+            if cand_text in (dedented, clause_dedented):
                 if isinstance(tree, ast.Module):
                     if len(tree.body) == 1 and isinstance(
                         tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -2430,12 +2542,7 @@ def _inspect_unit_scope(
                                     source_digest=(
                                         None
                                         if full_src_text
-                                        else hashlib.sha256(
-                                            ast.dump(
-                                                mod_tree,
-                                                include_attributes=True,
-                                            ).encode("utf-8")
-                                        ).hexdigest()
+                                        else _get_tree_sha256_digest(mod_tree)
                                     ),
                                 )
                                 if ds_live is None:
