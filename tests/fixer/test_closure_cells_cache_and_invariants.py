@@ -5945,6 +5945,12 @@ def test_module_compound_statement_suppressor_alias_propagation_and_linear_seed(
     assert "post_sup" in seed.suffix_delta_by_top_stmt_id[id(f_stmt)].suppressors
     assert {"s49", "post_sup"} <= seed.by_top_stmt_id[id(f_stmt)].suppressors
 
+    import dataclasses
+    from pydoppelgangerhunt.fixer._df_with_provenance import _ModuleSuppressSeed
+
+    for dc_field in dataclasses.fields(_ModuleSuppressSeed):
+        assert dc_field.default is dataclasses.MISSING or dc_field.default.__hash__ is not None
+
 
 @pytest.mark.parametrize(
     "assign_src,cond_var,expected_x_definite",

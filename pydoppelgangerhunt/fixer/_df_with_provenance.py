@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 from types import MappingProxyType
 from typing import (
@@ -1670,6 +1670,9 @@ class _LazyModuleStmtSeedMap(Mapping[int, _SuppressProvenance]):
         return res
 
 
+_EMPTY_STMT_SEED_MAP: Mapping[int, _SuppressProvenance] = MappingProxyType({})
+
+
 @dataclass(frozen=True)
 class _ModuleSuppressSeed:
     """Cached per-module top-level suppression provenance summary."""
@@ -1677,8 +1680,12 @@ class _ModuleSuppressSeed:
     full_forward_prov: _SuppressProvenance
     by_top_stmt_id: Mapping[int, _SuppressProvenance]
     has_any_positive_or_suppressor: bool
-    prefix_by_top_stmt_id: Mapping[int, _SuppressProvenance] = MappingProxyType({})
-    suffix_delta_by_top_stmt_id: Mapping[int, _SuppressProvenance] = MappingProxyType({})
+    prefix_by_top_stmt_id: Mapping[int, _SuppressProvenance] = field(
+        default_factory=lambda: _EMPTY_STMT_SEED_MAP
+    )
+    suffix_delta_by_top_stmt_id: Mapping[int, _SuppressProvenance] = field(
+        default_factory=lambda: _EMPTY_STMT_SEED_MAP
+    )
 
     def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
         """Returns AST nodes retained by this cached value (none)."""
