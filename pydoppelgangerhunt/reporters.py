@@ -224,7 +224,7 @@ def synthesize_refactoring_suggestion(
     repo_root: Optional[str] = None,
     *,
     closure_strictness: Optional[str] = None,
-    skip_pre_unit_closures: bool = False,
+    skip_pre_unit_closures: Optional[bool] = None,
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> str:
     """Synthesizes actionable refactoring recommendation and shared helper template."""
@@ -259,19 +259,27 @@ def synthesize_refactoring_suggestion(
     ]
     diff_summary = f"{len(diff_lines)} varying line(s) detected between clone blocks."
 
+    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        log_heuristic_ctx_manager_summary,
+    )
     from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
         synthesize_shared_helper_code,
     )
 
-    helper_code = synthesize_shared_helper_code(
-        u1,
-        u2,
-        helper_name=helper_name,
-        repo_root=repo_root,
-        closure_strictness=closure_strictness,
-        skip_pre_unit_closures=skip_pre_unit_closures,
-        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
-    )
+    try:
+        helper_code = synthesize_shared_helper_code(
+            u1,
+            u2,
+            helper_name=helper_name,
+            repo_root=repo_root,
+            closure_strictness=closure_strictness,
+            skip_pre_unit_closures=skip_pre_unit_closures,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        helper_code = ""
+    finally:
+        log_heuristic_ctx_manager_summary()
     if helper_code:
         indented_helper = "\n".join(
             f"    {ln}" if ln.strip() else ""
@@ -285,9 +293,10 @@ def synthesize_refactoring_suggestion(
 
     return (
         f"[REFACTOR SUGGESTION] Automatic extraction into '{helper_name}' rejected as unsafe "
-        f"(closure, control-flow, or source hazard detected for {n1} and {n2}); manual review required:\n"
+        f"or structurally incompatible (safety hazard, scope conflict, or incompatible structure "
+        f"detected for {n1} and {n2}); manual review required:\n"
         f"    # {diff_summary}\n"
-        f"    # WARNING: Automatic helper synthesis was skipped due to a safety hazard."
+        f"    # WARNING: Automatic helper synthesis was skipped due to a safety hazard or structural incompatibility."
     )
 
 

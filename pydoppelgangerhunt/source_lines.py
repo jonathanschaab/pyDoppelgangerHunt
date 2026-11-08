@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import enum
 import logging
 import math
 from pathlib import Path
@@ -27,30 +28,23 @@ __all__ = [
 ]
 
 
-class SourceLinesOrigin:
-    """Origin flag for unit source lines returned by extract_unit_source_lines_with_state.
+class SourceLinesOrigin(enum.Enum):
+    """Origin enum for unit source lines returned by extract_unit_source_lines_with_state.
 
-    Behaves as a boolean for backwards compatibility: ``bool(origin)`` is True when the
-    lines are already pre-sliced to the unit (or are a synthetic placeholder), and False
-    when the lines were sliced from a full-file buffer or disk read.
+    Prefer explicit properties (``is_pre_sliced``, ``is_placeholder``, ``has_real_source``).
+    ``bool(origin)`` is retained only as a backwards-compatibility shim returning
+    ``self.is_pre_sliced``.
     """
 
-    PRE_SLICED: SourceLinesOrigin
-    PLACEHOLDER: SourceLinesOrigin
-    FULL_BUFFER: SourceLinesOrigin
-    DISK: SourceLinesOrigin
+    PRE_SLICED = ("PRE_SLICED", True, False)
+    PLACEHOLDER = ("PLACEHOLDER", True, True)
+    FULL_BUFFER = ("FULL_BUFFER", False, False)
+    DISK = ("DISK", False, False)
 
-    def __init__(
-        self, name: str, *, is_pre_sliced: bool, is_placeholder: bool = False
-    ) -> None:
-        self._name = name
+    def __init__(self, label: str, is_pre_sliced: bool, is_placeholder: bool) -> None:
+        self._label = label
         self._is_pre_sliced = is_pre_sliced
         self._is_placeholder = is_placeholder
-
-    @property
-    def name(self) -> str:
-        """Canonical variant name of this origin."""
-        return self._name
 
     @property
     def is_pre_sliced(self) -> bool:
@@ -62,33 +56,13 @@ class SourceLinesOrigin:
         """True if lines are a synthetic missing-source placeholder."""
         return self._is_placeholder
 
+    @property
+    def has_real_source(self) -> bool:
+        """True if lines come from actual source text rather than a synthetic placeholder."""
+        return not self._is_placeholder
+
     def __bool__(self) -> bool:
         return self._is_pre_sliced
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, SourceLinesOrigin):
-            return self._name == other._name
-        return NotImplemented
-
-    def __hash__(self) -> int:
-        return hash((SourceLinesOrigin, self._name))
-
-    def __repr__(self) -> str:
-        return f"SourceLinesOrigin.{self._name}"
-
-
-SourceLinesOrigin.PRE_SLICED = SourceLinesOrigin(
-    "PRE_SLICED", is_pre_sliced=True, is_placeholder=False
-)
-SourceLinesOrigin.PLACEHOLDER = SourceLinesOrigin(
-    "PLACEHOLDER", is_pre_sliced=True, is_placeholder=True
-)
-SourceLinesOrigin.FULL_BUFFER = SourceLinesOrigin(
-    "FULL_BUFFER", is_pre_sliced=False, is_placeholder=False
-)
-SourceLinesOrigin.DISK = SourceLinesOrigin(
-    "DISK", is_pre_sliced=False, is_placeholder=False
-)
 
 _COORD_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
     "start_col": ("start_col", "start_col_offset"),

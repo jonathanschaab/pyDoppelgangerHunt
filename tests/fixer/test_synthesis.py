@@ -3955,15 +3955,22 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
         {"start": 10, "end": 12}, eof_lines, orig_text=eof_pragma_src
     )
 
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
+        _evict_tree_scopes,
+    )
+
     mut_tree = ast.parse("def alpha():\n    return 1\n")
     intervals_initial = _get_tree_scope_intervals(mut_tree)
     assert intervals_initial[0][:2] == (1, 2)
     mut_tree.body[0].lineno = 5  # type: ignore[attr-defined]
     mut_tree.body[0].end_lineno = 8  # type: ignore[attr-defined]
+    assert _get_tree_scope_intervals(mut_tree)[0][:2] == (1, 2)
+    _evict_tree_scopes(mut_tree)
     intervals_updated = _get_tree_scope_intervals(mut_tree)
     assert intervals_updated[0][:2] == (5, 8)
     extra_fn = ast.parse("def beta():\n    return 2\n").body[0]
     mut_tree.body.append(extra_fn)
+    _evict_tree_scopes(mut_tree)
     assert len(_get_tree_scope_intervals(mut_tree)) == 2
 
     crlf_helper = (

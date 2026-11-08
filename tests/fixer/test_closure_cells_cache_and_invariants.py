@@ -3503,15 +3503,9 @@ def test_fn_scope_context_fingerprint_downstream_cache_key_and_multiline_decorat
     assert dk_1 != dk_2
 
 
-def test_shared_helper_regression_contracts() -> None:
-    """Covers regression contracts for _extract_scope_local_names, _get_scope_parent_map, and _is_irrefutable_pattern."""
-    import pydoppelgangerhunt.fixer.scope as scope_mod
-    from pydoppelgangerhunt.fixer._df_cache import _get_scope_parent_map
-    from pydoppelgangerhunt.fixer._df_closures import (
-        _extract_scope_local_names,
-        _is_irrefutable_case,
-        _is_irrefutable_pattern,
-    )
+def test_extract_scope_local_names_class_visibility_flag() -> None:
+    """Verifies _extract_scope_local_names obeys include_classes per PEP 227 class scope rules."""
+    from pydoppelgangerhunt.fixer._df_closures import _extract_scope_local_names
 
     cls_src = (
         "def enclosing():\n"
@@ -3537,9 +3531,25 @@ def test_shared_helper_regression_contracts() -> None:
         method_node, module_tree=cls_tree, include_classes=True
     )
 
+
+def test_get_scope_parent_map_excludes_expr_context_tokens() -> None:
+    """Verifies _get_scope_parent_map skips shared ast.expr_context singleton tokens."""
+    from pydoppelgangerhunt.fixer._df_cache import _get_scope_parent_map
+
+    cls_tree = ast.parse("def enclosing(x):\n    y = x + 1\n    return y\n")
+    fn_node = cls_tree.body[0]
     pmap = _get_scope_parent_map(cls_tree)
     assert not any(isinstance(k, ast.expr_context) for k in pmap)
     assert fn_node in pmap
+
+
+def test_is_irrefutable_pattern_rejects_none_and_scope_exports_match() -> None:
+    """Verifies _is_irrefutable_pattern(None) returns False and scope re-exports match _df_closures."""
+    import pydoppelgangerhunt.fixer.scope as scope_mod
+    from pydoppelgangerhunt.fixer._df_closures import (
+        _is_irrefutable_case,
+        _is_irrefutable_pattern,
+    )
 
     assert _is_irrefutable_pattern(None) is False
     assert scope_mod._is_irrefutable_pattern is _is_irrefutable_pattern
@@ -5829,13 +5839,17 @@ def test_synthesize_refactoring_suggestion_unconditional_delegation_and_hazard_w
     assert "(*args, **kwargs)" not in sug_hazard
 
 
-def test_concurrent_suppress_syntax_warnings_and_stmt_deltas_cap() -> None:
-    """Verifies reference-counted _suppress_syntax_warnings concurrency and _MAX_STMT_DELTAS_PER_FN bound."""
+def test_concurrent_suppress_syntax_warnings_and_stmt_deltas_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies lock-serialized _suppress_syntax_warnings concurrency with catch_warnings and _MAX_STMT_DELTAS_PER_FN LRU reuse."""
     import concurrent.futures
-    import threading
     import warnings
+    import pydoppelgangerhunt.fixer._df_cell_traversal as trav_mod
     from pydoppelgangerhunt.fixer._df_cache import (
         _MAX_STMT_DELTAS_PER_FN,
+        _ScopeCacheKey,
+        _scope_cell_info_cache,
         _suppress_syntax_warnings,
     )
     from pydoppelgangerhunt.fixer._df_cell_carriers import _SpanBounds
@@ -5843,19 +5857,26 @@ def test_concurrent_suppress_syntax_warnings_and_stmt_deltas_cap() -> None:
         _analyze_enclosing_fn_cells_uncached,
     )
 
-    barrier = threading.Barrier(4)
+    pre_test_snapshot = list(warnings.filters)
 
-    def _worker() -> None:
-        with _suppress_syntax_warnings():
-            barrier.wait(timeout=5.0)
-            ast.parse(r"s = '\d+'")
+    def _suppress_worker() -> None:
+        for _ in range(10):
+            with _suppress_syntax_warnings():
+                ast.parse(r"s = '\d+'")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        futs = [pool.submit(_worker) for _ in range(4)]
+    def _catch_warnings_worker() -> None:
+        for _ in range(10):
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always", UserWarning)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        futs = [pool.submit(_suppress_worker) for _ in range(3)] + [
+            pool.submit(_catch_warnings_worker) for _ in range(3)
+        ]
         for f in futs:
             f.result(timeout=10.0)
 
-    assert not any(f[0] == "ignore" and f[2] is SyntaxWarning for f in warnings.filters)
+    assert list(warnings.filters) == pre_test_snapshot
 
     clear_dataflow_cache()
     many_lines = (
@@ -5873,6 +5894,32 @@ def test_concurrent_suppress_syntax_warnings_and_stmt_deltas_cap() -> None:
         use_stmt_deltas=True,
     )
     assert info is not None
+    stmt_deltas = _scope_cell_info_cache.get(
+        _ScopeCacheKey(big_fn, "stmt_deltas", aux_ast_nodes=(big_tree,))
+    )
+    assert isinstance(stmt_deltas, dict)
+    assert len(stmt_deltas) == _MAX_STMT_DELTAS_PER_FN
+
+    orig_apply = trav_mod._try_apply_cached_stmt_delta
+    pass2_hits = 0
+
+    def _counting_apply(*args: Any, **kwargs: Any) -> Any:
+        nonlocal pass2_hits
+        res = orig_apply(*args, **kwargs)
+        if res is not None:
+            pass2_hits += 1
+        return res
+
+    monkeypatch.setattr(trav_mod, "_try_apply_cached_stmt_delta", _counting_apply)
+    info2 = _analyze_enclosing_fn_cells_uncached(
+        big_fn,
+        _SpanBounds(2, 6),
+        mod_tree=big_tree,
+        use_stmt_deltas=True,
+    )
+    assert info2 is not None
+    assert len(stmt_deltas) == _MAX_STMT_DELTAS_PER_FN
+    assert pass2_hits >= _MAX_STMT_DELTAS_PER_FN - 10
 
 
 def test_validate_unit_schema_strict_accepts_strict_with_suppression() -> None:
@@ -5899,6 +5946,7 @@ def test_validate_unit_schema_strict_accepts_strict_with_suppression() -> None:
 def test_module_compound_statement_suppressor_alias_propagation_and_linear_seed() -> None:
     """Verifies suppressor imports inside module-level compound blocks propagate into nested functions."""
     from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _ModuleSuppressSeed,
         _build_module_suppress_seed,
         _extract_block_definite_bindings_and_term,
         _seed_scope_suppress_aliases,
@@ -5945,11 +5993,16 @@ def test_module_compound_statement_suppressor_alias_propagation_and_linear_seed(
     assert "post_sup" in seed.suffix_delta_by_top_stmt_id[id(f_stmt)].suppressors
     assert {"s49", "post_sup"} <= seed.by_top_stmt_id[id(f_stmt)].suppressors
 
-    import dataclasses
-    from pydoppelgangerhunt.fixer._df_with_provenance import _ModuleSuppressSeed
+    from types import MappingProxyType
 
-    for dc_field in dataclasses.fields(_ModuleSuppressSeed):
-        assert dc_field.default is dataclasses.MISSING or dc_field.default.__hash__ is not None
+    default_seed_a = _ModuleSuppressSeed(seeded_prov, MappingProxyType({}), False)
+    default_seed_b = _ModuleSuppressSeed(seeded_prov, MappingProxyType({}), False)
+    assert default_seed_a.prefix_by_top_stmt_id == {}
+    assert default_seed_b.suffix_delta_by_top_stmt_id == {}
+    with pytest.raises(TypeError):
+        default_seed_a.prefix_by_top_stmt_id[1] = seeded_prov  # type: ignore[index]
+    with pytest.raises(TypeError):
+        default_seed_b.suffix_delta_by_top_stmt_id[1] = seeded_prov  # type: ignore[index]
 
 
 @pytest.mark.parametrize(
@@ -6121,7 +6174,7 @@ def test_seed_scope_suppress_aliases_clears_function_locals_at_entry() -> None:
 
 
 def test_suppress_syntax_warnings_copy_on_write_and_nan_cache_key_equality() -> None:
-    """Verifies _suppress_syntax_warnings uses copy-on-write on warnings.filters and _ScopeCacheKey handles NaN."""
+    """Verifies _suppress_syntax_warnings uses catch_warnings copy-on-write and _ScopeCacheKey handles NaN."""
     import warnings
     from pydoppelgangerhunt.fixer._df_cache import (
         _ScopeCacheKey,
@@ -6134,7 +6187,10 @@ def test_suppress_syntax_warnings_copy_on_write_and_nan_cache_key_equality() -> 
         inner_filters_ref = warnings.filters
         assert inner_filters_ref is not outer_filters_ref
         assert outer_filters_ref == outer_snapshot
-    assert warnings.filters is not inner_filters_ref
+        with _suppress_syntax_warnings():
+            assert warnings.filters is inner_filters_ref
+        assert warnings.filters is inner_filters_ref
+    assert list(warnings.filters) == outer_snapshot
     assert outer_filters_ref == outer_snapshot
 
     owner = ast.parse("x = 1\n")
@@ -6175,3 +6231,389 @@ def test_resolve_unit_and_pair_closure_flags_conflict_warning_and_explicit_overr
     assert overridden.unit1.skip_pre_unit_closures is False
     assert overridden.unit2.skip_pre_unit_closures is False
     assert overridden.effective_skip_pre_unit_closures is False
+
+
+def test_unit_level_closure_strictness_lenient_survives_generate_refactoring_patch(
+    tmp_path: Any,
+) -> None:
+    """Verifies unit-level closure_strictness='lenient' is preserved by generate_refactoring_patch and synthesize_refactoring_suggestion when no explicit override is passed."""
+    from pydoppelgangerhunt.fixer import generate_refactoring_patch
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    src = (
+        "def gen_a(items):\n"
+        "    pre_cb = lambda: step\n"
+        "    for x in items:\n"
+        "        step = x + 1\n"
+        "        yield step\n"
+        "    return len(items)\n\n"
+        "def gen_b(items):\n"
+        "    pre_cb = lambda: step\n"
+        "    for x in items:\n"
+        "        step = x + 1\n"
+        "        yield step\n"
+        "    return len(items)\n"
+    )
+    target_file = tmp_path / "unit_lenient.py"
+    target_file.write_text(src, encoding="utf-8")
+    unit_code = (
+        "    for x in items:\n"
+        "        step = x + 1\n"
+        "        yield step\n"
+    )
+    u1_strict: dict[str, Any] = {
+        "file": str(target_file),
+        "start": 3,
+        "end": 5,
+        "name": "gen_a:For",
+        "kind": "compound_block",
+        "source_text": src,
+        "source_code": unit_code,
+    }
+    u2_strict: dict[str, Any] = {
+        "file": str(target_file),
+        "start": 10,
+        "end": 12,
+        "name": "gen_b:For",
+        "kind": "compound_block",
+        "source_text": src,
+        "source_code": unit_code,
+    }
+    patch_default = generate_refactoring_patch(
+        [(1.0, u1_strict, u2_strict)],
+        repo_root=str(tmp_path),
+    )
+    assert patch_default == ""
+
+    u1_lenient = {**u1_strict, "closure_strictness": "lenient"}
+    u2_lenient = {**u2_strict, "closure_strictness": "lenient"}
+    patch_lenient = generate_refactoring_patch(
+        [(1.0, u1_lenient, u2_lenient)],
+        repo_root=str(tmp_path),
+    )
+    assert "def _shared_" in patch_lenient
+
+    sug_lenient = synthesize_refactoring_suggestion(
+        u1_lenient,
+        u2_lenient,
+        repo_root=str(tmp_path),
+    )
+    assert "def _shared_" in sug_lenient
+
+
+def test_synthesize_refactoring_suggestion_contains_helper_synthesis_exception(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies synthesize_refactoring_suggestion catches unexpected exceptions from synthesize_shared_helper_code and returns a safe warning comment."""
+    import pydoppelgangerhunt.fixer.synthesis as synth_mod
+    import pydoppelgangerhunt.reporters as reporters_mod
+
+    src = (
+        "def f1(a):\n"
+        "    b = a + 1\n"
+        "    c = b * 2\n"
+        "    return c\n\n"
+        "def f2(a):\n"
+        "    b = a + 1\n"
+        "    c = b * 2\n"
+        "    return c\n"
+    )
+    target_file = tmp_path / "synth_exc.py"
+    target_file.write_text(src, encoding="utf-8")
+    u1 = {
+        "file": str(target_file),
+        "start": 2,
+        "end": 3,
+        "kind": "compound_block",
+        "source_text": src,
+        "source_code": "    b = a + 1\n    c = b * 2\n",
+    }
+    u2 = {
+        "file": str(target_file),
+        "start": 7,
+        "end": 8,
+        "kind": "compound_block",
+        "source_text": src,
+        "source_code": "    b = a + 1\n    c = b * 2\n",
+    }
+
+    def _boom(*_args: Any, **_kwargs: Any) -> str:
+        raise RuntimeError("simulated helper synthesis failure")
+
+    monkeypatch.setattr(synth_mod, "synthesize_shared_helper_code", _boom)
+    suggestion = reporters_mod.synthesize_refactoring_suggestion(
+        u1, u2, repo_root=str(tmp_path)
+    )
+    assert "rejected as unsafe" in suggestion
+    assert "WARNING: Automatic helper synthesis was skipped" in suggestion
+
+
+@pytest.mark.parametrize(
+    "fn_kw,stmt_lines",
+    [
+        ("def", ["    with ctx:\n", "        v = G + 1\n"]),
+        ("async def", ["    async with ctx:\n", "        v = G + 1\n"]),
+        ("async def", ["    await coro\n", "    v = G + 1\n"]),
+        ("def", ["    yield 1\n", "    v = G + 1\n"]),
+        ("def", ["    yield from seq\n", "    v = G + 1\n"]),
+        ("async def", ["    async for item in aiter:\n", "        v = G + 1\n"]),
+        ("def", ["    tmp = [1]\n", "    del tmp\n", "    v = G + 1\n"]),
+    ],
+)
+def test_global_escape_rejects_with_await_yield_async_for_and_del(
+    fn_kw: str,
+    stmt_lines: list[str],
+) -> None:
+    """Verifies _unit_has_global_mutating_call marks with/async-with/await/yield/async-for/del as potential global mutators."""
+    body_str = "".join(stmt_lines)
+    end_ln = 2 + len(stmt_lines)
+    src = (
+        f"{fn_kw} run(ctx, coro, seq, aiter):\n"
+        "    global G\n"
+        f"{body_str}"
+        "    return v\n"
+    )
+    scope = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": end_ln,
+            "kind": "compound_block",
+            "source_text": src,
+            "source_code": body_str,
+        },
+        tree=ast.parse(src),
+    )
+    assert "severed_closure_cell" in scope["control_flow_hazards"]
+    assert "global_escape" in scope["closure_hazard_reasons"]
+    assert scope["is_control_flow_safe"] is False
+
+
+def test_invalid_lexical_declarations_cache_key_and_use_before_declaration() -> None:
+    """Verifies _scope_has_invalid_lexical_declarations detects use-before-global/nonlocal in both AST-only and symtable modes and caches them under distinct keys."""
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _scope_has_invalid_lexical_declarations,
+        _walk_invalid_lexical_scope_declarations,
+    )
+
+    use_before_global_src = "def f():\n    a = 1\n    global a\n"
+    tree_g = ast.parse(use_before_global_src)
+    fn_g = tree_g.body[0]
+    assert (
+        _walk_invalid_lexical_scope_declarations(
+            [(fn_g, frozenset(), frozenset(), False)]
+        )
+        is True
+    )
+    assert _scope_has_invalid_lexical_declarations(fn_g, True, None) is True
+    assert (
+        _scope_has_invalid_lexical_declarations(
+            fn_g, True, use_before_global_src.splitlines(keepends=True)
+        )
+        is True
+    )
+
+    read_before_nonlocal_src = (
+        "def outer():\n"
+        "    x = 1\n"
+        "    def inner():\n"
+        "        y = x + 1\n"
+        "        nonlocal x\n"
+        "        x = y\n"
+    )
+    tree_nl = ast.parse(read_before_nonlocal_src)
+    outer_fn = tree_nl.body[0]
+    assert (
+        _walk_invalid_lexical_scope_declarations(
+            [(outer_fn, frozenset(), frozenset(), False)]
+        )
+        is True
+    )
+    assert _scope_has_invalid_lexical_declarations(outer_fn, True, None) is True
+    assert (
+        _scope_has_invalid_lexical_declarations(
+            outer_fn, True, read_before_nonlocal_src.splitlines(keepends=True)
+        )
+        is True
+    )
+
+
+def test_multiline_parenthesised_decorator_earliest_start_pos_across_pipeline() -> None:
+    """Verifies _node_earliest_start_pos uses cached tree source_lines to locate multiline parenthesised `@(` decorators even when source_lines is omitted."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import _SpanBounds
+    from pydoppelgangerhunt.fixer._df_cell_traversal import _analyze_enclosing_fn_cells
+    from pydoppelgangerhunt.fixer._df_closures import (
+        _collect_scope_closures,
+        _node_earliest_start_pos,
+    )
+
+    src = (
+        "def outer(dec):\n"
+        "    @(\n"
+        "        dec\n"
+        "    )\n"
+        "    def inner():\n"
+        "        return x\n"
+        "    x = 1\n"
+        "    return inner\n"
+    )
+    src_lines = src.splitlines(keepends=True)
+    mod_tree = ast.parse(src)
+    outer_fn = mod_tree.body[0]
+    assert isinstance(outer_fn, ast.FunctionDef)
+    inner_fn = outer_fn.body[0]
+    assert isinstance(inner_fn, ast.FunctionDef)
+
+    # First call registers tree_source_lines via mod_tree
+    closures = _collect_scope_closures(
+        outer_fn,
+        module_tree=mod_tree,
+        source_lines=src_lines,
+    )
+    assert any(
+        (pos.line, pos.col) == (2, 4) and "x" in reads
+        for pos, reads in closures
+    )
+    # Subsequent call to _node_earliest_start_pos without explicit source_lines resolves line 2 via parent_map + cached tree_source_lines
+    assert _node_earliest_start_pos(inner_fn) == (2, 4)
+
+    cell_info = _analyze_enclosing_fn_cells(
+        outer_fn,
+        _SpanBounds(7, 7),
+        mod_tree=mod_tree,
+    )
+    assert any("x" in reads for name, reads, _ in cell_info.sibling_closures if name == "inner")
+
+
+def test_harvest_file_units_passes_strict_unit_schema_and_scope_inspection(
+    tmp_path: Any,
+) -> None:
+    """Verifies every unit dict produced by harvest_file_units passes validate_unit_schema(strict=True) and inspect_single_unit_scope without stale_source_code."""
+    from pydoppelgangerhunt.fixer.source import validate_unit_schema
+    from pydoppelgangerhunt.parser import harvest_file_units
+
+    sample_src = (
+        "class Widget:\n"
+        "    TABLE = [\n"
+        "        (1, 'a', True),\n"
+        "        (2, 'b', False),\n"
+        "        (3, 'c', True),\n"
+        "        (4, 'd', False),\n"
+        "    ]\n"
+        "    def compute(self, items, scale):\n"
+        "        def scale_it(v):\n"
+        "            return v * scale + 1\n"
+        "        vals = [scale_it(x) for x in items if x > 0]\n"
+        "        if len(vals) > 2:\n"
+        "            total = sum(vals) + (scale * 2 + 3) * (scale - 1)\n"
+        "            avg = total / len(vals)\n"
+        "            return avg\n"
+        "        else:\n"
+        "            fallback = (scale + 10) * (scale + 20) - 5\n"
+        "            return fallback\n"
+    )
+    sample_file = tmp_path / "harvest_all_kinds.py"
+    sample_file.write_text(sample_src, encoding="utf-8")
+
+    units = harvest_file_units(
+        str(sample_file),
+        str(tmp_path),
+        min_lines=2,
+        min_tokens=4,
+        functions_only=False,
+        sliding_window=True,
+        window_size=2,
+        complex_expressions=True,
+        min_expr_complexity=3,
+        clause_level=True,
+        data_tables=True,
+        class_level=True,
+        harvest_closures=True,
+        comprehensions=True,
+    )
+    assert len(units) >= 5
+    for u in units:
+        assert validate_unit_schema(u, strict=True) == set()
+        sc = inspect_single_unit_scope(u, repo_root=str(tmp_path))
+        assert "stale_source_code" not in sc["control_flow_hazards"]
+
+
+@pytest.mark.parametrize(
+    "unit_dict,strictness,skip_closures,strict_with,expected",
+    [
+        ({}, None, None, None, (False, False)),
+        ({}, "strict", None, None, (False, False)),
+        ({}, "pedantic", None, None, (False, True)),
+        ({}, "lenient", None, None, (True, False)),
+        ({}, "pedantic", True, None, (False, True)),
+        ({}, "lenient", None, True, (True, False)),
+        ({"closure_strictness": "pedantic"}, None, None, None, (False, True)),
+        ({"closure_strictness": "lenient"}, None, None, None, (True, False)),
+        ({"closure_strictness": "lenient"}, "pedantic", None, None, (False, True)),
+        ({"skip_pre_unit_closures": True}, None, None, None, (True, False)),
+        ({"strict_with_suppression": True}, None, None, None, (False, True)),
+        (
+            {"closure_strictness": "pedantic", "skip_pre_unit_closures": True},
+            None,
+            None,
+            None,
+            (False, True),
+        ),
+        (
+            {"skip_pre_unit_closures": True},
+            None,
+            False,
+            True,
+            (False, True),
+        ),
+    ],
+)
+def test_resolve_unit_closure_flags_truth_table(
+    unit_dict: dict[str, Any],
+    strictness: Any,
+    skip_closures: Any,
+    strict_with: Any,
+    expected: tuple[bool, bool],
+) -> None:
+    """Verifies resolve_unit_closure_flags 3-tier precedence truth table."""
+    from pydoppelgangerhunt.config import resolve_unit_closure_flags
+
+    base_unit = {"start": 1, "end": 2, **unit_dict}
+    assert (
+        resolve_unit_closure_flags(
+            base_unit,
+            closure_strictness=strictness,
+            skip_pre_unit_closures=skip_closures,
+            strict_with_suppression=strict_with,
+        )
+        == expected
+    )
+
+
+def test_source_lines_origin_enum_properties_and_hash_contract() -> None:
+    """Verifies SourceLinesOrigin is an Enum with transitive equality, consistent hashing, and boolean properties."""
+    import enum
+    from pydoppelgangerhunt.source_lines import SourceLinesOrigin
+
+    assert issubclass(SourceLinesOrigin, enum.Enum)
+    assert SourceLinesOrigin.PRE_SLICED.is_pre_sliced is True
+    assert SourceLinesOrigin.PRE_SLICED.is_placeholder is False
+    assert SourceLinesOrigin.PRE_SLICED.has_real_source is True
+    assert bool(SourceLinesOrigin.PRE_SLICED) is True
+
+    assert SourceLinesOrigin.PLACEHOLDER.is_pre_sliced is True
+    assert SourceLinesOrigin.PLACEHOLDER.is_placeholder is True
+    assert SourceLinesOrigin.PLACEHOLDER.has_real_source is False
+    assert bool(SourceLinesOrigin.PLACEHOLDER) is True
+
+    assert SourceLinesOrigin.FULL_BUFFER.is_pre_sliced is False
+    assert SourceLinesOrigin.FULL_BUFFER.has_real_source is True
+    assert bool(SourceLinesOrigin.FULL_BUFFER) is False
+
+    assert SourceLinesOrigin.DISK.is_pre_sliced is False
+    assert SourceLinesOrigin.DISK.has_real_source is True
+    assert bool(SourceLinesOrigin.DISK) is False
+
+    assert SourceLinesOrigin.PRE_SLICED != "PRE_SLICED"
+    assert SourceLinesOrigin.PRE_SLICED != True  # noqa: E712
+    assert len(set(SourceLinesOrigin)) == 4

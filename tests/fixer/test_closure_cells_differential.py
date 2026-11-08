@@ -1256,27 +1256,49 @@ def test_differential_execution_closure_and_context_manager_hazards() -> None:
 
 def test_seeded_generated_closure_program_differential_fuzzer(tmp_path: Path) -> None:
     """Seeded differential fuzzer generating nested-closure programs and verifying runtime equivalence."""
+    import itertools  # pylint: disable=import-outside-toplevel
+    import os  # pylint: disable=import-outside-toplevel
     import random  # pylint: disable=import-outside-toplevel
     import shutil  # pylint: disable=import-outside-toplevel
     import subprocess  # pylint: disable=import-outside-toplevel
     import pytest  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.fixer import generate_refactoring_patch
+    from pydoppelgangerhunt.fixer._df_cell_carriers import _SpanBounds
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _analyze_enclosing_fn_cells_uncached,
+    )
 
     if shutil.which("git") is None:
         pytest.skip("git executable is required for differential fuzzer patch application")
 
+    all_combinations = [
+        (has_pre, mut_acc, call_sib, cap_mode, post_mut, use_with)
+        for has_pre, mut_acc, call_sib, cap_mode, post_mut, use_with in itertools.product(
+            [False, True],
+            [False, True],
+            [False, True],
+            ["default_arg", "late_cell", "nonlocal_inc", "none"],
+            [False, True],
+            [False, True],
+        )
+        if not (call_sib and not has_pre)
+    ]
     rng = random.Random(20261106)
+    rng.shuffle(all_combinations)
+    seed_limit = int(os.environ.get("PDH_FUZZ_SEEDS", str(len(all_combinations))))
+    selected_combinations = all_combinations[:seed_limit]
     patched_count = 0
     blocked_count = 0
+    git_apply_count = 0
 
-    for idx in range(24):
-        has_pre_sibling = rng.choice([False, True])
-        mutate_acc_in_unit = rng.choice([False, True])
-        call_sibling_in_unit = has_pre_sibling and rng.choice([False, True])
-        capture_mode = rng.choice(["default_arg", "late_cell", "nonlocal_inc", "none"])
-        post_mutate_scale = rng.choice([False, True])
-        use_with_lock = rng.choice([False, True])
-
+    for idx, (
+        has_pre_sibling,
+        mutate_acc_in_unit,
+        call_sibling_in_unit,
+        capture_mode,
+        post_mutate_scale,
+        use_with_lock,
+    ) in enumerate(selected_combinations):
         lines: list[str] = [
             "import contextlib",
             "def entry(items, cond):",
@@ -1333,8 +1355,32 @@ def test_seeded_generated_closure_program_differential_fuzzer(tmp_path: Path) ->
         fn_b_src = fn_src.replace("def entry(", "def entry_b(", 1)
         line_offset = len(lines)
         combined_src = f"{fn_src}{fn_b_src}"
+        fuzz_tree = ast.parse(combined_src)
+        fuzz_fn = fuzz_tree.body[1]
+        assert isinstance(fuzz_fn, ast.FunctionDef)
+        span_bounds = _SpanBounds(u_start, u_end)
 
         for mode in ("strict", "pedantic"):
+            strict_w = mode == "pedantic"
+            info_with_deltas = _analyze_enclosing_fn_cells_uncached(
+                fuzz_fn,
+                span_bounds,
+                mod_tree=fuzz_tree,
+                use_stmt_deltas=True,
+                strict_with_suppression=strict_w,
+            )
+            info_without_deltas = _analyze_enclosing_fn_cells_uncached(
+                fuzz_fn,
+                span_bounds,
+                mod_tree=fuzz_tree,
+                use_stmt_deltas=False,
+                strict_with_suppression=strict_w,
+            )
+            assert info_with_deltas == info_without_deltas
+
+            if idx >= 24:
+                continue
+
             case_dir = tmp_path / f"fuzz_{idx}_{mode}"
             case_dir.mkdir(parents=True, exist_ok=True)
             (case_dir / ".git").mkdir(exist_ok=True)
@@ -1355,31 +1401,6 @@ def test_seeded_generated_closure_program_differential_fuzzer(tmp_path: Path) ->
                 "name": "entry_b:block",
                 "kind": "compound_block",
             }
-            from pydoppelgangerhunt.fixer._df_cell_carriers import _SpanBounds
-            from pydoppelgangerhunt.fixer._df_cell_traversal import (
-                _analyze_enclosing_fn_cells_uncached,
-            )
-
-            fuzz_tree = ast.parse(combined_src)
-            fuzz_fn = fuzz_tree.body[1]
-            assert isinstance(fuzz_fn, ast.FunctionDef)
-            span_bounds = _SpanBounds(u_start, u_end)
-            info_with_deltas = _analyze_enclosing_fn_cells_uncached(
-                fuzz_fn,
-                span_bounds,
-                mod_tree=fuzz_tree,
-                use_stmt_deltas=True,
-                strict_with_suppression=(mode == "pedantic"),
-            )
-            info_without_deltas = _analyze_enclosing_fn_cells_uncached(
-                fuzz_fn,
-                span_bounds,
-                mod_tree=fuzz_tree,
-                use_stmt_deltas=False,
-                strict_with_suppression=(mode == "pedantic"),
-            )
-            assert info_with_deltas == info_without_deltas
-
             patch = generate_refactoring_patch(
                 [(1.0, u1, u2)],
                 repo_root=str(case_dir),
@@ -1388,6 +1409,7 @@ def test_seeded_generated_closure_program_differential_fuzzer(tmp_path: Path) ->
             )
             if patch:
                 patched_count += 1
+                git_apply_count += 1
                 subprocess.run(
                     ["git", "apply", "--whitespace=nowarn"],
                     input=patch,
@@ -1412,5 +1434,61 @@ def test_seeded_generated_closure_program_differential_fuzzer(tmp_path: Path) ->
             else:
                 blocked_count += 1
 
+    assert len(selected_combinations) >= 64
     assert patched_count > 0
     assert blocked_count > 0
+    assert git_apply_count > 0
+
+
+def test_definite_assignment_engine_parity_across_generated_control_flow() -> None:
+    """Verifies parity between _analyze_block_assignment and _extract_block_definite_bindings_and_term across generated control-flow ASTs."""
+    import random  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _analyze_block_assignment,
+        _block_terminates,
+        _extract_block_definite_bindings_and_term,
+    )
+
+    rng = random.Random(20261108)
+    ctx_choices = [
+        "open('f')",
+        "contextlib.nullcontext()",
+        "contextlib.suppress(ValueError)",
+        "UnknownTransaction()",
+    ]
+    stmt_templates = [
+        "a = 1",
+        "b = compute(a)",
+        "if (w := flag):\n    a = 2\nelse:\n    a = 3",
+        "if cond:\n    b = 4\nelse:\n    return 0",
+        "try:\n    c = 1\n    d = risky()\nexcept ValueError:\n    d = 2\nelse:\n    e = 3\nfinally:\n    f = 4",
+        "try:\n    c = risky()\nexcept Exception:\n    return 1",
+        "for item in seq:\n    loop_v = item\nelse:\n    loop_else = 1",
+    ]
+    for _ in range(80):
+        chosen_ctx = rng.choice(ctx_choices)
+        chosen_stmts = rng.sample(stmt_templates, k=3)
+        with_stmt = (
+            f"with {chosen_ctx} as ctx_var:\n"
+            f"    w_pre = 10\n"
+            f"    w_post = risky_call()\n"
+        )
+        block_src = "import contextlib\n" + "\n".join([chosen_stmts[0], with_stmt, *chosen_stmts[1:]]) + "\n"
+        stmts = ast.parse(block_src).body
+        for strict_w in (False, True):
+            def_assign, cond_assign = _analyze_block_assignment(
+                stmts,
+                strict_with_suppression=strict_w,
+            )
+            ext_bound, ext_term = _extract_block_definite_bindings_and_term(
+                stmts,
+                None,
+                strict_with_suppression=strict_w,
+            )
+            block_term = _block_terminates(
+                stmts,
+                strict_with_suppression=strict_w,
+            )
+            assert ext_term == block_term
+            assert def_assign == ext_bound
+            assert def_assign.isdisjoint(cond_assign)

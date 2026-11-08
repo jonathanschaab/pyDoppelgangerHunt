@@ -25,6 +25,8 @@ from pydoppelgangerhunt.fixer._ast_compat import (
 )
 from pydoppelgangerhunt.fixer._df_cache import (
     _MAX_STMT_DELTAS_PER_FN,
+    _MAX_STMT_WITH_SUMMARY_CACHE_SIZE,
+    _TrackedCachedDict,
     _downstream_cache_lock,
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
@@ -1124,10 +1126,41 @@ def _get_stmt_with_summary(
         if stmt in _stmt_with_summary_cache:
             _stmt_with_summary_cache.move_to_end(stmt)
             return _stmt_with_summary_cache[stmt]
-        while len(_stmt_with_summary_cache) >= 512 and _stmt_with_summary_cache:
+        while (
+            len(_stmt_with_summary_cache) >= _MAX_STMT_WITH_SUMMARY_CACHE_SIZE
+            and _stmt_with_summary_cache
+        ):
             _stmt_with_summary_cache.popitem(last=False)
         _stmt_with_summary_cache[stmt] = result
         return result
+
+
+def _evict_stmt_delta_if_full(
+    stmt_deltas: Dict[Tuple[Any, ...], Optional[_StmtCellDelta]],
+    incoming_key: Tuple[Any, ...],
+) -> None:
+    """Evicts one entry when stmt_deltas reaches _MAX_STMT_DELTAS_PER_FN without sequential-scan thrashing."""
+    if (
+        incoming_key in stmt_deltas
+        or len(stmt_deltas) < _MAX_STMT_DELTAS_PER_FN
+        or not stmt_deltas
+    ):
+        return
+    oldest_key = next(iter(stmt_deltas))
+    newest_key = next(reversed(stmt_deltas))
+    inc_ln = getattr(incoming_key[0], "lineno", 0) or 0
+    old_ln = getattr(oldest_key[0], "lineno", 0) or 0
+    new_ln = getattr(newest_key[0], "lineno", 0) or 0
+    victim_key = (
+        newest_key
+        if (
+            old_ln < new_ln < inc_ln
+            and oldest_key[1:] == incoming_key[1:]
+            and newest_key[1:] == incoming_key[1:]
+        )
+        else oldest_key
+    )
+    stmt_deltas.pop(victim_key, None)
 
 
 def _try_apply_cached_stmt_delta(
@@ -1179,12 +1212,16 @@ def _try_apply_cached_stmt_delta(
     )
     with _downstream_cache_lock:
         has_key = key in stmt_deltas
-        delta = stmt_deltas.get(key) if has_key else None
+        if has_key:
+            delta = stmt_deltas.get(key)
+            if isinstance(stmt_deltas, _TrackedCachedDict):
+                stmt_deltas.touch_lru(key)
+        else:
+            delta = None
     if not has_key:
         if _extract_shallow_deleted_names(stmt):
             with _downstream_cache_lock:
-                if key not in stmt_deltas and len(stmt_deltas) >= _MAX_STMT_DELTAS_PER_FN:
-                    stmt_deltas.pop(next(iter(stmt_deltas)), None)
+                _evict_stmt_delta_if_full(stmt_deltas, key)
                 stmt_deltas.setdefault(key, None)
             return False
         dummy_span = _SpanBounds(c_end + 1, c_end + 1) if is_before else _SpanBounds(0, 0)
@@ -1231,8 +1268,7 @@ def _try_apply_cached_stmt_delta(
             sibling_nl_deletions=frozenset(sub_bufs.sibling_nl_deletions),
         )
         with _downstream_cache_lock:
-            if key not in stmt_deltas and len(stmt_deltas) >= _MAX_STMT_DELTAS_PER_FN:
-                stmt_deltas.pop(next(iter(stmt_deltas)), None)
+            _evict_stmt_delta_if_full(stmt_deltas, key)
             delta = stmt_deltas.setdefault(key, computed_delta)
     if delta is None:
         return False

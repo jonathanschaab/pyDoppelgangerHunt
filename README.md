@@ -125,6 +125,7 @@ min_tokens = 15
 cross_file_strategy = "auto"
 shared_module_name = "_common.py"
 closure_strictness = "strict"  # "strict" (default), "pedantic", or "lenient"
+strict_with_suppression = false  # optional boolean fallback when closure_strictness is omitted
 non_suppressing_ctx_managers = []
 exclude = [
     "tests",
@@ -264,11 +265,13 @@ escaping callbacks across lexical scopes.
 - **Precision vs. Soundness Trade-off**: Pre-unit closure and context-manager exception-suppression
   analysis can be configured via `--closure-strictness {strict,pedantic,lenient}`
   (deprecated aliases: `fail_closed` $\to$ `pedantic`, `fast`/`skip` $\to$ `lenient`; or `--skip-pre-unit-closures`,
-  or setting `closure_strictness = "strict"|"pedantic"|"lenient"` and `non_suppressing_ctx_managers = [...]`
-  in `pyproject.toml`):
+  or setting `closure_strictness = "strict"|"pedantic"|"lenient"`, `strict_with_suppression = true|false`,
+  and `non_suppressing_ctx_managers = [...]` in `pyproject.toml` or per-unit `UnitSchema` dicts):
   - `strict` (default): Conservative closure mode that treats pre-unit closures capturing candidate
     outputs as live escaping callbacks and enforces all closure-cell hazard checks. For `with` /
-    `async with` blocks, standard library non-suppressing context managers (`open`, `io.*`,
+    `async with` blocks, standard library non-suppressing context managers (`open`, `io.open`,
+    `io.StringIO`, `io.BytesIO`, `io.TextIOWrapper`, `io.BufferedReader`, `io.BufferedWriter`,
+    `io.BufferedRandom`, `io.BufferedRWPair`, `io.FileIO`,
     `tempfile.*`, `contextlib.nullcontext`, `contextlib.closing`, `contextlib.aclosing`,
     `contextlib.chdir`, `contextlib.redirect_stdout`, `contextlib.redirect_stderr`,
     `warnings.catch_warnings`, `threading.Lock`/`RLock`/`Condition`/`Semaphore`/`BoundedSemaphore`,
@@ -285,13 +288,16 @@ escaping callbacks across lexical scopes.
     manager is accepted via the name heuristic, `pyDoppelgangerHunt` logs a deduplicated `INFO`
     diagnostic and an end-of-run summary; use `--closure-strictness pedantic` to fail closed on all
     unproven context managers.
-  - `pedantic` (deprecated alias: `fail_closed`): Fully
+  - `pedantic` (deprecated alias: `fail_closed`; or `strict_with_suppression = true` when
+    `closure_strictness` is omitted): Fully
     fail-closed mode that treats all unproven unknown `with` context managers as potentially
     exception-suppressing unless explicitly allowlisted via `--non-suppressing-ctx-managers`
     or `non_suppressing_ctx_managers` (merged across global config and per-unit overrides).
-    Allowlist entries support bare names (including locally defined classes and relative imports),
-    dotted paths (e.g., `pkg.tx.atomic`), and wildcard attribute suffixes (`*.atomic` or `.atomic`
-    matching `<any_receiver>.atomic(...)`).
+    Allowlist entries support bare names (including locally defined classes), dotted paths
+    (e.g., `pkg.tx.atomic`), and wildcard attribute suffixes (`*.atomic` matching
+    `<any_receiver>.atomic(...)`; note that a single-dot `.atomic` entry matches both relative
+    imports `from . import atomic` and `*.atomic` attribute suffixes, so prefer `*.atomic` for
+    explicit attribute-suffix wildcards).
   - `lenient` (deprecated aliases: `fast`, `skip`): Precision-oriented mode that skips pre-unit
     closure liveness scanning for generator subroutines and relaxes speculative unreferenced-sibling
     closure checks, while still enforcing checks for unbound captured cells at the extraction point,
@@ -324,10 +330,12 @@ strict fail-closed safety invariants:
   module-level units, variables defined within the unit are module-level globals; ensure
   module-level refactorings do not alter globals exported as public module API. When a subroutine
   inside an enclosing function reads a variable declared `global` in that enclosing scope, calls to
-  arbitrary functions are rejected as a `global_escape` hazard because the callee could rebind the
-  module-level global mid-execution; only unshadowed pure inspection/conversion built-ins (`len`,
-  `bool`, `int`, `bin`, `hex`, `oct`, `chr`, `ord`, `id`, `callable`, `isinstance`, `issubclass`,
-  `range`) and non-call AST operations (operators, subscripts, attribute/`@property` reads, and
+  arbitrary functions, context-manager blocks (`with` / `async with`), coroutine/generator
+  suspension points (`await`, `yield`, `yield from`, `async for`), and deletions (`del`) are
+  rejected as a `global_escape` hazard because they could rebind or mutate the module-level global
+  mid-execution; only unshadowed pure inspection/conversion built-ins (`len`, `bool`, `int`, `bin`,
+  `hex`, `oct`, `chr`, `ord`, `id`, `callable`, `isinstance`, `issubclass`, `range`) and remaining
+  non-call AST operations (operators, subscripts, attribute/`@property` reads, and synchronous
   `for` iteration) are permitted under the heuristic assumption that user types do not mutate
   module-level globals inside those dunders or property getters.
 - **Dynamic Scope Reflection Limitations**: Downstream variable liveness analysis statically

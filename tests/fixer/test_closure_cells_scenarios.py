@@ -784,6 +784,7 @@ _CLOSURE_CELL_SCENARIOS = [
         },
         False,
     ),
+    # --- Additional positive and negative multi-level/carrier scenarios ---
     (
         "multilevel_intermediate_pre_unit_nonlocal_mutation",
         (

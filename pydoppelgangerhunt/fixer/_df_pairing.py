@@ -759,7 +759,7 @@ def resolve_clone_pair_outputs(
             else None
         )
 
-    scope1, scope2, effective_skip_closures = _ensure_pair_scopes_closure_mode(
+    scope1, scope2, _ = _ensure_pair_scopes_closure_mode(
         u1,
         u2,
         scope1,
@@ -797,7 +797,7 @@ def resolve_clone_pair_outputs(
             tree1=tree1,
             tree2=tree2,
             repo_root=repo_root,
-            skip_pre_unit_closures=effective_skip_closures,
+            skip_pre_unit_closures=skip_pre_unit_closures,
             source_digest1=source_digest1,
             source_digest2=source_digest2,
             closure_strictness=closure_strictness,

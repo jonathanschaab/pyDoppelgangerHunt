@@ -24,7 +24,12 @@ from typing import (
 
 from pydoppelgangerhunt.fixer._ast_compat import is_trystar_node
 from pydoppelgangerhunt.fixer._df_cache import (
+    _get_cached_tree_source_lines,
+    _get_or_compute_scope_cached,
     _get_or_parse_tree,
+    _make_trusted_scope_cache_key,
+    _register_tree_source_lines,
+    _scope_cell_info_cache,
     _suppress_syntax_warnings,
 )
 from pydoppelgangerhunt.fixer._df_closures import _node_earliest_start_pos
@@ -1710,16 +1715,33 @@ def _get_tree_scope_intervals(
     tree: ast.AST,
     source_lines: Optional[Sequence[str]] = None,
 ) -> List[Tuple[int, int, int, ast.AST]]:
-    """Builds sorted intervals (earliest_start, n_end, span, node) for scope nodes in tree."""
-    intervals: List[Tuple[int, int, int, ast.AST]] = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            earliest_start, n_end = _node_scope_bounds(node, source_lines)
-            intervals.append((earliest_start, n_end, n_end - earliest_start, node))
-    intervals.sort(
-        key=lambda item: (item[2], -item[0], -getattr(item[3], "col_offset", 0))
+    """Builds and caches sorted intervals (earliest_start, n_end, span, node) for scope nodes in tree."""
+    if source_lines is not None:
+        _register_tree_source_lines(tree, source_lines)
+    else:
+        source_lines = _get_cached_tree_source_lines(tree)
+
+    def _compute() -> Tuple[Tuple[int, int, int, ast.AST], ...]:
+        intervals: List[Tuple[int, int, int, ast.AST]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                earliest_start, n_end = _node_scope_bounds(node, source_lines)
+                intervals.append((earliest_start, n_end, n_end - earliest_start, node))
+        intervals.sort(
+            key=lambda item: (item[2], -item[0], -getattr(item[3], "col_offset", 0))
+        )
+        return tuple(intervals)
+
+    if getattr(tree, "_is_ephemeral_unit_mod", False):
+        return list(_compute())
+    cache_key = _make_trusted_scope_cache_key(
+        owner=tree,
+        kind="tree_scope_intervals",
+        params=(bool(source_lines),),
     )
-    return intervals
+    return list(
+        _get_or_compute_scope_cached(_scope_cell_info_cache, cache_key, _compute)
+    )
 
 
 def _find_innermost_enclosing_node(

@@ -146,11 +146,14 @@ from pydoppelgangerhunt.fixer._df_span_index import (
 from pydoppelgangerhunt.parser import _node_is_effectively_async
 
 __all__ = [
+    "_PURE_GLOBAL_SAFE_BUILTINS",
     "_UnitClosureHazardContext",
     "_check_captured_cell_mutations",
     "_check_intra_unit_nonlocal_mutators",
     "_check_sibling_closure_sharing",
+    "_evaluate_severed_closure_cell_hazard",
     "_has_severed_closure_cell_hazard",
+    "_unit_has_global_mutating_call",
 ]
 
 
@@ -452,14 +455,17 @@ def _unit_has_global_mutating_call(
     *,
     has_star_import: bool = False,
 ) -> bool:
-    """Returns True when candidate_stmts contain a call other than an unshadowed pure builtin.
+    """Returns True when candidate_stmts contain a call or protocol hook other than an unshadowed pure builtin.
 
     When an extracted helper reads a variable declared ``global`` in an enclosing
     function, the helper receives that global's value as a snapshot parameter at
-    call entry. Any impure or user-defined call inside the helper could mutate the
-    module-level global mid-execution, causing subsequent reads inside the helper
-    to observe the stale parameter rather than the updated global. Calls to
-    unshadowed pure builtins cannot rebind module globals and are safe to allow.
+    call entry. Any impure or user-defined call, context-manager protocol hook
+    (``with`` / ``async with``), coroutine/generator suspension point (``await``,
+    ``yield``, ``yield from``, ``async for``), or deletion (``del``) inside the
+    helper could mutate the module-level global mid-execution, causing subsequent
+    reads inside the helper to observe the stale parameter rather than the updated
+    global. Calls to unshadowed pure builtins cannot rebind module globals and are
+    safe to allow.
     """
     effective_shadowed: Set[str] = set(shadowed_names)
     for st in candidate_stmts:
@@ -474,6 +480,19 @@ def _unit_has_global_mutating_call(
     all_builtins_shadowed = has_star_import or ("*" in effective_shadowed)
     for st in candidate_stmts:
         for node in ast.walk(st):
+            if isinstance(
+                node,
+                (
+                    ast.With,
+                    ast.AsyncWith,
+                    ast.Await,
+                    ast.Yield,
+                    ast.YieldFrom,
+                    ast.AsyncFor,
+                    ast.Delete,
+                ),
+            ):
+                return True
             if isinstance(node, ast.Call):
                 if all_builtins_shadowed or not (
                     isinstance(node.func, ast.Name)

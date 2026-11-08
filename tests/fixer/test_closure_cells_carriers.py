@@ -844,38 +844,17 @@ def test_scope_preservation_carrier_shadowing_and_concurrency() -> None:
     assert all(results)
 
 
-def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
+def test_unmarked_and_mismatched_scope_recomputation_across_modes(
     tmp_path: Any,
 ) -> None:
-    """Covers unmarked precomputed scopes, multiline slice end_col truncation, and class/closure propagation."""
-    import sys  # pylint: disable=import-outside-toplevel
-    from pydoppelgangerhunt.fixer import (
-        _is_irrefutable_case,
-        _is_irrefutable_pattern,
-    )
-    from pydoppelgangerhunt.fixer._df_cell_carriers import (
-        _SpanBounds,
-        _extract_closure_nonlocal_mutations_and_deletions,
-        _extract_fn_outer_carrier_targets,
-        _get_fn_scope_context,
-        _is_closure_factory_scope,
-        _propagate_sibling_closures,
-    )
-    from pydoppelgangerhunt.fixer._df_cell_traversal import (
-        _analyze_enclosing_fn_cells,
-    )
-    from pydoppelgangerhunt.fixer._df_closures import (
-        _is_eagerly_consumed_genexp,
-    )
+    """Verifies unmarked or mismatched precomputed scopes are recomputed when closure_strictness changes."""
     from pydoppelgangerhunt.fixer.scope import (
         ensure_unit_scope_closure_mode,
         scope_matches_closure_mode,
     )
-    from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
 
     clear_dataflow_cache()
 
-    # Unmarked scopes never match strict or lenient mode and are recomputed when unit has source
     gen_src = (
         "def gen_a(items):\n"
         "    pre_cb = lambda: step\n"
@@ -929,7 +908,6 @@ def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
         is False
     )
 
-    # Passing unmarked strict scopes into lenient mode recomputes to lenient
     recomputed_lenient = ensure_unit_scope_closure_mode(
         u_g1, unmarked_strict1, True, repo_root=str(tmp_path)
     )
@@ -958,7 +936,6 @@ def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
     )
     assert "def " in synth_from_unmarked_strict
 
-    # Passing marked lenient scopes into strict mode recomputes to strict
     lenient_sc1 = inspect_single_unit_scope(
         {**u_g1, "skip_pre_unit_closures": True}, repo_root=str(tmp_path)
     )
@@ -999,7 +976,11 @@ def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
         == ""
     )
 
-    # _slice_unit_token_lines truncates end_col even when line 0 is pre-sliced or empty
+
+def test_slice_unit_token_lines_multiline_end_col_truncation() -> None:
+    """Verifies _slice_unit_token_lines truncates end_col across pre-sliced, empty-first-line, and UTF-8 lines."""
+    from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
+
     assert _slice_unit_token_lines(
         {"kind": "comprehension", "start_col": 24, "end_col": 5},
         ["[\n", "        x * 2 for x in items\n", "    ] + [99]\n"],
@@ -1020,7 +1001,15 @@ def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
         [utf8_empty_slice],
     ) == [""]
 
-    # Closure mutation propagation through classes
+
+def test_class_hierarchy_closure_nonlocal_mutations_and_evaluation_timing() -> None:
+    """Verifies nonlocal mutation propagation through class hierarchies and comprehension/generator-expression evaluation timing."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _extract_closure_nonlocal_mutations_and_deletions,
+        _get_fn_scope_context,
+    )
+    from pydoppelgangerhunt.fixer._df_closures import _is_eagerly_consumed_genexp
+
     cls_prop_tree = ast.parse(
         "def outer():\n"
         "    x = 1\n"
@@ -1052,7 +1041,6 @@ def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
     assert dels_cls == {"w"}
     assert "g_var" not in muts_cls
 
-    # Class attribute assignment without nonlocal does not report nonlocal mutation
     cls_shadow_only = ast.parse(
         "def outer():\n"
         "    x = 1\n"
@@ -1065,7 +1053,6 @@ def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
         cls_shadow_only.body[0].body[1]  # type: ignore[attr-defined]
     ) == (set(), set())
 
-    # Comprehension and generator-expression evaluation timing
     lazy_walrus_src = (
         "def f1(items):\n"
         "    x = 0\n"
@@ -1129,7 +1116,18 @@ def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
         is False
     )
 
-    # Precision of _is_closure_factory_scope for ClassDef and AsyncFunctionDef
+
+def test_closure_factory_scope_precision_and_cyclic_alias_propagation() -> None:
+    """Verifies _is_closure_factory_scope precision on classes/async functions and cyclic sibling-closure propagation."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _SpanBounds,
+        _extract_fn_outer_carrier_targets,
+        _get_fn_scope_context,
+        _is_closure_factory_scope,
+        _propagate_sibling_closures,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import _analyze_enclosing_fn_cells
+
     factory_prec_tree = ast.parse(
         "def outer(x):\n"
         "    class PureRecord:\n"
@@ -1176,7 +1174,6 @@ def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
     assert _is_closure_factory_scope(body_nodes["mutating_async"], f_prec_ctx) is True
     assert _is_closure_factory_scope(body_nodes["async_gen"], f_prec_ctx) is True
 
-    # Transitive sibling-closure propagation (cyclic aliases, rebound aliases, factory chains)
     cyclic_closures: list[tuple[str | None, set[str], set[str]]] = [
         ("seed_cb", {"x"}, {"y"}),
     ]
@@ -1216,7 +1213,17 @@ def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
     )
     assert "x" in cf_info_chain.post_reads
 
-    # Exception-handler implicit deletion and pattern-binding analysis
+
+def test_except_handler_deletion_and_concurrent_async_generator_suspension() -> None:
+    """Verifies exception-handler implicit deletion and concurrent closure/suspension analysis for coroutines and generators."""
+    import sys  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer import (
+        _is_irrefutable_case,
+        _is_irrefutable_pattern,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import _SpanBounds
+    from pydoppelgangerhunt.fixer._df_cell_traversal import _analyze_enclosing_fn_cells
+
     assert _is_irrefutable_pattern(None) is False
     if sys.version_info >= (3, 10):
         match_tree = ast.parse(
@@ -1280,7 +1287,6 @@ def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
     assert "deleted_in_handler" not in tf_info.pre_bound
     assert "only_in_try" not in tf_info.pre_bound
 
-    # Concurrent closure and suspension analysis (generators and async coroutines)
     async_coro_src = (
         "async def run_task(items):\n"
         "    x = 1\n"

@@ -240,43 +240,59 @@ def resolve_unit_closure_flags(
     skip_pre_unit_closures: Optional[bool] = None,
     strict_with_suppression: Optional[bool] = None,
 ) -> UnitClosureFlags:
-    """Resolves (skip_pre_unit_closures, strict_with_suppression) for a unit with optional overrides."""
-    has_explicit_flag_override = closure_strictness is None and (
-        skip_pre_unit_closures is not None or strict_with_suppression is not None
-    )
-    eff_strictness = (
-        closure_strictness
-        if closure_strictness is not None
-        else (None if has_explicit_flag_override else unit.get("closure_strictness"))
-    )
-    eff_skip_input = (
-        skip_pre_unit_closures
-        if skip_pre_unit_closures is not None
-        else unit.get("skip_pre_unit_closures", False)
-    )
-    eff_sw_input = (
-        strict_with_suppression
-        if strict_with_suppression is not None
-        else (
-            None
-            if skip_pre_unit_closures is not None and closure_strictness is None
+    """Resolves (skip_pre_unit_closures, strict_with_suppression) for a unit with optional overrides.
+
+    Precedence Order (highest to lowest):
+        1. Explicit ``closure_strictness`` argument.
+        2. Explicit boolean argument (``skip_pre_unit_closures`` or ``strict_with_suppression``)
+           when ``closure_strictness`` is ``None`` (overrides ``unit["closure_strictness"]``).
+        3. Unit dictionary keys (``unit["closure_strictness"]`` >
+           ``unit["skip_pre_unit_closures"]`` > ``unit["strict_with_suppression"]``).
+        4. Default ``"strict"`` mode: ``UnitClosureFlags(False, False)``.
+
+    Truth Table (effective inputs -> ``(skip_pre_unit_closures, strict_with_suppression)``):
+        ========================  ======  ===========  ==================
+        eff_strictness            skip    strict_with  Result
+        ========================  ======  ===========  ==================
+        "pedantic"/"fail_closed"  any     any          (False, True)
+        "strict"                  any     any          (False, False)
+        "lenient"/"fast"/"skip"   any     any          (True, False)
+        None                      True    any          (True, False)
+        None                      False   True         (False, True)
+        None                      False   False/None   (False, False)
+        ========================  ======  ===========  ==================
+    """
+    if closure_strictness is not None:
+        eff_strictness: Optional[str] = closure_strictness
+        eff_skip_in = (
+            skip_pre_unit_closures
+            if skip_pre_unit_closures is not None
+            else unit.get("skip_pre_unit_closures", False)
+        )
+        eff_sw_in = (
+            strict_with_suppression
+            if strict_with_suppression is not None
             else unit.get("strict_with_suppression")
         )
-    )
-    _, eff_skip = resolve_closure_strictness_mode(
+    elif skip_pre_unit_closures is not None or strict_with_suppression is not None:
+        eff_strictness = None
+        eff_skip_in = (
+            skip_pre_unit_closures
+            if skip_pre_unit_closures is not None
+            else unit.get("skip_pre_unit_closures", False)
+        )
+        eff_sw_in = strict_with_suppression
+    else:
+        eff_strictness = unit.get("closure_strictness")
+        eff_skip_in = unit.get("skip_pre_unit_closures", False)
+        eff_sw_in = unit.get("strict_with_suppression")
+
+    resolved_mode, eff_skip = resolve_closure_strictness_mode(
         closure_strictness=eff_strictness,
-        skip_pre_unit_closures=bool(eff_skip_input),
-        strict_with_suppression=eff_sw_input,
+        skip_pre_unit_closures=bool(eff_skip_in),
+        strict_with_suppression=eff_sw_in,
     )
-    eff_strict_with = resolve_strict_with_suppression(
-        closure_strictness=eff_strictness,
-        strict_with_suppression=(
-            False if eff_skip and strict_with_suppression is None else eff_sw_input
-        ),
-    )
-    if eff_skip and eff_strict_with and eff_strictness is None:
-        eff_strict_with = False
-    return UnitClosureFlags(eff_skip, eff_strict_with)
+    return UnitClosureFlags(eff_skip, resolved_mode == "pedantic")
 
 
 def resolve_pair_closure_flags(

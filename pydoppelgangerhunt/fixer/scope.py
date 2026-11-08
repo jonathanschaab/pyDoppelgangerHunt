@@ -36,8 +36,10 @@ from pydoppelgangerhunt.fixer._ast_compat import (
 )
 from pydoppelgangerhunt.fixer._df_cache import (
     _ScopeCacheKey,
+    _get_cached_tree_source_lines,
     _get_or_compute_scope_cached,
     _get_or_parse_tree,
+    _register_tree_source_lines,
     _scope_cell_info_cache,
     _suppress_syntax_warnings,
 )
@@ -1739,9 +1741,26 @@ def _is_normalized_source_equivalent(
 def _get_tree_sha256_digest(mod_tree: ast.AST) -> str:
     """Returns a cached SHA-256 hex digest of mod_tree for downstream cache keys when source_text is absent."""
     def _compute() -> str:
-        return hashlib.sha256(
-            ast.dump(mod_tree, include_attributes=True).encode("utf-8")
-        ).hexdigest()
+        cached_lines = _get_cached_tree_source_lines(mod_tree)
+        hasher = hashlib.sha256()
+        if cached_lines is not None:
+            for line in cached_lines:
+                hasher.update(line.encode("utf-8"))
+                hasher.update(b"\n")
+            return hasher.hexdigest()
+        for node in ast.walk(mod_tree):
+            hasher.update(type(node).__name__.encode("ascii"))
+            for attr in ("id", "name", "attr", "arg", "module"):
+                val = getattr(node, attr, None)
+                if isinstance(val, str):
+                    hasher.update(val.encode("utf-8"))
+            if isinstance(node, ast.Constant):
+                hasher.update(repr(node.value).encode("utf-8"))
+            lineno = getattr(node, "lineno", None)
+            col = getattr(node, "col_offset", None)
+            if isinstance(lineno, int):
+                hasher.update(f":{lineno}:{col}".encode("ascii"))
+        return hasher.hexdigest()
 
     if getattr(mod_tree, "_is_ephemeral_unit_mod", False):
         return _compute()
@@ -2365,6 +2384,8 @@ def _inspect_unit_scope(
             if full_mod_src
             else None
         )
+        if mod_tree is not None and full_mod_lines is not None:
+            _register_tree_source_lines(mod_tree, full_mod_lines)
         if mod_tree is not None and u_start > 0:
             resolved_s_col, resolved_e_col = _resolve_unit_col_bounds(
                 candidate_stmts,
@@ -2458,6 +2479,8 @@ def _inspect_unit_scope(
             if cond_live_ins or cond_escaping_cands:
                 pre_bound: Set[str] = set()
                 rejected_escaping_vars: Set[str] = set()
+                if mod_tree is not None and full_mod_lines is not None:
+                    _register_tree_source_lines(mod_tree, full_mod_lines)
                 if mod_tree is not None and u_start > 0:
                     u_start_col, u_end_col = resolved_s_col, resolved_e_col
                     pre_bound, _ = _find_enclosing_pre_bound_names(

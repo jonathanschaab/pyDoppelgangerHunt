@@ -27,9 +27,11 @@ from pydoppelgangerhunt.fixer._ast_compat import (
     is_type_alias_node,
 )
 from pydoppelgangerhunt.fixer._df_cache import (
+    _get_cached_tree_source_lines,
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
     _make_trusted_scope_cache_key,
+    _register_tree_source_lines,
     _scope_cell_info_cache,
     _scope_closures_cache,
 )
@@ -65,7 +67,10 @@ def _node_earliest_start_pos(
     n_col = getattr(node, "col_offset", None)
     best_line: Optional[int] = n_line if isinstance(n_line, int) else None
     best_col: Optional[int] = n_col if isinstance(n_col, int) else None
-    for dec in getattr(node, "decorator_list", ()):
+    decorators = getattr(node, "decorator_list", ())
+    if decorators and source_lines is None:
+        source_lines = _get_cached_tree_source_lines(node)
+    for dec in decorators:
         d_line = getattr(dec, "lineno", None)
         if isinstance(d_line, int):
             eff_d_line = d_line
@@ -571,7 +576,15 @@ def _extract_scope_local_names(
     enclosing_scopes: Sequence[ast.AST] = (),
 ) -> Set[str]:
     """Extracts parameters and locally assigned/imported/defined symbols in scope_node
-    and all enclosing scopes up to module level."""
+    and all enclosing scopes up to module level.
+
+    By default ``include_classes=False`` enforces PEP 227 lexical scoping rules:
+    enclosing ``ClassDef`` namespaces do not form lexical closures for nested
+    functions, lambdas, or comprehensions (only when ``scope_node`` itself is a
+    non-function block directly inside a ``ClassDef`` are immediate class attributes
+    visible). Pass ``include_classes=True`` to include all ancestor ``ClassDef``
+    bindings unconditionally.
+    """
     if include_self_name and cache_scope_node:
         names = set(_get_cached_single_node_local_names(scope_node))
     else:
@@ -820,6 +833,15 @@ def _collect_scope_closures_uncached(
         cache_scope_node=use_parent_cache,
         enclosing_scopes=enclosing_scopes,
     )
+
+    if source_lines is not None:
+        if isinstance(module_tree, ast.AST):
+            _register_tree_source_lines(module_tree, source_lines)
+        _register_tree_source_lines(scope_node, source_lines)
+    else:
+        source_lines = _get_cached_tree_source_lines(
+            module_tree if isinstance(module_tree, ast.AST) else scope_node
+        )
 
     def _resolve_stmt_start_pos(s: ast.AST) -> Tuple[int, int]:
         estart, ecol = _node_earliest_start_pos(s, source_lines=source_lines)
@@ -1070,6 +1092,17 @@ def _collect_scope_closures(
     source_lines: Optional[Sequence[str]] = None,
 ) -> _FrozenClosureList:
     """Discovers all closures defined in a scope, recorded with their starting line."""
+    if source_lines is not None:
+        if isinstance(module_tree, ast.AST):
+            _register_tree_source_lines(module_tree, source_lines)
+        _register_tree_source_lines(scope_node, source_lines)
+    eff_source_lines = (
+        source_lines
+        if source_lines is not None
+        else _get_cached_tree_source_lines(
+            module_tree if isinstance(module_tree, ast.AST) else scope_node
+        )
+    )
     aux_nodes: Tuple[ast.AST, ...] = (
         *(
             (module_tree,)
@@ -1080,11 +1113,11 @@ def _collect_scope_closures(
     )
     cache_key: Any = (
         scope_node
-        if not aux_nodes and source_lines is None
+        if not aux_nodes and eff_source_lines is None
         else _make_trusted_scope_cache_key(
             scope_node,
             "scope_closures",
-            params=(bool(source_lines),) if source_lines is not None else (),
+            params=(bool(eff_source_lines),) if eff_source_lines is not None else (),
             aux_ast_nodes=aux_nodes,
         )
     )
@@ -1097,7 +1130,7 @@ def _collect_scope_closures(
                 scope_node,
                 module_tree=module_tree,
                 enclosing_scopes=enclosing_scopes,
-                source_lines=source_lines,
+                source_lines=eff_source_lines,
             ),
         ),
     )

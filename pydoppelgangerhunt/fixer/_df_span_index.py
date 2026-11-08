@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import symtable
 from typing import (
+    AbstractSet,
     Dict,
     List,
     NamedTuple,
@@ -23,8 +24,10 @@ from pydoppelgangerhunt.fixer._ast_compat import (
     is_type_alias_node,
 )
 from pydoppelgangerhunt.fixer._df_cache import (
+    _get_cached_tree_source_lines,
     _get_or_compute_scope_cached,
     _make_trusted_scope_cache_key,
+    _register_tree_source_lines,
     _scope_cell_info_cache,
     _suppress_syntax_warnings,
 )
@@ -367,6 +370,13 @@ def _get_span_line_index(
     source_lines: Optional[Sequence[str]] = None,
 ) -> _SpanLineIndex:
     """Returns or builds the cached _SpanLineIndex for root_node."""
+    if source_lines is not None:
+        _register_tree_source_lines(root_node, source_lines)
+    eff_source_lines = (
+        source_lines
+        if source_lines is not None
+        else _get_cached_tree_source_lines(root_node)
+    )
     return cast(
         _SpanLineIndex,
         _get_or_compute_scope_cached(
@@ -374,12 +384,12 @@ def _get_span_line_index(
             _make_trusted_scope_cache_key(
                 root_node,
                 "span_line_index",
-                params=(bool(source_lines),) if source_lines is not None else (),
+                params=(bool(eff_source_lines),) if eff_source_lines is not None else (),
             ),
             lambda: (
                 _SpanLineIndex(root_node)
-                if source_lines is None
-                else _SpanLineIndex(root_node, source_lines=source_lines)
+                if eff_source_lines is None
+                else _SpanLineIndex(root_node, source_lines=eff_source_lines)
             ),
         ),
     )
@@ -671,6 +681,66 @@ def _extract_type_alias_or_pattern_name(node: ast.AST) -> Optional[str]:
     return None
 
 
+def _scope_has_use_before_lexical_declaration(
+    scope_node: ast.AST,
+    target_decls: AbstractSet[str],
+) -> bool:
+    """Returns True if any name in target_decls is used, assigned, or annotated prior to its global/nonlocal declaration in scope_node."""
+    raw_body = getattr(scope_node, "body", None)
+    if not target_decls or not isinstance(raw_body, (list, tuple)):
+        return False
+    seen_in_scope: Set[str] = set()
+    walk_stack: List[ast.AST] = list(reversed(raw_body))
+    while walk_stack:
+        node = walk_stack.pop()
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            if any(name in seen_in_scope for name in node.names):
+                return True
+            continue
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id in target_decls
+        ):
+            return True
+        if isinstance(node, _INNER_SCOPE_TYPES):
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and node.name in target_decls
+            ):
+                seen_in_scope.add(node.name)
+            has_type_params = bool(getattr(node, "type_params", ()))
+            for hdr in reversed(
+                iter_nested_scope_header_nodes(
+                    node, include_annotations=not has_type_params
+                )
+            ):
+                walk_stack.append(hdr)
+            if isinstance(node, _COMPREHENSION_TYPES) and node.generators:
+                walk_stack.append(node.generators[0].iter)
+            continue
+        if isinstance(node, ast.Name):
+            if node.id in target_decls:
+                seen_in_scope.add(node.id)
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".", 1)[0]
+                if bound in target_decls:
+                    seen_in_scope.add(bound)
+            continue
+        if isinstance(node, ast.ExceptHandler):
+            if isinstance(node.name, str) and node.name in target_decls:
+                seen_in_scope.add(node.name)
+        else:
+            pat_name = _extract_type_alias_or_pattern_name(node)
+            if pat_name is not None and pat_name in target_decls:
+                seen_in_scope.add(pat_name)
+        for ch in reversed(tuple(ast.iter_child_nodes(node))):
+            walk_stack.append(ch)
+    return False
+
+
 def _walk_invalid_lexical_scope_declarations(
     initial_stack: List[Tuple[ast.AST, frozenset[str], frozenset[str], bool]],
 ) -> bool:
@@ -685,6 +755,10 @@ def _walk_invalid_lexical_scope_declarations(
                 return True
             if cur_rooted and d_nl:
                 return True
+            if (d_nl or d_g) and _scope_has_use_before_lexical_declaration(
+                curr, d_nl | d_g
+            ):
+                return True
         if isinstance(
             curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
         ):
@@ -697,6 +771,10 @@ def _walk_invalid_lexical_scope_declarations(
             if d_nl & cur_blocked:
                 return True
             if cur_rooted and (d_nl - cur_bound):
+                return True
+            if (d_nl or d_g) and _scope_has_use_before_lexical_declaration(
+                curr, d_nl | d_g
+            ):
                 return True
             if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 params = _extract_arg_names(
@@ -749,11 +827,16 @@ def _scope_has_invalid_lexical_declarations(
     source_lines: Optional[Sequence[str]] = None,
 ) -> bool:
     """Checks (and caches per AST root scope) whether root_scope has invalid lexical declarations."""
+    has_src = bool(
+        isinstance(source_lines, (list, tuple)) and source_lines
+    )
     return bool(
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
             _make_trusted_scope_cache_key(
-                root_scope, "invalid_lex_decls", params=(is_module_rooted,)
+                root_scope,
+                "invalid_lex_decls",
+                params=(is_module_rooted, has_src),
             ),
             lambda: _compute_scope_invalid_lexical_declarations(
                 root_scope, is_module_rooted, source_lines=source_lines

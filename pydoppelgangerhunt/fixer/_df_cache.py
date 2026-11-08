@@ -42,55 +42,43 @@ _CacheValT = TypeVar("_CacheValT")
 _downstream_cache_lock: threading.RLock = threading.RLock()
 _syntax_warning_lock: threading.RLock = threading.RLock()
 _RLOCK_TYPE: type = type(_downstream_cache_lock)
-_SYNTAX_WARNING_FILTER: Tuple[Any, ...] = (
-    "ignore",
-    None,
-    SyntaxWarning,
-    None,
-    0,
-)
 _syntax_warning_active_count: List[int] = [0]
 
 
-def _notify_warnings_filters_mutated() -> None:
-    """Notifies the warnings module that warnings.filters was updated in place."""
-    mutated = getattr(warnings, "_filters_mutated", None)
-    if callable(mutated):
-        mutated()
+class _MissingCachedAstNodesError(TypeError):
+    """Raised when a custom cached value type does not implement cached_ast_nodes()."""
 
 
 @contextlib.contextmanager
 def _suppress_syntax_warnings() -> Iterator[None]:
-    """Suppresses SyntaxWarning during AST/symtable parsing via a reference-counted filter rule.
+    """Suppresses SyntaxWarning during AST/symtable parsing under a process-wide reentrant lock.
 
-    Acquires ``_syntax_warning_lock`` only when incrementing/decrementing the active
-    reference count and updating ``warnings.filters``, allowing concurrent ``ast.parse``
-    and ``symtable.symtable`` calls across worker threads without lock serialization.
+    Holds ``_syntax_warning_lock`` across ``warnings.catch_warnings()`` for the brief
+    ``ast.parse`` / ``symtable.symtable`` call so concurrent threads entering
+    ``warnings.catch_warnings()`` cannot snapshot or restore an intermediate filter list.
     """
     with _syntax_warning_lock:
-        cur_filters = list(warnings.filters)
-        if not cur_filters or cur_filters[0] is not _SYNTAX_WARNING_FILTER:
-            setattr(warnings, "filters", [_SYNTAX_WARNING_FILTER, *cur_filters])
-            _notify_warnings_filters_mutated()
-        _syntax_warning_active_count[0] += 1
-    try:
-        yield
-    finally:
-        with _syntax_warning_lock:
-            _syntax_warning_active_count[0] -= 1
-            if _syntax_warning_active_count[0] == 0:
-                setattr(
-                    warnings,
-                    "filters",
-                    [f for f in warnings.filters if f is not _SYNTAX_WARNING_FILTER],
-                )
-                _notify_warnings_filters_mutated()
+        if _syntax_warning_active_count[0] > 0:
+            _syntax_warning_active_count[0] += 1
+            try:
+                yield
+            finally:
+                _syntax_warning_active_count[0] -= 1
+            return
+        _syntax_warning_active_count[0] = 1
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", SyntaxWarning)
+                yield
+        finally:
+            _syntax_warning_active_count[0] = 0
 
 
 _MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
 _MAX_SCOPE_CACHE_SIZE: int = 4096
 _MAX_PARSED_TREE_CACHE_SIZE: int = 128
 _MAX_STMT_DELTAS_PER_FN: int = 512
+_MAX_STMT_WITH_SUMMARY_CACHE_SIZE: int = 512
 _SCOPE_CACHE_KIND_CAPS: Dict[str, int] = {
     "span_line_index": 128,
     "fn_scope_ctx": 512,
@@ -98,6 +86,8 @@ _SCOPE_CACHE_KIND_CAPS: Dict[str, int] = {
     "enclosing_fn_cells": 512,
     "suppress_seed": 256,
     "tree_sha256_digest": 256,
+    "tree_scope_intervals": 256,
+    "tree_source_lines": 256,
 }
 _downstream_reads_cache: OrderedDict[Tuple[Any, ...], frozenset[str]] = OrderedDict()
 _parsed_tree_cache: OrderedDict[Tuple[str, int], Optional[ast.AST]] = OrderedDict()
@@ -406,7 +396,7 @@ def _extract_value_ast_nodes(value: Any) -> Tuple[ast.AST, ...]:
         elif curr_type in (dict, _TrackedCachedDict, MappingProxyType):
             children = tuple(part for kv in curr.items() for part in kv)
         else:
-            raise TypeError(
+            raise _MissingCachedAstNodesError(
                 f"Cached value of custom type {curr_type.__name__} must implement cached_ast_nodes()"
             )
         for elem in children:
@@ -561,11 +551,21 @@ class _TrackedCachedDict(Dict[Any, Any]):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._bound_owners: Dict[Tuple[int, Any], Tuple[Any, Any]] = {}
+        self._node_refcounts: Dict[ast.AST, int] = {}
+        for k, v in self.items():
+            for n in set(_extract_value_ast_nodes(k)) | set(_extract_value_ast_nodes(v)):
+                self._node_refcounts[n] = self._node_refcounts.get(n, 0) + 1
 
     def _ensure_bound_owners(self) -> Dict[Tuple[int, Any], Tuple[Any, Any]]:
         return cast(
             Dict[Tuple[int, Any], Tuple[Any, Any]],
             self.__dict__.setdefault("_bound_owners", {}),
+        )
+
+    def _ensure_node_refcounts(self) -> Dict[ast.AST, int]:
+        return cast(
+            Dict[ast.AST, int],
+            self.__dict__.setdefault("_node_refcounts", {}),
         )
 
     def copy(self) -> _TrackedCachedDict:
@@ -588,17 +588,54 @@ class _TrackedCachedDict(Dict[Any, Any]):
         self._ensure_bound_owners().pop((id(cache), cache_key), None)
 
     def _register_inserted_pair(self, k: Any, v: Any) -> None:
+        entry_nodes = set(_extract_value_ast_nodes(k)) | set(_extract_value_ast_nodes(v))
+        if not entry_nodes:
+            return
+        refcounts = self._ensure_node_refcounts()
+        new_nodes = [n for n in entry_nodes if refcounts.get(n, 0) == 0]
+        for n in entry_nodes:
+            refcounts[n] = refcounts.get(n, 0) + 1
         owners = getattr(self, "_bound_owners", None)
-        if not owners:
+        if not owners or not new_nodes:
             return
-        k_nodes = _extract_value_ast_nodes(k)
-        v_nodes = _extract_value_ast_nodes(v)
-        if not k_nodes and not v_nodes:
-            return
-        combined = (*k_nodes, *v_nodes)
         for cache, ck in list(owners.values()):
             if ck in cache:
-                _register_key_ast_nodes(ck, combined)
+                _register_key_ast_nodes(ck, new_nodes)
+
+    def _unregister_removed_pair(self, k: Any, prev_v: Any) -> None:
+        entry_nodes = set(_extract_value_ast_nodes(k)) | set(_extract_value_ast_nodes(prev_v))
+        if not entry_nodes:
+            return
+        refcounts = self._ensure_node_refcounts()
+        zeroed_nodes: List[ast.AST] = []
+        for n in entry_nodes:
+            cnt = refcounts.get(n, 0)
+            if cnt <= 1:
+                refcounts.pop(n, None)
+                zeroed_nodes.append(n)
+            else:
+                refcounts[n] = cnt - 1
+        owners = getattr(self, "_bound_owners", None)
+        if not owners or not zeroed_nodes:
+            return
+        if len(owners) == 1:
+            cache, ck = next(iter(owners.values()))
+            if ck in cache and (
+                ck not in _scope_closures_cache or ck not in _scope_cell_info_cache
+            ):
+                ck_own_nodes = set(_extract_key_ast_nodes(ck))
+                key_bucket = _scope_key_nodes_index.get(ck)
+                for n in zeroed_nodes:
+                    if n not in ck_own_nodes:
+                        if key_bucket is not None:
+                            key_bucket.discard(n)
+                        owner_bucket = _scope_owner_keys_index.get(n)
+                        if owner_bucket is not None:
+                            owner_bucket.discard(ck)
+                            if not owner_bucket:
+                                _scope_owner_keys_index.pop(n, None)
+                return
+        self._sync_owners_ast_nodes()
 
     def _sync_owners_ast_nodes(self) -> None:
         owners = getattr(self, "_bound_owners", None)
@@ -611,19 +648,27 @@ class _TrackedCachedDict(Dict[Any, Any]):
                 seen_keys.add(ck)
                 _resync_key_ast_nodes_locked(ck, extra_caches=owner_caches)
 
+    def touch_lru(self, k: Any) -> Any:
+        """Promotes an existing key to the MRU end in O(1) without re-indexing AST nodes."""
+        with _downstream_cache_lock:
+            val = super().pop(k)
+            super().__setitem__(k, val)
+            return val
+
     def __setitem__(self, k: Any, v: Any) -> None:
         with _downstream_cache_lock:
             overwriting = k in self
+            prev_v = dict.__getitem__(self, k) if overwriting else None
             super().__setitem__(k, v)
             if overwriting:
-                self._sync_owners_ast_nodes()
-            else:
-                self._register_inserted_pair(k, v)
+                self._unregister_removed_pair(k, prev_v)
+            self._register_inserted_pair(k, v)
 
     def __delitem__(self, k: Any) -> None:
         with _downstream_cache_lock:
+            prev_v = dict.__getitem__(self, k)
             super().__delitem__(k)
-            self._sync_owners_ast_nodes()
+            self._unregister_removed_pair(k, prev_v)
 
     def setdefault(self, k: Any, default: Any = None) -> Any:
         with _downstream_cache_lock:
@@ -638,25 +683,20 @@ class _TrackedCachedDict(Dict[Any, Any]):
             had_key = k in self
             res = super().pop(k, *args)
             if had_key:
-                self._sync_owners_ast_nodes()
+                self._unregister_removed_pair(k, res)
             return res
 
     def popitem(self) -> Tuple[Any, Any]:
         with _downstream_cache_lock:
             item = super().popitem()
-            self._sync_owners_ast_nodes()
+            self._unregister_removed_pair(item[0], item[1])
             return item
 
     def update(self, *args: Any, **kwargs: Any) -> None:
         with _downstream_cache_lock:
             temp = dict(*args, **kwargs)
-            had_overwrite = any(k in self for k in temp)
-            super().update(temp)
-            if had_overwrite:
-                self._sync_owners_ast_nodes()
-            else:
-                for k, v in temp.items():
-                    self._register_inserted_pair(k, v)
+            for k, v in temp.items():
+                self[k] = v
 
     def __or__(self, other: Any) -> Dict[Any, Any]:
         return dict.__or__(self, other)
@@ -664,18 +704,14 @@ class _TrackedCachedDict(Dict[Any, Any]):
     def __ior__(self, other: Any) -> _TrackedCachedDict:
         with _downstream_cache_lock:
             temp = dict(other)
-            had_overwrite = any(k in self for k in temp)
-            super().update(temp)
-            if had_overwrite:
-                self._sync_owners_ast_nodes()
-            else:
-                for k, v in temp.items():
-                    self._register_inserted_pair(k, v)
+            for k, v in temp.items():
+                self[k] = v
             return self
 
     def clear(self) -> None:
         with _downstream_cache_lock:
             super().clear()
+            self._ensure_node_refcounts().clear()
             self._sync_owners_ast_nodes()
 
 
@@ -976,9 +1012,9 @@ def _get_or_compute_scope_cached(
     computed = compute_fn()
     try:
         return _store_lru_cache_entry(cache, scope_node, computed, _MAX_SCOPE_CACHE_SIZE)
+    except _MissingCachedAstNodesError:
+        raise
     except TypeError as exc:
-        if "cached_ast_nodes()" in str(exc):
-            raise
         logger.debug(
             "Skipping scope cache insertion due to unhashable key: %s",
             exc,
@@ -994,6 +1030,56 @@ def _split_source_lines_stripped(source_text: str) -> Tuple[str, ...]:
         else source_text
     )
     return tuple(ln.rstrip("\r\n") for ln in split_source_lines(normalized))
+
+
+def _register_tree_source_lines(
+    tree: Optional[ast.AST],
+    source_lines: Optional[Sequence[str]] = None,
+    *,
+    source_text: Optional[str] = None,
+) -> Optional[Tuple[str, ...]]:
+    """Associates stripped source_lines with tree in _scope_cell_info_cache and indexes tree's parent map."""
+    if (
+        tree is None
+        or not isinstance(tree, ast.AST)
+        or getattr(tree, "_is_ephemeral_unit_mod", False)
+        or (not source_lines and not source_text)
+    ):
+        return None
+    ck = _make_trusted_scope_cache_key(owner=tree, kind="tree_source_lines")
+    with _downstream_cache_lock:
+        if ck in _scope_cell_info_cache:
+            _scope_cell_info_cache.move_to_end(ck)
+            return cast(Tuple[str, ...], _scope_cell_info_cache[ck])
+    norm_lines = (
+        tuple(ln.rstrip("\r\n") for ln in source_lines)
+        if source_lines is not None
+        else _split_source_lines_stripped(source_text or "")
+    )
+    if not norm_lines:
+        return None
+    _get_scope_parent_map(tree)
+    return cast(
+        Tuple[str, ...],
+        _store_lru_cache_entry(_scope_cell_info_cache, ck, norm_lines, _MAX_SCOPE_CACHE_SIZE),
+    )
+
+
+def _get_cached_tree_source_lines(node: Optional[ast.AST]) -> Optional[Tuple[str, ...]]:
+    """Retrieves cached source_lines for node or any of its indexed ancestor scope roots."""
+    if node is None or not isinstance(node, ast.AST):
+        return None
+    with _downstream_cache_lock:
+        direct_ck = _make_trusted_scope_cache_key(owner=node, kind="tree_source_lines")
+        if direct_ck in _scope_cell_info_cache:
+            _scope_cell_info_cache.move_to_end(direct_ck)
+            return cast(Tuple[str, ...], _scope_cell_info_cache[direct_ck])
+        for root in _node_to_parent_map_roots.get(node, ()):
+            root_ck = _make_trusted_scope_cache_key(owner=root, kind="tree_source_lines")
+            if root_ck in _scope_cell_info_cache:
+                _scope_cell_info_cache.move_to_end(root_ck)
+                return cast(Tuple[str, ...], _scope_cell_info_cache[root_ck])
+    return None
 
 
 def _get_or_parse_tree(
@@ -1013,6 +1099,8 @@ def _get_or_parse_tree(
         if key in _parsed_tree_cache:
             cached_tree = _parsed_tree_cache[key]
             _parsed_tree_cache.move_to_end(key)
+            if cached_tree is not None:
+                _register_tree_source_lines(cached_tree, source_text=source_text)
             return cached_tree
 
     parsed: Optional[ast.AST] = None
@@ -1032,6 +1120,8 @@ def _get_or_parse_tree(
     stored_tree = _store_lru_cache_entry(
         _parsed_tree_cache, key, parsed, _MAX_PARSED_TREE_CACHE_SIZE
     )
+    if stored_tree is not None:
+        _register_tree_source_lines(stored_tree, source_text=source_text)
     return stored_tree
 
 
@@ -1042,6 +1132,8 @@ def _parse_source_tree(
 ) -> Optional[ast.AST]:
     """Parses Python source code into an AST tree if not already provided."""
     if tree is not None:
+        if source_text and source_text.strip():
+            _register_tree_source_lines(tree, source_text=source_text)
         return tree
     return _get_or_parse_tree(source_text, source_digest=source_digest)
 

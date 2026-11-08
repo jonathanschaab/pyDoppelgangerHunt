@@ -88,7 +88,19 @@ _STDLIB_NON_SUPPRESSING_MODULES: Mapping[str, frozenset[str]] = MappingProxyType
     {
         "builtins": frozenset({"open"}),
         "__builtins__": frozenset({"open"}),
-        "io": frozenset({"open"}),
+        "io": frozenset(
+            {
+                "open",
+                "StringIO",
+                "BytesIO",
+                "TextIOWrapper",
+                "BufferedReader",
+                "BufferedWriter",
+                "BufferedRandom",
+                "BufferedRWPair",
+                "FileIO",
+            }
+        ),
         "contextlib": frozenset(
             {
                 "nullcontext",
@@ -190,6 +202,27 @@ _SAFE_EXCEPTION_TYPE_NAMES: frozenset[str] = frozenset(
 
 _SHADOWABLE_BUILTIN_CTX_NAMES: frozenset[str] = frozenset({"open", "builtins", "__builtins__"})
 
+_SAFE_EXIT_BASE_CLASS_NAMES: frozenset[str] = frozenset(
+    {
+        "object",
+        "AbstractContextManager",
+        "AsyncContextManager",
+        "ContextManager",
+    }
+)
+
+_TRACKED_SHADOW_NAMES: frozenset[str] = frozenset(
+    {
+        *_SHADOWABLE_BUILTIN_CTX_NAMES,
+        *_SUPPRESSING_CTX_MANAGER_NAMES,
+        *_STDLIB_NON_SUPPRESSING_MODULES.keys(),
+        *_SAFE_EXIT_BASE_CLASS_NAMES,
+        "nullcontext",
+        "contextlib",
+        "typing",
+    }
+)
+
 _SUSPICIOUS_SUPPRESS_SUBSTRINGS: Tuple[str, ...] = (
     "suppress",
     "raises",
@@ -239,7 +272,7 @@ class _SuppressProvenance:
             tuple(sorted(self.shadowed_builtins)),
             self.has_star_import,
             tuple(sorted(self.imported_symbols)),
-            tuple(sorted(self.shadowed_names)),
+            tuple(sorted(self.shadowed_names & _TRACKED_SHADOW_NAMES)),
         )
 
     def __bool__(self) -> bool:
@@ -531,7 +564,15 @@ def _matches_extra_non_suppressing_symbol(
     prov: _SuppressProvenance,
     extra_non_suppressing_ctx_managers: AbstractSet[str],
 ) -> bool:
-    """Returns True if base_id (with optional attribute tail_parts) matches extra_non_suppressing_ctx_managers."""
+    """Returns True if base_id (with optional attribute tail_parts) matches extra_non_suppressing_ctx_managers.
+
+    Note:
+        Entries prefixed with ``*.`` (e.g. ``"*.atomic"``) or ``.`` (e.g. ``".atomic"``)
+        match any attribute chain or imported symbol ending in that suffix. A leading
+        single-dot entry ``".Name"`` matches both relative imports (``from . import Name``)
+        and attribute suffixes; prefer ``"*.Name"`` when configuring an explicit
+        attribute-suffix wildcard.
+    """
     if not extra_non_suppressing_ctx_managers or base_id in prov.suppressors:
         return False
     candidate = ".".join((base_id, *tail_parts))
@@ -646,14 +687,6 @@ def _is_proven_non_suppressing_call(
     )
 
 
-_SAFE_EXIT_BASE_CLASS_NAMES: frozenset[str] = frozenset(
-    {
-        "object",
-        "AbstractContextManager",
-        "AsyncContextManager",
-        "ContextManager",
-    }
-)
 _CLASS_DISALLOWED_META_DUNDERS: frozenset[str] = frozenset(
     {
         "__new__",
@@ -1480,19 +1513,6 @@ def _scope_has_direct_star_import(scope_node: ast.AST) -> bool:
             return True
         stack.extend(ast.iter_child_nodes(curr))
     return False
-
-
-_TRACKED_SHADOW_NAMES: frozenset[str] = frozenset(
-    {
-        *_SHADOWABLE_BUILTIN_CTX_NAMES,
-        *_SUPPRESSING_CTX_MANAGER_NAMES,
-        *_STDLIB_NON_SUPPRESSING_MODULES.keys(),
-        *_SAFE_EXIT_BASE_CLASS_NAMES,
-        "nullcontext",
-        "contextlib",
-        "typing",
-    }
-)
 
 
 def _extract_stmt_referenced_and_bound_names(stmt: ast.AST) -> Set[str]:

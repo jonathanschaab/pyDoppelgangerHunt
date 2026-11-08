@@ -2218,47 +2218,12 @@ def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
             ) == [expr_str]
 
 
-def test_chained_walrus_augassign_trystar_and_slice_edge_cases(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Covers chained-comparison walrus short-circuiting, conditional live-in hazards, x += unit post-reads, TryStar definite bindings, UTF-8 slice edge cases, NamedTuple mutators, and star-import caching."""
-    import copy
-    import pickle
-    import sys
-    from pydoppelgangerhunt.fixer import (
-        _is_irrefutable_case,
-        _is_irrefutable_pattern,
-        generate_refactoring_patch,
-    )
-    from pydoppelgangerhunt.fixer._df_cache import (
-        _scope_cell_info_cache,
-        clear_dataflow_cache,
-    )
-    from pydoppelgangerhunt.fixer._df_cell_carriers import (
-        _IntraUnitMutator,
-        _collect_unit_nonlocal_mutators,
-    )
-    from pydoppelgangerhunt.fixer._df_cell_traversal import (
-        _analyze_enclosing_fn_cells,
-    )
-    from pydoppelgangerhunt.fixer._df_with_provenance import (
-        _extract_block_definite_bindings_and_term,
-        _extract_unconditional_walrus_names,
-    )
-    import pydoppelgangerhunt.fixer._df_closures as df_closures_mod
-    from pydoppelgangerhunt.fixer._df_hazards import (
-        _scope_reads_outputs_after_line,
-    )
-    from pydoppelgangerhunt.fixer.scope import (
-        ensure_unit_scope_closure_mode,
-        inspect_single_unit_scope,
-    )
-    from pydoppelgangerhunt.fixer.source import (
-        _slice_unit_token_lines,
-        _slice_utf8_line,
-    )
+def test_chained_comparison_walrus_short_circuiting() -> None:
+    """Verifies chained comparison short-circuiting in _extract_unconditional_walrus_names and cell traversal."""
+    from pydoppelgangerhunt.fixer._df_cell_traversal import _analyze_enclosing_fn_cells
+    from pydoppelgangerhunt.fixer._df_with_provenance import _extract_unconditional_walrus_names
+    from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope
 
-    # 1. Chained comparison short-circuiting in _extract_unconditional_walrus_names and cell traversal
     chain_cmp_expr = ast.parse("a < b < (y := f())", mode="eval").body
     assert _extract_unconditional_walrus_names(chain_cmp_expr) == set()
     first_cmp_expr = ast.parse("(x := g()) < (y := f()) < (z := h())", mode="eval").body
@@ -2311,7 +2276,13 @@ def test_chained_walrus_augassign_trystar_and_slice_edge_cases(
     )
     assert "severed_closure_cell" not in sc_chain_first["control_flow_hazards"]
 
-    # 2. Dropped inputs for conditional live-ins (v in pre_bound raises hazard; purely intra-unit stays safe)
+
+def test_conditional_live_in_pre_bound_hazard_vs_intra_unit_safe(
+    tmp_path: Path,
+) -> None:
+    """Verifies conditional live-ins with pre-unit binding raise severed_closure_cell while purely intra-unit conditional live-ins stay safe."""
+    from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope
+
     src_cond_live_in_pre = (
         "def entry(flag1, flag2):\n"
         "    if flag1:\n"
@@ -2367,7 +2338,14 @@ def test_chained_walrus_augassign_trystar_and_slice_edge_cases(
     assert "x" not in sc_cond_intra["inputs"]
     assert "severed_closure_cell" not in sc_cond_intra["control_flow_hazards"]
 
-    # 3. Scope closure mode recomputation and non-mutation of caller u1/u2 dicts in patch.py
+
+def test_patch_closure_mode_recomputation_does_not_mutate_caller_units(
+    tmp_path: Path,
+) -> None:
+    """Verifies generate_refactoring_patch and ensure_unit_scope_closure_mode do not mutate caller unit dictionaries."""
+    from pydoppelgangerhunt.fixer import generate_refactoring_patch
+    from pydoppelgangerhunt.fixer.scope import ensure_unit_scope_closure_mode
+
     src_patch_mode = (
         "def f1(a):\n"
         "    b = a + 1\n"
@@ -2411,7 +2389,18 @@ def test_chained_walrus_augassign_trystar_and_slice_edge_cases(
     assert recomputed_sc["skip_pre_unit_closures"] is True
     assert "skip_pre_unit_closures" not in u1_orig
 
-    # 4. Performance: module star-import and single-node-locals caching across many units
+
+def test_module_star_import_and_single_node_locals_cached_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies module star-import and single_node_locals checks are cached across multiple units in the same module."""
+    import pydoppelgangerhunt.fixer._df_closures as df_closures_mod
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _scope_cell_info_cache,
+        clear_dataflow_cache,
+    )
+    from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope
+
     clear_dataflow_cache()
     star_walk_calls = 0
     orig_uncached_star = df_closures_mod._node_has_star_import_uncached
@@ -2461,7 +2450,31 @@ def test_chained_walrus_augassign_trystar_and_slice_edge_cases(
         for k in _scope_cell_info_cache
     )
 
-    # 5. _slice_utf8_line and _slice_unit_token_lines edge cases
+
+def test_slice_utf8_line_and_augassign_post_read_and_trystar_bindings() -> None:
+    """Verifies UTF-8 slice boundaries, AugAssign post-read/mutation tracking, TryStar bindings, and NamedTuple mutator copying."""
+    import copy
+    import pickle
+    import sys
+    from pydoppelgangerhunt.fixer import (
+        _is_irrefutable_case,
+        _is_irrefutable_pattern,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _IntraUnitMutator,
+        _collect_unit_nonlocal_mutators,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import _analyze_enclosing_fn_cells
+    from pydoppelgangerhunt.fixer._df_hazards import _scope_reads_outputs_after_line
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _extract_block_definite_bindings_and_term,
+    )
+    from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope
+    from pydoppelgangerhunt.fixer.source import (
+        _slice_unit_token_lines,
+        _slice_utf8_line,
+    )
+
     assert _slice_utf8_line("é = foo(1)\n", 4, 4) == ""
     assert _slice_utf8_line("é = foo(1)\n", 5, 2) == "foo(1)\n"
     assert _slice_unit_token_lines(
@@ -2477,7 +2490,6 @@ def test_chained_walrus_augassign_trystar_and_slice_edge_cases(
         ["[x for x in y]"],
     ) == ["[x for x in y]"]
 
-    # 6. `x += <unit>` records post-read and post-mutation of `x`
     src_aug = (
         "def outer(items):\n"
         "    x = 1\n"
@@ -2502,7 +2514,6 @@ def test_chained_walrus_augassign_trystar_and_slice_edge_cases(
     )
     assert "severed_closure_cell" in sc_aug["control_flow_hazards"]
 
-    # 7. TryStar / except* definite-binding and closure-cell hazard analysis (Python 3.11+)
     if sys.version_info >= (3, 11):
         src_trystar = (
             "def outer(op, items):\n"
@@ -2554,7 +2565,6 @@ def test_chained_walrus_augassign_trystar_and_slice_edge_cases(
         )
         assert "severed_closure_cell" in sc_ts_unsafe["control_flow_hazards"]
 
-    # 8. _is_irrefutable_pattern(None), _IntraUnitMutator(NamedTuple), and _scope_reads_outputs_after_line list outputs
     assert _is_irrefutable_pattern(None) is False
     assert _is_irrefutable_case(ast.AST()) is False
 
@@ -2580,7 +2590,15 @@ def test_chained_walrus_augassign_trystar_and_slice_edge_cases(
         is True
     )
 
-    # 9. PEP 227 class scope isolation and nested tuple cache eviction
+
+def test_pep227_class_scope_isolation_and_nested_tuple_cache_eviction() -> None:
+    """Verifies PEP 227 class scope isolation for global/nonlocal declarations and nested tuple cache eviction."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _evict_tree_scopes,
+        _scope_cell_info_cache,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import _collect_unit_nonlocal_mutators
+
     pep227_tree = ast.parse(
         "def outer():\n"
         "    def inner():\n"
@@ -2605,8 +2623,6 @@ def test_chained_walrus_augassign_trystar_and_slice_edge_cases(
     assert any(m.name == "m" and "x" in m.mutated_vars for m in cls_muts)
     inner_muts = _collect_unit_nonlocal_mutators([inner_fn], mod_tree=pep227_tree)
     assert not any("x" in m.mutated_vars for m in inner_muts)
-
-    from pydoppelgangerhunt.fixer._df_cache import _evict_tree_scopes
 
     nested_key = (("deep", (pep227_tree, "nested_tag")), 42)
     _scope_cell_info_cache[nested_key] = "sentinel"
