@@ -125,7 +125,6 @@ min_tokens = 15
 cross_file_strategy = "auto"
 shared_module_name = "_common.py"
 closure_strictness = "strict"  # "strict" (default), "pedantic", or "lenient"
-# strict_with_suppression = false  # Deprecated compatibility alias; prefer closure_strictness = "pedantic"
 non_suppressing_ctx_managers = []
 exclude = [
     "tests",
@@ -263,34 +262,40 @@ escaping callbacks across lexical scopes.
   `clear_dataflow_cache()` periodically between scan runs or batch boundaries to release
   memoized AST trees and parent node maps.
 - **Precision vs. Soundness Trade-off**: Pre-unit closure and context-manager exception-suppression
-  analysis can be configured via `--closure-strictness {strict,pedantic,lenient,fail_closed,strict_with,fast,skip}`
-  (or `--skip-pre-unit-closures`, or setting `closure_strictness = "strict"|"pedantic"|"lenient"`
-  and `non_suppressing_ctx_managers = [...]` in `pyproject.toml`):
-  - `strict` (default, `strict_with_suppression = false`): Conservative closure mode that treats
-    pre-unit closures capturing candidate outputs as live escaping callbacks and enforces all four
-    closure-cell hazard checks. For `with` / `async with` blocks, standard library non-suppressing
-    context managers (`open`, `io.*`, `tempfile.*`, `contextlib.nullcontext`, `contextlib.closing`,
-    `contextlib.redirect_stdout`, `contextlib.redirect_stderr`, `warnings.catch_warnings`,
-    `threading.Lock`/`RLock`/`Condition`/`Semaphore`/`BoundedSemaphore`, `asyncio.Lock`,
-    `decimal.localcontext`, `unittest.mock.patch`, `os.scandir`, `sqlite3.connect`, `zipfile.ZipFile`,
-    `tarfile.open`, `gzip.open`, `bz2.open`, `lzma.open`, `pathlib.Path`) and local classes whose
-    `__exit__`/`__aexit__` returns only `False`/`None` are proven non-suppressing; unproven context
-    managers use a name-and-provenance heuristic (treating managers as non-suppressing unless their
-    identifier matches suppression idioms such as `suppress`, `raises`, `ignore`, `subTest`,
-    `ExitStack`, `enter_context`, or is proven suppressing via local/function/class `__exit__`
-    provenance, and logging a diagnostic warning when the heuristic treats an unknown manager as
-    non-suppressing).
-  - `pedantic` (aliases: `fail_closed`, `strict_with`; or `strict_with_suppression = true`): Fully
+  analysis can be configured via `--closure-strictness {strict,pedantic,lenient}`
+  (deprecated aliases: `fail_closed` $\to$ `pedantic`, `fast`/`skip` $\to$ `lenient`; or `--skip-pre-unit-closures`,
+  or setting `closure_strictness = "strict"|"pedantic"|"lenient"` and `non_suppressing_ctx_managers = [...]`
+  in `pyproject.toml`):
+  - `strict` (default): Conservative closure mode that treats pre-unit closures capturing candidate
+    outputs as live escaping callbacks and enforces all closure-cell hazard checks. For `with` /
+    `async with` blocks, standard library non-suppressing context managers (`open`, `io.*`,
+    `tempfile.*`, `contextlib.nullcontext`, `contextlib.closing`, `contextlib.aclosing`,
+    `contextlib.chdir`, `contextlib.redirect_stdout`, `contextlib.redirect_stderr`,
+    `warnings.catch_warnings`, `threading.Lock`/`RLock`/`Condition`/`Semaphore`/`BoundedSemaphore`,
+    `asyncio.Lock`, `decimal.localcontext`, `unittest.mock.patch`, `os.scandir`, `sqlite3.connect`,
+    `zipfile.ZipFile`, `tarfile.open`, `gzip.open`, `bz2.open`, `lzma.open`, `mmap.mmap`,
+    `socket.socket`, `socket.create_connection`, `pathlib.Path`) and local classes whose
+    `__exit__`/`__aexit__` returns only `False`/`None` are proven non-suppressing. Unproven context
+    managers use a name-and-provenance heuristic: managers are treated as non-suppressing unless
+    their identifier matches suppression idioms (`suppress`, `raises`, `ignore`, `subTest`,
+    `ExitStack`, `enter_context`, etc.) or is proven suppressing via local/function/class
+    `__exit__` provenance. **Note**: because this heuristic is name-based, `strict` mode is
+    **fail-open for neutrally named custom exception-suppressing context managers** (such as
+    `tolerate()`, `swallow()`, `best_effort()`, or `Transaction()`). Whenever an unproven context
+    manager is accepted via the name heuristic, `pyDoppelgangerHunt` logs a deduplicated `INFO`
+    diagnostic and an end-of-run summary; use `--closure-strictness pedantic` to fail closed on all
+    unproven context managers.
+  - `pedantic` (deprecated alias: `fail_closed`): Fully
     fail-closed mode that treats all unproven unknown `with` context managers as potentially
     exception-suppressing unless explicitly allowlisted via `--non-suppressing-ctx-managers`
     or `non_suppressing_ctx_managers` (merged across global config and per-unit overrides).
     Allowlist entries support bare names (including locally defined classes and relative imports),
     dotted paths (e.g., `pkg.tx.atomic`), and wildcard attribute suffixes (`*.atomic` or `.atomic`
     matching `<any_receiver>.atomic(...)`).
-  - `lenient` (aliases: `fast`, `skip`): Precision-oriented mode that skips pre-unit closure
-    liveness scanning for generator subroutines and relaxes speculative unreferenced-sibling
-    closure checks, while still enforcing Checks 1–3 (unbound captured cells, externally mutated
-    captured cells, and intra-unit `nonlocal`/walrus mutator escapes) and Check 4 for sibling
+  - `lenient` (deprecated aliases: `fast`, `skip`): Precision-oriented mode that skips pre-unit
+    closure liveness scanning for generator subroutines and relaxes speculative unreferenced-sibling
+    closure checks, while still enforcing checks for unbound captured cells at the extraction point,
+    externally mutated captured cells, intra-unit `nonlocal`/walrus mutator escapes, and sibling
     closures explicitly referenced as unit inputs.
 
 #### Safety Model & Fail-Closed Refactoring Guarantees
@@ -317,7 +322,14 @@ strict fail-closed safety invariants:
   reads within the local module file. Because `yield` at module level is a Python `SyntaxError`,
   generator return propagation applies strictly to functions and methods. For non-generator
   module-level units, variables defined within the unit are module-level globals; ensure
-  module-level refactorings do not alter globals exported as public module API.
+  module-level refactorings do not alter globals exported as public module API. When a subroutine
+  inside an enclosing function reads a variable declared `global` in that enclosing scope, calls to
+  arbitrary functions are rejected as a `global_escape` hazard because the callee could rebind the
+  module-level global mid-execution; only unshadowed pure inspection/conversion built-ins (`len`,
+  `bool`, `int`, `bin`, `hex`, `oct`, `chr`, `ord`, `id`, `callable`, `isinstance`, `issubclass`,
+  `range`) and non-call AST operations (operators, subscripts, attribute/`@property` reads, and
+  `for` iteration) are permitted under the heuristic assumption that user types do not mutate
+  module-level globals inside those dunders or property getters.
 - **Dynamic Scope Reflection Limitations**: Downstream variable liveness analysis statically
   identifies dynamic local and global reads via `locals()`, `vars()`, `eval()`, `exec()`, `dir()`,
   and `globals()`. Dynamic reflection via runtime stack frame introspection (such as
@@ -391,7 +403,7 @@ pydoppelgangerhunt --init
 | `--cross-file-strategy` | `auto\|shared_module\|host_module\|skip` | Cross-module deduplication strategy (`auto`, `shared_module`, `host_module`, or `skip`; default: `auto`) |
 | `--shared-module-name` | `FILENAME` | Target filename for shared utility extractions (default: `_common.py`) |
 | `--skip-pre-unit-closures` | Flag | Relax speculative unreferenced pre-unit closure checks (`lenient` mode) |
-| `--closure-strictness` | `strict\|pedantic\|lenient\|fail_closed\|strict_with\|fast\|skip` | Closure strictness mode (`strict` [heuristic `with`-suppression, default], `pedantic` / `fail_closed` / `strict_with` [all unproven `with`-managers treated as potentially suppressing], or `lenient` / `fast` / `skip` [relaxes speculative unreferenced-sibling closure checks while keeping Checks 1–3 and referenced-sibling Check 4]) |
+| `--closure-strictness` | `strict\|pedantic\|lenient\|fail_closed\|fast\|skip` | Closure strictness mode (`strict` [heuristic `with`-suppression, default], `pedantic` [all unproven `with`-managers treated as potentially suppressing], or `lenient` [relaxes speculative unreferenced-sibling closure checks while keeping unbound/mutated captured-cell, intra-unit `nonlocal`/walrus mutator, and referenced-sibling closure checks]; deprecated aliases: `fail_closed`, `fast`, `skip`) |
 | `--non-suppressing-ctx-managers` | `NAMES` | Context manager names, dotted paths, or `*.attr` / `.attr` suffixes proven not to suppress exceptions (comma-separated or repeatable) |
 | `--sort-by` | `similarity\|priority\|sloc` | Sort clone hits (default: `similarity`) |
 | `--priority` | Flag | Sort clones by Priority score: $\text{Sim} \times \text{SLOC} \times \text{Complexity}$ |

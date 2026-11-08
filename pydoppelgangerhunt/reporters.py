@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
 from pydoppelgangerhunt.config import normalize_path_string
 from pydoppelgangerhunt.source_lines import (
+    SourceLinesOrigin,
     is_sliced_unit_source_lines,
     parse_unit_coord,
     resolve_safe_unit_file_path,
@@ -65,12 +66,14 @@ def _unit_line_bounds(unit: Dict[str, Any]) -> Tuple[int, int]:
 
 def extract_unit_source_lines_with_state(
     unit: Dict[str, Any], repo_root: Optional[str] = None
-) -> Tuple[List[str], bool]:
-    """Reads raw source code lines for a unit and returns ``(lines, is_pre_sliced)``.
+) -> Tuple[List[str], SourceLinesOrigin]:
+    """Reads raw source code lines for a unit and returns ``(lines, origin)``.
 
-    ``is_pre_sliced`` is True when the returned lines came from a pre-sliced
-    ``source_lines`` excerpt (or fallback placeholder) rather than slicing a
-    full-file buffer or reading from disk.
+    ``origin`` is a :class:`SourceLinesOrigin` indicating whether the returned lines
+    came from a pre-sliced ``source_lines`` excerpt (``PRE_SLICED``), a full-file
+    in-memory buffer (``FULL_BUFFER``), disk (``DISK``), or a synthetic missing-source
+    comment (``PLACEHOLDER``). ``bool(origin)`` evaluates to True for ``PRE_SLICED``
+    and ``PLACEHOLDER`` and False for ``FULL_BUFFER`` and ``DISK``.
     """
     s_d, e_d = _unit_line_bounds(unit)
     n_d = str(unit.get("name") or "unit")
@@ -93,7 +96,7 @@ def extract_unit_source_lines_with_state(
 
     if source_lines is not None and isinstance(source_lines, (list, tuple)):
         if not source_lines:
-            return placeholder, True
+            return placeholder, SourceLinesOrigin.PLACEHOLDER
         # Sliced lines fast-path:
         # If 'source_lines_is_sliced' is explicitly set, honor caller intent.
         # Otherwise, heuristic: if len(source_lines) == (e_d - s_d + 1),
@@ -104,7 +107,7 @@ def extract_unit_source_lines_with_state(
                     ln if ln.endswith("\n") else ln + "\n"
                     for ln in source_lines
                 ],
-                True,
+                SourceLinesOrigin.PRE_SLICED,
             )
         start = max(1, s_d)
         end = min(len(source_lines), e_d)
@@ -113,12 +116,12 @@ def extract_unit_source_lines_with_state(
                 ln if ln.endswith("\n") else ln + "\n"
                 for ln in source_lines[start - 1 : end]
             ],
-            False,
+            SourceLinesOrigin.FULL_BUFFER,
         )
 
     resolved_file = resolve_safe_unit_file_path(unit, repo_root=repo_root)
     if resolved_file is None:
-        return placeholder, True
+        return placeholder, SourceLinesOrigin.PLACEHOLDER
 
     try:
         is_cell_anchor = False
@@ -152,9 +155,12 @@ def extract_unit_source_lines_with_state(
                 all_lines = fh.readlines()
         start = max(1, s_d)
         end = min(len(all_lines), e_d)
-        return all_lines[start - 1 : end], False
+        return all_lines[start - 1 : end], SourceLinesOrigin.DISK
     except OSError:
-        return [f"# Unable to read {str(unit.get('file') or '')}\n"], True
+        return (
+            [f"# Unable to read {str(unit.get('file') or '')}\n"],
+            SourceLinesOrigin.PLACEHOLDER,
+        )
 
 
 def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:

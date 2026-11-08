@@ -1331,23 +1331,19 @@ def synthesize_shared_helper_code(
         repo_root: Optional root directory of the repository for relative path resolution.
         helper_name: Optional custom helper name override.
         skip_pre_unit_closures: Whether to bypass scanning pre-unit AST closures.
-        closure_strictness: Closure isolation strictness ("strict", "pedantic" / "fail_closed" /
-            "strict_with", or "lenient" / "fast" / "skip").
+        closure_strictness: Closure isolation strictness ("strict", "pedantic" / "fail_closed",
+            or "lenient" / "fast" / "skip").
         outputs: Optional pre-resolved output variable names for u1.
         outputs2: Optional pre-resolved output variable names for u2.
     """
     u1 = dict(u1)
     u2 = dict(u2)
-    if source_text1 is not None and (
-        not isinstance(u1.get("source_text"), str)
-        or not u1["source_text"].strip()
-    ):
-        u1["source_text"] = source_text1
-    if source_text2 is not None and (
-        not isinstance(u2.get("source_text"), str)
-        or not u2["source_text"].strip()
-    ):
-        u2["source_text"] = source_text2
+    for u_target, src_override in ((u1, source_text1), (u2, source_text2)):
+        if src_override is not None and (
+            not isinstance(u_target.get("source_text"), str)
+            or not u_target["source_text"].strip()
+        ):
+            u_target["source_text"] = src_override
     if not _align_pair_expr_kinds(u1, u2):
         return ""
     raw_lines1, is_sliced1 = extract_unit_source_lines_with_state(
@@ -1512,11 +1508,6 @@ def synthesize_shared_helper_code(
             eff_non_sup2,
         ),
     ):
-        if s_text is not None and (
-            not isinstance(u_item.get("source_text"), str)
-            or not u_item["source_text"].strip()
-        ):
-            u_item["source_text"] = s_text
         _populate_unit_receiver_metadata(
             u_item, repo_root=repo_root, source_text=s_text, tree=t_item
         )

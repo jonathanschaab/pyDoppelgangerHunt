@@ -27,10 +27,10 @@ from pydoppelgangerhunt.config import (
     DEFAULT_EXCLUDES,
     init_tool_configuration,
     load_tool_config,
+    log_heuristic_ctx_manager_summary,
     normalize_non_suppressing_ctx_managers,
     normalize_path_string,
     resolve_closure_strictness_mode,
-    resolve_strict_with_suppression,
 )
 from pydoppelgangerhunt.canonical_path import CanonicalPathResolver
 from pydoppelgangerhunt.coverage import check_asymmetric_coverage, read_coverage_data
@@ -206,21 +206,25 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
             "lenient",
             "pedantic",
             "fail_closed",
-            "strict_with",
             "fast",
             "skip",
         ],
         help=(
             "Closure strictness ('strict' [heuristic with-suppression, default], "
-            "'pedantic'/'fail_closed'/'strict_with' [all unproven with-managers treated as potentially suppressing], "
-            "or 'lenient'/'fast'/'skip' [relax unreferenced sibling closure checks]; takes precedence over --skip-pre-unit-closures)"
+            "'pedantic' [all unproven with-managers treated as potentially suppressing], "
+            "or 'lenient' [relax unreferenced sibling closure checks]; "
+            "deprecated aliases: 'fail_closed' -> 'pedantic', 'fast'/'skip' -> 'lenient'; "
+            "takes precedence over --skip-pre-unit-closures)"
         ),
     )
     parser.add_argument(
         "--non-suppressing-ctx-managers",
         action="append",
         default=[],
-        help="Context manager names or dotted paths proven not to suppress exceptions (comma-separated or repeatable)",
+        help=(
+            "Context manager names, dotted paths, or suffix wildcards ('*.attr' / '.attr') "
+            "proven not to suppress exceptions (comma-separated or repeatable)"
+        ),
     )
 
     color_group = parser.add_mutually_exclusive_group()
@@ -1183,7 +1187,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cli_skip: bool = _safe_bool(args.skip_pre_unit_closures)
         if (
             str(cli_strictness).strip().lower()
-            in ("strict", "fail_closed", "pedantic", "strict_with")
+            in ("strict", "fail_closed", "pedantic")
             and args.skip_pre_unit_closures
         ):
             cli_skip = False
@@ -1199,7 +1203,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "strict",
             "fail_closed",
             "pedantic",
-            "strict_with",
         ):
             logger.warning(
                 "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
@@ -1214,16 +1217,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         cli_strictness = cfg_strictness
         cli_skip = cfg_skip
-
-    if (
-        args.closure_strictness is None
-        and cfg_strictness is not None
-        and cfg_strict_with is not None
-    ):
-        resolve_strict_with_suppression(
-            closure_strictness=cfg_strictness,
-            strict_with_suppression=cfg_strict_with,
-        )
 
     closure_strictness, skip_pre_unit_closures = resolve_closure_strictness_mode(
         closure_strictness=cli_strictness,
@@ -1628,6 +1621,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         skip_pre_unit_closures=skip_pre_unit_closures,
         non_suppressing_ctx_managers=non_suppressing_ctx_managers,
     )
+    log_heuristic_ctx_manager_summary()
 
     if args.output:
         out_p = Path(args.output)

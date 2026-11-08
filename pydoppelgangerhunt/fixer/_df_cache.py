@@ -40,15 +40,10 @@ _RLOCK_TYPE: type = type(_downstream_cache_lock)
 
 @contextlib.contextmanager
 def _suppress_syntax_warnings() -> Iterator[None]:
-    """Thread-safely suppresses SyntaxWarning during AST/symtable parsing via a dedicated RLock."""
+    """Suppresses SyntaxWarning during AST/symtable parsing, serializing callers of this helper via _syntax_warning_lock."""
     with _syntax_warning_lock, warnings.catch_warnings():
         warnings.simplefilter("ignore", SyntaxWarning)
         yield
-
-
-def _is_reentrant_cache_lock(lock: Any) -> bool:
-    """Returns True if lock is a reentrant threading.RLock instance."""
-    return isinstance(lock, _RLOCK_TYPE)
 
 
 _MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
@@ -66,6 +61,7 @@ _parsed_tree_cache: OrderedDict[Tuple[str, int], Optional[ast.AST]] = OrderedDic
 
 _scope_loops_cache: OrderedDict[ast.AST, List[Tuple[int, int, int]]] = OrderedDict()
 _scope_try_with_cache: OrderedDict[ast.AST, List[ast.AST]] = OrderedDict()
+_stmt_with_summary_cache: OrderedDict[ast.stmt, Tuple[bool, frozenset[str]]] = OrderedDict()
 _warned_lenient_closure: List[bool] = [False]
 
 
@@ -227,23 +223,25 @@ class _ScopeCacheKey(_BaseScopeCacheKey):
     Cache Key & Value Policy:
         Production entries in ``_scope_closures_cache`` and ``_scope_cell_info_cache`` use
         ``_ScopeCacheKey(owner, kind, params, aux_ast_nodes)``, enabling O(1) owner
-        extraction via explicit AST owner fields and indexed tree eviction via
-        ``_scope_owner_keys_index`` without scanning unrelated cache entries.
+        extraction via explicit AST owner fields and reverse-indexed key lookup in
+        ``_evict_tree_scopes`` via ``_scope_owner_keys_index`` without scanning every
+        entry in ``_scope_closures_cache`` and ``_scope_cell_info_cache``.
         ``params`` must contain only AST-free immutable scalars, tuples, and frozensets;
         any additional AST dependencies must be placed in ``aux_ast_nodes``.
         Cached values must be immutable (frozenset, tuple, NamedTuple, MappingProxyType,
         bool), wrapped in ``_TrackedCachedDict`` (protected by ``_downstream_cache_lock``
-        with O(1) incremental node registration on insert), or returned via defensive
+        with incremental node registration and removal sync), or returned via defensive
         copies to callers. All custom cached value types must implement ``cached_ast_nodes()``
         (enforced eagerly upon cache insertion via ``_extract_value_ast_nodes``).
 
     AST Identity & Lifetime Invariant:
-        Cache keys and ``_scope_parent_maps`` hold live ``ast.AST`` object references.
-        Synthesized ephemeral unit modules must always set ``_is_ephemeral_unit_mod = True``
-        and bypass node-keyed caches so detached AST nodes never enter ``_scope_owner_keys_index``.
-        Any future code path that mutates a cached AST in place must call
-        ``_evict_tree_scopes(tree)`` prior to mutation so reverse owner and parent-map
-        indexes never become stale.
+        Cache keys and ``_scope_parent_maps`` hold strong references to live ``ast.AST``
+        objects until LRU eviction or an explicit ``clear_dataflow_cache()`` /
+        ``_evict_tree_scopes(tree)`` call. Synthesized ephemeral unit modules must always
+        set ``_is_ephemeral_unit_mod = True`` and bypass node-keyed caches so detached AST
+        nodes never enter ``_scope_owner_keys_index``. Any future code path that mutates a
+        cached AST in place must call ``_evict_tree_scopes(tree)`` prior to mutation so
+        reverse owner and parent-map indexes never become stale.
     """
 
     def __new__(
@@ -526,14 +524,32 @@ class _TrackedCachedDict(Dict[Any, Any]):
             if ck in cache:
                 _register_key_ast_nodes(ck, combined)
 
+    def _sync_owners_ast_nodes(self) -> None:
+        owners = getattr(self, "_bound_owners", None)
+        if not owners:
+            return
+        dict_nodes = _extract_value_ast_nodes(dict(self))
+        for cache, ck in list(owners.values()):
+            if ck in cache:
+                _prune_reverse_index_buckets(
+                    ck, _scope_key_nodes_index, _scope_owner_keys_index
+                )
+                key_nodes = _extract_key_ast_nodes(ck)
+                _register_key_ast_nodes(ck, (*key_nodes, *dict_nodes))
+
     def __setitem__(self, k: Any, v: Any) -> None:
         with _downstream_cache_lock:
+            overwriting = k in self
             super().__setitem__(k, v)
-            self._register_inserted_pair(k, v)
+            if overwriting:
+                self._sync_owners_ast_nodes()
+            else:
+                self._register_inserted_pair(k, v)
 
     def __delitem__(self, k: Any) -> None:
         with _downstream_cache_lock:
             super().__delitem__(k)
+            self._sync_owners_ast_nodes()
 
     def setdefault(self, k: Any, default: Any = None) -> Any:
         with _downstream_cache_lock:
@@ -545,18 +561,28 @@ class _TrackedCachedDict(Dict[Any, Any]):
 
     def pop(self, k: Any, *args: Any) -> Any:
         with _downstream_cache_lock:
-            return super().pop(k, *args)
+            had_key = k in self
+            res = super().pop(k, *args)
+            if had_key:
+                self._sync_owners_ast_nodes()
+            return res
 
     def popitem(self) -> Tuple[Any, Any]:
         with _downstream_cache_lock:
-            return super().popitem()
+            item = super().popitem()
+            self._sync_owners_ast_nodes()
+            return item
 
     def update(self, *args: Any, **kwargs: Any) -> None:
         with _downstream_cache_lock:
             temp = dict(*args, **kwargs)
+            had_overwrite = any(k in self for k in temp)
             super().update(temp)
-            for k, v in temp.items():
-                self._register_inserted_pair(k, v)
+            if had_overwrite:
+                self._sync_owners_ast_nodes()
+            else:
+                for k, v in temp.items():
+                    self._register_inserted_pair(k, v)
 
     def __or__(self, other: Any) -> Dict[Any, Any]:
         return dict.__or__(self, other)
@@ -564,14 +590,19 @@ class _TrackedCachedDict(Dict[Any, Any]):
     def __ior__(self, other: Any) -> _TrackedCachedDict:
         with _downstream_cache_lock:
             temp = dict(other)
+            had_overwrite = any(k in self for k in temp)
             super().update(temp)
-            for k, v in temp.items():
-                self._register_inserted_pair(k, v)
+            if had_overwrite:
+                self._sync_owners_ast_nodes()
+            else:
+                for k, v in temp.items():
+                    self._register_inserted_pair(k, v)
             return self
 
     def clear(self) -> None:
         with _downstream_cache_lock:
             super().clear()
+            self._sync_owners_ast_nodes()
 
 
 class _TrackedScopeCache(OrderedDict[Any, _CacheValT]):
@@ -709,10 +740,11 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
     """Purges scope-cache entries belonging to an evicted AST tree or detached subtree.
 
     Note:
-        Uses ``_node_to_parent_map_roots`` and ``_scope_parent_maps`` to locate owning
-        trees and walk ancestor scopes (proportional to ``|tree_nodes|`` plus the active
-        parent-map/statement-line root sets), and ``_scope_owner_keys_index`` to evict
-        affected cache keys without flushing unrelated sibling scopes.
+        Walks ``tree`` and inspects ``_node_to_parent_map_roots``, ``_scope_parent_maps``,
+        and statement-line caches (``_scope_stmts_by_start`` / ``_scope_stmts_by_end``) to
+        identify enclosing ancestor scopes, then uses ``_scope_owner_keys_index`` to evict
+        matching keys from ``_scope_closures_cache`` and ``_scope_cell_info_cache`` without
+        iterating over all cached scope keys or flushing unrelated sibling scopes.
     """
     if tree is None or not isinstance(tree, ast.AST):
         return
@@ -797,6 +829,8 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
             _unregister_key_if_absent(k)
         for node in tree_nodes:
             _scope_owner_keys_index.pop(node, None)
+            if isinstance(node, ast.stmt):
+                _stmt_with_summary_cache.pop(node, None)
         for node in scope_nodes:
             _pop_parent_map_locked(node)
             _scope_stmts_by_end.pop(node, None)
@@ -884,8 +918,10 @@ def _get_or_compute_scope_cached(
             cache, scope_node, computed, _MAX_SCOPE_CACHE_SIZE
         )
     except TypeError as exc:
+        if "cached_ast_nodes()" in str(exc):
+            raise
         logger.debug(
-            "Skipping scope cache insertion due to unhashable key or unindexed value: %s",
+            "Skipping scope cache insertion due to unhashable key: %s",
             exc,
         )
         return computed
@@ -899,16 +935,6 @@ def _split_source_lines_stripped(source_text: str) -> Tuple[str, ...]:
         else source_text
     )
     return tuple(ln.rstrip("\r\n") for ln in split_source_lines(normalized))
-
-
-def _attach_tree_source_lines(
-    tree: ast.AST, source_lines: Tuple[str, ...]
-) -> None:
-    """Attaches _source_lines to root and decorated scope nodes for exact @-line lookup."""
-    setattr(tree, "_source_lines", source_lines)
-    for node in ast.walk(tree):
-        if getattr(node, "decorator_list", None):
-            setattr(node, "_source_lines", source_lines)
 
 
 def _get_or_parse_tree(
@@ -935,7 +961,6 @@ def _get_or_parse_tree(
         with _suppress_syntax_warnings():
             parsed = ast.parse(source_text)
         setattr(parsed, "_immutable_cached", True)
-        _attach_tree_source_lines(parsed, _split_source_lines_stripped(source_text))
     except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
         parsed = None
 
@@ -952,10 +977,6 @@ def _parse_source_tree(
 ) -> Optional[ast.AST]:
     """Parses Python source code into an AST tree if not already provided."""
     if tree is not None:
-        if source_text and getattr(tree, "_source_lines", None) is None:
-            _attach_tree_source_lines(
-                tree, _split_source_lines_stripped(source_text)
-            )
         return tree
     return _get_or_parse_tree(source_text, source_digest=source_digest)
 
@@ -1193,6 +1214,7 @@ def clear_dataflow_cache() -> None:
         _scope_key_nodes_index.clear()
         _scope_loops_cache.clear()
         _scope_try_with_cache.clear()
+        _stmt_with_summary_cache.clear()
         _warned_lenient_closure[0] = False
     clear_closure_warning_cache()
 

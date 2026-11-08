@@ -1,4 +1,4 @@
-"""Cross-version AST node type tuples and predicates for Python 3.8+ compatibility."""
+"""Cross-version AST node type tuples and predicates for Python 3.9+ compatibility."""
 
 from __future__ import annotations
 

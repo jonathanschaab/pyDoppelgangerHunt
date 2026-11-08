@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 _PHYSICAL_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
 
 __all__ = [
+    "SourceLinesOrigin",
     "count_physical_newlines",
     "detect_line_ending",
     "is_sliced_unit_source_lines",
@@ -24,6 +25,69 @@ __all__ = [
     "resolve_unit_line_bounds",
     "split_source_lines",
 ]
+
+
+class SourceLinesOrigin:
+    """Origin flag for unit source lines returned by extract_unit_source_lines_with_state.
+
+    Behaves as a boolean for backwards compatibility: ``bool(origin)`` is True when the
+    lines are already pre-sliced to the unit (or are a synthetic placeholder), and False
+    when the lines were sliced from a full-file buffer or disk read.
+    """
+
+    PRE_SLICED: SourceLinesOrigin
+    PLACEHOLDER: SourceLinesOrigin
+    FULL_BUFFER: SourceLinesOrigin
+    DISK: SourceLinesOrigin
+
+    def __init__(
+        self, name: str, *, is_pre_sliced: bool, is_placeholder: bool = False
+    ) -> None:
+        self._name = name
+        self._is_pre_sliced = is_pre_sliced
+        self._is_placeholder = is_placeholder
+
+    @property
+    def is_pre_sliced(self) -> bool:
+        """True if lines are already pre-sliced (or a placeholder)."""
+        return self._is_pre_sliced
+
+    @property
+    def is_placeholder(self) -> bool:
+        """True if lines are a synthetic missing-source placeholder."""
+        return self._is_placeholder
+
+    def __bool__(self) -> bool:
+        return self._is_pre_sliced
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, SourceLinesOrigin):
+            return self._name == other._name
+        if isinstance(other, bool):
+            return self._is_pre_sliced == other
+        if isinstance(other, str):
+            return self._name == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self._is_pre_sliced)
+
+    def __repr__(self) -> str:
+        return f"SourceLinesOrigin.{self._name}"
+
+
+SourceLinesOrigin.PRE_SLICED = SourceLinesOrigin(
+    "PRE_SLICED", is_pre_sliced=True, is_placeholder=False
+)
+SourceLinesOrigin.PLACEHOLDER = SourceLinesOrigin(
+    "PLACEHOLDER", is_pre_sliced=True, is_placeholder=True
+)
+SourceLinesOrigin.FULL_BUFFER = SourceLinesOrigin(
+    "FULL_BUFFER", is_pre_sliced=False, is_placeholder=False
+)
+SourceLinesOrigin.DISK = SourceLinesOrigin(
+    "DISK", is_pre_sliced=False, is_placeholder=False
+)
 
 _COORD_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
     "start_col": ("start_col", "start_col_offset"),

@@ -17,6 +17,7 @@ from unittest import mock
 import pytest
 
 from pydoppelgangerhunt import (
+    SCOPE_SCHEMA_VERSION,
     generate_refactoring_patch,
     synthesize_shared_helper_code,
 )
@@ -961,14 +962,14 @@ def test_resolve_clone_generator_subroutine_outputs_precomputed_and_fallback(
         "globals": ["b"],
         "nonlocals": [],
         "skip_pre_unit_closures": False,
-        "scope_schema_version": 2,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
     }
     s2 = {
         "definite_stores": ["x"],
         "globals": [],
         "nonlocals": ["y"],
         "skip_pre_unit_closures": False,
-        "scope_schema_version": 2,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
     }
     res = resolve_clone_generator_subroutine_outputs(u1_pre, u2_pre, s1, s2)
     assert res is not None
@@ -1907,13 +1908,13 @@ def test_resolve_clone_generator_subroutine_outputs_precomputed_definite_stores(
         "definite_stores": ["x"],
         "inputs": [],
         "skip_pre_unit_closures": False,
-        "scope_schema_version": 2,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
     }
     s2 = {
         "definite_stores": ["a", "b"],
         "inputs": [],
         "skip_pre_unit_closures": False,
-        "scope_schema_version": 2,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
     }
     res_rejected = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
     assert res_rejected is None
@@ -1923,7 +1924,7 @@ def test_resolve_clone_generator_subroutine_outputs_precomputed_definite_stores(
         "definite_stores": ["x", "unassigned"],
         "inputs": [],
         "skip_pre_unit_closures": False,
-        "scope_schema_version": 2,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
     }
     res_valid = resolve_clone_generator_subroutine_outputs(u1, u2, s1_valid, s2)
     assert res_valid == (["x", "unassigned"], ["a", "b"])
@@ -2693,13 +2694,13 @@ def test_resolve_clone_pair_outputs_clean_pair() -> None:
         "inputs": [],
         "definite_stores": ["a", "b"],
         "skip_pre_unit_closures": False,
-        "scope_schema_version": 2,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
     }
     s2: Dict[str, Any] = {
         "inputs": [],
         "definite_stores": ["x", "y"],
         "skip_pre_unit_closures": False,
-        "scope_schema_version": 2,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
     }
 
     res = resolve_clone_pair_outputs(u1, u2, s1, s2)
@@ -3198,7 +3199,7 @@ def test_clear_downstream_reads_cache_resets_closure_warning_cache() -> None:
 
     clear_closure_warning_cache()
     resolve_closure_strictness_mode("unrecognized_mode_foo")
-    assert "unrecognized_mode_foo" in _warned_closure_strictness_values
+    assert "unrecognized_strictness:unrecognized_mode_foo" in _warned_closure_strictness_values
 
     _clear_downstream_reads_cache()
     assert len(_warned_closure_strictness_values) == 0
@@ -3962,14 +3963,14 @@ def test_resolve_clone_generator_subroutine_outputs_unflagged_sliced_lines() -> 
         "outputs": ["total"],
         "definite_stores": ["total"],
         "skip_pre_unit_closures": False,
-        "scope_schema_version": 2,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
     }
     scope2 = {
         "inputs": ["total"],
         "outputs": ["total"],
         "definite_stores": ["total"],
         "skip_pre_unit_closures": False,
-        "scope_schema_version": 2,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
     }
     # Sliced lines with len(source_lines) < end fail closed because full file text is unavailable
     res = resolve_clone_generator_subroutine_outputs(u1, u2, scope1, scope2)

@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import sys
 import threading
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.canonical_path import normalize_lexical_posix, parse_notebook_cell_anchor
 
@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 _warned_closure_lock: threading.Lock = threading.Lock()
 _warned_closure_strictness_values: Set[str] = set()
+_heuristic_non_suppressing_ctx_managers: Set[str] = set()
 
 _CONFIG_KEY_NAMES: Tuple[str, ...] = (
     "threshold",
@@ -29,6 +30,29 @@ _CONFIG_KEY_NAMES: Tuple[str, ...] = (
 )
 
 
+class UnitClosureFlags(NamedTuple):
+    """Resolved (skip_pre_unit_closures, strict_with_suppression) flags for a single unit."""
+
+    skip_pre_unit_closures: bool
+    strict_with_suppression: bool
+
+
+class UnitClosureEndpointConfig(NamedTuple):
+    """Resolved closure and context-manager allowlist flags for one endpoint of a clone pair."""
+
+    skip_pre_unit_closures: bool
+    strict_with_suppression: bool
+    non_suppressing_ctx_managers: Tuple[str, ...] = ()
+
+
+class PairClosureFlags(NamedTuple):
+    """Resolved per-unit and pair-level closure and context-manager configuration."""
+
+    unit1: UnitClosureEndpointConfig
+    unit2: UnitClosureEndpointConfig
+    effective_skip_pre_unit_closures: bool
+
+
 def should_warn_closure_event(event_key: str) -> bool:
     """Returns True the first time *event_key* is seen since cache reset."""
     with _warned_closure_lock:
@@ -36,6 +60,38 @@ def should_warn_closure_event(event_key: str) -> bool:
             return False
         _warned_closure_strictness_values.add(event_key)
         return True
+
+
+def _warn_closure_event_once(event_key: str, msg: str, *args: Any) -> None:
+    """Logs a warning message the first time *event_key* is seen since cache reset."""
+    if should_warn_closure_event(event_key):
+        logger.warning(msg, *args)
+
+
+def record_heuristic_non_suppressing_ctx_manager(mgr_name: str) -> None:
+    """Records an unproven context manager accepted by the strict-mode name heuristic."""
+    with _warned_closure_lock:
+        _heuristic_non_suppressing_ctx_managers.add(mgr_name)
+
+
+def log_heuristic_ctx_manager_summary() -> Tuple[str, ...]:
+    """Logs a consolidated summary of unproven context managers accepted via name heuristic."""
+    with _warned_closure_lock:
+        if not _heuristic_non_suppressing_ctx_managers:
+            return ()
+        names = tuple(sorted(_heuristic_non_suppressing_ctx_managers))
+        _heuristic_non_suppressing_ctx_managers.clear()
+    preview = ", ".join(repr(n) for n in names[:10])
+    if len(names) > 10:
+        preview += f", ... ({len(names)} total)"
+    logger.warning(
+        "Summary: %d unproven context manager(s) (%s) were treated as non-suppressing via "
+        "name heuristic in strict mode; use --closure-strictness pedantic to fail closed or "
+        "list known-safe managers in --non-suppressing-ctx-managers.",
+        len(names),
+        preview,
+    )
+    return names
 
 
 def resolve_closure_strictness_mode(
@@ -50,10 +106,10 @@ def resolve_closure_strictness_mode(
     that might execute after the unit, while treating unknown context managers as
     non-suppressing unless their name looks like suppress/raises/ignore/subTest/ExitStack
     or is proven suppressing.
-    'pedantic' (aliases 'fail_closed', 'strict_with') additionally treats all unproven
+    'pedantic' (deprecated alias 'fail_closed') additionally treats all unproven
     unknown context managers as potentially exception-suppressing unless explicitly listed
     in non_suppressing_ctx_managers.
-    'lenient' (aliases 'fast', 'skip') relaxes speculative unreferenced-sibling closure
+    'lenient' (deprecated aliases 'fast', 'skip') relaxes speculative unreferenced-sibling closure
     checks while still enforcing direct cell-capture, intra-unit nonlocal mutator, and
     referenced-sibling closure checks.
     """
@@ -62,58 +118,66 @@ def resolve_closure_strictness_mode(
         is_lenient_mode = c_mode in ("lenient", "fast", "skip")
         if is_lenient_mode or c_mode in (
             "pedantic",
-            "strict_with",
             "strict",
             "fail_closed",
         ):
-            conflict_flag, conflict_key, overridden_setting = (
-                (
-                    bool(strict_with_suppression),
-                    f"conflict_strict_with:{closure_strictness}:True",
-                    "strict_with_suppression=True",
-                )
+            resolved_mode = (
+                "lenient"
                 if is_lenient_mode
                 else (
-                    bool(skip_pre_unit_closures),
-                    f"conflict_skip:{closure_strictness}",
-                    "skip_pre_unit_closures=True",
+                    "pedantic"
+                    if c_mode in ("pedantic", "fail_closed")
+                    else "strict"
                 )
             )
-            if conflict_flag and should_warn_closure_event(conflict_key):
-                logger.warning(
-                    "Conflicting configuration: closure_strictness '%s' takes precedence over %s",
+            if c_mode in ("fail_closed", "fast", "skip"):
+                _warn_closure_event_once(
+                    f"deprecated_strictness_alias:{c_mode}",
+                    "closure_strictness alias '%s' is deprecated; use '%s' instead",
                     closure_strictness,
-                    overridden_setting,
+                    resolved_mode,
                 )
-            if is_lenient_mode:
-                return "lenient", True
-            resolved_mode = (
-                "pedantic"
-                if c_mode in ("pedantic", "strict_with", "fail_closed")
-                else "strict"
-            )
-            return resolved_mode, False
+            if not is_lenient_mode and skip_pre_unit_closures:
+                _warn_closure_event_once(
+                    f"conflict_skip:{closure_strictness}",
+                    "Conflicting configuration: closure_strictness '%s' takes precedence over "
+                    "skip_pre_unit_closures=True",
+                    closure_strictness,
+                )
+            expected_strict_with = resolved_mode == "pedantic"
+            if (
+                strict_with_suppression is not None
+                and bool(strict_with_suppression) != expected_strict_with
+                and (not is_lenient_mode or bool(strict_with_suppression))
+            ):
+                _warn_closure_event_once(
+                    f"conflict_strict_with:{closure_strictness}:{bool(strict_with_suppression)}",
+                    "Conflicting configuration: closure_strictness '%s' takes precedence over "
+                    "strict_with_suppression=%s",
+                    closure_strictness,
+                    bool(strict_with_suppression),
+                )
+            return resolved_mode, is_lenient_mode
         fallback = (
             "lenient"
             if skip_pre_unit_closures
             else ("pedantic" if strict_with_suppression else "strict")
         )
-        raw_key = str(closure_strictness)
-        if should_warn_closure_event(raw_key):
-            logger.warning(
-                "Unrecognized closure_strictness '%s'; falling back to %s mode",
-                closure_strictness,
-                fallback,
-            )
+        _warn_closure_event_once(
+            f"unrecognized_strictness:{closure_strictness}",
+            "Unrecognized closure_strictness '%s'; falling back to %s mode",
+            closure_strictness,
+            fallback,
+        )
         return fallback, bool(skip_pre_unit_closures)
     is_lenient = bool(skip_pre_unit_closures)
     if is_lenient and strict_with_suppression:
-        if should_warn_closure_event("conflict_strict_with_and_skip:True:True"):
-            logger.warning(
-                "Conflicting configuration: strict_with_suppression=True and "
-                "skip_pre_unit_closures=True cannot both be active; "
-                "skip_pre_unit_closures=True takes precedence (using 'lenient' mode)"
-            )
+        _warn_closure_event_once(
+            "conflict_strict_with_and_skip:True:True",
+            "Conflicting configuration: strict_with_suppression=True and "
+            "skip_pre_unit_closures=True cannot both be active; "
+            "skip_pre_unit_closures=True takes precedence (using 'lenient' mode)",
+        )
         return "lenient", True
     if strict_with_suppression:
         return "pedantic", False
@@ -134,7 +198,6 @@ def resolve_strict_with_suppression(
         c_mode = str(closure_strictness).strip().lower()
         mode_strict_map = {
             "pedantic": True,
-            "strict_with": True,
             "fail_closed": True,
             "strict": False,
             "lenient": False,
@@ -147,14 +210,13 @@ def resolve_strict_with_suppression(
                 strict_with_suppression is not None
                 and bool(strict_with_suppression) != resolved_flag
             ):
-                conflict_key = f"conflict_strict_with:{closure_strictness}:{bool(strict_with_suppression)}"
-                if should_warn_closure_event(conflict_key):
-                    logger.warning(
-                        "Conflicting configuration: closure_strictness '%s' takes precedence over "
-                        "strict_with_suppression=%s",
-                        closure_strictness,
-                        bool(strict_with_suppression),
-                    )
+                _warn_closure_event_once(
+                    f"conflict_strict_with:{closure_strictness}:{bool(strict_with_suppression)}",
+                    "Conflicting configuration: closure_strictness '%s' takes precedence over "
+                    "strict_with_suppression=%s",
+                    closure_strictness,
+                    bool(strict_with_suppression),
+                )
             return resolved_flag
     if strict_with_suppression is not None:
         return bool(strict_with_suppression)
@@ -167,7 +229,7 @@ def resolve_unit_closure_flags(
     closure_strictness: Optional[str] = None,
     skip_pre_unit_closures: Optional[bool] = None,
     strict_with_suppression: Optional[bool] = None,
-) -> Tuple[bool, bool]:
+) -> UnitClosureFlags:
     """Resolves (skip_pre_unit_closures, strict_with_suppression) for a unit with optional overrides."""
     eff_strictness = (
         closure_strictness
@@ -202,7 +264,7 @@ def resolve_unit_closure_flags(
     )
     if eff_skip and eff_strict_with and strict_with_suppression is None:
         eff_strict_with = False
-    return eff_skip, eff_strict_with
+    return UnitClosureFlags(eff_skip, eff_strict_with)
 
 
 def resolve_pair_closure_flags(
@@ -212,11 +274,7 @@ def resolve_pair_closure_flags(
     closure_strictness: Optional[str] = None,
     skip_pre_unit_closures: bool = False,
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
-) -> Tuple[
-    Tuple[bool, bool, Tuple[str, ...]],
-    Tuple[bool, bool, Tuple[str, ...]],
-    bool,
-]:
+) -> PairClosureFlags:
     """Resolves per-unit and pair-level closure and context-manager flags for two clone units."""
     explicit_skip = True if skip_pre_unit_closures else None
     skip1, strict_with1 = resolve_unit_closure_flags(
@@ -237,10 +295,10 @@ def resolve_pair_closure_flags(
         non_suppressing_ctx_managers,
         u2.get("non_suppressing_ctx_managers"),
     )
-    return (
-        (skip1, strict_with1, eff_non_sup1),
-        (skip2, strict_with2, eff_non_sup2),
-        bool(skip1 and skip2),
+    return PairClosureFlags(
+        unit1=UnitClosureEndpointConfig(skip1, strict_with1, eff_non_sup1),
+        unit2=UnitClosureEndpointConfig(skip2, strict_with2, eff_non_sup2),
+        effective_skip_pre_unit_closures=bool(skip1 and skip2),
     )
 
 
@@ -274,6 +332,7 @@ def clear_closure_warning_cache() -> None:
     """Clears the set of warned closure strictness values for multi-run lifecycle."""
     with _warned_closure_lock:
         _warned_closure_strictness_values.clear()
+        _heuristic_non_suppressing_ctx_managers.clear()
 
 
 DEFAULT_EXCLUDES: List[str] = [

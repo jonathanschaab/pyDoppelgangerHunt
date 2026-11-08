@@ -405,9 +405,15 @@ class _UnitClosureHazardContext(NamedTuple):
     cols_resolved: bool = False
     enclosing_chain: Optional[Sequence[Tuple[int, int, ast.AST]]] = None
     lex_validated: bool = False
-    hazard_reasons_out: Optional[List[str]] = None
     strict_with_suppression: bool = False
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset()
+
+
+class _ClosureHazardResult(NamedTuple):
+    """Outcome of closure cell hazard evaluation with structured diagnostic reasons."""
+
+    has_hazard: bool
+    reasons: Tuple[str, ...] = ()
 
 
 # Pragmatic purity heuristic for standard inspection and conversion built-ins treated as
@@ -468,37 +474,31 @@ def _unit_has_global_mutating_call(
     return False
 
 
-def _flag_hazard_reason(
-    ctx: _UnitClosureHazardContext,
+def _append_hazard_reason(
+    reasons: List[str],
     reason: str,
-) -> bool:
-    """Appends a granular closure hazard sub-reason when requested and returns True."""
-    if (
-        ctx.hazard_reasons_out is not None
-        and reason not in ctx.hazard_reasons_out
-    ):
-        ctx.hazard_reasons_out.append(reason)
-    return True
+) -> None:
+    """Appends a granular closure hazard sub-reason if not already present."""
+    if reason not in reasons:
+        reasons.append(reason)
 
 
-def _flag_global_or_cell_hazard(
-    ctx: _UnitClosureHazardContext,
+def _append_global_or_cell_hazard(
+    reasons: List[str],
     names: AbstractSet[str],
     outer_globals: AbstractSet[str],
-) -> bool:
-    """Flags 'global_escape' when names overlap outer_globals, otherwise 'cell_severing'."""
-    return _flag_hazard_reason(
-        ctx,
+) -> None:
+    """Appends 'global_escape' when names overlap outer_globals, otherwise 'cell_severing'."""
+    _append_hazard_reason(
+        reasons,
         "global_escape" if bool(names & outer_globals) else "cell_severing",
     )
 
 
-_record_hazard_reason = _flag_hazard_reason
-_record_global_or_cell_hazard = _flag_global_or_cell_hazard
-
-
-def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
-    """Detects whether extracting a unit to module scope would sever closure cell bindings.
+def _evaluate_severed_closure_cell_hazard(
+    ctx: _UnitClosureHazardContext,
+) -> _ClosureHazardResult:
+    """Evaluates whether extracting a unit to module scope would sever closure cell bindings.
 
     Note:
         When ``ctx.skip_pre_unit_closures`` is True (lenient mode), speculative checks for
@@ -513,14 +513,16 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         sibling closures explicitly referenced via ``eff_input_set`` remain enforced in
         both modes, guaranteeing monotonicity (lenient hazard implies strict hazard).
     """
+    reasons: List[str] = []
     if not ctx.is_subroutine and ctx.unit_kind not in (
         "closure",
         "comprehension",
         "complex_expr",
     ):
-        return False
+        return _ClosureHazardResult(False, ())
     if ctx.mod_tree is None or ctx.u_start <= 0:
-        return _flag_hazard_reason(ctx, "unresolved_span_bounds")
+        _append_hazard_reason(reasons, "unresolved_span_bounds")
+        return _ClosureHazardResult(True, tuple(reasons))
 
     u_start_col, u_end_col = (
         (ctx.u_start_col, ctx.u_end_col)
@@ -546,7 +548,8 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         enclosing_chain=enclosing_chain,
         mod_tree=ctx.mod_tree,
     ):
-        return _flag_hazard_reason(ctx, "invalid_lexical_declaration")
+        _append_hazard_reason(reasons, "invalid_lexical_declaration")
+        return _ClosureHazardResult(True, tuple(reasons))
     if not enclosing_chain:
         span_idx = _get_span_line_index(ctx.mod_tree)
         has_missing_end = False
@@ -573,11 +576,10 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
                 ctx.candidate_stmts,
             )
         )
-        return (
-            _flag_hazard_reason(ctx, "unresolved_span_bounds")
-            if has_unresolved
-            else False
-        )
+        if has_unresolved:
+            _append_hazard_reason(reasons, "unresolved_span_bounds")
+            return _ClosureHazardResult(True, tuple(reasons))
+        return _ClosureHazardResult(False, ())
     if _has_unresolved_span_bounds(
         enclosing_chain[-1][2],
         ctx.u_start,
@@ -586,7 +588,8 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         u_end_col,
         ctx.candidate_stmts,
     ):
-        return _flag_hazard_reason(ctx, "unresolved_span_bounds")
+        _append_hazard_reason(reasons, "unresolved_span_bounds")
+        return _ClosureHazardResult(True, tuple(reasons))
 
     unit_mod = ast.Module(body=list(ctx.candidate_stmts), type_ignores=[])
     setattr(unit_mod, "_is_ephemeral_unit_mod", True)
@@ -617,7 +620,8 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         helper_rebound_vars | immediate_cell_mutations
     )
     if not unit_stores_affect_enclosing and bool(explicit_nonlocal_mutations):
-        return _flag_hazard_reason(ctx, "cell_severing")
+        _append_hazard_reason(reasons, "cell_severing")
+        return _ClosureHazardResult(True, tuple(reasons))
 
     innermost_stmt_fn: ast.AST = next(
         (
@@ -635,7 +639,8 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         u_end_col=u_end_col,
         is_subroutine=ctx.is_subroutine,
     ):
-        return _flag_hazard_reason(ctx, "global_escape")
+        _append_hazard_reason(reasons, "global_escape")
+        return _ClosureHazardResult(True, tuple(reasons))
     enc_nonlocals, enc_outer_globals = _extract_scope_nonlocals_and_outer_globals(
         innermost_stmt_fn,
         ctx.u_start,
@@ -648,9 +653,10 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         escaping_unit_mutations
         & (enc_outer_globals if ctx.is_subroutine else enc_escaping)
     ):
-        return _flag_global_or_cell_hazard(
-            ctx, escaping_unit_mutations, enc_outer_globals
+        _append_global_or_cell_hazard(
+            reasons, escaping_unit_mutations, enc_outer_globals
         )
+        return _ClosureHazardResult(True, tuple(reasons))
     imm_scope = _resolve_immediate_scope_in_fn(
         innermost_stmt_fn,
         ctx.u_start,
@@ -683,12 +689,14 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         )
     )
     if is_suspended and bool(unit_mutated_names & (enc_escaping | nonlocal_set)):
-        return _flag_global_or_cell_hazard(
-            ctx, unit_mutated_names, enc_outer_globals
+        _append_global_or_cell_hazard(
+            reasons, unit_mutated_names, enc_outer_globals
         )
+        return _ClosureHazardResult(True, tuple(reasons))
 
     if ctx.is_subroutine and _extract_direct_nonlocals(unit_mod):
-        return _flag_hazard_reason(ctx, "cell_severing")
+        _append_hazard_reason(reasons, "cell_severing")
+        return _ClosureHazardResult(True, tuple(reasons))
     unit_closures = _collect_scope_closures_uncached(
         unit_mod,
         module_tree=ctx.mod_tree,
@@ -743,7 +751,8 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
             shadowed_builtin_names,
             has_star_import=has_star,
         ):
-            return _flag_hazard_reason(ctx, "global_escape")
+            _append_hazard_reason(reasons, "global_escape")
+            return _ClosureHazardResult(True, tuple(reasons))
     if unit_stores_affect_enclosing and bool(
         unit_closure_reads
         & (
@@ -751,9 +760,10 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
             | (enc_outer_globals & eff_input_set)
         )
     ):
-        return _flag_global_or_cell_hazard(
-            ctx, unit_closure_reads, enc_outer_globals
+        _append_global_or_cell_hazard(
+            reasons, unit_closure_reads, enc_outer_globals
         )
+        return _ClosureHazardResult(True, tuple(reasons))
     unit_mutations = (
         (escaping_unit_mutations | (unit_mutated_names & unit_closure_reads))
         if unit_stores_affect_enclosing
@@ -766,7 +776,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         and not ctx.is_subroutine
         and not unit_mutations
     ):
-        return False
+        return _ClosureHazardResult(False, ())
 
     chain_infos = _build_enclosing_chain_cell_infos(
         enclosing_chain,
@@ -819,7 +829,8 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
                     | unexported_pre_post
                 )
             ):
-                return _flag_hazard_reason(ctx, "cell_severing")
+                _append_hazard_reason(reasons, "cell_severing")
+                return _ClosureHazardResult(True, tuple(reasons))
 
     captured_candidates = intra_closure_reads & (
         eff_input_set
@@ -855,8 +866,12 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
             skip_pre_unit_closures=ctx.skip_pre_unit_closures,
         )
     )
-    return (
-        _flag_hazard_reason(ctx, "cell_severing")
-        if has_cell_hazard
-        else False
-    )
+    if has_cell_hazard:
+        _append_hazard_reason(reasons, "cell_severing")
+        return _ClosureHazardResult(True, tuple(reasons))
+    return _ClosureHazardResult(False, ())
+
+
+def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
+    """Detects whether extracting a unit to module scope would sever closure cell bindings."""
+    return _evaluate_severed_closure_cell_hazard(ctx).has_hazard

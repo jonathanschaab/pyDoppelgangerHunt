@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from tests.fixer.conftest import (
+from tests.fixer._closure_test_helpers import (
     _run_differential_refactoring_case,
 )
 
@@ -334,10 +334,10 @@ def test_2d_coordinate_enclosure_and_decorator_start_pos() -> None:
         col_offset=4,
         end_col_offset=12,
     )
-    assert _node_earliest_start_pos(dec_fn) == (2, 2)
+    assert _node_earliest_start_pos(dec_fn) == (2, 4)
     wrap_mod = ast.Module(body=[dec_fn], type_ignores=[])
     closures = _collect_scope_closures(wrap_mod)
-    assert closures[0][0] == (2, 2)
+    assert closures[0][0] == (2, 4)
 
 
 def test_duplicate_cols_decorator_snapping_and_cell_info_immutability() -> None:
@@ -1858,7 +1858,7 @@ def test_same_stmt_evaluation_order_comp_walrus_and_decorator_alignment() -> Non
     )
     assert "severed_closure_cell" in sc_d_unsafe_sib["control_flow_hazards"]
 
-    # 7. _node_earliest_start_pos snaps @foo, @ foo, and @  foo to def col and preserves unaligned earlier col
+    # 7. _node_earliest_start_pos snaps @foo, @ foo, and @  foo to def col and handles multiline decorator
     tree_e_aligned = ast.parse(
         "def outer():\n"
         "    @  dec\n"
@@ -1867,10 +1867,16 @@ def test_same_stmt_evaluation_order_comp_walrus_and_decorator_alignment() -> Non
     )
     inner_aligned = tree_e_aligned.body[0].body[0]  # type: ignore[attr-defined]
     assert _node_earliest_start_pos(inner_aligned) == (2, 4)
-    inner_aligned.decorator_list[0].col_offset = 9
-    assert _node_earliest_start_pos(inner_aligned) == (2, 4)
-    inner_aligned.decorator_list[0].col_offset = 2
-    assert _node_earliest_start_pos(inner_aligned) == (2, 1)
+    tree_e_multiline_dec = ast.parse(
+        "def outer():\n"
+        "    @(\n"
+        "        dec\n"
+        "    )\n"
+        "    def inner():\n"
+        "        return 1\n"
+    )
+    inner_ml_dec = tree_e_multiline_dec.body[0].body[0]  # type: ignore[attr-defined]
+    assert _node_earliest_start_pos(inner_ml_dec) == (3, 4)
 
 
 def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:

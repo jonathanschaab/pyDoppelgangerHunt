@@ -29,6 +29,7 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _get_scope_parent_map,
     _make_trusted_scope_cache_key,
     _scope_cell_info_cache,
+    _stmt_with_summary_cache,
 )
 from pydoppelgangerhunt.fixer._df_cell_carriers import (
     _EnclosingFnCellInfo,
@@ -1235,17 +1236,14 @@ def _apply_stmt_cell_delta(
     bufs.sibling_nl_deletions.update(delta.sibling_nl_deletions)
 
 
-_stmt_with_summary_cache: Dict[ast.stmt, Tuple[bool, frozenset[str]]] = {}
-
-
 def _get_stmt_with_summary(
     stmt: ast.stmt,
 ) -> Tuple[bool, frozenset[str]]:
     """Returns cached (has_with, stmt_name_ids) for a statement node."""
     with _downstream_cache_lock:
-        cached = _stmt_with_summary_cache.get(stmt)
-    if cached is not None:
-        return cached
+        if stmt in _stmt_with_summary_cache:
+            _stmt_with_summary_cache.move_to_end(stmt)
+            return _stmt_with_summary_cache[stmt]
     has_w = False
     name_ids: Set[str] = set()
     for node in ast.walk(stmt):
@@ -1258,9 +1256,13 @@ def _get_stmt_with_summary(
         frozenset(name_ids) if has_w else frozenset(),
     )
     with _downstream_cache_lock:
-        if len(_stmt_with_summary_cache) >= 512:
-            _stmt_with_summary_cache.pop(next(iter(_stmt_with_summary_cache)))
-        return _stmt_with_summary_cache.setdefault(stmt, result)
+        if stmt in _stmt_with_summary_cache:
+            _stmt_with_summary_cache.move_to_end(stmt)
+            return _stmt_with_summary_cache[stmt]
+        while len(_stmt_with_summary_cache) >= 512 and _stmt_with_summary_cache:
+            _stmt_with_summary_cache.popitem(last=False)
+        _stmt_with_summary_cache[stmt] = result
+        return result
 
 
 def _try_apply_cached_stmt_delta(

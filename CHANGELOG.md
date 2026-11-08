@@ -8,15 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Closure Strictness Modes (`--closure-strictness {strict,pedantic,lenient,fail_closed,strict_with,fast,skip}`)**:
+- **Closure Strictness Modes (`--closure-strictness {strict,pedantic,lenient,fail_closed,fast,skip}`)**:
   User-facing CLI flag and configuration setting (`closure_strictness` in `pyproject.toml` and `UnitSchema`) to
   select closure strictness and context-manager suppression policy during subroutine refactoring:
-  - `strict` (default, `strict_with_suppression = False`): enforces full pre-unit and sibling closure-cell hazard analysis while using a name-and-provenance heuristic for unknown `with` / `async with` context managers (treating unknown managers as non-suppressing unless their identifier matches suppression idioms such as `suppress`, `raises`, `ignore`, `subTest`, `ExitStack`, `enter_context`, or is proven exception-suppressing via local/function/class `__exit__` provenance).
-  - `pedantic` (aliases: `fail_closed`, `strict_with`; or `strict_with_suppression = True`): treats all unproven unknown `with` / `async with` context managers as potentially exception-suppressing unless allowlisted via `non_suppressing_ctx_managers`. Note that `"fail_closed"` resolves to `"pedantic"` (`strict_with_suppression = True`).
-  - `lenient` (aliases: `fast`, `skip`; or `skip_pre_unit_closures = True`): skips pre-unit closure liveness scanning for generator subroutines and relaxes speculative unreferenced-sibling closure checks while keeping Checks 1–3 and Check 4 for sibling closures explicitly referenced via unit inputs.
-  Emits a diagnostic warning when `--skip-pre-unit-closures` or `strict_with_suppression` conflicts with `closure_strictness` or with each other.
-- **`strict_with_suppression` & `non_suppressing_ctx_managers` Configuration**:
-  Added `--non-suppressing-ctx-managers` CLI flag and `strict_with_suppression` / `non_suppressing_ctx_managers` settings in `pyproject.toml` and `UnitSchema` (supporting bare names, locally defined classes, relative imports, dotted module paths, and `*.attr` / `.attr` wildcard suffixes). Global `non_suppressing_ctx_managers` and per-unit `unit["non_suppressing_ctx_managers"]` are union-merged consistently across `patch.py`, `_df_pairing.py`, `scope.py`, `synthesis.py`, and `--suggest` reporting.
+  - `strict` (default): enforces full pre-unit and sibling closure-cell hazard analysis while using a name-and-provenance heuristic for unknown `with` / `async with` context managers (treating unknown managers as non-suppressing unless their identifier matches suppression idioms such as `suppress`, `raises`, `ignore`, `subTest`, `ExitStack`, `enter_context`, or is proven exception-suppressing via local/function/class `__exit__` provenance; fail-open for neutrally named custom suppressors such as `tolerate()` or `Transaction()`). Logs a per-manager `INFO` diagnostic and a consolidated end-of-run summary when unknown managers are accepted by heuristic.
+  - `pedantic` (deprecated alias: `fail_closed`): treats all unproven unknown `with` / `async with` context managers as potentially exception-suppressing unless allowlisted via `non_suppressing_ctx_managers`.
+  - `lenient` (deprecated aliases: `fast`, `skip`; or `--skip-pre-unit-closures`): skips pre-unit closure liveness scanning for generator subroutines and relaxes speculative unreferenced-sibling closure checks while keeping checks for unbound captured cells, externally mutated captured cells, intra-unit `nonlocal`/walrus mutator escapes, and sibling closures explicitly referenced via unit inputs.
+  Emits a diagnostic warning when `--skip-pre-unit-closures` conflicts with `closure_strictness` or when deprecated aliases (`fail_closed`, `fast`, `skip`) are used.
+- **`non_suppressing_ctx_managers` Configuration**:
+  Added `--non-suppressing-ctx-managers` CLI flag and `non_suppressing_ctx_managers` setting in `pyproject.toml` and `UnitSchema` (supporting bare names, locally defined classes, relative imports, dotted module paths, and `*.attr` / `.attr` wildcard suffixes). Global `non_suppressing_ctx_managers` and per-unit `unit["non_suppressing_ctx_managers"]` are union-merged consistently across `patch.py`, `_df_pairing.py`, `scope.py`, `synthesis.py`, and `--suggest` reporting.
 - **Public Scope Mode Verification & Schema Helpers (`SCOPE_SCHEMA_VERSION`, `scope_matches_closure_mode`, `ensure_unit_scope_closure_mode`, `UnitSchema`, `validate_unit_schema`)**:
   Exported `SCOPE_SCHEMA_VERSION = 2`, `scope_matches_closure_mode`, `ensure_unit_scope_closure_mode`, `UnitSchema`, and `validate_unit_schema` from `pydoppelgangerhunt` and `pydoppelgangerhunt.fixer` to validate unit dictionaries and verify or recompute precomputed scope dictionaries against active closure strictness settings.
 - **Distinct `stale_source_code` Control-Flow Hazard**:
@@ -45,6 +45,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compiler stages.
 
 ### Changed
+- **BREAKING** - **`fail_closed` Alias Maps to `pedantic` & Legacy Alias Deprecation**:
+  `closure_strictness="fail_closed"` now resolves to `"pedantic"` (treating all unproven unknown `with` / `async with` context managers as potentially exception-suppressing) rather than `"strict"`. Legacy aliases `"fail_closed"`, `"fast"`, and `"skip"` emit a deprecation warning in favor of `"pedantic"` and `"lenient"`.
+- **BREAKING** - **`--suggest` Full Helper Synthesis Delegation**:
+  `synthesize_refactoring_suggestion` now delegates to `synthesize_shared_helper_code` whenever `closure_strictness`, `skip_pre_unit_closures`, or `non_suppressing_ctx_managers` is supplied (which the CLI always provides for `--suggest`), performing backing-file I/O and returning full synthesized helper definitions rather than signature-only strings.
+- **BREAKING** - **Precomputed Scope Schema Version & Mode Verification**:
+  Precomputed or serialized scope dictionaries passed to `ensure_unit_scope_closure_mode`, `analyze_unit_variable_scope`, `resolve_clone_pair_outputs`, and `resolve_clone_generator_subroutine_outputs` now require `scope_schema_version == SCOPE_SCHEMA_VERSION` (`2`) and an explicit boolean `skip_pre_unit_closures` matching the active mode; unmarked or mismatched scopes are recomputed when source/AST is available and fail closed otherwise.
+- **BREAKING** - **`--skip-pre-unit-closures` (`lenient`) Scope**:
+  `--skip-pre-unit-closures` (`closure_strictness="lenient"`) skips pre-unit closure liveness scanning for generator subroutines and relaxes speculative unreferenced-sibling closure checks, while continuing to enforce direct cell-capture, intra-unit `nonlocal`/walrus mutator, and referenced-sibling closure checks.
 - **Expression-Unit Closure & Control-Flow Hazard Enforcement**:
   `comprehension` and `complex_expr` units undergo full closure-cell severing and control-flow hazard checks during scope inspection, pair output resolution, and shared helper synthesis, while preserving LHS-pruned scope state across `pedantic` synthesis.
 - **Scoped Subroutine Colon Fallback**: Restricted colon detection in unit names to units with
@@ -119,8 +127,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   In multi-item `with` / `async with` statements, items following a suppressing or unknown item (or following a raising `as` target unpacking) treat both their `as` targets and any header `:=` walrus bindings as conditional rather than definitely assigned. `_split_with_body_by_mode`, `_split_suppress_with_body`, and `_stmt_cannot_raise_in_suppress` advance provenance across `stmt.items` (`as` targets and `:=` walrus expressions) and across `safe_prefix` statements, while recognizing imported and aliased `from contextlib import suppress` / `nullcontext` bindings and preserving positive `try` prefix and normal completion provenance across `else:`, `except:`, `finally:`, and post-`try` fallthrough.
 - **Write-Only Dead Conditional Store Pruning**:
   In `_inspect_unit_scope` (`scope.py`), write-only conditional stores (`cond_assigned - def_assigned` that are not read inside the unit and do not mutate an enclosing `nonlocal`/`global` target) are only promoted to `inputs` / `read_before_write` when the variable is live after the unit (in declared `outputs`, captured by an enclosing closure cell, or read downstream).
-- **Global-Read Call Purity & Wildcard Import Helper Promotion Guards**:
-  Excluded environment-dependent and side-effectful builtins (`dir`, `vars`, `print`, `input`, `open`, `breakpoint`, `help`, `eval`, `exec`, `compile`, `__import__`, `ascii`) when checking whether units reading enclosing globals invoke potentially global-mutating calls, and rejected nested helper promotion in `patch.py` when enclosing scopes contain `from ... import *`.
+- **Global-Read Call Purity & Wildcard Import Guards**:
+  Restricted calls allowed inside units that read an enclosing `global` variable to an explicit allowlist of 13 unshadowed pure built-ins (`_PURE_GLOBAL_SAFE_BUILTINS`: `bin`, `bool`, `callable`, `chr`, `hex`, `id`, `int`, `isinstance`, `issubclass`, `len`, `oct`, `ord`, `range`), and rejected all calls when `from ... import *` is present in the unit, module, or enclosing function/class scopes.
 - **Thread-Safe `SyntaxWarning` Suppression During AST and Symbol-Table Parsing**:
   Serialized `SyntaxWarning` suppression across `ast.parse` and `symtable.symtable` hot paths so concurrent scope analysis threads never race on process-wide `warnings.filters`.
 - **In-Memory Prioritized Unit Source Loading and Excerpt Slicing**: Prioritized in-memory unit

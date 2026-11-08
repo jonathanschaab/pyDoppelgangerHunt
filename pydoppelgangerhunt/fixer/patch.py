@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, TypedDict, Union
 
 from pydoppelgangerhunt.config import (
+    log_heuristic_ctx_manager_summary,
     normalize_non_suppressing_ctx_managers,
     normalize_path_string,
     resolve_closure_strictness_mode,
@@ -4443,6 +4444,7 @@ def _generate_refactoring_patch_impl(
                 seen_comments.add(chunk)
             patch_chunks.append(chunk)
 
+    log_heuristic_ctx_manager_summary()
     return "\n".join(patch_chunks)
 
 

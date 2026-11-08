@@ -55,34 +55,21 @@ def _node_earliest_start_pos(
 
     Note:
         Python's AST records decorator positions on the decorator expression node
-        rather than the ``@`` token. When ``source_lines`` is provided, this helper
-        scans upward from each decorator expression to locate the ``@`` line; otherwise
-        it uses ``max(0, dec.col_offset - 1)`` (clamped by ``node.col_offset``).
-        Because Python's grammar forbids any statement from preceding ``@`` on the same
-        line, no valid statement unit can fall strictly between ``@`` and ``dec.lineno``.
+        rather than the ``@`` token, while Python's grammar places ``@`` at the same
+        indentation column as ``def``/``class`` (``node.col_offset``). When
+        ``source_lines`` is provided, this helper scans upward from each decorator
+        expression to locate the ``@`` line; otherwise it uses ``dec.lineno`` and
+        ``node.col_offset``.
     """
     n_line = getattr(node, "lineno", None)
     n_col = getattr(node, "col_offset", None)
     best_line: Optional[int] = n_line if isinstance(n_line, int) else None
     best_col: Optional[int] = n_col if isinstance(n_col, int) else None
-    if source_lines is None:
-        raw_src_lines = getattr(node, "_source_lines", None)
-        if isinstance(raw_src_lines, (list, tuple)):
-            source_lines = raw_src_lines
     for dec in getattr(node, "decorator_list", ()):
         d_line = getattr(dec, "lineno", None)
-        d_col = getattr(dec, "col_offset", None)
         if isinstance(d_line, int):
             eff_d_line = d_line
-            at_col: Optional[int] = (
-                min(n_col, max(0, d_col - 1))
-                if isinstance(n_col, int) and isinstance(d_col, int)
-                else (
-                    n_col
-                    if isinstance(n_col, int)
-                    else (max(0, d_col - 1) if isinstance(d_col, int) else best_col)
-                )
-            )
+            at_col: Optional[int] = best_col
             if source_lines is not None and 1 <= d_line <= len(source_lines):
                 scan_ln = d_line
                 while scan_ln >= 1:
@@ -796,6 +783,7 @@ def _collect_scope_closures_uncached(
     genexp_include_header: bool = True,
     cache_parent_map: bool = True,
     enclosing_scopes: Sequence[ast.AST] = (),
+    source_lines: Optional[Sequence[str]] = None,
 ) -> _FrozenClosureList:
     raw_scope_body = getattr(scope_node, "body", None)
     skip_root = isinstance(raw_scope_body, list)
@@ -832,14 +820,9 @@ def _collect_scope_closures_uncached(
         cache_scope_node=use_parent_cache,
         enclosing_scopes=enclosing_scopes,
     )
-    src_lines: Optional[Sequence[str]] = (
-        getattr(module_tree, "_source_lines", None)
-        if module_tree is not None
-        else None
-    ) or getattr(scope_node, "_source_lines", None)
 
     def _resolve_stmt_start_pos(s: ast.AST) -> Tuple[int, int]:
-        estart, ecol = _node_earliest_start_pos(s, source_lines=src_lines)
+        estart, ecol = _node_earliest_start_pos(s, source_lines=source_lines)
         return int(estart or 0), int(ecol or 0)
 
     class _ExprClosureCollector(_BaseScopeVisitor):
@@ -1084,6 +1067,7 @@ def _collect_scope_closures(
     module_tree: Optional[ast.AST] = None,
     *,
     enclosing_scopes: Sequence[ast.AST] = (),
+    source_lines: Optional[Sequence[str]] = None,
 ) -> _FrozenClosureList:
     """Discovers all closures defined in a scope, recorded with their starting line."""
     aux_nodes: Tuple[ast.AST, ...] = (
@@ -1096,9 +1080,12 @@ def _collect_scope_closures(
     )
     cache_key: Any = (
         scope_node
-        if not aux_nodes
+        if not aux_nodes and source_lines is None
         else _make_trusted_scope_cache_key(
-            scope_node, "scope_closures", aux_ast_nodes=aux_nodes
+            scope_node,
+            "scope_closures",
+            params=(bool(source_lines),) if source_lines is not None else (),
+            aux_ast_nodes=aux_nodes,
         )
     )
     return cast(
@@ -1110,6 +1097,7 @@ def _collect_scope_closures(
                 scope_node,
                 module_tree=module_tree,
                 enclosing_scopes=enclosing_scopes,
+                source_lines=source_lines,
             ),
         ),
     )
@@ -1164,6 +1152,7 @@ def _collect_pre_unit_closures(
     module_tree: Optional[ast.AST] = None,
     *,
     enclosing_scopes: Sequence[ast.AST] = (),
+    source_lines: Optional[Sequence[str]] = None,
 ) -> Set[str]:
     """Discovers free variables captured by functions, class methods, and lambdas defined prior
     to the unit in the same lexical scope."""
@@ -1172,6 +1161,7 @@ def _collect_pre_unit_closures(
         scope_node,
         module_tree=module_tree,
         enclosing_scopes=enclosing_scopes,
+        source_lines=source_lines,
     ):
         is_pre, _, _ = _classify_closure_position(
             c_pos, u_start, u_start, u_start_col=u_start_col

@@ -77,13 +77,14 @@ def _find_enclosing_function_chain(
     u_end: int,
     u_start_col: Optional[int] = None,
     u_end_col: Optional[int] = None,
+    *,
+    source_lines: Optional[Sequence[str]] = None,
 ) -> List[Tuple[int, int, ast.AST]]:
     """Finds enclosing function, lambda, and comprehension scopes ordered outermost to innermost."""
     chain: List[Tuple[int, int, int, int, ast.AST]] = []
-    src_lines: Optional[Sequence[str]] = getattr(
-        mod_tree, "_source_lines", None
-    )
-    for estart, n_end, _span, node in _get_tree_scope_intervals(mod_tree):
+    for estart, n_end, _span, node in _get_tree_scope_intervals(
+        mod_tree, source_lines=source_lines
+    ):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         n_lineno = int(getattr(node, "lineno", estart) or estart)
@@ -110,7 +111,7 @@ def _find_enclosing_function_chain(
         ):
             continue
         if u_start in (estart, n_lineno):
-            _, e_col = _node_earliest_start_pos(node, source_lines=src_lines)
+            _, e_col = _node_earliest_start_pos(node, source_lines=source_lines)
             bound_col = (
                 e_col
                 if (u_start == estart and e_col is not None)
@@ -216,7 +217,11 @@ class _SpanLineIndex:
         "_dump_cache",
     )
 
-    def __init__(self, root_node: ast.AST) -> None:
+    def __init__(
+        self,
+        root_node: ast.AST,
+        source_lines: Optional[Sequence[str]] = None,
+    ) -> None:
         self.by_start_line: Dict[int, List[_IndexedSpanNode]] = {}
         self.by_end_line: Dict[int, List[_IndexedSpanNode]] = {}
         self.stmts_by_start_line: Dict[int, List[ast.stmt]] = {}
@@ -226,9 +231,6 @@ class _SpanLineIndex:
         missing_cols: List[Tuple[int, int]] = []
         closure_nodes: List[ast.AST] = []
         self._dump_cache: Dict[int, str] = {}
-        src_lines: Optional[Sequence[str]] = getattr(
-            root_node, "_source_lines", None
-        )
 
         stack: List[ast.AST] = [root_node]
         while stack:
@@ -244,7 +246,7 @@ class _SpanLineIndex:
             ):
                 closure_nodes.append(node)
             n_start, n_col = _node_earliest_start_pos(
-                node, source_lines=src_lines
+                node, source_lines=source_lines
             )
             raw_end = getattr(node, "end_lineno", None)
             n_end_col = getattr(node, "end_col_offset", None)
@@ -360,14 +362,25 @@ class _SpanLineIndex:
         return ()
 
 
-def _get_span_line_index(root_node: ast.AST) -> _SpanLineIndex:
+def _get_span_line_index(
+    root_node: ast.AST,
+    source_lines: Optional[Sequence[str]] = None,
+) -> _SpanLineIndex:
     """Returns or builds the cached _SpanLineIndex for root_node."""
     return cast(
         _SpanLineIndex,
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
-            _make_trusted_scope_cache_key(root_node, "span_line_index"),
-            lambda: _SpanLineIndex(root_node),
+            _make_trusted_scope_cache_key(
+                root_node,
+                "span_line_index",
+                params=(bool(source_lines),) if source_lines is not None else (),
+            ),
+            lambda: (
+                _SpanLineIndex(root_node)
+                if source_lines is None
+                else _SpanLineIndex(root_node, source_lines=source_lines)
+            ),
         ),
     )
 
@@ -708,19 +721,23 @@ def _walk_invalid_lexical_scope_declarations(
 def _compute_scope_invalid_lexical_declarations(
     root_scope: ast.AST,
     is_module_rooted: bool,
+    source_lines: Optional[Sequence[str]] = None,
 ) -> bool:
     """Checks whether root_scope has invalid lexical declarations using symtable fast-path for Module."""
-    if is_module_rooted and isinstance(root_scope, ast.Module):
-        src_lines = getattr(root_scope, "_source_lines", None)
-        if isinstance(src_lines, (list, tuple)) and src_lines:
-            try:
-                with _suppress_syntax_warnings():
-                    symtable.symtable("\n".join(src_lines), "<symtable>", "exec")
-                return False
-            except SyntaxError:
-                return True
-            except (TypeError, ValueError, RecursionError, MemoryError):
-                pass
+    if (
+        is_module_rooted
+        and isinstance(root_scope, ast.Module)
+        and isinstance(source_lines, (list, tuple))
+        and source_lines
+    ):
+        try:
+            with _suppress_syntax_warnings():
+                symtable.symtable("\n".join(source_lines), "<symtable>", "exec")
+            return False
+        except SyntaxError:
+            return True
+        except (TypeError, ValueError, RecursionError, MemoryError):
+            pass
     return _walk_invalid_lexical_scope_declarations(
         [(root_scope, frozenset(), frozenset(), is_module_rooted)]
     )
@@ -729,6 +746,7 @@ def _compute_scope_invalid_lexical_declarations(
 def _scope_has_invalid_lexical_declarations(
     root_scope: ast.AST,
     is_module_rooted: bool,
+    source_lines: Optional[Sequence[str]] = None,
 ) -> bool:
     """Checks (and caches per AST root scope) whether root_scope has invalid lexical declarations."""
     return bool(
@@ -738,7 +756,7 @@ def _scope_has_invalid_lexical_declarations(
                 root_scope, "invalid_lex_decls", params=(is_module_rooted,)
             ),
             lambda: _compute_scope_invalid_lexical_declarations(
-                root_scope, is_module_rooted
+                root_scope, is_module_rooted, source_lines=source_lines
             ),
         )
     )
@@ -748,12 +766,16 @@ def _has_invalid_lexical_scope_declarations(
     candidate_stmts: Sequence[ast.AST],
     enclosing_chain: Sequence[Tuple[int, int, ast.AST]] = (),
     mod_tree: Optional[ast.AST] = None,
+    *,
+    source_lines: Optional[Sequence[str]] = None,
 ) -> bool:
     """Returns True if any scope in enclosing_chain or candidate_stmts violates PEP 3104 nonlocal/global rules."""
     is_module_rooted = isinstance(mod_tree, ast.Module)
     if isinstance(
         mod_tree, ast.Module
-    ) and _scope_has_invalid_lexical_declarations(mod_tree, True):
+    ) and _scope_has_invalid_lexical_declarations(
+        mod_tree, True, source_lines=source_lines
+    ):
         return True
     if (
         enclosing_chain

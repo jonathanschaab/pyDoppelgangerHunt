@@ -90,6 +90,21 @@ def _has_unordered_multiset_outputs(unit: Dict[str, Any]) -> bool:
     return False
 
 
+def _has_deleted_output_hazard(
+    scope1: Dict[str, Any],
+    scope2: Dict[str, Any],
+    outs1: Sequence[str],
+    outs2: Sequence[str],
+) -> bool:
+    """Returns True if either unit scope has a deleted_output hazard or deletes an effective output."""
+    return (
+        "deleted_output" in scope1.get("control_flow_hazards", ())
+        or "deleted_output" in scope2.get("control_flow_hazards", ())
+        or bool(set(outs1) & set(scope1.get("deleted_names", [])))
+        or bool(set(outs2) & set(scope2.get("deleted_names", [])))
+    )
+
+
 def _validate_try_cleanup_hazard(
     unit: Dict[str, Any],
     needed_outs: Sequence[str],
@@ -454,56 +469,39 @@ def resolve_clone_generator_subroutine_outputs(
         repo_root=repo_root,
     )
 
+    def _reject_gen_pair(
+        reason: str, log_msg: str
+    ) -> Optional[CloneOutputResolution]:
+        logger.debug("Rejecting generator subroutine pair: %s", log_msg)
+        return CloneOutputResolution(None, reason) if return_details else None
+
     for u_chk, s_chk, side_lbl in ((u1, scope1, "u1"), (u2, scope2, "u2")):
         if _has_unordered_multiset_outputs(u_chk):
-            logger.debug(
-                "Rejecting generator subroutine pair: set-valued outputs lack positional ordering"
-            )
-            return (
-                CloneOutputResolution(None, "unpaired outputs")
-                if return_details
-                else None
+            return _reject_gen_pair(
+                "unpaired outputs",
+                "set-valued outputs lack positional ordering",
             )
         if s_chk.get("outputs_ambiguous"):
-            logger.debug(
-                "Rejecting generator subroutine pair: ambiguous scope outputs "
-                "lack positional ordering"
-            )
-            return (
-                CloneOutputResolution(None, "ambiguous outputs")
-                if return_details
-                else None
+            return _reject_gen_pair(
+                "ambiguous outputs",
+                "ambiguous scope outputs lack positional ordering",
             )
         for hazard_key, reason_str in (
             ("deleted_output", "deleted output hazard"),
             ("severed_closure_cell", "severed closure cell"),
             ("stale_source_code", "stale source code"),
-            ("pathological_ast", "pathological or deeply nested AST"),
+            ("pathological_ast", "pathological ast"),
         ):
             if hazard_key in s_chk.get("control_flow_hazards", ()):
-                logger.debug(
-                    "Rejecting generator subroutine pair: %s on %s",
-                    reason_str,
-                    side_lbl,
-                )
-                return (
-                    CloneOutputResolution(None, reason_str)
-                    if return_details
-                    else None
+                return _reject_gen_pair(
+                    reason_str, f"{reason_str} on {side_lbl}"
                 )
 
     outs1 = _extract_effective_unit_outputs(u1, scope1)
     outs2 = _extract_effective_unit_outputs(u2, scope2)
-    if bool(set(outs1) & set(scope1.get("deleted_names", []))) or bool(
-        set(outs2) & set(scope2.get("deleted_names", []))
-    ):
-        logger.debug(
-            "Rejecting generator subroutine pair: deleted output hazard"
-        )
-        return (
-            CloneOutputResolution(None, "deleted output hazard")
-            if return_details
-            else None
+    if _has_deleted_output_hazard(scope1, scope2, outs1, outs2):
+        return _reject_gen_pair(
+            "deleted output hazard", "deleted output hazard"
         )
 
     u1_cond = set(scope1.get("conditional_outputs", [])) | set(
@@ -813,7 +811,7 @@ def resolve_clone_pair_outputs(
     for hazard_key, reason_str in (
         ("severed_closure_cell", "severed closure cell"),
         ("stale_source_code", "stale source code"),
-        ("pathological_ast", "pathological or deeply nested AST"),
+        ("pathological_ast", "pathological ast"),
     ):
         if (
             hazard_key in scope1.get("control_flow_hazards", ())
@@ -827,12 +825,7 @@ def resolve_clone_pair_outputs(
                 if return_details
                 else None
             )
-    if is_sub and (
-        "deleted_output" in scope1.get("control_flow_hazards", ())
-        or "deleted_output" in scope2.get("control_flow_hazards", ())
-        or bool(set(outs1) & set(scope1.get("deleted_names", [])))
-        or bool(set(outs2) & set(scope2.get("deleted_names", [])))
-    ):
+    if is_sub and _has_deleted_output_hazard(scope1, scope2, outs1, outs2):
         logger.debug(
             "Rejecting clone pair output resolution: deleted output hazard"
         )

@@ -2911,20 +2911,55 @@ def test_cli_unrecognized_config_closure_strictness_falls_back(
 
 
 def test_resolve_closure_strictness_mode_thread_safety() -> None:
-    """Verifies that concurrent invocations of resolve_closure_strictness_mode are thread-safe."""
+    """Verifies that concurrent invocations of resolve_closure_strictness_mode deduplicate warnings across threads."""
     import concurrent.futures  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        clear_closure_warning_cache,
         resolve_closure_strictness_mode,
     )
+
+    clear_closure_warning_cache()
 
     def _worker(val: str) -> tuple[str, bool]:
         return resolve_closure_strictness_mode(val)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(_worker, f"unknown_mode_{i % 3}") for i in range(50)]
-        results = [f.result() for f in futures]
+    with mock.patch("pydoppelgangerhunt.config.logger.warning") as mock_warn:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(_worker, f"unknown_mode_{i % 3}") for i in range(50)]
+            results = [f.result() for f in futures]
 
     assert all(r == ("strict", False) for r in results)
+    assert mock_warn.call_count == 3
+
+
+def test_resolve_closure_strictness_legacy_aliases_emit_deprecation_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies that legacy aliases emit a one-time deprecation warning and unshipped aliases are rejected."""
+    import logging  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        clear_closure_warning_cache,
+        resolve_closure_strictness_mode,
+    )
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert resolve_closure_strictness_mode("fail_closed") == ("pedantic", False)
+        assert resolve_closure_strictness_mode("fail_closed") == ("pedantic", False)
+        assert resolve_closure_strictness_mode("fast") == ("lenient", True)
+        assert resolve_closure_strictness_mode("skip") == ("lenient", True)
+        assert resolve_closure_strictness_mode("strict_with") == ("strict", False)
+
+    dep_msgs = [r.message for r in caplog.records if "deprecated" in r.message]
+    assert len(dep_msgs) == 3
+    assert any("closure_strictness alias 'fail_closed' is deprecated" in m for m in dep_msgs)
+    assert any("closure_strictness alias 'fast' is deprecated" in m for m in dep_msgs)
+    assert any("closure_strictness alias 'skip' is deprecated" in m for m in dep_msgs)
+    assert any(
+        "Unrecognized closure_strictness 'strict_with'" in r.message
+        for r in caplog.records
+    )
 
 
 def test_resolve_closure_strictness_mode_config_conflict_warning(

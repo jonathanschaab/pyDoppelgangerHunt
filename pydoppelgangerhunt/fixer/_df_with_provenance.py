@@ -20,7 +20,10 @@ from typing import (
     cast,
 )
 
-from pydoppelgangerhunt.config import should_warn_closure_event
+from pydoppelgangerhunt.config import (
+    record_heuristic_non_suppressing_ctx_manager,
+    should_warn_closure_event,
+)
 from pydoppelgangerhunt.fixer._ast_compat import (
     is_match_node,
     is_try_or_trystar_node,
@@ -303,16 +306,17 @@ class _SuppressProvenance:
         imported_qualname: Optional[str] = None,
     ) -> _SuppressProvenance:
         """Clears prior bindings for name and optionally records a new provenance entry."""
+        is_shadowable_builtin = name in _SHADOWABLE_BUILTIN_CTX_NAMES
         has_pos_binding = bool(
             allow_positive
             and (
                 is_non_suppressor
                 or stdlib_mod is not None
-                or imported_qualname is not None
+                or (imported_qualname is not None and not is_shadowable_builtin)
             )
         )
         cleared = self.clear_name(name, mark_shadow=not has_pos_binding)
-        if not (allow_positive or is_suppressor) or not name:
+        if not (has_pos_binding or is_suppressor) or not name:
             return cleared
         return _SuppressProvenance(
             suppressors=(
@@ -338,7 +342,11 @@ class _SuppressProvenance:
             has_star_import=cleared.has_star_import,
             imported_symbols=(
                 cleared.imported_symbols | {(name, imported_qualname)}
-                if (allow_positive and imported_qualname is not None)
+                if (
+                    allow_positive
+                    and imported_qualname is not None
+                    and (has_pos_binding or is_suppressor)
+                )
                 else cleared.imported_symbols
             ),
             shadowed_names=(
@@ -950,7 +958,7 @@ def _update_suppress_provenance_from_stmt(
                 prov = prov.with_stdlib_module(
                     bound, alias.name, allow_positive=allow_pos
                 )
-            elif allow_pos:
+            elif allow_pos and bound not in _SHADOWABLE_BUILTIN_CTX_NAMES:
                 prov = prov.with_imported_symbol(
                     bound, target_qual, allow_positive=allow_pos
                 )
@@ -995,7 +1003,11 @@ def _update_suppress_provenance_from_stmt(
                     allow_positive=allow_pos,
                     imported_qualname=imp_qual,
                 )
-            elif imp_qual is not None and allow_pos:
+            elif (
+                imp_qual is not None
+                and allow_pos
+                and bound not in _SHADOWABLE_BUILTIN_CTX_NAMES
+            ):
                 prov = prov.with_imported_symbol(
                     bound,
                     imp_qual,
@@ -1777,7 +1789,9 @@ def _looks_like_suppressing_ctx_manager(
     prov = _coerce_suppress_provenance(suppress_aliases)
     call_name = _extract_ctx_manager_call_name(expr)
     if call_name == "open" and (
-        "open" in prov.shadowed_builtins or prov.has_star_import
+        "open" in prov.shadowed_builtins
+        or "open" in prov.shadowed_names
+        or prov.has_star_import
     ):
         return True
     stack: List[ast.AST] = [expr]
@@ -1808,7 +1822,7 @@ def _looks_like_suppressing_ctx_manager(
             stack.append(sub.orelse)
         elif isinstance(sub, ast.BoolOp):
             stack.extend(sub.values)
-        if ident is not None:
+        if ident is not None and ident != "catch_warnings":
             low = ident.lower()
             if any(tok in low for tok in _SUSPICIOUS_SUPPRESS_SUBSTRINGS):
                 return True
@@ -1874,7 +1888,7 @@ def _with_header_has_post_suppress_risk(
 
 
 def _warn_heuristic_non_suppressing_ctx_manager(expr: ast.AST) -> None:
-    """Logs a deduplicated warning when an unproven context manager is treated as non-suppressing via name heuristic."""
+    """Logs a deduplicated info message when an unproven context manager is treated as non-suppressing via name heuristic."""
     while isinstance(expr, ast.NamedExpr):
         expr = expr.value
     mgr_name = _extract_ctx_manager_call_name(expr)
@@ -1885,8 +1899,9 @@ def _warn_heuristic_non_suppressing_ctx_manager(expr: ast.AST) -> None:
             mgr_name = expr.attr
         else:
             mgr_name = "<expr>"
+    record_heuristic_non_suppressing_ctx_manager(mgr_name)
     if should_warn_closure_event(f"heuristic_safe_ctx:{mgr_name}"):
-        logger.warning(
+        logger.info(
             "Treating unproven context manager %r as non-suppressing via name heuristic in "
             "strict mode; use closure_strictness='pedantic' to fail closed on unknown context "
             "managers or add %r to non_suppressing_ctx_managers.",
@@ -3358,11 +3373,7 @@ def _analyze_try_stmt_assignment(
     try_terminates = f_term or (
         t_term and (not handlers or all_handlers_terminate)
     )
-    if try_terminates:
-        if handlers and not f_body and loop_control_terminates:
-            definite.clear()
-        return True, local_prov
-    return False, local_prov
+    return try_terminates, local_prov
 
 
 def _analyze_match_stmt_assignment(
@@ -3393,6 +3404,7 @@ def _analyze_match_stmt_assignment(
     non_term_case_defs: List[Set[str]] = []
     case_conds: Set[str] = set()
     case_dels: Set[str] = set()
+    all_case_dels: Set[str] = set()
     non_term_case_dels: List[Set[str]] = []
     has_irrefutable_default = False
     merged_match_prov = local_prov
@@ -3444,10 +3456,13 @@ def _analyze_match_stmt_assignment(
         case_defs.append(c_def)
         case_conds.update(c_def | c_cond)
         c_del = _extract_block_Combined_deletions(case_body) - c_def
+        all_case_dels.update(c_del)
         if not c_term:
             case_dels.update(c_del)
             non_term_case_defs.append(c_def)
             non_term_case_dels.append(c_del)
+            may_del.update(c_may - raw_pattern_stores)
+        elif loop_control_terminates:
             may_del.update(c_may - raw_pattern_stores)
         if _is_irrefutable_case(case):
             has_irrefutable_default = True
@@ -3477,8 +3492,7 @@ def _analyze_match_stmt_assignment(
         case_dels - all_del, definite, conditional
     )
     if case_defs and has_irrefutable_default and not non_term_case_defs:
-        if loop_control_terminates:
-            definite.clear()
+        _demote_deletions_to_conditional(all_case_dels, definite, conditional)
         return True, local_prov
     return False, local_prov
 
