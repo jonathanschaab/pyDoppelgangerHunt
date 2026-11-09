@@ -6765,7 +6765,7 @@ def test_local_class_dynamic_namespace_mutation_not_proven_non_suppressing() -> 
 
 
 def test_global_escape_dunder_builtins_heuristic_vs_pedantic_mode() -> None:
-    """Verifies dunder-invoking builtins (len, bool, int, isinstance) are allowed in strict mode but rejected as global_escape in pedantic mode."""
+    """Verifies dunder-invoking builtins (len, chr, bool, int, isinstance) are allowed in strict mode but rejected as global_escape in pedantic mode."""
     from pydoppelgangerhunt.fixer._df_cell_hazards import (
         _HEURISTIC_GLOBAL_SAFE_BUILTINS,
         _PROVEN_PURE_GLOBAL_SAFE_BUILTINS,
@@ -6773,48 +6773,60 @@ def test_global_escape_dunder_builtins_heuristic_vs_pedantic_mode() -> None:
         _unit_has_global_mutating_call,
     )
 
-    assert _PROVEN_PURE_GLOBAL_SAFE_BUILTINS == frozenset({"callable", "chr", "id", "ord"})
+    assert _PROVEN_PURE_GLOBAL_SAFE_BUILTINS == frozenset({"callable", "id", "ord"})
     assert "len" in _HEURISTIC_GLOBAL_SAFE_BUILTINS
+    assert "chr" in _HEURISTIC_GLOBAL_SAFE_BUILTINS
     assert "len" not in _PROVEN_PURE_GLOBAL_SAFE_BUILTINS
+    assert "chr" not in _PROVEN_PURE_GLOBAL_SAFE_BUILTINS
     assert _PURE_GLOBAL_SAFE_BUILTINS == (
         _PROVEN_PURE_GLOBAL_SAFE_BUILTINS | _HEURISTIC_GLOBAL_SAFE_BUILTINS
     )
 
     len_stmts = ast.parse("n = len(obj)\nout = n + G\n").body
+    chr_stmts = ast.parse("b = chr(m)\nout = G\n").body
     id_stmts = ast.parse("n = id(obj)\nout = n + G\n").body
     assert _unit_has_global_mutating_call(len_stmts, set(), allow_heuristic_builtins=True) is False
     assert _unit_has_global_mutating_call(len_stmts, set(), allow_heuristic_builtins=False) is True
+    assert _unit_has_global_mutating_call(chr_stmts, set(), allow_heuristic_builtins=True) is False
+    assert _unit_has_global_mutating_call(chr_stmts, set(), allow_heuristic_builtins=False) is True
     assert _unit_has_global_mutating_call(id_stmts, set(), allow_heuristic_builtins=False) is False
 
-    dunder_global_src = (
-        "G = 1\n"
-        "class Mutator:\n"
-        "    def __len__(self):\n"
-        "        global G\n"
-        "        G = 100\n"
-        "        return 5\n"
-        "def f(m):\n"
-        "    global G\n"
-        "    a = G\n"
-        "    b = len(m)\n"
-        "    c = G\n"
-        "    return a, b, c\n"
-    )
-    tree = ast.parse(dunder_global_src)
-    base_unit = {
-        "start": 9,
-        "end": 11,
-        "kind": "compound_block",
-        "source_text": dunder_global_src,
-        "source_code": "    a = G\n    b = len(m)\n    c = G\n",
-    }
-    sc_strict = inspect_single_unit_scope({**base_unit, "closure_strictness": "strict"}, tree=tree)
-    sc_pedantic = inspect_single_unit_scope(
-        {**base_unit, "closure_strictness": "pedantic"}, tree=tree
-    )
-    assert "global_escape" not in sc_strict.get("closure_hazard_reasons", ())
-    assert "global_escape" in sc_pedantic.get("closure_hazard_reasons", ())
-    assert "severed_closure_cell" in sc_pedantic["control_flow_hazards"]
+    for call_expr in ("len(m)", "chr(m)"):
+        dunder_global_src = (
+            "G = 1\n"
+            "class Mutator:\n"
+            "    def __len__(self):\n"
+            "        global G\n"
+            "        G = 100\n"
+            "        return 5\n"
+            "    def __index__(self):\n"
+            "        global G\n"
+            "        G = 100\n"
+            "        return 65\n"
+            "def f(m):\n"
+            "    global G\n"
+            "    a = G\n"
+            f"    b = {call_expr}\n"
+            "    c = G\n"
+            "    return a, b, c\n"
+        )
+        tree = ast.parse(dunder_global_src)
+        base_unit = {
+            "start": 13,
+            "end": 15,
+            "kind": "compound_block",
+            "source_text": dunder_global_src,
+            "source_code": f"    a = G\n    b = {call_expr}\n    c = G\n",
+        }
+        sc_strict = inspect_single_unit_scope(
+            {**base_unit, "closure_strictness": "strict"}, tree=tree
+        )
+        sc_pedantic = inspect_single_unit_scope(
+            {**base_unit, "closure_strictness": "pedantic"}, tree=tree
+        )
+        assert "global_escape" not in sc_strict.get("closure_hazard_reasons", ())
+        assert "global_escape" in sc_pedantic.get("closure_hazard_reasons", ())
+        assert "severed_closure_cell" in sc_pedantic["control_flow_hazards"]
 
 
 def test_public_evict_tree_scopes_invalidates_mutated_ast_caches() -> None:
@@ -7529,4 +7541,130 @@ def test_make_scope_ctx_cache_key_validates_extra_params_and_strict_with_warning
         "strict_with_suppression=True and skip_pre_unit_closures=True" in r.message
         for r in caplog.records
     )
+
+
+def test_slice_unit_token_lines_clips_multiline_presliced_line_excerpt_without_duplicating_suffix(
+    tmp_path: Any,
+) -> None:
+    """Verifies multiline line-sliced excerpts clip boundary columns so neighboring '+ tail' suffixes are not duplicated."""
+    from pydoppelgangerhunt.fixer import generate_refactoring_patch
+    from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
+    from pydoppelgangerhunt.source_lines import SourceLinesOrigin
+
+    excerpt = [
+        "    result = [\n",
+        "        x * 2\n",
+        "        for x in items\n",
+        "    ] + tail\n",
+    ]
+    unit = {
+        "name": "f1:comp",
+        "start": 2,
+        "end": 5,
+        "start_col": 13,
+        "end_col": 5,
+        "kind": "comprehension",
+        "source_lines": excerpt,
+    }
+    clipped = _slice_unit_token_lines(
+        unit,
+        [ln.rstrip("\r\n") for ln in excerpt],
+        is_pre_sliced=SourceLinesOrigin.PRE_SLICED,
+    )
+    assert clipped == ["[", "        x * 2", "        for x in items", "    ]"]
+
+    src = (
+        "def f1(items, tail):\n"
+        "    result = [\n"
+        "        x * 2\n"
+        "        for x in items\n"
+        "    ] + tail\n"
+        "    return result\n\n"
+        "def f2(items, tail):\n"
+        "    result = [\n"
+        "        x * 2\n"
+        "        for x in items\n"
+        "    ] + tail\n"
+        "    return result\n"
+    )
+    mod_file = tmp_path / "comp_tail.py"
+    mod_file.write_text(src, encoding="utf-8")
+    u1 = {
+        "name": "f1:comp",
+        "file": str(mod_file),
+        "start": 2,
+        "end": 5,
+        "start_col": 13,
+        "end_col": 5,
+        "kind": "comprehension",
+        "source_lines": list(excerpt),
+    }
+    u2 = {
+        "name": "f2:comp",
+        "file": str(mod_file),
+        "start": 9,
+        "end": 12,
+        "start_col": 13,
+        "end_col": 5,
+        "kind": "comprehension",
+        "source_lines": list(excerpt),
+    }
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "def _shared_" in helper
+    assert "tail" not in helper
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch != ""
+    refactored = mod_file.read_text(encoding="utf-8")
+    ns: dict[str, Any] = {}
+    exec(compile(refactored, str(mod_file), "exec"), ns)  # nosec B102
+    assert ns["f1"]([1, 2, 3], [99]) == [2, 4, 6, 99]
+    assert ns["f2"]([4, 5], [0]) == [8, 10, 0]
+
+
+@pytest.mark.parametrize("ctrl_stmt", ["break", "continue"])
+def test_synthesize_refactoring_suggestion_rejects_naked_break_and_continue_helpers(
+    ctrl_stmt: str,
+) -> None:
+    """Verifies synthesize_refactoring_suggestion compiles helpers and emits unsafe-extraction diagnostics on naked break/continue."""
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    src = (
+        "def f1(items):\n"
+        "    for x in items:\n"
+        "        if x < 0:\n"
+        f"            {ctrl_stmt}\n"
+        "        y = x + 1\n"
+        "    return 0\n\n"
+        "def f2(items):\n"
+        "    for x in items:\n"
+        "        if x < 0:\n"
+        f"            {ctrl_stmt}\n"
+        "        y = x + 1\n"
+        "    return 0\n"
+    )
+    u1 = {
+        "name": "f1:block",
+        "file": "loop_mod.py",
+        "start": 3,
+        "end": 5,
+        "kind": "compound_block",
+        "source_text": src,
+        "source_code": f"        if x < 0:\n            {ctrl_stmt}\n        y = x + 1\n",
+    }
+    u2 = {
+        "name": "f2:block",
+        "file": "loop_mod.py",
+        "start": 10,
+        "end": 12,
+        "kind": "compound_block",
+        "source_text": src,
+        "source_code": f"        if x < 0:\n            {ctrl_stmt}\n        y = x + 1\n",
+    }
+    suggestion = synthesize_refactoring_suggestion(u1, u2)
+    assert "rejected as unsafe" in suggestion
+    assert "def _shared_" not in suggestion
+
 

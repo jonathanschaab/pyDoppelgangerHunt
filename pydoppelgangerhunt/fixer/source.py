@@ -781,10 +781,6 @@ def _slice_unit_token_lines(
         if is_pre_sliced is not None
         else eff_col_sliced
     )
-    if effective_pre_sliced is True and (
-        "source_lines" not in unit or len(lines) > 1
-    ):
-        return list(lines)
     s_col_opt = _extract_slice_col_offset(
         unit, ("start_col", "start_col_offset"), default=0
     )
@@ -802,6 +798,11 @@ def _slice_unit_token_lines(
             and e_col is not None
             and first_byte_len == e_col - s_col
             and not res[0][:1].isspace()
+        ) or (
+            "source_lines" not in unit
+            and e_col is None
+            and not res[0][:1].isspace()
+            and _is_valid_eval_expr(res[0])
         ):
             return res
     if effective_pre_sliced is None:
@@ -811,11 +812,24 @@ def _slice_unit_token_lines(
                 ln.rstrip("\r\n") for ln in split_source_lines(src_code)
             ]
             res_stripped = [ln.rstrip("\r\n") for ln in res]
-            if res_stripped == code_lines and (
-                s_col > 0
-                or (
-                    e_col is not None
-                    and len(res_stripped[-1].encode("utf-8")) == e_col
+            if (
+                res_stripped == code_lines
+                and not res_stripped[0][:1].isspace()
+                and _is_valid_eval_expr("\n".join(res_stripped))
+                and (
+                    (
+                        len(res_stripped) == 1
+                        and s_col > 0
+                        and e_col is not None
+                        and len(res_stripped[0].encode("utf-8")) == e_col - s_col
+                    )
+                    or (
+                        len(res_stripped) > 1
+                        and (
+                            e_col is None
+                            or len(res_stripped[-1].encode("utf-8")) == e_col
+                        )
+                    )
                 )
             ):
                 return res
@@ -832,10 +846,25 @@ def _slice_unit_token_lines(
         res[0] = _slice_utf8_line(res[0], s_col, e_col)
     else:
         last_byte_len = len(res[-1].rstrip("\r\n").encode("utf-8"))
+        clipped = list(res)
         if 0 < s_col < first_byte_len:
-            res[0] = _slice_utf8_line(res[0], s_col, None)
+            clipped[0] = _slice_utf8_line(clipped[0], s_col, None)
         if e_col is not None and e_col <= last_byte_len:
-            res[-1] = _slice_utf8_line(res[-1].rstrip("\r\n"), 0, e_col)
+            clipped[-1] = _slice_utf8_line(clipped[-1].rstrip("\r\n"), 0, e_col)
+        res_stripped = [ln.rstrip("\r\n") for ln in res]
+        clipped_stripped = [ln.rstrip("\r\n") for ln in clipped]
+        if (
+            effective_pre_sliced is True
+            and (s_col == 0 or not res[0][:1].isspace())
+            and (e_col is None or last_byte_len == e_col)
+            and _is_valid_eval_expr("\n".join(res_stripped))
+            and (
+                clipped_stripped == res_stripped
+                or not _is_valid_eval_expr("\n".join(clipped_stripped))
+            )
+        ):
+            return res
+        res = clipped
     return res
 
 

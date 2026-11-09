@@ -338,9 +338,9 @@ strict fail-closed safety invariants:
   suspension points (`await`, `yield`, `yield from`, `async for`), and deletions (`del`) are
   rejected as a `global_escape` hazard because they could rebind or mutate the module-level global
   mid-execution. C-level built-ins that do not invoke user-defined Python dunders
-  (`_PROVEN_PURE_GLOBAL_SAFE_BUILTINS`: `callable`, `chr`, `id`, `ord`) are permitted when
+  (`_PROVEN_PURE_GLOBAL_SAFE_BUILTINS`: `callable`, `id`, `ord`) are permitted when
   unshadowed in both `strict` and `pedantic` modes; dunder-invoking inspection/conversion built-ins
-  (`_HEURISTIC_GLOBAL_SAFE_BUILTINS`: `bin`, `bool`, `hex`, `int`, `isinstance`, `issubclass`,
+  (`_HEURISTIC_GLOBAL_SAFE_BUILTINS`: `bin`, `bool`, `chr`, `hex`, `int`, `isinstance`, `issubclass`,
   `len`, `oct`, `range`) are permitted in `strict` mode under the heuristic assumption that user
   types do not mutate module-level globals inside `__len__`/`__bool__`/`__int__`/`__index__`/
   `__instancecheck__`/`__subclasscheck__`, and are rejected in `pedantic` mode. Remaining non-call

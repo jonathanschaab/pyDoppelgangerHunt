@@ -276,6 +276,8 @@ def synthesize_refactoring_suggestion(
             skip_pre_unit_closures=skip_pre_unit_closures,
             non_suppressing_ctx_managers=non_suppressing_ctx_managers,
         )
+        if helper_code:
+            compile(helper_code, "<synthesized_suggestion>", "exec")
     except Exception:  # pylint: disable=broad-exception-caught
         helper_code = ""
     if helper_code:

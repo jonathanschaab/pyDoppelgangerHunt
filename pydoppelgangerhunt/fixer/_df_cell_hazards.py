@@ -425,12 +425,9 @@ class _ClosureHazardResult(NamedTuple):
 # - `id(x)`: returns the C pointer address of `x` without calling any Python method.
 # - `callable(x)`: inspects `Py_TYPE(x)->tp_call` in C without calling any Python method.
 # - `ord(c)`: inspects 1-char `str`/`bytes`/`bytearray` buffers in C without dunders.
-# - `chr(i)`: allowed in proven set only when `chr` is called (note: `_HEURISTIC_GLOBAL_SAFE_BUILTINS`
-#   contains built-ins that invoke user dunders on custom objects).
 _PROVEN_PURE_GLOBAL_SAFE_BUILTINS: frozenset[str] = frozenset(
     {
         "callable",
-        "chr",
         "id",
         "ord",
     }
@@ -439,12 +436,14 @@ _PROVEN_PURE_GLOBAL_SAFE_BUILTINS: frozenset[str] = frozenset(
 # Built-ins that are side-effect-free for standard types in `strict` mode under the
 # heuristic assumption that user-defined dunders (`__len__`, `__bool__`, `__int__`,
 # `__index__`, `__instancecheck__`, `__subclasscheck__`) do not mutate module-level
-# global variables. Rejected in `pedantic` mode (`strict_with_suppression=True`) when
-# a unit reads an enclosing `global` variable.
+# global variables (note: `chr(i)` invokes `__index__` via `PyNumber_AsSsize_t`).
+# Rejected in `pedantic` mode (`strict_with_suppression=True`) when a unit reads an
+# enclosing `global` variable.
 _HEURISTIC_GLOBAL_SAFE_BUILTINS: frozenset[str] = frozenset(
     {
         "bin",
         "bool",
+        "chr",
         "hex",
         "int",
         "isinstance",
