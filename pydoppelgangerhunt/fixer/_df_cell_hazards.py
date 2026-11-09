@@ -147,6 +147,8 @@ from pydoppelgangerhunt.fixer._df_span_index import (
 from pydoppelgangerhunt.parser import _node_is_effectively_async
 
 __all__ = [
+    "_HEURISTIC_GLOBAL_SAFE_BUILTINS",
+    "_PROVEN_PURE_GLOBAL_SAFE_BUILTINS",
     "_PURE_GLOBAL_SAFE_BUILTINS",
     "_UnitClosureHazardContext",
     "_check_captured_cell_mutations",

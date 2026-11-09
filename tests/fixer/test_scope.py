@@ -560,7 +560,7 @@ def test_comprehension_multi_generator_scoping(tmp_path: Path) -> None:
         "start": 2,
         "end": 2,
         "start_col": 7,
-        "end_col": 42,
+        "end_col": 41,
         "name": "flat_comp",
         "kind": "comprehension",
     }

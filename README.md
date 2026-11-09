@@ -282,16 +282,18 @@ escaping callbacks across lexical scopes.
     `socket.socket`, `socket.create_connection`, `pathlib.Path`) and local classes with a
     strictly static class body whose `__exit__`/`__aexit__` returns only `False`/`None` are
     proven non-suppressing. Unproven context managers use a name-and-provenance heuristic:
-    managers are treated as non-suppressing unless their identifier matches suppression idioms
-    (`suppress`, `raises`, `ignore`, `subTest`, `ExitStack`, `enter_context`, `swallow`, `silent`,
-    `tolerat`, `best_effort`, `absorb`, `trap`, `fallback`, `noop`, `shield`, `retry`, `attempt`,
-    etc.) or is proven suppressing via local/function/class `__exit__` provenance. **Note**: because
-    this heuristic is name-based, `strict` mode is **fail-open for neutrally named custom
-    exception-suppressing context managers** (such as `Transaction()` or `Guard()`).
+    managers are treated as non-suppressing unless their identifier matches one of the 22
+    case-insensitive suppression-idiom substrings (`suppress`, `ignore`, `swallow`, `silent`,
+    `noop`, `no_op`, `null_error`, `catch`, `trap`, `absorb`, `tolerat`, `forgiv`, `eat_`,
+    `mute`, `quench`, `squelch`, `masked`, `subtest`, `raises`, `exitstack`, `enter_context`,
+    `may_suppress`) or is proven suppressing via local/function/class `__exit__` provenance.
+    **Note**: because this heuristic is name-based, `strict` mode is **fail-open for neutrally
+    named custom exception-suppressing context managers** (such as `Transaction()`, `Guard()`,
+    `fallback()`, `shield()`, `retry()`, `attempt()`, or `best_effort()`).
     Whenever an unproven context manager is accepted via the name heuristic, `pyDoppelgangerHunt`
-    logs a deduplicated `INFO` diagnostic and an end-of-run summary (and records an advisory header
-    comment in `--patch` / `--output` artifacts); use `--closure-strictness pedantic` to fail
-    closed on all unproven context managers.
+    logs a deduplicated `INFO` diagnostic and an end-of-run summary (and records a per-hunk
+    advisory comment in `--patch` / `--output` artifacts); use `--closure-strictness pedantic` to
+    fail closed on all unproven context managers.
   - `pedantic` (deprecated alias: `fail_closed`; or `strict_with_suppression = true` in programmatic
     `UnitSchema` dicts when `closure_strictness` is omitted): **Fail-closed mode** that treats all
     unproven unknown `with` context managers as potentially exception-suppressing unless explicitly

@@ -479,6 +479,10 @@ def resolve_clone_generator_subroutine_outputs(
                 "ambiguous scope outputs lack positional ordering",
             )
         for hazard_key, reason_str in (
+            (
+                "unavailable_source_for_closure_mode",
+                "unavailable source for closure mode",
+            ),
             ("severed_closure_cell", "severed closure cell"),
             ("stale_source_code", "stale source code"),
             ("pathological_ast", "pathological ast"),
@@ -800,6 +804,10 @@ def resolve_clone_pair_outputs(
     outs1 = _extract_effective_unit_outputs(u1, scope1)
     outs2 = _extract_effective_unit_outputs(u2, scope2)
     for hazard_key, reason_str in (
+        (
+            "unavailable_source_for_closure_mode",
+            "unavailable source for closure mode",
+        ),
         ("severed_closure_cell", "severed closure cell"),
         ("stale_source_code", "stale source code"),
         ("pathological_ast", "pathological ast"),

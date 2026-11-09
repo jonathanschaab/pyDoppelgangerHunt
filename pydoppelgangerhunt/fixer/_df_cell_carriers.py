@@ -260,6 +260,13 @@ def _get_fn_scope_context_uncached(
             else MappingProxyType(dict(parent_map_override))
         )
     else:
+        if (
+            cache_parent_map
+            and isinstance(mod_tree, ast.AST)
+            and not getattr(mod_tree, "_is_ephemeral_unit_mod", False)
+            and scope_node is not mod_tree
+        ):
+            _get_scope_parent_map(mod_tree, use_cache=True)
         raw_parent_map = _get_scope_parent_map(
             scope_node, use_cache=cache_parent_map
         )
@@ -912,6 +919,7 @@ class _EnclosingFnCellInfo(NamedTuple):
     alias_edges: Tuple[Tuple[str, frozenset[str]], ...] = ()
     pre_unbound: frozenset[str] = frozenset()
     concurrent_sibling_vars: frozenset[str] = frozenset()
+    heuristic_ctx_managers: Tuple[str, ...] = ()
 
     def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
         """Returns an empty tuple because _EnclosingFnCellInfo retains only string sets."""

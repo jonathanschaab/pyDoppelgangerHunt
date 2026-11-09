@@ -23,6 +23,7 @@ from typing import (
 )
 
 from pydoppelgangerhunt.config import (
+    collect_heuristic_ctx_managers,
     normalize_non_suppressing_ctx_managers,
     resolve_pair_closure_flags,
     resolve_unit_closure_flags,
@@ -40,6 +41,7 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _get_cached_tree_source_lines,
     _get_or_compute_scope_cached,
     _get_or_parse_tree,
+    _get_scope_parent_map,
     _register_tree_source_lines,
     _scope_cell_info_cache,
     _suppress_syntax_warnings,
@@ -58,6 +60,7 @@ from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=unused-im
     _extract_scope_nonlocals_and_outer_globals,
     _extract_single_node_local_names,
     _extract_strict_fn_local_names,
+    _get_tree_scope_intervals,
     _is_irrefutable_case,
     _is_irrefutable_pattern,
     _is_span_in_scope_header,
@@ -68,6 +71,7 @@ from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=unused-im
 )
 from pydoppelgangerhunt.fixer._df_span_index import (
     _find_enclosing_function_chain,
+    _get_span_line_index,
     _has_invalid_lexical_scope_declarations,
     _resolve_unit_col_bounds,
 )
@@ -95,7 +99,6 @@ from pydoppelgangerhunt.fixer.source import (
     _SUBROUTINE_KINDS,
     _WHOLE_UNIT_KINDS,
     _extract_slice_col_offset,
-    _get_tree_scope_intervals,
     _is_valid_eval_expr,
     _load_unit_file_text,
     _slice_unit_token_lines,
@@ -1634,19 +1637,21 @@ def _parse_normalized_stmt_dumps(text: str) -> Optional[List[str]]:
     dedented = _normalize_clause_header_snippet(raw_dedented)
     for cand in (
         dedented,
-        f"if 1:\n{textwrap.indent(dedented, '    ')}",
-        f"def _norm_wrap():\n{textwrap.indent(dedented, '    ')}",
         f"async def _norm_wrap():\n{textwrap.indent(dedented, '    ')}",
     ):
         try:
             with _suppress_syntax_warnings():
                 parsed = ast.parse(cand)
-            if cand == dedented:
-                stmts = parsed.body
-            else:
-                stmts = getattr(parsed.body[0], "body", [])
-            if stmts:
-                return [ast.dump(s, include_attributes=False) for s in stmts]
+            stmts = (
+                parsed.body
+                if cand == dedented
+                else getattr(parsed.body[0], "body", [])
+            )
+            return (
+                [ast.dump(s, include_attributes=False) for s in stmts]
+                if stmts
+                else None
+            )
         except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
             continue
     return None
@@ -1819,6 +1824,15 @@ def _unit_source_code_matches_tree(
         "complex_expr",
         "closure",
     )
+    span_idx = _get_span_line_index(file_tree)
+    end_entries = [
+        entry
+        for entry in (
+            *span_idx.by_start_line.get(u_end, ()),
+            *span_idx.by_end_line.get(u_end, ()),
+        )
+        if entry.n_end == u_end
+    ]
     src_dumps = _parse_normalized_stmt_dumps(src_code)
     if src_dumps:
         candidate_dump_seqs: List[List[str]] = [src_dumps]
@@ -1853,20 +1867,22 @@ def _unit_source_code_matches_tree(
                 MemoryError,
             ):
                 pass
-        for node in ast.walk(file_tree):
+        parent_map = _get_scope_parent_map(file_tree)
+        candidate_parents: List[ast.AST] = []
+        seen_parent_ids: Set[int] = set()
+        for entry in end_entries:
+            node = entry.node
             if isinstance(node, (ast.stmt, ast.ExceptHandler)):
-                estart, _ = _node_earliest_start_pos(node)
-                n_s = getattr(node, "lineno", estart)
-                n_e = getattr(node, "end_lineno", n_s)
-                if (
-                    isinstance(n_s, int)
-                    and isinstance(n_e, int)
-                    and u_start in (n_s, estart)
-                    and n_e == u_end
-                ):
-                    single_dump = [ast.dump(node, include_attributes=False)]
+                n_s = getattr(node, "lineno", entry.n_start)
+                if u_start in (n_s, entry.n_start):
+                    single_dump = [span_idx.get_dump(node)]
                     if single_dump in candidate_dump_seqs:
                         return True
+                parent_node = parent_map.get(node)
+                if parent_node is not None and id(parent_node) not in seen_parent_ids:
+                    seen_parent_ids.add(id(parent_node))
+                    candidate_parents.append(parent_node)
+        for node in candidate_parents:
             for attr_name in ("body", "orelse", "finalbody", "handlers"):
                 seq = getattr(node, attr_name, None)
                 if not isinstance(seq, list) or not seq:
@@ -1898,9 +1914,7 @@ def _unit_source_code_matches_tree(
                 )
                 if not (starts_at_u_start and last_end == u_end):
                     continue
-                span_dumps = [
-                    ast.dump(s, include_attributes=False) for s in in_span
-                ]
+                span_dumps = [span_idx.get_dump(s) for s in in_span]
                 for target_dumps in candidate_dump_seqs:
                     if span_dumps == target_dumps:
                         return True
@@ -1920,18 +1934,14 @@ def _unit_source_code_matches_tree(
             with _suppress_syntax_warnings():
                 expr_node = ast.parse(dedented, mode="eval").body
             expr_dump = ast.dump(expr_node, include_attributes=False)
-            for node in ast.walk(file_tree):
-                if isinstance(node, ast.expr):
-                    n_s = getattr(node, "lineno", None)
-                    n_e = getattr(node, "end_lineno", n_s)
-                    if (
-                        isinstance(n_s, int)
-                        and isinstance(n_e, int)
-                        and n_s == u_start
-                        and n_e == u_end
-                        and ast.dump(node, include_attributes=False) == expr_dump
-                    ):
-                        return True
+            for entry in end_entries:
+                node = entry.node
+                if (
+                    isinstance(node, ast.expr)
+                    and entry.n_start == u_start
+                    and span_idx.get_dump(node) == expr_dump
+                ):
+                    return True
         except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
             pass
     return False
@@ -1964,7 +1974,7 @@ def _has_out_of_bounds_unit_cols(
     first_b = len(unit_code_lines[0].rstrip("\r\n").encode("utf-8"))
     last_b = len(unit_code_lines[-1].rstrip("\r\n").encode("utf-8"))
     s_in_bounds = raw_s_col is None or (0 <= raw_s_col < first_b)
-    e_in_bounds = raw_e_col is None or (0 < raw_e_col <= last_b + 1)
+    e_in_bounds = raw_e_col is None or (0 < raw_e_col <= last_b)
     order_ok = (
         len(unit_code_lines) > 1
         or raw_s_col is None
@@ -2014,7 +2024,7 @@ def _inspect_unit_scope(
     )
     is_pre_sliced = line_origin.is_pre_sliced or line_origin.is_placeholder
     is_placeholder_origin = line_origin.is_placeholder
-    explicit_col_sliced = bool(unit.get("source_lines_is_sliced"))
+    explicit_col_sliced = bool(unit.get("source_lines_is_col_sliced"))
     col_bounds_invalid = _has_out_of_bounds_unit_cols(
         unit,
         unit_code_lines,
@@ -2224,6 +2234,7 @@ def _inspect_unit_scope(
         "skip_pre_unit_closures": skip_pre_unit_closures_flag,
         "strict_with_suppression": strict_with_flag,
         "non_suppressing_ctx_managers": sorted(extra_non_sup),
+        "heuristic_ctx_managers": [],
     }
     if stale_source_code_mismatch:
         return {
@@ -2987,6 +2998,7 @@ def _inspect_unit_scope(
             if "invalid_lexical_declaration" not in closure_hazard_reasons:
                 closure_hazard_reasons.append("invalid_lexical_declaration")
 
+        unit_heuristic_mgrs: Set[str] = set()
         if is_subroutine or unit.get("kind") in (
             "closure",
             "comprehension",
@@ -2994,34 +3006,35 @@ def _inspect_unit_scope(
         ):
             if u_start > 0 and mod_tree is not None:
                 if "severed_closure_cell" not in hazards:
-                    hazard_res = _evaluate_severed_closure_cell_hazard(
-                        _UnitClosureHazardContext(
-                            candidate_stmts=candidate_stmts,
-                            mod_tree=mod_tree,
-                            u_start=u_start,
-                            u_end=u_end,
-                            u_start_col=resolved_s_col,
-                            u_end_col=resolved_e_col,
-                            is_subroutine=is_subroutine,
-                            unit_kind=str(unit.get("kind") or ""),
-                            inputs=inputs,
-                            outputs=outputs,
-                            stores=visitor.stores,
-                            deleted_names=all_deleted,
-                            unit_top_locals=visitor.unit_top_locals,
-                            free_vars=free_vars,
-                            nonlocals=visitor.nonlocals,
-                            has_yield=visitor.has_yield,
-                            is_async=visitor.is_async,
-                            skip_pre_unit_closures=skip_pre_unit_closures_flag,
-                            strict_with_suppression=strict_with_flag,
-                            extra_non_suppressing_ctx_managers=extra_non_sup,
-                            definite_stores=def_assigned,
-                            cols_resolved=cols_resolved,
-                            enclosing_chain=enclosing_chain,
-                            lex_validated=True,
+                    with collect_heuristic_ctx_managers() as unit_heuristic_mgrs:
+                        hazard_res = _evaluate_severed_closure_cell_hazard(
+                            _UnitClosureHazardContext(
+                                candidate_stmts=candidate_stmts,
+                                mod_tree=mod_tree,
+                                u_start=u_start,
+                                u_end=u_end,
+                                u_start_col=resolved_s_col,
+                                u_end_col=resolved_e_col,
+                                is_subroutine=is_subroutine,
+                                unit_kind=str(unit.get("kind") or ""),
+                                inputs=inputs,
+                                outputs=outputs,
+                                stores=visitor.stores,
+                                deleted_names=all_deleted,
+                                unit_top_locals=visitor.unit_top_locals,
+                                free_vars=free_vars,
+                                nonlocals=visitor.nonlocals,
+                                has_yield=visitor.has_yield,
+                                is_async=visitor.is_async,
+                                skip_pre_unit_closures=skip_pre_unit_closures_flag,
+                                strict_with_suppression=strict_with_flag,
+                                extra_non_suppressing_ctx_managers=extra_non_sup,
+                                definite_stores=def_assigned,
+                                cols_resolved=cols_resolved,
+                                enclosing_chain=enclosing_chain,
+                                lex_validated=True,
+                            )
                         )
-                    )
                     if hazard_res.has_hazard:
                         hazards.append("severed_closure_cell")
                         for r in hazard_res.reasons:
@@ -3050,6 +3063,7 @@ def _inspect_unit_scope(
                 "pathological_ast",
                 "deleted_output",
                 "severed_closure_cell",
+                "unavailable_source_for_closure_mode",
             )
             for h in hazards
         )
@@ -3149,6 +3163,7 @@ def _inspect_unit_scope(
             "skip_pre_unit_closures": skip_pre_unit_closures_flag,
             "strict_with_suppression": strict_with_flag,
             "non_suppressing_ctx_managers": sorted(extra_non_sup),
+            "heuristic_ctx_managers": sorted(unit_heuristic_mgrs),
         }
     except (RecursionError, MemoryError):
         return {
@@ -3362,7 +3377,14 @@ def ensure_unit_scope_closure_mode(
             or bool(_load_unit_file_text(u_copy, repo_root=repo_root))
         )
         if not has_unit_source:
+            logger.debug(
+                "Precomputed scope for unit %r does not match active closure mode "
+                "and backing source is unavailable; failing closed",
+                unit.get("name"),
+            )
             hazards = list(scope.get("control_flow_hazards", ()))
+            if "unavailable_source_for_closure_mode" not in hazards:
+                hazards.append("unavailable_source_for_closure_mode")
             if "severed_closure_cell" not in hazards:
                 hazards.append("severed_closure_cell")
             reasons = list(scope.get("closure_hazard_reasons", ()))
@@ -3377,7 +3399,14 @@ def ensure_unit_scope_closure_mode(
                 "skip_pre_unit_closures": eff_skip,
                 "strict_with_suppression": eff_strict_with,
                 "non_suppressing_ctx_managers": list(eff_non_sup),
+                "heuristic_ctx_managers": list(
+                    scope.get("heuristic_ctx_managers", ())
+                ),
             }
+        logger.debug(
+            "Recomputing precomputed scope for unit %r to match active closure mode",
+            unit.get("name"),
+        )
     return inspect_single_unit_scope(u_copy, repo_root=repo_root, tree=tree)
 
 
@@ -3645,5 +3674,13 @@ def analyze_unit_variable_scope(
             & set(info2.get("non_suppressing_ctx_managers", ()))
             if u2 is not None
             else set(info1.get("non_suppressing_ctx_managers", ()))
+        ),
+        "heuristic_ctx_managers": sorted(
+            set(info1.get("heuristic_ctx_managers", ()))
+            | (
+                set(info2.get("heuristic_ctx_managers", ()))
+                if u2 is not None
+                else set()
+            )
         ),
     }

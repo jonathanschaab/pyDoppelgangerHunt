@@ -1541,18 +1541,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.coverage:
         cov_data = read_coverage_data(args.coverage)
 
-    if args.html:
-        html_report = generate_html_report(
-            clones,
-            target,
-            threshold,
-            families=families,
-            stats=stats,
-            repo_root=git_worktree_root,
-        )
-        _write_artifact_file(args.html, html_report, "HTML", args.format == "text")
-
     with defer_heuristic_ctx_manager_summary():
+        if args.html:
+            html_report = generate_html_report(
+                clones,
+                target,
+                threshold,
+                families=families,
+                stats=stats,
+                repo_root=git_worktree_root,
+            )
+            _write_artifact_file(args.html, html_report, "HTML", args.format == "text")
+
         try:
             if args.patch:
                 patch_text = (

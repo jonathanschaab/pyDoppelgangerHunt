@@ -37,6 +37,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _extract_node_type_param_names,
     _extract_strict_fn_local_names,
     _get_tree_expr_scope_intervals,
+    _get_tree_scope_intervals,
     _is_span_in_scope_header,
     _node_earliest_start_pos,
     _node_strictly_encloses_bounds,
@@ -45,7 +46,6 @@ from pydoppelgangerhunt.fixer._df_visitors import (
     _collect_func_params as _extract_arg_names,
     _extract_pattern_bound_name,
 )
-from pydoppelgangerhunt.fixer.source import _get_tree_scope_intervals
 from pydoppelgangerhunt.parser import iter_nested_scope_header_nodes
 
 
@@ -787,9 +787,7 @@ def _compute_scope_invalid_lexical_declarations(
             with _suppress_syntax_warnings():
                 symtable.symtable("\n".join(source_lines), "<symtable>", "exec")
             return False
-        except SyntaxError:
-            return True
-        except (TypeError, ValueError, RecursionError, MemoryError):
+        except (SyntaxError, TypeError, ValueError, RecursionError, MemoryError):
             pass
     return _walk_invalid_lexical_scope_declarations(
         [(root_scope, frozenset(), frozenset(), is_module_rooted)]
@@ -829,15 +827,16 @@ def _has_invalid_lexical_scope_declarations(
 ) -> bool:
     """Returns True if any scope in enclosing_chain or candidate_stmts violates PEP 3104 nonlocal/global rules."""
     is_module_rooted = isinstance(mod_tree, ast.Module)
-    if isinstance(
-        mod_tree, ast.Module
-    ) and _scope_has_invalid_lexical_declarations(
-        mod_tree, True, source_lines=source_lines
-    ):
-        return True
+    mod_has_invalid = (
+        _scope_has_invalid_lexical_declarations(
+            mod_tree, True, source_lines=source_lines
+        )
+        if isinstance(mod_tree, ast.Module)
+        else True
+    )
     if (
         enclosing_chain
-        and not isinstance(mod_tree, ast.Module)
+        and mod_has_invalid
         and _scope_has_invalid_lexical_declarations(
             enclosing_chain[0][2], is_module_rooted
         )

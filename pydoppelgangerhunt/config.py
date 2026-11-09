@@ -31,10 +31,12 @@ logger = logging.getLogger(__name__)
 
 _warned_closure_lock: threading.Lock = threading.Lock()
 _MAX_WARNED_CLOSURE_EVENTS: int = 4096
-_MAX_HEURISTIC_CTX_MANAGERS: int = 1024
+_MAX_HEURISTIC_CTX_MANAGERS: int = 16384
 _warned_closure_strictness_values: Set[str] = set()
 _heuristic_non_suppressing_ctx_managers: Set[str] = set()
+_heuristic_ctx_managers_overflow_count: List[int] = [0]
 _defer_heuristic_summary_depth: List[int] = [0]
+_heuristic_collector_tls: threading.local = threading.local()
 
 _CONFIG_KEY_NAMES: Tuple[str, ...] = (
     "threshold",
@@ -97,12 +99,32 @@ def _warn_closure_event_once(event_key: str, msg: str, *args: Any) -> None:
         logger.warning(msg, *args)
 
 
+@contextlib.contextmanager
+def collect_heuristic_ctx_managers() -> Iterator[Set[str]]:
+    """Collects heuristic context-manager names recorded on the current thread within this block."""
+    stack: Optional[List[Set[str]]] = getattr(_heuristic_collector_tls, "stack", None)
+    if stack is None:
+        stack = []
+        _heuristic_collector_tls.stack = stack
+    bucket: Set[str] = set()
+    stack.append(bucket)
+    try:
+        yield bucket
+    finally:
+        stack.pop()
+
+
 def record_heuristic_non_suppressing_ctx_manager(mgr_name: str) -> None:
     """Records an unproven context manager accepted by the strict-mode name heuristic."""
+    stack: Optional[List[Set[str]]] = getattr(_heuristic_collector_tls, "stack", None)
+    if stack:
+        for bucket in stack:
+            bucket.add(mgr_name)
     with _warned_closure_lock:
         if mgr_name in _heuristic_non_suppressing_ctx_managers:
             return
         if len(_heuristic_non_suppressing_ctx_managers) >= _MAX_HEURISTIC_CTX_MANAGERS:
+            _heuristic_ctx_managers_overflow_count[0] += 1
             return
         _heuristic_non_suppressing_ctx_managers.add(mgr_name)
 
@@ -149,15 +171,18 @@ def log_heuristic_ctx_manager_summary(*, force: bool = False) -> Tuple[str, ...]
         if _defer_heuristic_summary_depth[0] > 0 and not force:
             return tuple(sorted(_heuristic_non_suppressing_ctx_managers))
         names = tuple(sorted(_heuristic_non_suppressing_ctx_managers))
+        overflow = _heuristic_ctx_managers_overflow_count[0]
         _heuristic_non_suppressing_ctx_managers.clear()
+        _heuristic_ctx_managers_overflow_count[0] = 0
+    total_count = len(names) + overflow
     preview = ", ".join(repr(n) for n in names[:10])
-    if len(names) > 10:
-        preview += f", ... ({len(names)} total)"
+    if total_count > 10:
+        preview += f", ... ({total_count} total)"
     logger.warning(
         "Summary: %d unproven context manager(s) (%s) were treated as non-suppressing via "
         "name heuristic in strict mode; use --closure-strictness pedantic to fail closed or "
         "list known-safe managers in --non-suppressing-ctx-managers.",
-        len(names),
+        total_count,
         preview,
     )
     return names
@@ -200,9 +225,10 @@ def resolve_closure_strictness_mode(
             if c_mode == "fail_closed":
                 _warn_closure_event_once(
                     f"deprecated_strictness_alias:{c_mode}",
-                    "closure_strictness alias '%s' is deprecated and maps to 'pedantic' "
-                    "(which fails closed on unproven with-blocks and arbitrary calls); "
-                    "use 'pedantic' or 'strict' (previous default-strict behavior) instead",
+                    "closure_strictness alias '%s' is deprecated and now resolves to 'pedantic' "
+                    "(changed from 'strict'; rejects all unproven with-blocks and dunder-invoking "
+                    "builtins in global-reading units); use 'pedantic' for fail-closed analysis "
+                    "or 'strict' to preserve prior behavior",
                     closure_strictness,
                 )
             elif c_mode in ("fast", "skip"):
@@ -417,6 +443,7 @@ def clear_closure_warning_cache() -> None:
     with _warned_closure_lock:
         _warned_closure_strictness_values.clear()
         _heuristic_non_suppressing_ctx_managers.clear()
+        _heuristic_ctx_managers_overflow_count[0] = 0
 
 
 DEFAULT_EXCLUDES: List[str] = [

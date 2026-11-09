@@ -18,7 +18,6 @@ from pydoppelgangerhunt.config import (
     log_heuristic_ctx_manager_summary,
     normalize_non_suppressing_ctx_managers,
     normalize_path_string,
-    peek_heuristic_non_suppressing_ctx_managers,
     resolve_closure_strictness_mode,
     resolve_pair_closure_flags,
 )
@@ -3899,6 +3898,15 @@ def _generate_refactoring_patch_impl(
             f1_disp = normalize_path_string(str(u1.get("file") or "file1"), strip_anchor=False)
             f2_disp = normalize_path_string(str(u2.get("file") or "file2"), strip_anchor=False)
             pair_comment = f"# Clone Pair ({sim:.1%}): {f1_disp} <===> {f2_disp}\n"
+            pair_heuristics = sorted(
+                set(s1.get("heuristic_ctx_managers", ()))
+                | set(s2.get("heuristic_ctx_managers", ()))
+                | set(scope.get("heuristic_ctx_managers", ()))
+            )
+            if pair_heuristics:
+                pair_comment += (
+                    format_heuristic_ctx_manager_comment(pair_heuristics) + "\n"
+                )
 
             candidate_units = [u1_eff]
             if is_same_file and not check_units_overlap(u1_eff, u2_eff, repo_root=str(root)):
@@ -4447,10 +4455,7 @@ def _generate_refactoring_patch_impl(
                 seen_comments.add(chunk)
             patch_chunks.append(chunk)
 
-    heuristic_names = peek_heuristic_non_suppressing_ctx_managers()
     log_heuristic_ctx_manager_summary()
-    if patch_chunks and heuristic_names:
-        patch_chunks.insert(0, format_heuristic_ctx_manager_comment(heuristic_names))
     return "\n".join(patch_chunks)
 
 

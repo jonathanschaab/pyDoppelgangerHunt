@@ -2500,12 +2500,14 @@ def test_scope_cache_key_kind_validation_cross_cache_eviction_and_detached_subtr
     assert free_reads_key in _scope_cell_info_cache
     assert inner_fn in ctx_outer.parent_map
     assert len(closures_outer) == 1
-    assert outer_fn in _scope_parent_maps
+    assert nested_tree in _scope_parent_maps
+    assert outer_fn not in _scope_parent_maps
     _assert_central_index_invariant()
 
     outer_fn.body.remove(inner_fn)
     _evict_tree_scopes(inner_fn)
     _assert_central_index_invariant()
+    assert nested_tree not in _scope_parent_maps
     assert outer_fn not in _scope_parent_maps
     assert free_reads_key not in _scope_cell_info_cache
     assert not any(
@@ -3921,7 +3923,7 @@ def test_closure_strictness_precedence_ctx_managers_and_global_pure_builtins(
             "start_col": 0,
             "end_col": 7,
             "kind": "complex_expr",
-            "source_lines_is_sliced": True,
+            "source_lines_is_col_sliced": True,
         },
         ["(a + b)\n"],
     )
@@ -5838,19 +5840,34 @@ def test_concurrent_suppress_syntax_warnings_and_stmt_deltas_cap(
         _analyze_enclosing_fn_cells_uncached,
     )
 
-    pre_test_snapshot = list(warnings.filters)
-
-    def _suppress_worker() -> None:
+    def _suppress_worker() -> tuple[int, int]:
+        suppressed_syntax = 0
+        kept_user = 0
         for _ in range(10):
-            with _suppress_syntax_warnings():
-                ast.parse(r"s = '\d+'")
+            with warnings.catch_warnings(record=True) as rec:
+                warnings.simplefilter("always")
+                with _suppress_syntax_warnings():
+                    ast.parse(r"s = '\d+'")
+                    warnings.warn("user_msg", UserWarning, stacklevel=1)
+            suppressed_syntax += sum(
+                1 for w in rec if issubclass(w.category, SyntaxWarning)
+            )
+            kept_user += sum(
+                1 for w in rec if issubclass(w.category, UserWarning)
+            )
+        return suppressed_syntax, kept_user
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         futs = [pool.submit(_suppress_worker) for _ in range(6)]
         for f in futs:
-            f.result(timeout=10.0)
+            sup_cnt, usr_cnt = f.result(timeout=10.0)
+            assert sup_cnt == 0
+            assert usr_cnt == 10
 
-    assert list(warnings.filters) == pre_test_snapshot
+    with warnings.catch_warnings(record=True) as post_rec:
+        warnings.simplefilter("always", SyntaxWarning)
+        warnings.warn("post_check", SyntaxWarning, stacklevel=1)
+    assert any(issubclass(w.category, SyntaxWarning) for w in post_rec)
 
     clear_dataflow_cache()
     many_lines = (
@@ -7961,6 +7978,7 @@ def test_lazy_parent_map_eviction_and_total_node_budget() -> None:
         _ScopeCacheKey,
         _downstream_cache_lock,
         _evict_tree_scopes,
+        _get_scope_parent_map,
         _parent_map_total_nodes,
         _scope_cell_info_cache,
         _scope_parent_maps,
@@ -7974,6 +7992,9 @@ def test_lazy_parent_map_eviction_and_total_node_budget() -> None:
     mod_ck = _ScopeCacheKey(mod, "mod_test")
     _scope_cell_info_cache[mod_ck] = ("mod_val",)
     assert mod in _scope_parent_maps
+    assert _get_scope_parent_map(inner_fn, use_cache=True) is _get_scope_parent_map(
+        mod, use_cache=True
+    )
     # Inserting a nested scope key when mod is already indexed skips building a duplicate parent map for inner_fn
     ck = _ScopeCacheKey(inner_fn, "lazy_evict_test")
     _scope_cell_info_cache[ck] = ("cached_val",)
@@ -7999,8 +8020,312 @@ def test_lazy_parent_map_eviction_and_total_node_budget() -> None:
         assert mod not in _scope_parent_maps
         assert mod2 in _scope_parent_maps
         assert _parent_map_total_nodes[0] == len(huge_pm)
+        # A single map exceeding _MAX_PARENT_MAP_TOTAL_NODES must not evict existing cached maps
+        mod3 = ast.parse("y = 2\n")
+        oversized_pm: dict[ast.AST, ast.AST] = {
+            ast.Name(id=f"z{i}"): mod3 for i in range(_MAX_PARENT_MAP_TOTAL_NODES + 5)
+        }
+        _store_parent_map_locked(mod3, oversized_pm)
+        assert mod3 not in _scope_parent_maps
+        assert mod2 in _scope_parent_maps
+        assert _parent_map_total_nodes[0] == len(huge_pm)
     clear_dataflow_cache()
     assert _parent_map_total_nodes[0] == 0
+
+
+def test_col_sliced_flag_separation_and_fail_closed_remap_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies source_lines_is_sliced vs source_lines_is_col_sliced and fail_closed warning message."""
+    import logging
+    from pydoppelgangerhunt.config import (
+        clear_closure_warning_cache,
+        resolve_closure_strictness_mode,
+    )
+    from pydoppelgangerhunt.fixer.source import (
+        _slice_unit_token_lines,
+        validate_unit_schema,
+    )
+
+    line_excerpt = ["    result = [v + offset for v in items] + tail_extra\n"]
+    unit_line_sliced = {
+        "start": 10,
+        "end": 10,
+        "start_col": 13,
+        "end_col": 40,
+        "kind": "comprehension",
+        "source_lines": line_excerpt,
+        "source_lines_is_sliced": True,
+    }
+    assert validate_unit_schema(unit_line_sliced, strict=True) == set()
+    trimmed = _slice_unit_token_lines(unit_line_sliced, line_excerpt)
+    assert trimmed == ["[v + offset for v in items]"]
+    sc_line_sliced = inspect_single_unit_scope(unit_line_sliced)
+    assert "tail_extra" not in sc_line_sliced["inputs"]
+    assert set(sc_line_sliced["inputs"]) == {"items", "offset"}
+
+    already_col_sliced = ["[v + offset for v in items]"]
+    unit_col_sliced = {
+        **unit_line_sliced,
+        "source_lines": already_col_sliced,
+        "source_lines_is_col_sliced": True,
+    }
+    assert validate_unit_schema(unit_col_sliced, strict=True) == set()
+    untouched = _slice_unit_token_lines(unit_col_sliced, already_col_sliced)
+    assert untouched == already_col_sliced
+    sc_col_sliced = inspect_single_unit_scope(unit_col_sliced)
+    assert set(sc_col_sliced["inputs"]) == {"items", "offset"}
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        res_mode, res_skip = resolve_closure_strictness_mode(
+            closure_strictness="fail_closed"
+        )
+    assert res_mode == "pedantic"
+    assert res_skip is False
+    assert any(
+        "now resolves to 'pedantic' (changed from 'strict'" in rec.message
+        and "or 'strict' to preserve prior behavior" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_cached_heuristic_ctx_manager_replay_and_per_hunk_patch_comment(
+    tmp_path: Path,
+) -> None:
+    """Verifies cached delta/scope replay of heuristic managers and per-pair patch comment scoping."""
+    from pydoppelgangerhunt.config import (
+        clear_closure_warning_cache,
+        format_heuristic_ctx_manager_comment,
+        peek_heuristic_non_suppressing_ctx_managers,
+    )
+    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch
+
+    src = (
+        "def f1(compute, a):\n"
+        "    with CustomTx():\n"
+        "        x = compute(a)\n"
+        "        y = x + 1\n"
+        "    cb = lambda: y\n"
+        "    return cb(), x\n\n"
+        "def f2(compute, a):\n"
+        "    with CustomTx():\n"
+        "        x = compute(a)\n"
+        "        y = x + 1\n"
+        "    cb = lambda: y\n"
+        "    return cb(), x\n\n"
+        "def clean1(b):\n"
+        "    z = b * 2\n"
+        "    w = z + 3\n"
+        "    return w\n\n"
+        "def clean2(b):\n"
+        "    z = b * 2\n"
+        "    w = z + 3\n"
+        "    return w\n"
+    )
+    tree = ast.parse(src)
+    u_tx = {
+        "start": 5,
+        "end": 5,
+        "kind": "basic_block",
+        "source_text": src,
+        "source_code": "    cb = lambda: y\n",
+        "closure_strictness": "strict",
+    }
+    sc1 = inspect_single_unit_scope(u_tx, tree=tree)
+    assert sc1["heuristic_ctx_managers"] == ["CustomTx"]
+    assert "CustomTx" in peek_heuristic_non_suppressing_ctx_managers()
+
+    # Clearing warning cache WITHOUT clearing AST/dataflow cache still replays CustomTx on warm cache hit
+    clear_closure_warning_cache()
+    assert peek_heuristic_non_suppressing_ctx_managers() == ()
+    sc2 = inspect_single_unit_scope(u_tx, tree=tree)
+    assert sc2["heuristic_ctx_managers"] == ["CustomTx"]
+    assert "CustomTx" in peek_heuristic_non_suppressing_ctx_managers()
+
+    # In generate_refactoring_patch, if the pair with CustomTx is rejected (e.g. output arity mismatch)
+    # and only the clean pair is emitted, the patch must NOT contain the heuristic advisory comment.
+    mod_file = tmp_path / "mod_heur.py"
+    mod_file.write_text(src, encoding="utf-8")
+    u_rej_1 = {
+        "file": str(mod_file),
+        "start": 2,
+        "end": 4,
+        "name": "f1:tx",
+        "kind": "compound_block",
+        "outputs": ["x"],
+    }
+    u_rej_2 = {
+        "file": str(mod_file),
+        "start": 9,
+        "end": 11,
+        "name": "f2:tx",
+        "kind": "compound_block",
+        "outputs": ["x", "y"],
+    }
+    u_clean_1 = {
+        "file": str(mod_file),
+        "start": 16,
+        "end": 17,
+        "name": "clean1:blk",
+        "kind": "compound_block",
+    }
+    u_clean_2 = {
+        "file": str(mod_file),
+        "start": 21,
+        "end": 22,
+        "name": "clean2:blk",
+        "kind": "compound_block",
+    }
+    patch_clean_only = generate_refactoring_patch(
+        [(1.0, u_rej_1, u_rej_2), (1.0, u_clean_1, u_clean_2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "_shared_" in patch_clean_only
+    assert format_heuristic_ctx_manager_comment(["CustomTx"]) not in patch_clean_only
+
+
+def test_ast_immutability_fingerprint_and_unavailable_source_closure_mode(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies AST mutation detection, unavailable_source_for_closure_mode skip reason, receiver sibling filtering, and module SyntaxError isolation."""
+    import logging
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _ScopeCacheKey,
+        _debug_ast_immutability,
+        _evict_tree_scopes,
+        _get_or_compute_scope_cached,
+        _scope_cell_info_cache,
+        _scope_stmts_by_end,
+        _scope_stmts_by_start,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _build_enclosing_chain_cell_infos,
+    )
+    from pydoppelgangerhunt.fixer._df_pairing import resolve_clone_pair_outputs
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _find_enclosing_function_chain,
+        _has_invalid_lexical_scope_declarations,
+    )
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _SuppressProvenance,
+        _build_module_suppress_seed,
+        _update_suppress_provenance_from_expr_walrus,
+    )
+    from pydoppelgangerhunt.fixer.scope import ensure_unit_scope_closure_mode
+
+    # 1. _evict_tree_scopes cleans _scope_stmts_by_start/_end and fingerprint detects in-place AST mutation
+    mod = ast.parse("def f():\n    x = 1\n    return x\n")
+    fn = mod.body[0]
+    _ = inspect_single_unit_scope(
+        {"start": 2, "end": 2, "kind": "basic_block", "source_code": "    x = 1\n"},
+        tree=mod,
+    )
+    _evict_tree_scopes(mod)
+    assert fn not in _scope_stmts_by_start
+    assert fn not in _scope_stmts_by_end
+
+    mut_mod = ast.parse("x = 1\n")
+    ck = _ScopeCacheKey(mut_mod, "fp_test")
+    _get_or_compute_scope_cached(_scope_cell_info_cache, ck, lambda: ("v1",))
+    mut_mod.body.append(ast.Pass())
+    _debug_ast_immutability[0] = True
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="Cached AST node was mutated in-place without calling evict_tree_scopes",
+        ):
+            _get_or_compute_scope_cached(_scope_cell_info_cache, ck, lambda: ("v2",))
+    finally:
+        _debug_ast_immutability[0] = False
+    assert _get_or_compute_scope_cached(_scope_cell_info_cache, ck, lambda: ("v2",)) == ("v2",)
+
+    # 2. ensure_unit_scope_closure_mode logs DEBUG and sets unavailable_source_for_closure_mode
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        failed_sc = ensure_unit_scope_closure_mode(
+            {"name": "no_src_unit", "start": 2, "end": 3, "kind": "compound_block"},
+            {"inputs": ["a"], "outputs": ["b"], "control_flow_hazards": []},
+            False,
+        )
+    assert "unavailable_source_for_closure_mode" in failed_sc["control_flow_hazards"]
+    assert any("failing closed" in rec.message for rec in caplog.records)
+    res_pair = resolve_clone_pair_outputs(
+        {"name": "u1", "start": 2, "end": 3, "kind": "compound_block"},
+        {"name": "u2", "start": 2, "end": 3, "kind": "compound_block"},
+        failed_sc,
+        failed_sc,
+        return_details=True,
+    )
+    assert res_pair.outputs is None
+    assert res_pair.skip_reason == "unavailable source for closure mode"
+
+    # 3. Single-method class does not synthesize a self-referential receiver sibling closure
+    cls_src = (
+        "class Worker:\n"
+        "    def compute(self, x):\n"
+        "        val = self.base + x\n"
+        "        return val\n"
+    )
+    cls_tree = ast.parse(cls_src)
+    chain = _find_enclosing_function_chain(cls_tree, 3, 3)
+    infos = _build_enclosing_chain_cell_infos(
+        chain, 3, 3, None, None, set(), mod_tree=cls_tree
+    )
+    assert len(infos) == 1
+    assert "self" not in infos[0].sibling_closures
+
+    # 4. Unrelated function with invalid nonlocal in same module does not taint valid function
+    mixed_mod_src = (
+        "def bad_other():\n"
+        "    nonlocal missing_cell\n"
+        "    missing_cell = 1\n\n"
+        "def good_target(a):\n"
+        "    b = a + 2\n"
+        "    return b\n"
+    )
+    mixed_tree = ast.parse(mixed_mod_src)
+    good_chain = _find_enclosing_function_chain(mixed_tree, 6, 6)
+    good_fn = mixed_tree.body[1]
+    assert isinstance(good_fn, ast.FunctionDef)
+    assert (
+        _has_invalid_lexical_scope_declarations(
+            [good_fn.body[0]],
+            enclosing_chain=good_chain,
+            mod_tree=mixed_tree,
+            source_lines=mixed_mod_src.splitlines(),
+        )
+        is False
+    )
+
+    # 5. ast.Dict walrus order (k1, v1, k2, v2) and _LazyModuleStmtSeedMap O(1) table lookup
+    dict_expr = ast.parse(
+        "{(k1 := suppress): (v1 := 1), (k2 := v1): (k1 := open)}",
+        mode="eval",
+    ).body
+    prov_dict = _update_suppress_provenance_from_expr_walrus(
+        [dict_expr],
+        _SuppressProvenance(
+            suppressors=frozenset({"suppress"}),
+            non_suppressors=frozenset({"open"}),
+        ),
+        allow_positive=True,
+    )
+    assert "k1" not in prov_dict.suppressors
+    assert "k1" in prov_dict.non_suppressors
+
+    seed_mod = ast.parse(
+        "from contextlib import suppress as s1\n"
+        "x = 1\n"
+        "from contextlib import nullcontext as nc1\n"
+    )
+    seed_res = _build_module_suppress_seed(seed_mod)
+    last_id = id(seed_mod.body[-1])
+    assert "s1" in seed_res.prefix_by_top_stmt_id[last_id].suppressors
+    assert seed_res.suffix_delta_by_top_stmt_id[last_id].suppressors == frozenset()
+
 
 
 

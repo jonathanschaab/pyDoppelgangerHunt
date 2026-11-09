@@ -1285,7 +1285,7 @@ def test_seeded_generated_closure_program_differential_fuzzer(tmp_path: Path) ->
     ]
     rng = random.Random(20261106)
     rng.shuffle(all_combinations)
-    seed_limit = int(os.environ.get("PDH_FUZZ_SEEDS", str(len(all_combinations))))
+    seed_limit = int(os.environ.get("PDH_FUZZ_SEEDS", "24"))
     selected_combinations = all_combinations[:seed_limit]
     patched_count = 0
     blocked_count = 0
@@ -1298,7 +1298,7 @@ def test_seeded_generated_closure_program_differential_fuzzer(tmp_path: Path) ->
         capture_mode,
         post_mutate_scale,
         use_with_lock,
-    ) in enumerate(selected_combinations):
+    ) in enumerate(all_combinations):
         lines: list[str] = [
             "import contextlib",
             "def entry(items, cond):",
@@ -1378,7 +1378,7 @@ def test_seeded_generated_closure_program_differential_fuzzer(tmp_path: Path) ->
             )
             assert info_with_deltas == info_without_deltas
 
-            if idx >= 24:
+            if idx >= len(selected_combinations):
                 continue
 
             case_dir = tmp_path / f"fuzz_{idx}_{mode}"
@@ -1436,10 +1436,10 @@ def test_seeded_generated_closure_program_differential_fuzzer(tmp_path: Path) ->
 
     assert len(selected_combinations) == min(seed_limit, len(all_combinations))
     assert len(selected_combinations) >= 1
-    if len(selected_combinations) >= 8:
-        assert patched_count > 0
-        assert blocked_count > 0
-        assert git_apply_count > 0
+    assert patched_count > 0
+    assert blocked_count > 0
+    assert git_apply_count == patched_count
+    assert patched_count + blocked_count == len(selected_combinations) * 2
 
     # Negative control: forcing extraction on a blocked late-binding cell + post-unit mutation
     # case produces observable runtime divergence (helper captures scale=3 instead of post-unit scale=10).

@@ -3964,7 +3964,7 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     assert intervals_initial[0][:2] == (1, 2)
     mut_tree.body[0].lineno = 5  # type: ignore[attr-defined]
     mut_tree.body[0].end_lineno = 8  # type: ignore[attr-defined]
-    assert _get_tree_scope_intervals(mut_tree)[0][:2] == (1, 2)
+    assert _get_tree_scope_intervals(mut_tree)[0][:2] == (5, 8)
     _evict_tree_scopes(mut_tree)
     intervals_updated = _get_tree_scope_intervals(mut_tree)
     assert intervals_updated[0][:2] == (5, 8)

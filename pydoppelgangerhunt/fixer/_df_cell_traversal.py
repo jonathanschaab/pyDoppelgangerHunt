@@ -19,6 +19,10 @@ from typing import (
     cast,
 )
 
+from pydoppelgangerhunt.config import (
+    collect_heuristic_ctx_managers,
+    record_heuristic_non_suppressing_ctx_manager,
+)
 from pydoppelgangerhunt.fixer._ast_compat import (
     is_match_node,
     is_try_or_trystar_node,
@@ -1006,6 +1010,7 @@ class _StmtCellDelta(NamedTuple):
     factory_names: frozenset[str]
     fn_return_refs: Tuple[Tuple[str, frozenset[str], frozenset[str]], ...]
     sibling_nl_deletions: frozenset[str]
+    heuristic_ctx_managers: Tuple[str, ...] = ()
 
     def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
         """Returns an empty tuple because _StmtCellDelta retains only string/int tuples."""
@@ -1234,11 +1239,12 @@ def _try_apply_cached_stmt_delta(
             extra_non_suppressing_ctx_managers=extra_non_sup,
             seed_pre_mutated=False,
         )
-        _traverse_fn_cell_frames(
-            [_StackFrame(stmt, False, False, None)],
-            dummy_span,
-            sub_bufs,
-        )
+        with collect_heuristic_ctx_managers() as stmt_heuristics:
+            _traverse_fn_cell_frames(
+                [_StackFrame(stmt, False, False, None)],
+                dummy_span,
+                sub_bufs,
+            )
         delta_pre_mutated = frozenset(sub_bufs.state.pre_mutated)
         delta_pre_bound = frozenset(
             (sub_bufs.state.pre_bound - init_pre_bound)
@@ -1266,12 +1272,16 @@ def _try_apply_cached_stmt_delta(
                 ) in sub_bufs.fn_return_refs.items()
             ),
             sibling_nl_deletions=frozenset(sub_bufs.sibling_nl_deletions),
+            heuristic_ctx_managers=tuple(sorted(stmt_heuristics)),
         )
         with _downstream_cache_lock:
             _evict_stmt_delta_if_full(stmt_deltas, key)
             delta = stmt_deltas.setdefault(key, computed_delta)
     if delta is None:
         return False
+    if has_key and not strict_w and delta.heuristic_ctx_managers:
+        for mgr_name in delta.heuristic_ctx_managers:
+            record_heuristic_non_suppressing_ctx_manager(mgr_name)
     if is_before and not is_branched and bufs.state.suppress_aliases is not None:
         bufs.state.suppress_aliases = _update_suppress_provenance_from_stmt(
             stmt,
@@ -1644,9 +1654,10 @@ def _analyze_enclosing_fn_cells_uncached(
             _StackFrame(stmt, False, False, None)
             for stmt in reversed(body_seq if isinstance(body_seq, (list, tuple)) else ())
         ]
-    enclosed_fn_multi_invoked = _traverse_fn_cell_frames(
-        stack, span, bufs, enclosed_fn=enclosed_fn, stmt_deltas=stmt_deltas
-    )
+    with collect_heuristic_ctx_managers() as fn_heuristics:
+        enclosed_fn_multi_invoked = _traverse_fn_cell_frames(
+            stack, span, bufs, enclosed_fn=enclosed_fn, stmt_deltas=stmt_deltas
+        )
 
     if enclosed_fn is not None and enclosed_fn_multi_invoked:
         enc_muts, enc_dels = _extract_closure_nonlocal_mutations_and_deletions(enclosed_fn)
@@ -1723,6 +1734,7 @@ def _analyze_enclosing_fn_cells_uncached(
         alias_edges=tuple((t_name, frozenset(srcs)) for t_name, srcs in rebound_alias_edges),
         pre_unbound=frozenset(bufs.state.pre_unbound),
         concurrent_sibling_vars=frozenset(concurrent_sib_vars),
+        heuristic_ctx_managers=tuple(sorted(fn_heuristics)),
     )
 
 
@@ -1760,7 +1772,7 @@ def _analyze_enclosing_fn_cells(
         params=params,
         aux_ast_nodes=aux_nodes,
     )
-    return cast(
+    info = cast(
         _EnclosingFnCellInfo,
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
@@ -1777,6 +1789,30 @@ def _analyze_enclosing_fn_cells(
             ),
         ),
     )
+    if not strict_with_suppression and info.heuristic_ctx_managers:
+        for mgr_name in info.heuristic_ctx_managers:
+            record_heuristic_non_suppressing_ctx_manager(mgr_name)
+    return info
+
+
+def _find_enclosing_method_class_node(
+    fn_node: ast.AST,
+    enc_child: ast.AST,
+) -> Optional[ast.ClassDef]:
+    """Finds the ClassDef inside fn_node that directly defines method enc_child."""
+    parent_map = _get_scope_parent_map(fn_node)
+    curr_p = parent_map.get(enc_child)
+    while curr_p is not None and curr_p is not fn_node:
+        if isinstance(curr_p, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        if isinstance(curr_p, ast.ClassDef):
+            return (
+                curr_p
+                if enc_child in _iter_class_body_methods(curr_p)
+                else None
+            )
+        curr_p = parent_map.get(curr_p)
+    return None
 
 
 def _find_enclosing_method_class_names(
@@ -1786,18 +1822,8 @@ def _find_enclosing_method_class_names(
     """Finds and caches class names in fn_node that directly define method enc_child."""
 
     def _compute() -> frozenset[str]:
-        parent_map = _get_scope_parent_map(fn_node)
-        curr_p = parent_map.get(enc_child)
-        cls_names: Set[str] = set()
-        while curr_p is not None and curr_p is not fn_node:
-            if isinstance(curr_p, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                break
-            if isinstance(curr_p, ast.ClassDef):
-                if enc_child in _iter_class_body_methods(curr_p):
-                    cls_names.add(curr_p.name)
-                break
-            curr_p = parent_map.get(curr_p)
-        return frozenset(cls_names)
+        cls_node = _find_enclosing_method_class_node(fn_node, enc_child)
+        return frozenset({cls_node.name}) if cls_node is not None else frozenset()
 
     return cast(
         frozenset[str],
@@ -1811,6 +1837,138 @@ def _find_enclosing_method_class_names(
             _compute,
         ),
     )
+
+
+def _extract_receiver_usage_in_method(
+    method_node: ast.AST,
+    rec_param: str,
+) -> Tuple[frozenset[str], frozenset[str], bool]:
+    """Returns (loaded_attrs, stored_attrs, bare_escape) for rec_param inside method_node."""
+    loaded_attrs: Set[str] = set()
+    stored_attrs: Set[str] = set()
+    bare_escape = False
+    attr_val_ids: Set[int] = set()
+    raw_body = getattr(method_node, "body", ())
+    stack: List[ast.AST] = list(
+        raw_body if isinstance(raw_body, (list, tuple)) else ()
+    )
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            sub_args = getattr(curr, "args", None)
+            if isinstance(sub_args, ast.arguments) and rec_param in _extract_arg_names(sub_args):
+                stack.extend(iter_nested_scope_header_nodes(curr))
+                continue
+            if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+                rec_param in _extract_single_node_local_names(curr, include_globals=True)
+            ):
+                stack.extend(iter_nested_scope_header_nodes(curr))
+                continue
+        elif isinstance(curr, _COMPREHENSION_TYPES):
+            comp_targets = {
+                n
+                for gen in curr.generators
+                for n in _extract_store_names_in_node(gen.target)
+            }
+            if rec_param in comp_targets:
+                if curr.generators:
+                    stack.append(curr.generators[0].iter)
+                continue
+        if (
+            isinstance(curr, ast.Attribute)
+            and isinstance(curr.value, ast.Name)
+            and curr.value.id == rec_param
+        ):
+            attr_val_ids.add(id(curr.value))
+            if isinstance(curr.ctx, ast.Load):
+                loaded_attrs.add(curr.attr)
+            else:
+                stored_attrs.add(curr.attr)
+        elif (
+            isinstance(curr, ast.Name)
+            and curr.id == rec_param
+            and isinstance(curr.ctx, ast.Load)
+            and id(curr) not in attr_val_ids
+        ):
+            bare_escape = True
+        stack.extend(reversed(list(ast.iter_child_nodes(curr))))
+    return frozenset(loaded_attrs), frozenset(stored_attrs), bare_escape
+
+
+def _collect_method_receiver_sibling_closures(
+    fn_node: ast.AST,
+    enc_child: ast.AST,
+    rec_param: str,
+    info_sibling_closures: Sequence[Tuple[Optional[str], frozenset[str], frozenset[str]]],
+) -> Tuple[Tuple[str, frozenset[str], frozenset[str]], ...]:
+    """Computes sibling closure reads and mutations reachable via rec_param on enc_child's class."""
+    loaded_attrs, _stored_attrs, bare_escape = _extract_receiver_usage_in_method(
+        enc_child, rec_param
+    )
+    if not loaded_attrs and not bare_escape:
+        return ()
+    cls_node = _find_enclosing_method_class_node(fn_node, enc_child)
+    if cls_node is None:
+        return ()
+    if cls_node.bases or cls_node.keywords:
+        return tuple(
+            (rec_param, frozenset(s_reads), frozenset(s_muts))
+            for s_name, s_reads, s_muts in info_sibling_closures
+            if s_name == cls_node.name
+        )
+    sib_methods = [m for m in _iter_class_body_methods(cls_node) if m is not enc_child]
+    method_usages: Dict[int, Tuple[frozenset[str], frozenset[str], bool]] = {}
+    for m in sib_methods:
+        is_stat = any(
+            (isinstance(d, ast.Name) and d.id == "staticmethod")
+            or (isinstance(d, ast.Attribute) and d.attr == "staticmethod")
+            for d in getattr(m, "decorator_list", ())
+        )
+        m_args = getattr(m, "args", None)
+        m_pos = (
+            (m_args.posonlyargs + m_args.args)
+            if isinstance(m_args, ast.arguments)
+            else []
+        )
+        if not is_stat and m_pos:
+            method_usages[id(m)] = _extract_receiver_usage_in_method(m, m_pos[0].arg)
+        else:
+            method_usages[id(m)] = (frozenset(), frozenset(), False)
+    reachable_attrs: Set[str] = set(loaded_attrs)
+    reachable_method_ids: Set[int] = set()
+    if not bare_escape:
+        changed = True
+        while changed:
+            changed = False
+            for m in sib_methods:
+                mid = id(m)
+                if mid in reachable_method_ids:
+                    continue
+                m_load, m_store, m_bare = method_usages[mid]
+                if m.name in reachable_attrs or bool(m_store & reachable_attrs):
+                    reachable_method_ids.add(mid)
+                    changed = True
+                    if m_bare:
+                        bare_escape = True
+                        break
+                    if not m_load.issubset(reachable_attrs):
+                        reachable_attrs.update(m_load)
+            if bare_escape:
+                break
+    active_methods = (
+        sib_methods
+        if bare_escape
+        else [m for m in sib_methods if id(m) in reachable_method_ids]
+    )
+    reads: Set[str] = set()
+    muts: Set[str] = set()
+    for m in active_methods:
+        reads.update(_extract_cached_scope_free_reads(m))
+        m_muts, m_dels = _extract_closure_nonlocal_mutations_and_deletions(m)
+        muts.update(m_muts | m_dels)
+    if not reads and not muts:
+        return ()
+    return ((rec_param, frozenset(reads), frozenset(muts)),)
 
 
 def _build_enclosing_chain_cell_infos(
@@ -1873,25 +2031,21 @@ def _build_enclosing_chain_cell_infos(
             )
             if pos_args:
                 rec_param = pos_args[0].arg
-                enclosing_cls_names = _find_enclosing_method_class_names(fn_node, enc_child)
-                if enclosing_cls_names:
-                    extra_sibs = tuple(
-                        (rec_param, frozenset(s_reads), frozenset(s_muts))
-                        for s_name, s_reads, s_muts in info.sibling_closures
-                        if s_name in enclosing_cls_names
+                extra_sibs = _collect_method_receiver_sibling_closures(
+                    fn_node, enc_child, rec_param, info.sibling_closures
+                )
+                if extra_sibs:
+                    prev_info = rev_infos[-1]
+                    rev_infos[-1] = prev_info._replace(
+                        sibling_closures=(
+                            *prev_info.sibling_closures,
+                            *extra_sibs,
+                        ),
+                        all_sibling_nonlocal_mutations=frozenset(
+                            set(prev_info.all_sibling_nonlocal_mutations)
+                            | set().union(*(m for _, _, m in extra_sibs))
+                        ),
                     )
-                    if extra_sibs:
-                        prev_info = rev_infos[-1]
-                        rev_infos[-1] = prev_info._replace(
-                            sibling_closures=(
-                                *prev_info.sibling_closures,
-                                *extra_sibs,
-                            ),
-                            all_sibling_nonlocal_mutations=frozenset(
-                                set(prev_info.all_sibling_nonlocal_mutations)
-                                | set().union(*(m for _, _, m in extra_sibs))
-                            ),
-                        )
         rev_infos.append(info)
         own_bound_locals = (
             _extract_single_node_local_names(fn_node)

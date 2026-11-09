@@ -1095,6 +1095,15 @@ def _update_suppress_provenance_from_expr_walrus(
             w_stack.append((w_curr.body, False, False))
             w_stack.append((w_curr.test, cur_allow_pos, False))
             continue
+        if isinstance(w_curr, ast.Dict):
+            for k_node, v_node in reversed(
+                list(zip(w_curr.keys, w_curr.values))
+            ):
+                if v_node is not None:
+                    w_stack.append((v_node, cur_allow_pos, False))
+                if k_node is not None:
+                    w_stack.append((k_node, cur_allow_pos, False))
+            continue
         for ch in reversed(tuple(ast.iter_child_nodes(w_curr))):
             if not isinstance(ch, ast.stmt):
                 w_stack.append((ch, cur_allow_pos, False))
@@ -1705,7 +1714,14 @@ class _ModuleStmtDelta(NamedTuple):
 class _LazyModuleStmtSeedMap(Mapping[int, _SuppressProvenance]):
     """On-demand mapping from top-level statement id() to its prefix, suffix, or combined provenance."""
 
-    __slots__ = ("_deltas", "_idx_by_id", "_kind", "_cache")
+    __slots__ = (
+        "_deltas",
+        "_idx_by_id",
+        "_kind",
+        "_cache",
+        "_prefix_table",
+        "_suffix_table",
+    )
 
     def __init__(
         self,
@@ -1717,6 +1733,10 @@ class _LazyModuleStmtSeedMap(Mapping[int, _SuppressProvenance]):
         self._idx_by_id = idx_by_id
         self._kind = kind
         self._cache: dict[int, _SuppressProvenance] = {}
+        self._prefix_table: Optional[Tuple[_SuppressProvenance, ...]] = None
+        self._suffix_table: Optional[
+            Tuple[Tuple[frozenset[str], frozenset[str], frozenset[str], bool], ...]
+        ] = None
 
     def __len__(self) -> int:
         return len(self._idx_by_id)
@@ -1727,21 +1747,30 @@ class _LazyModuleStmtSeedMap(Mapping[int, _SuppressProvenance]):
     def __contains__(self, key: object) -> bool:
         return key in self._idx_by_id
 
-    def __getitem__(self, stmt_id: int) -> _SuppressProvenance:
-        cached = self._cache.get(stmt_id)
-        if cached is not None:
-            return cached
-        target_idx = self._idx_by_id[stmt_id]
+    def _ensure_tables(self) -> None:
         deltas = self._deltas
-        p_sup: Set[str] = set()
-        p_nonsup: Set[str] = set()
-        p_mods: Set[Tuple[str, str]] = set()
-        p_imps: Set[Tuple[str, str]] = set()
-        p_shad_b: Set[str] = set()
-        p_shad_n: Set[str] = set()
-        p_star = False
-        if self._kind in ("prefix", "combined"):
-            for idx in range(target_idx):
+        n = len(deltas)
+        if self._kind in ("prefix", "combined") and self._prefix_table is None:
+            p_sup: Set[str] = set()
+            p_nonsup: Set[str] = set()
+            p_mods: Set[Tuple[str, str]] = set()
+            p_imps: Set[Tuple[str, str]] = set()
+            p_shad_b: Set[str] = set()
+            p_shad_n: Set[str] = set()
+            p_star = False
+            pref_list: List[_SuppressProvenance] = []
+            for idx in range(n):
+                pref_list.append(
+                    _SuppressProvenance(
+                        frozenset(p_sup),
+                        frozenset(p_nonsup),
+                        frozenset(p_mods),
+                        frozenset(p_shad_b),
+                        p_star,
+                        frozenset(p_imps),
+                        frozenset(p_shad_n),
+                    )
+                )
                 d = deltas[idx]
                 if d.fwd_rem_sup:
                     p_sup.difference_update(d.fwd_rem_sup)
@@ -1769,64 +1798,92 @@ class _LazyModuleStmtSeedMap(Mapping[int, _SuppressProvenance]):
                     p_shad_n.update(d.fwd_add_shad_n)
                 if d.fwd_star:
                     p_star = True
-            if self._kind == "prefix":
-                return self._cache.setdefault(
-                    stmt_id,
-                    _SuppressProvenance(
-                        frozenset(p_sup),
-                        frozenset(p_nonsup),
-                        frozenset(p_mods),
-                        frozenset(p_shad_b),
-                        p_star,
-                        frozenset(p_imps),
-                        frozenset(p_shad_n),
-                    ),
+            self._prefix_table = tuple(pref_list)
+
+        if self._kind in ("suffix", "combined") and self._suffix_table is None:
+            s_sup: Set[str] = set()
+            s_shad_b: Set[str] = set()
+            s_shad_n: Set[str] = set()
+            s_star = False
+            suff_list: List[
+                Tuple[frozenset[str], frozenset[str], frozenset[str], bool]
+            ] = [
+                (frozenset(), frozenset(), frozenset(), False)
+            ] * n
+            for idx in range(n - 1, -1, -1):
+                suff_list[idx] = (
+                    frozenset(s_sup),
+                    frozenset(s_shad_b),
+                    frozenset(s_shad_n),
+                    s_star,
                 )
+                d = deltas[idx]
+                if d.branch_new_sup:
+                    s_sup.update(d.branch_new_sup)
+                if d.branch_shad_b:
+                    s_shad_b.update(d.branch_shad_b)
+                if d.branch_shad_n:
+                    s_shad_n.update(d.branch_shad_n)
+                if d.branch_star:
+                    s_star = True
+            self._suffix_table = tuple(suff_list)
 
-        s_sup: Set[str] = set()
-        s_shad_b: Set[str] = set()
-        s_shad_n: Set[str] = set()
-        s_star = False
-        for idx in range(target_idx + 1, len(deltas)):
-            d = deltas[idx]
-            if d.branch_new_sup:
-                s_sup.update(d.branch_new_sup)
-            if d.branch_shad_b:
-                s_shad_b.update(d.branch_shad_b)
-            if d.branch_shad_n:
-                s_shad_n.update(d.branch_shad_n)
-            if d.branch_star:
-                s_star = True
+    def __getitem__(self, stmt_id: int) -> _SuppressProvenance:
+        cached = self._cache.get(stmt_id)
+        if cached is not None:
+            return cached
+        target_idx = self._idx_by_id[stmt_id]
+        self._ensure_tables()
+        if self._kind == "prefix":
+            assert self._prefix_table is not None
+            res = self._prefix_table[target_idx]
+            self._cache[stmt_id] = res
+            return res
+
+        assert self._suffix_table is not None
+        s_sup, s_shad_b, s_shad_n, s_star = self._suffix_table[target_idx]
         if self._kind == "suffix":
-            return self._cache.setdefault(
-                stmt_id,
-                _SuppressProvenance(
-                    suppressors=frozenset(s_sup),
-                    shadowed_builtins=frozenset(s_shad_b),
-                    has_star_import=s_star,
-                    shadowed_names=frozenset(s_shad_n),
-                ),
+            res = _SuppressProvenance(
+                suppressors=s_sup,
+                shadowed_builtins=s_shad_b,
+                has_star_import=s_star,
+                shadowed_names=s_shad_n,
             )
+            self._cache[stmt_id] = res
+            return res
 
+        assert self._prefix_table is not None
+        pref = self._prefix_table[target_idx]
+        if not s_sup and not s_shad_b and not s_shad_n and not s_star:
+            self._cache[stmt_id] = pref
+            return pref
+        p_nonsup = pref.non_suppressors
+        p_mods = pref.stdlib_modules
+        p_imps = pref.imported_symbols
+        p_shad_n = pref.shadowed_names
         if s_shad_n:
-            p_nonsup.difference_update(s_shad_n)
+            p_nonsup = p_nonsup - s_shad_n
             if p_mods:
-                p_mods = {pair for pair in p_mods if pair[0] not in s_shad_n}
+                p_mods = frozenset(
+                    pair for pair in p_mods if pair[0] not in s_shad_n
+                )
             if p_imps:
-                p_imps = {pair for pair in p_imps if pair[0] not in s_shad_n}
-            p_shad_n.update(s_shad_n)
-        if s_sup:
-            p_sup.update(s_sup)
-        if s_shad_b:
-            p_shad_b.update(s_shad_b)
+                p_imps = frozenset(
+                    pair for pair in p_imps if pair[0] not in s_shad_n
+                )
+            p_shad_n = p_shad_n | s_shad_n
         res = _SuppressProvenance(
-            suppressors=frozenset(p_sup),
-            non_suppressors=frozenset(p_nonsup),
-            stdlib_modules=frozenset(p_mods),
-            shadowed_builtins=frozenset(p_shad_b),
-            has_star_import=p_star or s_star,
-            imported_symbols=frozenset(p_imps),
-            shadowed_names=frozenset(p_shad_n),
+            suppressors=pref.suppressors | s_sup if s_sup else pref.suppressors,
+            non_suppressors=p_nonsup,
+            stdlib_modules=p_mods,
+            shadowed_builtins=(
+                pref.shadowed_builtins | s_shad_b
+                if s_shad_b
+                else pref.shadowed_builtins
+            ),
+            has_star_import=pref.has_star_import or s_star,
+            imported_symbols=p_imps,
+            shadowed_names=p_shad_n,
         )
         self._cache[stmt_id] = res
         return res

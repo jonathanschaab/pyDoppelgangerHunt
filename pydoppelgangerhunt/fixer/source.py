@@ -27,9 +27,8 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _get_or_parse_tree,
     _suppress_syntax_warnings,
 )
-from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=unused-import
+from pydoppelgangerhunt.fixer._df_closures import (
     _get_tree_scope_intervals,
-    _node_earliest_start_pos,
     _node_scope_bounds,
 )
 from pydoppelgangerhunt.source_lines import (
@@ -115,8 +114,11 @@ class UnitSchema(TypedDict, total=False):
         file_source: Fallback complete in-memory source text of the containing module.
         source_lines: Sequence of source lines (either pre-sliced excerpt or full module).
         source_lines_is_sliced: Explicit boolean disambiguating whether ``source_lines``
-            is already sliced to the unit's line/column boundaries (``True``) or represents
+            is already sliced to the unit's line boundaries (``True``) or represents
             the full module buffer (``False``).
+        source_lines_is_col_sliced: Explicit boolean disambiguating whether ``source_lines``
+            is already trimmed to ``start_col``..``end_col`` (``True``) or still requires
+            column slicing (``False``).
         inputs: Ordered list of live-in variable names required by the unit.
         outputs: Ordered list of live-out variable names exported by the unit.
         precomputed_outputs: Explicit caller-supplied output variable list taking
@@ -174,6 +176,7 @@ class UnitSchema(TypedDict, total=False):
     file_source: Optional[str]
     source_lines: Optional[Sequence[str]]
     source_lines_is_sliced: Optional[bool]
+    source_lines_is_col_sliced: Optional[bool]
     inputs: Sequence[str]
     outputs: Sequence[str]
     precomputed_outputs: Optional[Sequence[str]]
@@ -767,22 +770,23 @@ def _slice_unit_token_lines(
     """Slices source lines to the exact start_col and end_col offsets of the unit."""
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
         return lines
-    raw_flag = unit.get("source_lines_is_sliced")
+    raw_col_flag = unit.get("source_lines_is_col_sliced")
     eff_col_sliced = (
         explicit_col_sliced
         if explicit_col_sliced is not None
-        else (raw_flag if isinstance(raw_flag, bool) else None)
+        else (raw_col_flag if isinstance(raw_col_flag, bool) else None)
     )
     if eff_col_sliced is True:
         return list(lines)
+    raw_line_flag = unit.get("source_lines_is_sliced")
     if isinstance(is_pre_sliced, SourceLinesOrigin):
         effective_pre_sliced = (
             is_pre_sliced.is_pre_sliced or is_pre_sliced.is_placeholder
         )
     elif is_pre_sliced is not None:
         effective_pre_sliced = bool(is_pre_sliced)
-    elif eff_col_sliced is not None:
-        effective_pre_sliced = bool(eff_col_sliced)
+    elif isinstance(raw_line_flag, bool):
+        effective_pre_sliced = raw_line_flag
     else:
         effective_pre_sliced = is_sliced_unit_source_lines(unit)
     s_col_opt = _extract_slice_col_offset(
@@ -817,7 +821,7 @@ def _slice_unit_token_lines(
         if (
             s_col > first_byte_len
             or (s_col == first_byte_len and e_col != first_byte_len)
-            or (e_col is not None and e_col > first_byte_len + 1)
+            or (e_col is not None and e_col > first_byte_len)
         ):
             return []
         res[0] = _slice_utf8_line(res[0], s_col, e_col)
@@ -843,7 +847,7 @@ def _slice_unit_token_lines(
             ):
                 return res
         if (s_col >= first_byte_len and first_stripped[:1].isspace()) or (
-            e_col is not None and e_col > last_byte_len + 1
+            e_col is not None and e_col > last_byte_len
         ):
             return []
         clipped = list(res)
