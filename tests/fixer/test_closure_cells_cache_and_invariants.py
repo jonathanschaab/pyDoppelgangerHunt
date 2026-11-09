@@ -6566,6 +6566,20 @@ def test_harvest_file_units_passes_strict_unit_schema_and_scope_inspection(
             True,
             (False, True),
         ),
+        (
+            {"strict_with_suppression": True},
+            None,
+            False,
+            None,
+            (False, True),
+        ),
+        (
+            {"skip_pre_unit_closures": True},
+            None,
+            None,
+            False,
+            (True, False),
+        ),
     ],
 )
 def test_resolve_unit_closure_flags_truth_table(
@@ -6617,3 +6631,434 @@ def test_source_lines_origin_enum_properties_and_hash_contract() -> None:
     assert SourceLinesOrigin.PRE_SLICED != "PRE_SLICED"
     assert SourceLinesOrigin.PRE_SLICED != True  # noqa: E712
     assert len(set(SourceLinesOrigin)) == 4
+
+
+def test_synthesize_shared_helper_code_does_not_mutate_unit_allowlist_across_calls() -> None:
+    """Verifies synthesize_shared_helper_code does not mutate caller u1/u2 dictionaries with transient allowlists."""
+    import copy
+
+    src = (
+        "def f1(custom_cm, flag):\n"
+        "    with custom_cm():\n"
+        "        if flag:\n"
+        "            raise ValueError('boom')\n"
+        "        x = 2\n"
+        "    cb = lambda: x\n"
+        "    out = cb() + 1\n"
+        "    return out\n\n"
+        "def f2(custom_cm, flag):\n"
+        "    with custom_cm():\n"
+        "        if flag:\n"
+        "            raise ValueError('boom')\n"
+        "        x = 2\n"
+        "    cb = lambda: x\n"
+        "    out = cb() + 1\n"
+        "    return out\n"
+    )
+    u1: dict[str, Any] = {
+        "name": "f1:block",
+        "file": "mod.py",
+        "start": 6,
+        "end": 7,
+        "kind": "compound_block",
+        "source_text": src,
+        "source_code": "    cb = lambda: x\n    out = cb() + 1\n",
+    }
+    u2: dict[str, Any] = {
+        "name": "f2:block",
+        "file": "mod.py",
+        "start": 15,
+        "end": 16,
+        "kind": "compound_block",
+        "source_text": src,
+        "source_code": "    cb = lambda: x\n    out = cb() + 1\n",
+    }
+    u1_before = copy.deepcopy(u1)
+    u2_before = copy.deepcopy(u2)
+
+    allowed_helper = synthesize_shared_helper_code(
+        u1,
+        u2,
+        closure_strictness="pedantic",
+        non_suppressing_ctx_managers=["custom_cm"],
+    )
+    assert "def _shared_" in allowed_helper
+    assert u1 == u1_before
+    assert u2 == u2_before
+    assert "non_suppressing_ctx_managers" not in u1
+    assert "non_suppressing_ctx_managers" not in u2
+
+    rejected_helper = synthesize_shared_helper_code(
+        u1,
+        u2,
+        closure_strictness="pedantic",
+    )
+    assert rejected_helper == ""
+    sc1_pedantic = inspect_single_unit_scope(
+        {**u1, "closure_strictness": "pedantic"},
+    )
+    assert "severed_closure_cell" in sc1_pedantic["control_flow_hazards"]
+
+
+def test_local_class_dynamic_namespace_mutation_not_proven_non_suppressing() -> None:
+    """Verifies local classes with dynamic namespace mutation (locals().update, exec, setattr) are not proven non-suppressing."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _class_def_is_proven_non_suppressing_in_exit,
+        _class_def_may_suppress_in_exit,
+    )
+
+    tricky_cls_src = (
+        "class TrickyCM:\n"
+        "    def __enter__(self):\n"
+        "        return self\n"
+        "    def __exit__(self, *args):\n"
+        "        return False\n"
+        "    locals().update({'__exit__': lambda self, *a: True})\n"
+    )
+    tricky_cls = ast.parse(tricky_cls_src).body[0]
+    assert isinstance(tricky_cls, ast.ClassDef)
+    assert _class_def_may_suppress_in_exit(tricky_cls) is True
+    assert _class_def_is_proven_non_suppressing_in_exit(tricky_cls) is False
+
+    exec_cls_src = (
+        "class ExecCM:\n"
+        "    def __enter__(self):\n"
+        "        return self\n"
+        "    def __exit__(self, *args):\n"
+        "        return False\n"
+        "    exec('def __exit__(self, *a): return True')\n"
+    )
+    exec_cls = ast.parse(exec_cls_src).body[0]
+    assert isinstance(exec_cls, ast.ClassDef)
+    assert _class_def_may_suppress_in_exit(exec_cls) is True
+    assert _class_def_is_proven_non_suppressing_in_exit(exec_cls) is False
+
+    full_src = (
+        "def run_tricky(flag):\n"
+        "    class TrickyCM:\n"
+        "        def __enter__(self):\n"
+        "            return self\n"
+        "        def __exit__(self, *args):\n"
+        "            return False\n"
+        "        locals().update({'__exit__': lambda self, *a: True})\n"
+        "    with TrickyCM():\n"
+        "        if flag:\n"
+        "            raise ValueError('boom')\n"
+        "        x = 2\n"
+        "    cb = lambda: x\n"
+        "    out = cb() + 1\n"
+        "    return out\n"
+    )
+    for mode in ("strict", "pedantic"):
+        sc = inspect_single_unit_scope(
+            {
+                "start": 12,
+                "end": 13,
+                "kind": "compound_block",
+                "source_text": full_src,
+                "source_code": "    cb = lambda: x\n    out = cb() + 1\n",
+                "closure_strictness": mode,
+            }
+        )
+        assert "severed_closure_cell" in sc["control_flow_hazards"]
+        assert "conditional_live_in" in sc.get("closure_hazard_reasons", ())
+
+
+def test_global_escape_dunder_builtins_heuristic_vs_pedantic_mode() -> None:
+    """Verifies dunder-invoking builtins (len, bool, int, isinstance) are allowed in strict mode but rejected as global_escape in pedantic mode."""
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _HEURISTIC_GLOBAL_SAFE_BUILTINS,
+        _PROVEN_PURE_GLOBAL_SAFE_BUILTINS,
+        _PURE_GLOBAL_SAFE_BUILTINS,
+        _unit_has_global_mutating_call,
+    )
+
+    assert _PROVEN_PURE_GLOBAL_SAFE_BUILTINS == frozenset({"callable", "chr", "id", "ord"})
+    assert "len" in _HEURISTIC_GLOBAL_SAFE_BUILTINS
+    assert "len" not in _PROVEN_PURE_GLOBAL_SAFE_BUILTINS
+    assert _PURE_GLOBAL_SAFE_BUILTINS == (
+        _PROVEN_PURE_GLOBAL_SAFE_BUILTINS | _HEURISTIC_GLOBAL_SAFE_BUILTINS
+    )
+
+    len_stmts = ast.parse("n = len(obj)\nout = n + G\n").body
+    id_stmts = ast.parse("n = id(obj)\nout = n + G\n").body
+    assert _unit_has_global_mutating_call(len_stmts, set(), allow_heuristic_builtins=True) is False
+    assert _unit_has_global_mutating_call(len_stmts, set(), allow_heuristic_builtins=False) is True
+    assert _unit_has_global_mutating_call(id_stmts, set(), allow_heuristic_builtins=False) is False
+
+    dunder_global_src = (
+        "G = 1\n"
+        "class Mutator:\n"
+        "    def __len__(self):\n"
+        "        global G\n"
+        "        G = 100\n"
+        "        return 5\n"
+        "def f(m):\n"
+        "    global G\n"
+        "    a = G\n"
+        "    b = len(m)\n"
+        "    c = G\n"
+        "    return a, b, c\n"
+    )
+    tree = ast.parse(dunder_global_src)
+    base_unit = {
+        "start": 9,
+        "end": 11,
+        "kind": "compound_block",
+        "source_text": dunder_global_src,
+        "source_code": "    a = G\n    b = len(m)\n    c = G\n",
+    }
+    sc_strict = inspect_single_unit_scope({**base_unit, "closure_strictness": "strict"}, tree=tree)
+    sc_pedantic = inspect_single_unit_scope(
+        {**base_unit, "closure_strictness": "pedantic"}, tree=tree
+    )
+    assert "global_escape" not in sc_strict.get("closure_hazard_reasons", ())
+    assert "global_escape" in sc_pedantic.get("closure_hazard_reasons", ())
+    assert "severed_closure_cell" in sc_pedantic["control_flow_hazards"]
+
+
+def test_public_evict_tree_scopes_invalidates_mutated_ast_caches() -> None:
+    """Verifies public evict_tree_scopes invalidates cached scope intervals after in-place AST coordinate mutation."""
+    from pydoppelgangerhunt import evict_tree_scopes as top_evict_tree_scopes
+    from pydoppelgangerhunt.fixer import evict_tree_scopes
+    from pydoppelgangerhunt.fixer.source import _get_tree_scope_intervals
+
+    assert top_evict_tree_scopes is evict_tree_scopes
+    clear_dataflow_cache()
+    tree = ast.parse("def alpha():\n    return 1\n")
+    intervals_before = _get_tree_scope_intervals(tree)
+    assert len(intervals_before) == 1
+    assert intervals_before[0][:2] == (1, 2)
+
+    fn_node = tree.body[0]
+    fn_node.lineno = 10
+    fn_node.end_lineno = 20
+    evict_tree_scopes(tree)
+    intervals_after = _get_tree_scope_intervals(tree)
+    assert intervals_after[0][:2] == (10, 20)
+
+
+def test_ensure_unit_scope_closure_mode_preserves_terminal_pathological_or_stale_scope() -> None:
+    """Verifies ensure_unit_scope_closure_mode preserves terminal pathological_ast/stale_source_code scopes without re-parsing."""
+    from pydoppelgangerhunt.fixer.scope import ensure_unit_scope_closure_mode
+
+    stale_scope = {
+        "inputs": [],
+        "outputs": [],
+        "control_flow_hazards": ["stale_source_code"],
+        "is_control_flow_safe": False,
+        "scope_schema_version": 1,
+        "skip_pre_unit_closures": False,
+        "strict_with_suppression": False,
+        "non_suppressing_ctx_managers": [],
+    }
+    preserved = ensure_unit_scope_closure_mode(
+        {"start": 1, "end": 2},
+        stale_scope,
+        False,
+        strict_with_suppression=True,
+        non_suppressing_ctx_managers=["safe_cm"],
+    )
+    assert preserved is stale_scope
+    assert preserved["is_control_flow_safe"] is False
+    assert "stale_source_code" in preserved["control_flow_hazards"]
+
+
+@pytest.mark.parametrize(
+    "stmts_src,in_branch,expected_sup,expected_non_sup,expected_shadowed",
+    [
+        # A. Branch merging (if/else)
+        (
+            "if cond:\n"
+            "    from contextlib import suppress as cm, nullcontext as nc\n"
+            "else:\n"
+            "    from contextlib import nullcontext as cm, nullcontext as nc\n",
+            False,
+            {"cm"},
+            {"nc"},
+            set(),
+        ),
+        # B. Assignment invalidation
+        (
+            "from contextlib import nullcontext as safe_cm\n" "safe_cm = unknown_factory()\n",
+            False,
+            set(),
+            set(),
+            {"safe_cm"},
+        ),
+        # C. Deletion invalidation
+        (
+            "from contextlib import nullcontext as safe_cm, suppress as sup_cm\n"
+            "del safe_cm, sup_cm\n",
+            False,
+            set(),
+            set(),
+            {"safe_cm", "sup_cm"},
+        ),
+        # E. Aliasing after rebinding
+        (
+            "from contextlib import suppress as s1, nullcontext as n1\n"
+            "s2 = s1\n"
+            "n2 = n1\n"
+            "n1 = unknown_factory()\n",
+            False,
+            {"s1", "s2"},
+            {"n2"},
+            {"n1"},
+        ),
+        # F. try/except/else/finally normal vs exceptional flow
+        (
+            "from contextlib import nullcontext as pre_nc\n"
+            "try:\n"
+            "    try_nc = pre_nc\n"
+            "    may_raise()\n"
+            "    post_raise_nc = pre_nc\n"
+            "except Exception:\n"
+            "    post_raise_nc = unknown_cm()\n"
+            "else:\n"
+            "    else_nc = try_nc\n"
+            "finally:\n"
+            "    from contextlib import suppress as fin_sup\n",
+            False,
+            {"fin_sup"},
+            {"pre_nc", "try_nc"},
+            {"post_raise_nc"},
+        ),
+    ],
+)
+def test_suppress_provenance_dataflow_transitions_truth_table(
+    stmts_src: str,
+    in_branch: bool,
+    expected_sup: set[str],
+    expected_non_sup: set[str],
+    expected_shadowed: set[str],
+) -> None:
+    """Verifies _SuppressProvenance transitions across branches, rebinding, del, aliasing, and try/except/else/finally."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _EMPTY_SUPPRESS_PROVENANCE,
+        _seed_scope_suppress_aliases,
+        _update_suppress_provenance_from_stmts,
+    )
+
+    stmts = ast.parse(stmts_src).body
+    prov = _update_suppress_provenance_from_stmts(
+        stmts, _EMPTY_SUPPRESS_PROVENANCE, in_branch=in_branch
+    )
+    assert expected_sup <= set(prov.suppress_names)
+    assert expected_non_sup <= set(prov.non_suppress_names)
+    assert "else_nc" not in prov.non_suppress_names
+    for name in expected_shadowed:
+        assert name not in prov.non_suppress_names
+        assert name in prov.shadowed_names
+
+    # D. Function parameter shadowing of imported symbol
+    param_shadow_tree = ast.parse(
+        "from contextlib import nullcontext, suppress\n"
+        "def inner(nullcontext, open):\n"
+        "    return nullcontext, open, suppress\n"
+    )
+    inner_fn = param_shadow_tree.body[1]
+    assert isinstance(inner_fn, ast.FunctionDef)
+    seeded = _seed_scope_suppress_aliases(inner_fn, mod_tree=param_shadow_tree)
+    assert "nullcontext" not in seeded.non_suppress_names
+    assert "nullcontext" in seeded.shadowed_names
+    assert "open" in seeded.shadowed_builtins
+    assert "suppress" in seeded.suppress_names
+
+
+@pytest.mark.parametrize(
+    "with_src,strict_with,expected_defs,expected_conds",
+    [
+        # 1. (suppress, nullcontext): item 2 may be skipped if item 1's __enter__ or body raises
+        (
+            "from contextlib import suppress, nullcontext\n"
+            "with suppress(ValueError) as a, nullcontext() as b:\n"
+            "    may_raise()\n"
+            "    body_v = 1\n",
+            False,
+            {"a"},
+            {"b", "body_v"},
+        ),
+        # 2. (nullcontext, suppress): item 1 is proven non-suppressing, so `a` and `b` are definite, body after raising call is conditional
+        (
+            "from contextlib import suppress, nullcontext\n"
+            "with nullcontext() as a, suppress(ValueError) as b:\n"
+            "    may_raise()\n"
+            "    body_v = 1\n",
+            False,
+            {"a", "b"},
+            {"body_v"},
+        ),
+        # 3. (suppress, unknown_manager): item 1 suppresses, so `b` and `body_v` are conditional
+        (
+            "from contextlib import suppress\n"
+            "with suppress(ValueError) as a, custom_mgr() as b:\n"
+            "    may_raise()\n"
+            "    body_v = 1\n",
+            False,
+            {"a"},
+            {"b", "body_v"},
+        ),
+        # 4. (unknown_manager, nullcontext): in pedantic mode (strict_with=True), item 1 may suppress so `b` and `body_v` are conditional
+        (
+            "from contextlib import nullcontext\n"
+            "with custom_mgr() as a, nullcontext() as b:\n"
+            "    may_raise()\n"
+            "    body_v = 1\n",
+            True,
+            {"a"},
+            {"b", "body_v"},
+        ),
+        # 5. Walrus inside multi-item with: `manager` in item 1 is definite; `other` in item 2 after suppress is conditional
+        (
+            "from contextlib import suppress\n"
+            "with (manager := suppress(ValueError)) as a, (other := custom_mgr()) as b:\n"
+            "    may_raise()\n"
+            "    body_v = 1\n",
+            False,
+            {"manager", "a"},
+            {"other", "b", "body_v"},
+        ),
+    ],
+)
+def test_multi_item_with_provenance_and_walrus_transitions(
+    with_src: str,
+    strict_with: bool,
+    expected_defs: set[str],
+    expected_conds: set[str],
+) -> None:
+    """Verifies multi-item with statement definite vs conditional assignments and walrus provenance."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _analyze_block_assignment,
+    )
+
+    stmts = ast.parse(with_src).body
+    defs, conds = _analyze_block_assignment(
+        stmts, strict_with_suppression=strict_with
+    )
+    assert expected_defs <= defs
+    assert not (expected_conds & defs)
+    assert expected_conds <= conds
+
+
+def test_suppress_syntax_warnings_exception_and_nested_thread_restoration() -> None:
+    """Verifies _suppress_syntax_warnings restores filters and active count across nested calls and exceptions."""
+    import warnings
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _suppress_syntax_warnings,
+        _syntax_warning_active_count,
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("always", UserWarning)
+        baseline_filters = list(warnings.filters)
+
+        with pytest.raises(RuntimeError, match="simulated parse failure"):
+            with _suppress_syntax_warnings():
+                assert _syntax_warning_active_count[0] == 1
+                with _suppress_syntax_warnings():
+                    assert _syntax_warning_active_count[0] == 2
+                    raise RuntimeError("simulated parse failure")
+
+        assert _syntax_warning_active_count[0] == 0
+        assert list(warnings.filters) == baseline_filters

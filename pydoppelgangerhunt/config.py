@@ -116,13 +116,15 @@ def resolve_closure_strictness_mode(
     """Resolves canonical closure strictness mode ('strict', 'pedantic', or 'lenient') and boolean skip flag.
 
     Precision vs Soundness Trade-off:
-    'strict' (default) preserves soundness by inspecting escaping closures and callbacks
-    that might execute after the unit, while treating unknown context managers as
-    non-suppressing unless their name looks like suppress/raises/ignore/subTest/ExitStack
-    or is proven suppressing.
-    'pedantic' (deprecated alias 'fail_closed') additionally treats all unproven
-    unknown context managers as potentially exception-suppressing unless explicitly listed
-    in non_suppressing_ctx_managers.
+    'strict' (default) is a heuristic safety mode for context managers: it enforces all
+    escaping closure and callback hazard checks while using a name-and-provenance heuristic
+    for unproven unknown context managers (treating them as non-suppressing unless their
+    name matches suppression idioms such as suppress/raises/ignore/subTest/ExitStack or is
+    proven suppressing via local/function/class __exit__ provenance).
+    'pedantic' (deprecated alias 'fail_closed') is the fail-closed mode that treats all
+    unproven unknown context managers as potentially exception-suppressing unless explicitly
+    listed in non_suppressing_ctx_managers, and rejects dunder-invoking built-in calls inside
+    global-reading units.
     'lenient' (deprecated aliases 'fast', 'skip') relaxes speculative unreferenced-sibling closure
     checks while still enforcing direct cell-capture, intra-unit nonlocal mutator, and
     referenced-sibling closure checks.
@@ -264,28 +266,20 @@ def resolve_unit_closure_flags(
     """
     if closure_strictness is not None:
         eff_strictness: Optional[str] = closure_strictness
-        eff_skip_in = (
-            skip_pre_unit_closures
-            if skip_pre_unit_closures is not None
-            else unit.get("skip_pre_unit_closures", False)
-        )
-        eff_sw_in = (
-            strict_with_suppression
-            if strict_with_suppression is not None
-            else unit.get("strict_with_suppression")
-        )
     elif skip_pre_unit_closures is not None or strict_with_suppression is not None:
         eff_strictness = None
-        eff_skip_in = (
-            skip_pre_unit_closures
-            if skip_pre_unit_closures is not None
-            else unit.get("skip_pre_unit_closures", False)
-        )
-        eff_sw_in = strict_with_suppression
     else:
         eff_strictness = unit.get("closure_strictness")
-        eff_skip_in = unit.get("skip_pre_unit_closures", False)
-        eff_sw_in = unit.get("strict_with_suppression")
+    eff_skip_in = (
+        skip_pre_unit_closures
+        if skip_pre_unit_closures is not None
+        else unit.get("skip_pre_unit_closures", False)
+    )
+    eff_sw_in = (
+        strict_with_suppression
+        if strict_with_suppression is not None
+        else unit.get("strict_with_suppression")
+    )
 
     resolved_mode, eff_skip = resolve_closure_strictness_mode(
         closure_strictness=eff_strictness,

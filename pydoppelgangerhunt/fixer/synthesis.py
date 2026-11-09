@@ -1420,10 +1420,6 @@ def synthesize_shared_helper_code(
         skip_pre_unit_closures=skip_pre_unit_closures,
         non_suppressing_ctx_managers=non_suppressing_ctx_managers,
     )
-    if eff_non_sup1:
-        u1["non_suppressing_ctx_managers"] = list(eff_non_sup1)
-    if eff_non_sup2:
-        u2["non_suppressing_ctx_managers"] = list(eff_non_sup2)
     has_precomputed_scopes = (
         scope_matches_closure_mode(
             scope1,

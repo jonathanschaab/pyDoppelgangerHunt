@@ -41,6 +41,7 @@ hashlib = _hashlib
 # Public API exports
 GeneratorCloneSideData = _df_pairing.GeneratorCloneSideData
 clear_dataflow_cache = _df_cache.clear_dataflow_cache
+evict_tree_scopes = _df_cache.evict_tree_scopes
 collect_downstream_read_names = _df_hazards.collect_downstream_read_names
 has_async_generator_delegation_hazard = (
     _df_hazards.has_async_generator_delegation_hazard
@@ -62,6 +63,7 @@ __all__ = [
     "GeneratorCloneSideData",
     "clear_dataflow_cache",
     "collect_downstream_read_names",
+    "evict_tree_scopes",
     "has_async_generator_delegation_hazard",
     "is_async_generator_with_return_value",
     "resolve_clone_generator_subroutine_outputs",

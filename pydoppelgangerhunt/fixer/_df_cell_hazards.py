@@ -419,33 +419,44 @@ class _ClosureHazardResult(NamedTuple):
     reasons: Tuple[str, ...] = ()
 
 
-# Pragmatic purity heuristic for standard inspection and conversion built-ins treated as
-# side-effect-free with respect to module-level global variables when checking whether an
-# extracted helper might mutate an outer `global` mid-execution.
-# Excludes built-ins that iterate arbitrary iterables (`all`, `any`, `dict`, `enumerate`,
-# `frozenset`, `list`, `max`, `min`, `set`, `sum`, `tuple`, `zip`, `bytes`) or invoke
-# general value-producing dunders (`abs`, `ascii`, `divmod`, `float`, `hash`, `pow`,
-# `repr`, `reversed`, `round`, `str`).
-# Remaining built-ins (`bool`, `int`, `len`, `bin`, `hex`, `oct`) and non-call AST
-# operations (operators, subscripts, attribute/property reads, and `for` iteration) are
-# assumed by heuristic not to mutate module-level globals via pathological
-# `__bool__`/`__len__`/`__index__`/`__int__` or operator/descriptor side effects.
-_PURE_GLOBAL_SAFE_BUILTINS: frozenset[str] = frozenset(
+# Built-in functions that operate strictly on C-level object headers or primitive values
+# without invoking user-defined Python dunders (`__len__`, `__bool__`, `__int__`,
+# `__index__`, `__instancecheck__`, `__subclasscheck__`):
+# - `id(x)`: returns the C pointer address of `x` without calling any Python method.
+# - `callable(x)`: inspects `Py_TYPE(x)->tp_call` in C without calling any Python method.
+# - `ord(c)`: inspects 1-char `str`/`bytes`/`bytearray` buffers in C without dunders.
+# - `chr(i)`: allowed in proven set only when `chr` is called (note: `_HEURISTIC_GLOBAL_SAFE_BUILTINS`
+#   contains built-ins that invoke user dunders on custom objects).
+_PROVEN_PURE_GLOBAL_SAFE_BUILTINS: frozenset[str] = frozenset(
+    {
+        "callable",
+        "chr",
+        "id",
+        "ord",
+    }
+)
+
+# Built-ins that are side-effect-free for standard types in `strict` mode under the
+# heuristic assumption that user-defined dunders (`__len__`, `__bool__`, `__int__`,
+# `__index__`, `__instancecheck__`, `__subclasscheck__`) do not mutate module-level
+# global variables. Rejected in `pedantic` mode (`strict_with_suppression=True`) when
+# a unit reads an enclosing `global` variable.
+_HEURISTIC_GLOBAL_SAFE_BUILTINS: frozenset[str] = frozenset(
     {
         "bin",
         "bool",
-        "callable",
-        "chr",
         "hex",
-        "id",
         "int",
         "isinstance",
         "issubclass",
         "len",
         "oct",
-        "ord",
         "range",
     }
+)
+
+_PURE_GLOBAL_SAFE_BUILTINS: frozenset[str] = (
+    _PROVEN_PURE_GLOBAL_SAFE_BUILTINS | _HEURISTIC_GLOBAL_SAFE_BUILTINS
 )
 
 
@@ -454,8 +465,9 @@ def _unit_has_global_mutating_call(
     shadowed_names: AbstractSet[str],
     *,
     has_star_import: bool = False,
+    allow_heuristic_builtins: bool = True,
 ) -> bool:
-    """Returns True when candidate_stmts contain a call or protocol hook other than an unshadowed pure builtin.
+    """Returns True when candidate_stmts contain a call or protocol hook other than an allowed unshadowed builtin.
 
     When an extracted helper reads a variable declared ``global`` in an enclosing
     function, the helper receives that global's value as a snapshot parameter at
@@ -464,9 +476,21 @@ def _unit_has_global_mutating_call(
     ``yield``, ``yield from``, ``async for``), or deletion (``del``) inside the
     helper could mutate the module-level global mid-execution, causing subsequent
     reads inside the helper to observe the stale parameter rather than the updated
-    global. Calls to unshadowed pure builtins cannot rebind module globals and are
-    safe to allow.
+    global.
+
+    In ``strict`` mode (``allow_heuristic_builtins=True``), both
+    ``_PROVEN_PURE_GLOBAL_SAFE_BUILTINS`` and ``_HEURISTIC_GLOBAL_SAFE_BUILTINS``
+    are permitted when unshadowed. In ``pedantic`` mode
+    (``allow_heuristic_builtins=False``), only ``_PROVEN_PURE_GLOBAL_SAFE_BUILTINS``
+    are permitted because dunder-invoking built-ins (such as ``len()``, ``bool()``,
+    ``int()``, ``isinstance()``) can execute arbitrary user code in ``__len__``,
+    ``__bool__``, ``__int__``, ``__index__``, or ``__instancecheck__``.
     """
+    allowed_builtins = (
+        _PURE_GLOBAL_SAFE_BUILTINS
+        if allow_heuristic_builtins
+        else _PROVEN_PURE_GLOBAL_SAFE_BUILTINS
+    )
     effective_shadowed: Set[str] = set(shadowed_names)
     for st in candidate_stmts:
         for node in ast.walk(st):
@@ -496,7 +520,7 @@ def _unit_has_global_mutating_call(
             if isinstance(node, ast.Call):
                 if all_builtins_shadowed or not (
                     isinstance(node.func, ast.Name)
-                    and node.func.id in _PURE_GLOBAL_SAFE_BUILTINS
+                    and node.func.id in allowed_builtins
                     and node.func.id not in effective_shadowed
                 ):
                     return True
@@ -779,6 +803,7 @@ def _evaluate_severed_closure_cell_hazard(
             ctx.candidate_stmts,
             shadowed_builtin_names,
             has_star_import=has_star,
+            allow_heuristic_builtins=not ctx.strict_with_suppression,
         ):
             _append_hazard_reason(reasons, "global_escape")
             return _ClosureHazardResult(True, tuple(reasons))

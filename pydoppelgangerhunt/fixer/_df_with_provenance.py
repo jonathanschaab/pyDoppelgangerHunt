@@ -713,11 +713,123 @@ def _iter_shallow_scope_body_nodes(scope_node: ast.AST) -> Iterator[ast.AST]:
             stack.append(ch)
 
 
+_DYNAMIC_CLASS_NAMESPACE_CALLS: frozenset[str] = frozenset(
+    {"locals", "vars", "exec", "eval", "setattr", "delattr", "globals"}
+)
+_DYNAMIC_METHOD_MUTATION_CALLS: frozenset[str] = frozenset(
+    {"exec", "eval", "setattr", "delattr"}
+)
+_DYNAMIC_FRAME_ATTR_CALLS: frozenset[str] = frozenset({"_getframe", "currentframe"})
+_SAFE_METHOD_DECORATORS: frozenset[str] = frozenset({"staticmethod", "classmethod", "property"})
+_DISALLOWED_ANNOTATION_NODE_TYPES: Tuple[type, ...] = (
+    ast.Call,
+    ast.Lambda,
+    ast.NamedExpr,
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+    ast.Yield,
+    ast.YieldFrom,
+    ast.Await,
+)
+
+
+def _is_static_class_attr_value(node: Optional[ast.AST]) -> bool:
+    """Returns True if an expression is a side-effect-free constant or literal container."""
+    if node is None or isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(
+        node.op, (ast.UAdd, ast.USub, ast.Invert, ast.Not)
+    ):
+        return _is_static_class_attr_value(node.operand)
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(_is_static_class_attr_value(elt) for elt in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(
+            (k is None or _is_static_class_attr_value(k)) and _is_static_class_attr_value(v)
+            for k, v in zip(node.keys, node.values)
+        )
+    return False
+
+
+def _annotation_is_call_free(node: Optional[ast.AST]) -> bool:
+    """Returns True if a type annotation expression contains no calls, lambdas, walrus, or comprehensions."""
+    return node is None or not any(
+        isinstance(sub, _DISALLOWED_ANNOTATION_NODE_TYPES) for sub in ast.walk(node)
+    )
+
+
+def _is_safe_non_suppressing_class_body_stmt(
+    stmt: ast.stmt,
+    prov: _SuppressProvenance = _EMPTY_SUPPRESS_PROVENANCE,
+) -> bool:
+    """Returns True if a class-body statement belongs to the strict syntactic subset for proven non-suppressing classes."""
+    if isinstance(stmt, ast.Pass):
+        return True
+    if isinstance(stmt, ast.Expr):
+        return isinstance(stmt.value, ast.Constant)
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if stmt.name in ("__exit__", "__aexit__"):
+            return not stmt.decorator_list
+        return all(
+            isinstance(dec, ast.Name)
+            and dec.id in _SAFE_METHOD_DECORATORS
+            and dec.id not in prov.shadowed_names
+            and dec.id not in prov.shadowed_builtins
+            for dec in stmt.decorator_list
+        )
+    if isinstance(stmt, ast.Assign):
+        if not stmt.targets or not _is_static_class_attr_value(stmt.value):
+            return False
+        return all(
+            isinstance(tgt, ast.Name) and not tgt.id.startswith("__")
+            for tgt in stmt.targets
+        )
+    if isinstance(stmt, ast.AnnAssign):
+        return (
+            isinstance(stmt.target, ast.Name)
+            and not stmt.target.id.startswith("__")
+            and _is_static_class_attr_value(stmt.value)
+            and _annotation_is_call_free(stmt.annotation)
+        )
+    return False
+
+
+def _is_dynamic_namespace_call(node: ast.AST, call_names: frozenset[str]) -> bool:
+    """Returns True if node is a call to a dynamic reflection/mutation function or frame getter."""
+    if not isinstance(node, ast.Call):
+        return False
+    if isinstance(node.func, ast.Name) and node.func.id in call_names:
+        return True
+    return isinstance(node.func, ast.Attribute) and node.func.attr in _DYNAMIC_FRAME_ATTR_CALLS
+
+
+def _class_def_has_dynamic_exit_mutation(cls_node: ast.ClassDef) -> bool:
+    """Returns True if a ClassDef contains dynamic namespace reflection or runtime __exit__/__aexit__ mutation."""
+    if any(
+        _is_dynamic_namespace_call(sub, _DYNAMIC_CLASS_NAMESPACE_CALLS)
+        for sub in _iter_shallow_scope_body_nodes(cls_node)
+    ):
+        return True
+    return any(
+        _is_dynamic_namespace_call(node, _DYNAMIC_METHOD_MUTATION_CALLS)
+        or (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and node.attr in ("__exit__", "__aexit__", "__class__", "__dict__")
+        )
+        for node in ast.walk(cls_node)
+    )
+
+
 def _class_def_may_suppress_in_exit(
     cls_node: ast.ClassDef,
     prov: _SuppressProvenance = _EMPTY_SUPPRESS_PROVENANCE,
 ) -> bool:
     """Returns True if a ClassDef inherits from a suppressor or defines/binds an __exit__/__aexit__ that may return truthy."""
+    if _class_def_has_dynamic_exit_mutation(cls_node):
+        return True
     for b in cls_node.bases:
         base_target = b.value if isinstance(b, ast.Subscript) else b
         if _is_suppress_alias_target_expr(base_target, prov) or (
@@ -795,12 +907,13 @@ def _class_def_is_proven_non_suppressing_in_exit(
     cls_node: ast.ClassDef,
     prov: _SuppressProvenance = _EMPTY_SUPPRESS_PROVENANCE,
 ) -> bool:
-    """Returns True if a ClassDef defines __exit__/__aexit__ that only returns falsy constants and has no unknown bases or metaclasses."""
+    """Returns True if a ClassDef defines __exit__/__aexit__ that only returns falsy constants and has a strictly static class body."""
     if (
         cls_node.decorator_list
         or cls_node.keywords
         or prov.has_star_import
         or not all(_is_safe_context_manager_base_expr(b, prov) for b in cls_node.bases)
+        or not all(_is_safe_non_suppressing_class_body_stmt(s, prov) for s in cls_node.body)
     ):
         return False
     cls_locals = _extract_single_node_local_names(cls_node)
@@ -3166,9 +3279,15 @@ def _split_suppress_with_body(
 ) -> Tuple[List[ast.stmt], List[ast.stmt]]:
     """Splits a potentially suppressing with-block body into (non_raising_prefix, potentially_raising_suffix)."""
     safe_prefix: List[ast.stmt] = []
-    cur_safe: Set[str] = set(safe_names)
-    cur_bool: Set[str] = set(safe_bool_names)
     cur_prov = _coerce_suppress_provenance(suppress_aliases)
+    cur_safe: Set[str] = (
+        set(safe_names)
+        | set(cur_prov.suppressors)
+        | set(cur_prov.non_suppressors)
+        | {alias for alias, _ in cur_prov.stdlib_modules}
+        | {alias for alias, _ in cur_prov.imported_symbols}
+    )
+    cur_bool: Set[str] = set(safe_bool_names)
     for idx, b_stmt in enumerate(body):
         if _stmt_cannot_raise_in_suppress(
             b_stmt,

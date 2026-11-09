@@ -256,43 +256,47 @@ escaping callbacks across lexical scopes.
   and enclosing unit inputs (`unit_inputs`). Because cache keys depend solely on source content
   digests and unit coordinates rather than file paths or unit names, cache entries are cleanly
   shared across clones and files with identical content. To support concurrent patch generation
-  and avoid cache thrashing across multi-pair sessions, `clear_dataflow_cache()` is exposed
-  as a public API (exported from `pydoppelgangerhunt.fixer`) for callers to invoke at batch
-  boundaries. Long-running processes (such as IDE language servers, daemon file watchers, or
-  custom analysis pipelines invoking `collect_downstream_read_names` directly) should call
-  `clear_dataflow_cache()` periodically between scan runs or batch boundaries to release
-  memoized AST trees and parent node maps.
+  and avoid cache thrashing across multi-pair sessions, `clear_dataflow_cache()` and
+  `evict_tree_scopes(tree)` are exposed as public APIs (exported from `pydoppelgangerhunt` and
+  `pydoppelgangerhunt.fixer`). AST trees passed via `tree=` are assumed immutable while cached;
+  callers that mutate an `ast.AST` in place must call `evict_tree_scopes(tree)` (or
+  `clear_dataflow_cache()`) after mutation to invalidate cached scope intervals and parent maps.
+  Long-running processes (such as IDE language servers, daemon file watchers, or custom analysis
+  pipelines invoking `collect_downstream_read_names` directly) should call `clear_dataflow_cache()`
+  periodically between scan runs or batch boundaries to release memoized AST trees and parent node maps.
 - **Precision vs. Soundness Trade-off**: Pre-unit closure and context-manager exception-suppression
   analysis can be configured via `--closure-strictness {strict,pedantic,lenient}`
   (deprecated aliases: `fail_closed` $\to$ `pedantic`, `fast`/`skip` $\to$ `lenient`; or `--skip-pre-unit-closures`,
   or setting `closure_strictness = "strict"|"pedantic"|"lenient"`, `strict_with_suppression = true|false`,
   and `non_suppressing_ctx_managers = [...]` in `pyproject.toml` or per-unit `UnitSchema` dicts):
-  - `strict` (default): Conservative closure mode that treats pre-unit closures capturing candidate
-    outputs as live escaping callbacks and enforces all closure-cell hazard checks. For `with` /
-    `async with` blocks, standard library non-suppressing context managers (`open`, `io.open`,
-    `io.StringIO`, `io.BytesIO`, `io.TextIOWrapper`, `io.BufferedReader`, `io.BufferedWriter`,
-    `io.BufferedRandom`, `io.BufferedRWPair`, `io.FileIO`,
-    `tempfile.*`, `contextlib.nullcontext`, `contextlib.closing`, `contextlib.aclosing`,
-    `contextlib.chdir`, `contextlib.redirect_stdout`, `contextlib.redirect_stderr`,
-    `warnings.catch_warnings`, `threading.Lock`/`RLock`/`Condition`/`Semaphore`/`BoundedSemaphore`,
-    `asyncio.Lock`, `decimal.localcontext`, `unittest.mock.patch`, `os.scandir`, `sqlite3.connect`,
+  - `strict` (default): **Heuristic context-manager safety mode** with conservative closure-cell
+    analysis. Treats pre-unit closures capturing candidate outputs as live escaping callbacks and
+    enforces all closure-cell hazard checks. For `with` / `async with` blocks, standard library
+    non-suppressing context managers (`open`, `io.open`, `io.StringIO`, `io.BytesIO`,
+    `io.TextIOWrapper`, `io.BufferedReader`, `io.BufferedWriter`, `io.BufferedRandom`,
+    `io.BufferedRWPair`, `io.FileIO`, `tempfile.*`, `contextlib.nullcontext`,
+    `contextlib.closing`, `contextlib.aclosing`, `contextlib.chdir`,
+    `contextlib.redirect_stdout`, `contextlib.redirect_stderr`, `warnings.catch_warnings`,
+    `threading.Lock`/`RLock`/`Condition`/`Semaphore`/`BoundedSemaphore`, `asyncio.Lock`,
+    `decimal.localcontext`, `unittest.mock.patch`, `os.scandir`, `sqlite3.connect`,
     `zipfile.ZipFile`, `tarfile.open`, `gzip.open`, `bz2.open`, `lzma.open`, `mmap.mmap`,
-    `socket.socket`, `socket.create_connection`, `pathlib.Path`) and local classes whose
-    `__exit__`/`__aexit__` returns only `False`/`None` are proven non-suppressing. Unproven context
-    managers use a name-and-provenance heuristic: managers are treated as non-suppressing unless
-    their identifier matches suppression idioms (`suppress`, `raises`, `ignore`, `subTest`,
-    `ExitStack`, `enter_context`, etc.) or is proven suppressing via local/function/class
-    `__exit__` provenance. **Note**: because this heuristic is name-based, `strict` mode is
-    **fail-open for neutrally named custom exception-suppressing context managers** (such as
-    `tolerate()`, `swallow()`, `best_effort()`, or `Transaction()`). Whenever an unproven context
-    manager is accepted via the name heuristic, `pyDoppelgangerHunt` logs a deduplicated `INFO`
-    diagnostic and an end-of-run summary; use `--closure-strictness pedantic` to fail closed on all
-    unproven context managers.
+    `socket.socket`, `socket.create_connection`, `pathlib.Path`) and local classes with a
+    strictly static class body whose `__exit__`/`__aexit__` returns only `False`/`None` are
+    proven non-suppressing. Unproven context managers use a name-and-provenance heuristic:
+    managers are treated as non-suppressing unless their identifier matches suppression idioms
+    (`suppress`, `raises`, `ignore`, `subTest`, `ExitStack`, `enter_context`, etc.) or is proven
+    suppressing via local/function/class `__exit__` provenance. **Note**: because this heuristic
+    is name-based, `strict` mode is **fail-open for neutrally named custom exception-suppressing
+    context managers** (such as `tolerate()`, `swallow()`, `best_effort()`, or `Transaction()`).
+    Whenever an unproven context manager is accepted via the name heuristic, `pyDoppelgangerHunt`
+    logs a deduplicated `INFO` diagnostic and an end-of-run summary; use
+    `--closure-strictness pedantic` to fail closed on all unproven context managers.
   - `pedantic` (deprecated alias: `fail_closed`; or `strict_with_suppression = true` when
-    `closure_strictness` is omitted): Fully
-    fail-closed mode that treats all unproven unknown `with` context managers as potentially
-    exception-suppressing unless explicitly allowlisted via `--non-suppressing-ctx-managers`
-    or `non_suppressing_ctx_managers` (merged across global config and per-unit overrides).
+    `closure_strictness` is omitted): **Fail-closed mode** that treats all unproven unknown `with`
+    context managers as potentially exception-suppressing unless explicitly allowlisted via
+    `--non-suppressing-ctx-managers` or `non_suppressing_ctx_managers` (merged across global
+    config and per-unit overrides), and rejects dunder-invoking built-in calls (`len`, `bool`,
+    `int`, `bin`, `hex`, `oct`, `isinstance`, `issubclass`, `range`) inside global-reading units.
     Allowlist entries support bare names (including locally defined classes), dotted paths
     (e.g., `pkg.tx.atomic`), and wildcard attribute suffixes (`*.atomic` matching
     `<any_receiver>.atomic(...)`; note that a single-dot `.atomic` entry matches both relative
@@ -333,11 +337,15 @@ strict fail-closed safety invariants:
   arbitrary functions, context-manager blocks (`with` / `async with`), coroutine/generator
   suspension points (`await`, `yield`, `yield from`, `async for`), and deletions (`del`) are
   rejected as a `global_escape` hazard because they could rebind or mutate the module-level global
-  mid-execution; only unshadowed pure inspection/conversion built-ins (`len`, `bool`, `int`, `bin`,
-  `hex`, `oct`, `chr`, `ord`, `id`, `callable`, `isinstance`, `issubclass`, `range`) and remaining
-  non-call AST operations (operators, subscripts, attribute/`@property` reads, and synchronous
-  `for` iteration) are permitted under the heuristic assumption that user types do not mutate
-  module-level globals inside those dunders or property getters.
+  mid-execution. C-level built-ins that do not invoke user-defined Python dunders
+  (`_PROVEN_PURE_GLOBAL_SAFE_BUILTINS`: `callable`, `chr`, `id`, `ord`) are permitted when
+  unshadowed in both `strict` and `pedantic` modes; dunder-invoking inspection/conversion built-ins
+  (`_HEURISTIC_GLOBAL_SAFE_BUILTINS`: `bin`, `bool`, `hex`, `int`, `isinstance`, `issubclass`,
+  `len`, `oct`, `range`) are permitted in `strict` mode under the heuristic assumption that user
+  types do not mutate module-level globals inside `__len__`/`__bool__`/`__int__`/`__index__`/
+  `__instancecheck__`/`__subclasscheck__`, and are rejected in `pedantic` mode. Remaining non-call
+  AST operations (operators, subscripts, attribute/`@property` reads, and synchronous `for`
+  iteration) are likewise assumed by heuristic not to mutate module-level globals.
 - **Dynamic Scope Reflection Limitations**: Downstream variable liveness analysis statically
   identifies dynamic local and global reads via `locals()`, `vars()`, `eval()`, `exec()`, `dir()`,
   and `globals()`. Dynamic reflection via runtime stack frame introspection (such as

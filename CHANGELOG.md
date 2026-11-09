@@ -11,8 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Closure Strictness Modes (`--closure-strictness {strict,pedantic,lenient,fail_closed,fast,skip}`)**:
   User-facing CLI flag and configuration setting (`closure_strictness` in `pyproject.toml` and `UnitSchema`) to
   select closure strictness and context-manager suppression policy during subroutine refactoring:
-  - `strict` (default): enforces full pre-unit and sibling closure-cell hazard analysis while using a name-and-provenance heuristic for unknown `with` / `async with` context managers (treating unknown managers as non-suppressing unless their identifier matches suppression idioms such as `suppress`, `raises`, `ignore`, `subTest`, `ExitStack`, `enter_context`, or is proven exception-suppressing via local/function/class `__exit__` provenance; fail-open for neutrally named custom suppressors such as `tolerate()` or `Transaction()`). Logs a per-manager `INFO` diagnostic and a consolidated end-of-run summary when unknown managers are accepted by heuristic.
-  - `pedantic` (deprecated alias: `fail_closed`): treats all unproven unknown `with` / `async with` context managers as potentially exception-suppressing unless allowlisted via `non_suppressing_ctx_managers`.
+  - `strict` (default): heuristic context-manager safety mode with conservative closure-cell analysis. Enforces full pre-unit and sibling closure-cell hazard analysis while using a name-and-provenance heuristic for unknown `with` / `async with` context managers (treating unknown managers as non-suppressing unless their identifier matches suppression idioms such as `suppress`, `raises`, `ignore`, `subTest`, `ExitStack`, `enter_context`, or is proven exception-suppressing via local/function/class `__exit__` provenance; fail-open for neutrally named custom suppressors such as `tolerate()` or `Transaction()`). Logs a per-manager `INFO` diagnostic and a consolidated end-of-run summary when unknown managers are accepted by heuristic.
+  - `pedantic` (deprecated alias: `fail_closed`): fail-closed mode that treats all unproven unknown `with` / `async with` context managers as potentially exception-suppressing unless allowlisted via `non_suppressing_ctx_managers`, and rejects dunder-invoking built-in calls inside global-reading units.
   - `lenient` (deprecated aliases: `fast`, `skip`; or `--skip-pre-unit-closures`): skips pre-unit closure liveness scanning for generator subroutines and relaxes speculative unreferenced-sibling closure checks while keeping checks for unbound captured cells, externally mutated captured cells, intra-unit `nonlocal`/walrus mutator escapes, and sibling closures explicitly referenced via unit inputs.
   Emits a diagnostic warning when `--skip-pre-unit-closures` conflicts with `closure_strictness` or when deprecated aliases (`fail_closed`, `fast`, `skip`) are used.
 - **`non_suppressing_ctx_managers` Configuration**:
@@ -27,9 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (aliasing `is_async_generator_with_return_value`) guarding against PEP 525 delegation hazards
   (`async for ...: yield` losing `athrow()`/`aclose()` propagation, return values, yield
   assignments, or try/with cleanup blocks) across both subroutine and whole-function extractions.
-- **Public Dataflow Cache Clearing (`clear_dataflow_cache`)**: Added `clear_dataflow_cache()`
-  in `pydoppelgangerhunt.fixer` (aliasing `_clear_downstream_reads_cache`) allowing long-running
-  processes, IDE servers, and batch runners to reset AST and downstream read memoization caches.
+- **Public Dataflow Cache Clearing (`clear_dataflow_cache`, `evict_tree_scopes`)**: Added
+  `clear_dataflow_cache()` (aliasing `_clear_downstream_reads_cache`) and `evict_tree_scopes(tree)`
+  (aliasing `_evict_tree_scopes`) in `pydoppelgangerhunt` and `pydoppelgangerhunt.fixer`, allowing
+  long-running processes, IDE servers, and batch runners to reset AST and downstream read
+  memoization caches or invalidate scope caches after in-place AST mutations.
 - **Closure Warning Cache Lifecycle**: Added `clear_closure_warning_cache` in `config.py`
   (invoked by `clear_dataflow_cache`) for reset in long-running processes.
 - **Subroutine Unit Classification**: Added `is_subroutine_unit` to detect compound blocks,
@@ -132,9 +134,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Write-Only Dead Conditional Store Pruning**:
   In `_inspect_unit_scope` (`scope.py`), write-only conditional stores (`cond_assigned - def_assigned` that are not read inside the unit and do not mutate an enclosing `nonlocal`/`global` target) are only promoted to `inputs` / `read_before_write` when the variable is live after the unit (in declared `outputs`, captured by an enclosing closure cell, or read downstream).
 - **Global-Read Call Purity, Protocol Hooks, & Wildcard Import Guards**:
-  Restricted calls allowed inside units that read an enclosing `global` variable to an explicit allowlist of 13 unshadowed pure built-ins (`_PURE_GLOBAL_SAFE_BUILTINS`: `bin`, `bool`, `callable`, `chr`, `hex`, `id`, `int`, `isinstance`, `issubclass`, `len`, `oct`, `ord`, `range`), rejected context-manager blocks (`with` / `async with`), suspension points (`await`, `yield`, `yield from`, `async for`), and deletions (`del`) inside global-reading units, and rejected all calls when `from ... import *` is present in the unit, module, or enclosing function/class scopes.
-- **Thread-Safe `SyntaxWarning` Suppression During AST and Symbol-Table Parsing**:
-  Serialized `SyntaxWarning` suppression via a reentrant lock (`_syntax_warning_lock`) and depth-counted `warnings.catch_warnings()` context in `_suppress_syntax_warnings` so concurrent `warnings.catch_warnings()` contexts never leak or drop `SyntaxWarning` filters across threads.
+  Restricted calls allowed inside units that read an enclosing `global` variable to explicit C-level built-ins (`_PROVEN_PURE_GLOBAL_SAFE_BUILTINS`: `callable`, `chr`, `id`, `ord`, permitted in both `strict` and `pedantic` modes) and dunder-invoking inspection/conversion built-ins (`_HEURISTIC_GLOBAL_SAFE_BUILTINS`: `bin`, `bool`, `hex`, `int`, `isinstance`, `issubclass`, `len`, `oct`, `range`, permitted in `strict` mode and rejected in `pedantic` mode), rejected context-manager blocks (`with` / `async with`), suspension points (`await`, `yield`, `yield from`, `async for`), and deletions (`del`) inside global-reading units, and rejected all calls when `from ... import *` is present in the unit, module, or enclosing function/class scopes.
+- **Internal `SyntaxWarning` Suppression Serialization During AST and Symbol-Table Parsing**:
+  Serialized internal `SyntaxWarning` suppression via a reentrant lock (`_syntax_warning_lock`) and depth-counted `warnings.catch_warnings()` context in `_suppress_syntax_warnings` so cooperating internal callers across threads do not race when suppressing `SyntaxWarning` during `ast.parse` and `symtable.symtable`.
 - **In-Memory Prioritized Unit Source Loading and Excerpt Slicing**: Prioritized in-memory unit
   source buffers (`source_text`, `file_source`, and non-sliced `source_lines`) before falling
   back to disk in `_load_unit_file_text` (`fixer/source.py`), eliminated duplicate fallback

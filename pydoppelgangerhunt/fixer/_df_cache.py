@@ -51,11 +51,14 @@ class _MissingCachedAstNodesError(TypeError):
 
 @contextlib.contextmanager
 def _suppress_syntax_warnings() -> Iterator[None]:
-    """Suppresses SyntaxWarning during AST/symtable parsing under a process-wide reentrant lock.
+    """Suppresses SyntaxWarning during AST/symtable parsing under a reentrant lock.
 
     Holds ``_syntax_warning_lock`` across ``warnings.catch_warnings()`` for the brief
-    ``ast.parse`` / ``symtable.symtable`` call so concurrent threads entering
-    ``warnings.catch_warnings()`` cannot snapshot or restore an intermediate filter list.
+    ``ast.parse`` / ``symtable.symtable`` call so cooperating internal callers of
+    ``_suppress_syntax_warnings()`` across threads are serialized and do not race with
+    one another. Because Python's ``warnings.catch_warnings()`` mutates process-global
+    ``warnings.filters`` without a standard-library lock, uncoordinated external threads
+    calling ``warnings.catch_warnings()`` directly are not synchronized by this lock.
     """
     with _syntax_warning_lock:
         if _syntax_warning_active_count[0] > 0:
@@ -940,6 +943,9 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
             _scope_stmts_by_start.pop(node, None)
             _scope_loops_cache.pop(node, None)
             _scope_try_with_cache.pop(node, None)
+
+
+evict_tree_scopes = _evict_tree_scopes
 
 
 def _store_lru_cache_entry(

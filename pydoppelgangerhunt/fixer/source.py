@@ -1715,7 +1715,14 @@ def _get_tree_scope_intervals(
     tree: ast.AST,
     source_lines: Optional[Sequence[str]] = None,
 ) -> List[Tuple[int, int, int, ast.AST]]:
-    """Builds and caches sorted intervals (earliest_start, n_end, span, node) for scope nodes in tree."""
+    """Builds and caches sorted intervals (earliest_start, n_end, span, node) for scope nodes in tree.
+
+    Note:
+        AST trees passed via ``tree=`` are assumed immutable while cached. Callers that
+        mutate a cached AST in place must call ``evict_tree_scopes(tree)`` (or
+        ``clear_dataflow_cache()``) after mutation so cached scope intervals and parent
+        maps are invalidated.
+    """
     if source_lines is not None:
         _register_tree_source_lines(tree, source_lines)
     else:

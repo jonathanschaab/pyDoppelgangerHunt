@@ -3121,6 +3121,12 @@ def ensure_unit_scope_closure_mode(
     Unmarked or legacy scopes (missing ``scope_schema_version == SCOPE_SCHEMA_VERSION``)
     and scopes whose mode flags differ from the requested configuration are recomputed
     when unit source or AST is available, and fail closed when source is unavailable.
+
+    Note:
+        Scopes that already record terminal ``"pathological_ast"`` or ``"stale_source_code"``
+        in ``control_flow_hazards`` are returned directly without re-parsing or mutating
+        the terminal hazard dict, as they are unconditionally rejected downstream regardless
+        of closure mode.
     """
     resolved_flags = resolve_unit_closure_flags(
         unit,
