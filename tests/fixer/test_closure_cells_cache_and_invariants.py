@@ -1789,7 +1789,7 @@ def test_slice_unit_token_lines_multiline_and_utf8_boundaries() -> None:
         },
         ml_lines,
     )
-    assert sliced_exact_first[0] == ml_lines[0]
+    assert sliced_exact_first == []
     sliced_beyond_first = _slice_unit_token_lines(
         {
             "kind": "complex_expr",
@@ -1798,7 +1798,7 @@ def test_slice_unit_token_lines_multiline_and_utf8_boundaries() -> None:
         },
         ml_lines,
     )
-    assert sliced_beyond_first[0] == ml_lines[0]
+    assert sliced_beyond_first == []
     utf8_ml = ['    "\u00e9\u754c" + (\n', "        1 + 2\n", "    )\n"]
     after_mb_col = len('    "\u00e9\u754c" + '.encode("utf-8"))
     sliced_mb = _slice_unit_token_lines(
@@ -1813,9 +1813,9 @@ def test_slice_unit_token_lines_multiline_and_utf8_boundaries() -> None:
                 "kind": "complex_expr",
                 "start_col": 8,
                 "end_col": last_bytes_len,
-                "source_code": "".join(presliced_ml),
             },
             presliced_ml,
+            is_pre_sliced=True,
         )
         == presliced_ml
     )
@@ -4877,7 +4877,7 @@ def test_neutral_named_suppressor_strict_vs_pedantic_and_summary_log(
 
     neutral_src = (
         "def run_neutral(compute):\n"
-        "    with Swallow(), tolerate(), Transaction():\n"
+        "    with Guard(), SpanContext(), Transaction():\n"
         "        result = compute()\n"
         "    cb = lambda: result\n"
         "    return cb()\n"
@@ -4907,12 +4907,32 @@ def test_neutral_named_suppressor_strict_vs_pedantic_and_summary_log(
     caplog.clear()
     with caplog.at_level(logging.WARNING):
         recorded = log_heuristic_ctx_manager_summary()
-    assert set(recorded) == {"Swallow", "Transaction", "tolerate"}
+    assert set(recorded) == {"Guard", "SpanContext", "Transaction"}
     assert any(
         "3 unproven context manager(s)" in rec.message
         and "were treated as non-suppressing" in rec.message
         for rec in caplog.records
     )
+
+    suspicious_src = (
+        "def run_suspicious(compute):\n"
+        "    with Swallow(), tolerate():\n"
+        "        result = compute()\n"
+        "    cb = lambda: result\n"
+        "    return cb()\n"
+    )
+    sc_suspicious = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 4,
+            "kind": "basic_block",
+            "source_text": suspicious_src,
+            "source_code": "    cb = lambda: result\n",
+            "closure_strictness": "strict",
+        },
+        tree=ast.parse(suspicious_src),
+    )
+    assert "severed_closure_cell" in sc_suspicious["control_flow_hazards"]
 
     sc_pedantic = inspect_single_unit_scope(
         {
@@ -5333,45 +5353,6 @@ def test_tracked_cached_dict_prunes_reverse_index_and_missing_cached_ast_nodes_r
             _ScopeCacheKey(fn, "unit_test_bad_box_cache"),
             _UnindexedCustomBox,
         )
-
-
-def test_source_lines_origin_equality_and_hash_contract() -> None:
-    """Verifies SourceLinesOrigin preserves reflexive, symmetric, transitive equality and hash consistency."""
-    from pydoppelgangerhunt.source_lines import SourceLinesOrigin
-
-    origins = (
-        SourceLinesOrigin.PRE_SLICED,
-        SourceLinesOrigin.FULL_BUFFER,
-        SourceLinesOrigin.DISK,
-        SourceLinesOrigin.PLACEHOLDER,
-    )
-    assert len(set(origins)) == 4
-    for a in origins:
-        assert a == a
-        assert hash(a) == hash(a)
-        assert a != a.name
-        assert a != bool(a)
-        assert a != True  # noqa: E712
-        assert a != False  # noqa: E712
-        for b in origins:
-            if a is b:
-                assert a == b
-                assert hash(a) == hash(b)
-            else:
-                assert a != b
-
-    mixed_set = {
-        SourceLinesOrigin.PRE_SLICED,
-        SourceLinesOrigin.PLACEHOLDER,
-        True,
-        "PRE_SLICED",
-        "PLACEHOLDER",
-    }
-    assert len(mixed_set) == 5
-    assert SourceLinesOrigin.PRE_SLICED.is_pre_sliced is True
-    assert SourceLinesOrigin.PLACEHOLDER.is_placeholder is True
-    assert SourceLinesOrigin.DISK.is_pre_sliced is False
-    assert SourceLinesOrigin.DISK.is_placeholder is False
 
 
 def test_walrus_left_to_right_order_and_compare_short_circuit_provenance() -> None:
@@ -5842,7 +5823,7 @@ def test_synthesize_refactoring_suggestion_unconditional_delegation_and_hazard_w
 def test_concurrent_suppress_syntax_warnings_and_stmt_deltas_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verifies lock-serialized _suppress_syntax_warnings concurrency with catch_warnings and _MAX_STMT_DELTAS_PER_FN LRU reuse."""
+    """Verifies lock-serialized _suppress_syntax_warnings concurrency and _MAX_STMT_DELTAS_PER_FN LRU reuse."""
     import concurrent.futures
     import warnings
     import pydoppelgangerhunt.fixer._df_cell_traversal as trav_mod
@@ -5864,15 +5845,8 @@ def test_concurrent_suppress_syntax_warnings_and_stmt_deltas_cap(
             with _suppress_syntax_warnings():
                 ast.parse(r"s = '\d+'")
 
-    def _catch_warnings_worker() -> None:
-        for _ in range(10):
-            with warnings.catch_warnings(record=True):
-                warnings.simplefilter("always", UserWarning)
-
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-        futs = [pool.submit(_suppress_worker) for _ in range(3)] + [
-            pool.submit(_catch_warnings_worker) for _ in range(3)
-        ]
+        futs = [pool.submit(_suppress_worker) for _ in range(6)]
         for f in futs:
             f.result(timeout=10.0)
 
@@ -5906,7 +5880,7 @@ def test_concurrent_suppress_syntax_warnings_and_stmt_deltas_cap(
     def _counting_apply(*args: Any, **kwargs: Any) -> Any:
         nonlocal pass2_hits
         res = orig_apply(*args, **kwargs)
-        if res is not None:
+        if res is True:
             pass2_hits += 1
         return res
 
@@ -6489,10 +6463,17 @@ def test_harvest_file_units_passes_strict_unit_schema_and_scope_inspection(
     tmp_path: Any,
 ) -> None:
     """Verifies every unit dict produced by harvest_file_units passes validate_unit_schema(strict=True) and inspect_single_unit_scope without stale_source_code."""
+    import json
     from pydoppelgangerhunt.fixer.source import validate_unit_schema
-    from pydoppelgangerhunt.parser import harvest_file_units
+    from pydoppelgangerhunt.parser import harvest_file_units, harvest_notebook_units
 
     sample_src = (
+        "def identity_deco(fn):\n"
+        "    return fn\n\n"
+        "def tab_helper(a, b):\n"
+        "\ttotal = (a + b) * (a - b)\n"
+        "\tscaled = total + a * 2\n"
+        "\treturn scaled\n\n"
         "class Widget:\n"
         "    TABLE = [\n"
         "        (1, 'a', True),\n"
@@ -6500,13 +6481,17 @@ def test_harvest_file_units_passes_strict_unit_schema_and_scope_inspection(
         "        (3, 'c', True),\n"
         "        (4, 'd', False),\n"
         "    ]\n"
+        "    @identity_deco\n"
         "    def compute(self, items, scale):\n"
-        "        def scale_it(v):\n"
+        "        banner = '''header line\n"
+        "# hash inside multiline string\n"
+        "footer line'''  # trailing comment\n"
+        "\x0c        def scale_it(v):\n"
         "            return v * scale + 1\n"
         "        vals = [scale_it(x) for x in items if x > 0]\n"
         "        if len(vals) > 2:\n"
         "            total = sum(vals) + (scale * 2 + 3) * (scale - 1)\n"
-        "            avg = total / len(vals)\n"
+        "            avg = total / len(vals) + len(banner)\n"
         "            return avg\n"
         "        else:\n"
         "            fallback = (scale + 10) * (scale + 20) - 5\n"
@@ -6515,27 +6500,61 @@ def test_harvest_file_units_passes_strict_unit_schema_and_scope_inspection(
     sample_file = tmp_path / "harvest_all_kinds.py"
     sample_file.write_text(sample_src, encoding="utf-8")
 
-    units = harvest_file_units(
-        str(sample_file),
+    crlf_file = tmp_path / "harvest_crlf.py"
+    crlf_file.write_bytes(sample_src.replace("\n", "\r\n").encode("utf-8"))
+
+    for target_file in (sample_file, crlf_file):
+        units = harvest_file_units(
+            str(target_file),
+            str(tmp_path),
+            min_lines=2,
+            min_tokens=4,
+            functions_only=False,
+            sliding_window=True,
+            window_size=2,
+            complex_expressions=True,
+            min_expr_complexity=3,
+            clause_level=True,
+            data_tables=True,
+            class_level=True,
+            harvest_closures=True,
+            comprehensions=True,
+        )
+        assert len(units) >= 5
+        for u in units:
+            assert validate_unit_schema(u, strict=True) == set()
+            sc = inspect_single_unit_scope(u, repo_root=str(tmp_path))
+            assert "stale_source_code" not in sc["control_flow_hazards"]
+
+    nb_file = tmp_path / "sample.ipynb"
+    nb_payload = {
+        "cells": [
+            {
+                "cell_type": "code",
+                "source": [
+                    "def nb_compute(items, scale):\n",
+                    "    vals = [x * scale for x in items if x > 0]\n",
+                    "    total = sum(vals) + scale\n",
+                    "    return total\n",
+                ],
+            }
+        ],
+        "metadata": {},
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
+    nb_file.write_text(json.dumps(nb_payload), encoding="utf-8")
+    nb_units = harvest_notebook_units(
+        str(nb_file),
         str(tmp_path),
         min_lines=2,
         min_tokens=4,
-        functions_only=False,
-        sliding_window=True,
-        window_size=2,
-        complex_expressions=True,
-        min_expr_complexity=3,
-        clause_level=True,
-        data_tables=True,
-        class_level=True,
-        harvest_closures=True,
-        comprehensions=True,
     )
-    assert len(units) >= 5
-    for u in units:
-        assert validate_unit_schema(u, strict=True) == set()
-        sc = inspect_single_unit_scope(u, repo_root=str(tmp_path))
-        assert "stale_source_code" not in sc["control_flow_hazards"]
+    assert nb_units
+    for nu in nb_units:
+        assert validate_unit_schema(nu, strict=True) == set()
+        sc_nb = inspect_single_unit_scope(nu, repo_root=str(tmp_path))
+        assert "stale_source_code" not in sc_nb["control_flow_hazards"]
 
 
 @pytest.mark.parametrize(
@@ -6631,6 +6650,14 @@ def test_source_lines_origin_enum_properties_and_hash_contract() -> None:
     assert SourceLinesOrigin.PRE_SLICED != "PRE_SLICED"
     assert SourceLinesOrigin.PRE_SLICED != True  # noqa: E712
     assert len(set(SourceLinesOrigin)) == 4
+    mixed_set = {
+        SourceLinesOrigin.PRE_SLICED,
+        SourceLinesOrigin.PLACEHOLDER,
+        True,
+        "PRE_SLICED",
+        "PLACEHOLDER",
+    }
+    assert len(mixed_set) == 5
 
 
 def test_synthesize_shared_helper_code_does_not_mutate_unit_allowlist_across_calls() -> None:
@@ -7666,5 +7693,314 @@ def test_synthesize_refactoring_suggestion_rejects_naked_break_and_continue_help
     suggestion = synthesize_refactoring_suggestion(u1, u2)
     assert "rejected as unsafe" in suggestion
     assert "def _shared_" not in suggestion
+
+
+def test_unit_level_closure_strictness_downstream_alias_and_mixed_mode_pair_symmetry(
+    tmp_path: Any,
+) -> None:
+    """Verifies unit-level closure_strictness is honored in downstream alias scans and mixed-mode pair entrypoints."""
+    if sys.version_info >= (3, 12):
+        alias_src = (
+            "def run_alias(x):\n"
+            "    cb = lambda: AliasT\n"
+            "    type AliasT = int\n"
+            "    val = x + 1\n"
+            "    return val\n"
+        )
+        alias_tree = ast.parse(alias_src)
+        u_lenient_alias = {
+            "start": 3,
+            "end": 4,
+            "kind": "compound_block",
+            "source_text": alias_src,
+            "source_code": "    type AliasT = int\n    val = x + 1\n",
+            "closure_strictness": "lenient",
+        }
+        u_strict_alias = {
+            **u_lenient_alias,
+            "closure_strictness": "strict",
+        }
+        sc_lenient = inspect_single_unit_scope(u_lenient_alias, tree=alias_tree)
+        sc_strict = inspect_single_unit_scope(u_strict_alias, tree=alias_tree)
+        assert "AliasT" not in sc_lenient["outputs"]
+        assert "AliasT" in sc_strict["outputs"]
+
+    pair_src = (
+        "def f1(flag):\n"
+        "    with UnknownMgr():\n"
+        "        if flag:\n"
+        "            raise ValueError('err')\n"
+        "        x = 2\n"
+        "    cb = lambda: x\n"
+        "    out = cb() + 1\n"
+        "    return out\n\n"
+        "def f2(flag):\n"
+        "    with UnknownMgr():\n"
+        "        if flag:\n"
+        "            raise ValueError('err')\n"
+        "        x = 2\n"
+        "    cb = lambda: x\n"
+        "    out = cb() + 1\n"
+        "    return out\n"
+    )
+    mod_file = tmp_path / "mixed_pair.py"
+    mod_file.write_text(pair_src, encoding="utf-8")
+    u1_strict = {
+        "name": "f1:block",
+        "file": str(mod_file),
+        "start": 6,
+        "end": 7,
+        "kind": "compound_block",
+        "source_text": pair_src,
+        "source_code": "    cb = lambda: x\n    out = cb() + 1\n",
+        "closure_strictness": "strict",
+    }
+    u2_pedantic = {
+        "name": "f2:block",
+        "file": str(mod_file),
+        "start": 15,
+        "end": 16,
+        "kind": "compound_block",
+        "source_text": pair_src,
+        "source_code": "    cb = lambda: x\n    out = cb() + 1\n",
+        "closure_strictness": "pedantic",
+    }
+    comb_sc = analyze_unit_variable_scope(u1_strict, u2_pedantic)
+    assert comb_sc["is_control_flow_safe"] is False
+    assert "severed_closure_cell" in comb_sc["control_flow_hazards"]
+
+    assert synthesize_shared_helper_code(u1_strict, u2_pedantic) == ""
+    assert (
+        generate_refactoring_patch(
+            [(1.0, u1_strict, u2_pedantic)], repo_root=str(tmp_path)
+        )
+        == ""
+    )
+
+
+def test_out_of_range_unit_columns_fail_closed_in_scope_and_slicing() -> None:
+    """Verifies out-of-range start_col/end_col fail closed in _slice_unit_token_lines and _inspect_unit_scope."""
+    from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
+
+    src = "def f(items):\n    res = [x * 2 for x in items]\n    return res\n"
+    line = "    res = [x * 2 for x in items]\n"
+    assert (
+        _slice_unit_token_lines(
+            {"kind": "comprehension", "start_col": 999, "end_col": 1010},
+            [line],
+        )
+        == []
+    )
+    assert (
+        _slice_unit_token_lines(
+            {"kind": "comprehension", "start_col": 10, "end_col": 999},
+            [line],
+        )
+        == []
+    )
+    sc_oob = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 2,
+            "start_col": 999,
+            "end_col": 1010,
+            "kind": "comprehension",
+            "source_text": src,
+        },
+        tree=ast.parse(src),
+    )
+    assert "stale_source_code" in sc_oob["control_flow_hazards"]
+    assert sc_oob["is_control_flow_safe"] is False
+
+
+def test_except_handler_and_import_shadowing_of_dunder_builtin_in_global_reading_unit() -> None:
+    """Verifies except-as and import-as bindings of dunder builtins inside global-reading units are caught in strict and pedantic modes."""
+    except_shadow_src = (
+        "G = 1\n"
+        "def run_except(a):\n"
+        "    global G\n"
+        "    try:\n"
+        "        v = G\n"
+        "    except Exception as len:\n"
+        "        v = len(a)\n"
+        "    return v\n"
+    )
+    import_shadow_src = (
+        "G = 1\n"
+        "def run_import(a):\n"
+        "    global G\n"
+        "    import custom_pkg as id\n"
+        "    v = id(a) + G\n"
+        "    return v\n"
+    )
+    for mode in ("strict", "pedantic"):
+        sc_exc = inspect_single_unit_scope(
+            {
+                "start": 4,
+                "end": 7,
+                "kind": "compound_block",
+                "source_text": except_shadow_src,
+                "source_code": (
+                    "    try:\n"
+                    "        v = G\n"
+                    "    except Exception as len:\n"
+                    "        v = len(a)\n"
+                ),
+                "closure_strictness": mode,
+            },
+            tree=ast.parse(except_shadow_src),
+        )
+        assert "global_escape" in sc_exc["closure_hazard_reasons"]
+
+        sc_imp = inspect_single_unit_scope(
+            {
+                "start": 4,
+                "end": 5,
+                "kind": "compound_block",
+                "source_text": import_shadow_src,
+                "source_code": "    import custom_pkg as id\n    v = id(a) + G\n",
+                "closure_strictness": mode,
+            },
+            tree=ast.parse(import_shadow_src),
+        )
+        assert "global_escape" in sc_imp["closure_hazard_reasons"]
+
+
+def test_for_loop_retry_yielded_context_manager_and_relative_vs_wildcard_allowlist() -> None:
+    """Verifies for-loop yielded retry/attempt context managers and distinct .Name vs *.attr allowlist semantics."""
+    retry_src = (
+        "def run_retry(Retrying, flag):\n"
+        "    for step in Retrying():\n"
+        "        with step:\n"
+        "            if flag:\n"
+        "                raise ValueError('transient')\n"
+        "            x = 10\n"
+        "    cb = lambda: x\n"
+        "    return cb()\n"
+    )
+    sc_retry = inspect_single_unit_scope(
+        {
+            "start": 7,
+            "end": 7,
+            "kind": "basic_block",
+            "source_text": retry_src,
+            "source_code": "    cb = lambda: x\n",
+            "closure_strictness": "strict",
+        },
+        tree=ast.parse(retry_src),
+    )
+    assert "severed_closure_cell" in sc_retry["control_flow_hazards"]
+    assert "conditional_live_in" in sc_retry["closure_hazard_reasons"]
+
+    attr_src = (
+        "def run_attr(client, flag):\n"
+        "    with client.atomic():\n"
+        "        if flag:\n"
+        "            raise ValueError('err')\n"
+        "        x = 2\n"
+        "    cb = lambda: x\n"
+        "    return cb()\n"
+    )
+    sc_dot_only = inspect_single_unit_scope(
+        {
+            "start": 6,
+            "end": 6,
+            "kind": "basic_block",
+            "source_text": attr_src,
+            "source_code": "    cb = lambda: x\n",
+            "closure_strictness": "pedantic",
+            "non_suppressing_ctx_managers": [".atomic"],
+        },
+        tree=ast.parse(attr_src),
+    )
+    assert "severed_closure_cell" in sc_dot_only["control_flow_hazards"]
+
+    sc_star_dot = inspect_single_unit_scope(
+        {
+            "start": 6,
+            "end": 6,
+            "kind": "basic_block",
+            "source_text": attr_src,
+            "source_code": "    cb = lambda: x\n",
+            "closure_strictness": "pedantic",
+            "non_suppressing_ctx_managers": ["*.atomic"],
+        },
+        tree=ast.parse(attr_src),
+    )
+    assert "severed_closure_cell" not in sc_star_dot["control_flow_hazards"]
+
+    rel_import_src = (
+        "from . import atomic\n"
+        "def run_rel(flag):\n"
+        "    with atomic():\n"
+        "        if flag:\n"
+        "            raise ValueError('err')\n"
+        "        x = 2\n"
+        "    cb = lambda: x\n"
+        "    return cb()\n"
+    )
+    sc_rel = inspect_single_unit_scope(
+        {
+            "start": 7,
+            "end": 7,
+            "kind": "basic_block",
+            "source_text": rel_import_src,
+            "source_code": "    cb = lambda: x\n",
+            "closure_strictness": "pedantic",
+            "non_suppressing_ctx_managers": [".atomic"],
+        },
+        tree=ast.parse(rel_import_src),
+    )
+    assert "severed_closure_cell" not in sc_rel["control_flow_hazards"]
+
+
+def test_lazy_parent_map_eviction_and_total_node_budget() -> None:
+    """Verifies _TrackedScopeCache skips duplicate nested parent maps and enforces _MAX_PARENT_MAP_TOTAL_NODES budget."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _MAX_PARENT_MAP_TOTAL_NODES,
+        _ScopeCacheKey,
+        _downstream_cache_lock,
+        _evict_tree_scopes,
+        _parent_map_total_nodes,
+        _scope_cell_info_cache,
+        _scope_parent_maps,
+        _store_parent_map_locked,
+    )
+
+    clear_dataflow_cache()
+    mod = ast.parse("def outer():\n    def inner():\n        return 1\n")
+    outer_fn = mod.body[0]
+    inner_fn = outer_fn.body[0]  # type: ignore[attr-defined]
+    mod_ck = _ScopeCacheKey(mod, "mod_test")
+    _scope_cell_info_cache[mod_ck] = ("mod_val",)
+    assert mod in _scope_parent_maps
+    # Inserting a nested scope key when mod is already indexed skips building a duplicate parent map for inner_fn
+    ck = _ScopeCacheKey(inner_fn, "lazy_evict_test")
+    _scope_cell_info_cache[ck] = ("cached_val",)
+    assert inner_fn not in _scope_parent_maps
+
+    # Evicting outer_fn (non-Module subtree) evicts both inner_fn and ancestor mod keys
+    _evict_tree_scopes(outer_fn)
+    assert ck not in _scope_cell_info_cache
+    assert mod_ck not in _scope_cell_info_cache
+
+    clear_dataflow_cache()
+    assert _parent_map_total_nodes[0] == 0
+    big_pm: dict[ast.AST, ast.AST] = {ast.Name(id=f"n{i}"): mod for i in range(500)}
+    with _downstream_cache_lock:
+        _store_parent_map_locked(mod, big_pm)
+        assert _parent_map_total_nodes[0] == 500
+        # Exceeding _MAX_PARENT_MAP_TOTAL_NODES evicts older parent maps to stay within budget
+        mod2 = ast.parse("x = 1\n")
+        huge_pm: dict[ast.AST, ast.AST] = {
+            ast.Name(id=f"m{i}"): mod2 for i in range(_MAX_PARENT_MAP_TOTAL_NODES - 100)
+        }
+        _store_parent_map_locked(mod2, huge_pm)
+        assert mod not in _scope_parent_maps
+        assert mod2 in _scope_parent_maps
+        assert _parent_map_total_nodes[0] == len(huge_pm)
+    clear_dataflow_cache()
+    assert _parent_map_total_nodes[0] == 0
+
 
 

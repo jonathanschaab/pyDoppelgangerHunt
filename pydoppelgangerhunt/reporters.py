@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 import html
 import json
+import logging
 import os
 from pathlib import Path
 import sys
@@ -23,6 +24,8 @@ from pydoppelgangerhunt.source_lines import (
     resolve_unit_line_bounds,
     split_source_lines,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_unit_coord(unit: Dict[str, Any], key: str) -> Optional[int]:
@@ -75,8 +78,8 @@ def extract_unit_source_lines_with_state(
     ``origin`` is a :class:`SourceLinesOrigin` indicating whether the returned lines
     came from a pre-sliced ``source_lines`` excerpt (``PRE_SLICED``), a full-file
     in-memory buffer (``FULL_BUFFER``), disk (``DISK``), or a synthetic missing-source
-    comment (``PLACEHOLDER``). ``bool(origin)`` evaluates to True for ``PRE_SLICED``
-    and ``PLACEHOLDER`` and False for ``FULL_BUFFER`` and ``DISK``.
+    comment (``PLACEHOLDER``). Callers should query ``origin.is_pre_sliced``,
+    ``origin.is_placeholder``, or ``origin.has_real_source`` explicitly.
     """
     s_d, e_d = _unit_line_bounds(unit)
     n_d = str(unit.get("name") or "unit")
@@ -278,7 +281,14 @@ def synthesize_refactoring_suggestion(
         )
         if helper_code:
             compile(helper_code, "<synthesized_suggestion>", "exec")
-    except Exception:  # pylint: disable=broad-exception-caught
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.debug(
+            "Failed to synthesize refactoring suggestion for (%s, %s): %s",
+            n1,
+            n2,
+            exc,
+            exc_info=True,
+        )
         helper_code = ""
     if helper_code:
         indented_helper = "\n".join(

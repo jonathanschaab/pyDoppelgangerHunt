@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 from pathlib import Path
 import shutil
 import subprocess
@@ -20,8 +19,6 @@ from pydoppelgangerhunt.fixer._df_cache import _suppress_syntax_warnings
 __all__ = [
     "_extract_symtable_scope_info",
     "_run_differential_refactoring_case",
-    "locate_ast_stmt_bounds",
-    "locate_marked_line_bounds",
 ]
 
 
@@ -58,50 +55,6 @@ def _extract_symtable_scope_info(
             }
         stack.extend(tbl.get_children())
     return result
-
-
-def locate_marked_line_bounds(
-    source_text: str,
-    start_marker: str = "# <unit-start>",
-    end_marker: str = "# <unit-end>",
-) -> Tuple[int, int]:
-    """Locates 1-based inclusive (start, end) line numbers delimited by comment or substring markers."""
-    start_line: Optional[int] = None
-    end_line: Optional[int] = None
-    for idx, line in enumerate(source_text.splitlines(), start=1):
-        if start_line is None and start_marker in line:
-            start_line = idx
-        if end_marker in line:
-            end_line = idx
-    if start_line is None or end_line is None or end_line < start_line:
-        raise ValueError(
-            f"Could not resolve markers ({start_marker!r}, {end_marker!r}) in source"
-        )
-    return start_line, end_line
-
-
-def locate_ast_stmt_bounds(
-    source_text: str,
-    fn_name: str,
-    stmt_start_index: int = 0,
-    stmt_end_index: Optional[int] = None,
-) -> Tuple[int, int]:
-    """Locates 1-based inclusive (start, end) line numbers of body statements inside function fn_name."""
-    tree = ast.parse(source_text)
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == fn_name
-        ):
-            end_idx = (
-                stmt_start_index if stmt_end_index is None else stmt_end_index
-            )
-            first_stmt = node.body[stmt_start_index]
-            last_stmt = node.body[end_idx]
-            s_line = int(getattr(first_stmt, "lineno", 1))
-            e_line = int(getattr(last_stmt, "end_lineno", s_line) or s_line)
-            return s_line, e_line
-    raise ValueError(f"Function {fn_name!r} not found in source")
 
 
 def _run_differential_refactoring_case(

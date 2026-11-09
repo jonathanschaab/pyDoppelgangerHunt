@@ -125,7 +125,6 @@ min_tokens = 15
 cross_file_strategy = "auto"
 shared_module_name = "_common.py"
 closure_strictness = "strict"  # "strict" (default), "pedantic", or "lenient"
-strict_with_suppression = false  # optional boolean fallback when closure_strictness is omitted
 non_suppressing_ctx_managers = []
 exclude = [
     "tests",
@@ -284,24 +283,25 @@ escaping callbacks across lexical scopes.
     strictly static class body whose `__exit__`/`__aexit__` returns only `False`/`None` are
     proven non-suppressing. Unproven context managers use a name-and-provenance heuristic:
     managers are treated as non-suppressing unless their identifier matches suppression idioms
-    (`suppress`, `raises`, `ignore`, `subTest`, `ExitStack`, `enter_context`, etc.) or is proven
-    suppressing via local/function/class `__exit__` provenance. **Note**: because this heuristic
-    is name-based, `strict` mode is **fail-open for neutrally named custom exception-suppressing
-    context managers** (such as `tolerate()`, `swallow()`, `best_effort()`, or `Transaction()`).
+    (`suppress`, `raises`, `ignore`, `subTest`, `ExitStack`, `enter_context`, `swallow`, `silent`,
+    `tolerat`, `best_effort`, `absorb`, `trap`, `fallback`, `noop`, `shield`, `retry`, `attempt`,
+    etc.) or is proven suppressing via local/function/class `__exit__` provenance. **Note**: because
+    this heuristic is name-based, `strict` mode is **fail-open for neutrally named custom
+    exception-suppressing context managers** (such as `Transaction()` or `Guard()`).
     Whenever an unproven context manager is accepted via the name heuristic, `pyDoppelgangerHunt`
-    logs a deduplicated `INFO` diagnostic and an end-of-run summary; use
-    `--closure-strictness pedantic` to fail closed on all unproven context managers.
-  - `pedantic` (deprecated alias: `fail_closed`; or `strict_with_suppression = true` when
-    `closure_strictness` is omitted): **Fail-closed mode** that treats all unproven unknown `with`
-    context managers as potentially exception-suppressing unless explicitly allowlisted via
-    `--non-suppressing-ctx-managers` or `non_suppressing_ctx_managers` (merged across global
-    config and per-unit overrides), and rejects dunder-invoking built-in calls (`len`, `bool`,
-    `int`, `bin`, `hex`, `oct`, `isinstance`, `issubclass`, `range`) inside global-reading units.
-    Allowlist entries support bare names (including locally defined classes), dotted paths
-    (e.g., `pkg.tx.atomic`), and wildcard attribute suffixes (`*.atomic` matching
-    `<any_receiver>.atomic(...)`; note that a single-dot `.atomic` entry matches both relative
-    imports `from . import atomic` and `*.atomic` attribute suffixes, so prefer `*.atomic` for
-    explicit attribute-suffix wildcards).
+    logs a deduplicated `INFO` diagnostic and an end-of-run summary (and records an advisory header
+    comment in `--patch` / `--output` artifacts); use `--closure-strictness pedantic` to fail
+    closed on all unproven context managers.
+  - `pedantic` (deprecated alias: `fail_closed`; or `strict_with_suppression = true` in programmatic
+    `UnitSchema` dicts when `closure_strictness` is omitted): **Fail-closed mode** that treats all
+    unproven unknown `with` context managers as potentially exception-suppressing unless explicitly
+    allowlisted via `--non-suppressing-ctx-managers` or `non_suppressing_ctx_managers` (merged
+    across global config and per-unit overrides), and rejects dunder-invoking built-in calls (`len`,
+    `bool`, `int`, `bin`, `hex`, `oct`, `isinstance`, `issubclass`, `range`) inside global-reading
+    units. Allowlist entries support bare names (including locally defined classes), relative
+    imports (`.Name` matching `from . import Name`), dotted paths (e.g., `pkg.tx.atomic` or
+    `unittest.mock.patch.object`), and wildcard attribute suffixes (`*.atomic` or `*.lock` matching
+    `<any_receiver>.atomic` / `<any_receiver>.lock(...)`).
   - `lenient` (deprecated aliases: `fast`, `skip`): Precision-oriented mode that skips pre-unit
     closure liveness scanning for generator subroutines and relaxes speculative unreferenced-sibling
     closure checks, while still enforcing checks for unbound captured cells at the extraction point,
@@ -420,7 +420,7 @@ pydoppelgangerhunt --init
 | `--shared-module-name` | `FILENAME` | Target filename for shared utility extractions (default: `_common.py`) |
 | `--skip-pre-unit-closures` | Flag | Relax speculative unreferenced pre-unit closure checks (`lenient` mode) |
 | `--closure-strictness` | `strict\|pedantic\|lenient\|fail_closed\|fast\|skip` | Closure strictness mode (`strict` [heuristic `with`-suppression, default], `pedantic` [all unproven `with`-managers treated as potentially suppressing], or `lenient` [relaxes speculative unreferenced-sibling closure checks while keeping unbound/mutated captured-cell, intra-unit `nonlocal`/walrus mutator, and referenced-sibling closure checks]; deprecated aliases: `fail_closed`, `fast`, `skip`) |
-| `--non-suppressing-ctx-managers` | `NAMES` | Context manager names, dotted paths, or `*.attr` / `.attr` suffixes proven not to suppress exceptions (comma-separated or repeatable) |
+| `--non-suppressing-ctx-managers` | `NAMES` | Context manager names, `.Name` relative imports, dotted paths, or `*.attr` wildcard suffixes proven not to suppress exceptions (comma-separated or repeatable) |
 | `--sort-by` | `similarity\|priority\|sloc` | Sort clone hits (default: `similarity`) |
 | `--priority` | Flag | Sort clones by Priority score: $\text{Sim} \times \text{SLOC} \times \text{Complexity}$ |
 | `--top` | `INT` | Truncate report to top $N$ clone pairs |

@@ -1190,6 +1190,7 @@ def test_positional_meta2_internal_nonlocal_and_global_type_param_bounds() -> No
     """Verifies positional meta2 lookup, internal nonlocal scoping, enclosing global PEP 695 bounds, and multiline end_col."""
     import sys  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=protected-access,import-outside-toplevel
+        _evict_tree_scopes,
         _get_or_parse_tree,
         _resolve_unit_ast_end_col,
     )
@@ -1263,10 +1264,12 @@ def test_positional_meta2_internal_nonlocal_and_global_type_param_bounds() -> No
     orig_col = cached_tree.body[0].col_offset  # type: ignore[attr-defined]
     try:
         cached_tree.body[0].col_offset = 99  # type: ignore[attr-defined]
+        _evict_tree_scopes(cached_tree)
         intervals2 = _get_tree_scope_intervals(cached_tree)
         assert intervals2 is not intervals1
     finally:
         cached_tree.body[0].col_offset = orig_col  # type: ignore[attr-defined]
+        _evict_tree_scopes(cached_tree)
 
     multi_stmt_tree = ast.parse("if True:\n    x = (\n        1 + 2\n    )\n")
     assert (

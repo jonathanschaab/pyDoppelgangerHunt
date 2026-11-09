@@ -79,6 +79,7 @@ def _suppress_syntax_warnings() -> Iterator[None]:
 
 _MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
 _MAX_SCOPE_CACHE_SIZE: int = 4096
+_MAX_PARENT_MAP_TOTAL_NODES: int = 65536
 _MAX_PARSED_TREE_CACHE_SIZE: int = 128
 _MAX_STMT_DELTAS_PER_FN: int = 512
 _MAX_STMT_WITH_SUMMARY_CACHE_SIZE: int = 512
@@ -90,8 +91,10 @@ _SCOPE_CACHE_KIND_CAPS: Dict[str, int] = {
     "suppress_seed": 256,
     "tree_sha256_digest": 256,
     "tree_scope_intervals": 256,
+    "tree_expr_scope_intervals": 256,
     "tree_source_lines": 256,
 }
+_parent_map_total_nodes: List[int] = [0]
 _downstream_reads_cache: OrderedDict[Tuple[Any, ...], frozenset[str]] = OrderedDict()
 _parsed_tree_cache: OrderedDict[Tuple[str, int], Optional[ast.AST]] = OrderedDict()
 
@@ -462,27 +465,30 @@ def _prune_reverse_index_buckets(
 def _store_parent_map_locked(
     root_node: ast.AST, parent_map: Dict[ast.AST, ast.AST]
 ) -> Dict[ast.AST, ast.AST]:
-    """Stores parent_map in _scope_parent_maps with LRU cap and reverse node-to-root indexing."""
+    """Stores parent_map in _scope_parent_maps with LRU cap, total-node budget, and reverse indexing."""
     if root_node in _scope_parent_maps:
         _scope_parent_maps.move_to_end(root_node)
         return _scope_parent_maps[root_node]
-    while len(_scope_parent_maps) >= _MAX_SCOPE_CACHE_SIZE and _scope_parent_maps:
-        evicted_root, _ = _scope_parent_maps.popitem(last=False)
+    new_map_size = len(parent_map)
+    while _scope_parent_maps and (
+        len(_scope_parent_maps) >= _MAX_SCOPE_CACHE_SIZE
+        or _parent_map_total_nodes[0] + new_map_size > _MAX_PARENT_MAP_TOTAL_NODES
+    ):
+        evicted_root, evicted_map = _scope_parent_maps.popitem(last=False)
+        _parent_map_total_nodes[0] = max(
+            0, _parent_map_total_nodes[0] - len(evicted_map)
+        )
         _prune_reverse_index_buckets(
             evicted_root, _parent_map_root_nodes, _node_to_parent_map_roots
         )
     _scope_parent_maps[root_node] = parent_map
     _scope_parent_maps.move_to_end(root_node)
-    scope_boundary_nodes = [root_node]
-    for top_stmt in getattr(root_node, "body", ()):
-        if isinstance(top_stmt, ast.AST):
-            scope_boundary_nodes.append(top_stmt)
-    for child_node in parent_map:
-        if isinstance(child_node, _SCOPE_ROOT_TYPES):
-            scope_boundary_nodes.append(child_node)
+    _parent_map_total_nodes[0] += new_map_size
+    all_nodes: Set[ast.AST] = set(parent_map.keys()) | set(parent_map.values())
+    all_nodes.add(root_node)
     _index_entry_ast_nodes(
         root_node,
-        scope_boundary_nodes,
+        tuple(all_nodes),
         _parent_map_root_nodes,
         _node_to_parent_map_roots,
     )
@@ -491,8 +497,11 @@ def _store_parent_map_locked(
 
 def _pop_parent_map_locked(root_node: ast.AST) -> None:
     """Removes root_node from _scope_parent_maps and prunes its reverse node-to-root index entries."""
-    if root_node in _scope_parent_maps:
-        _scope_parent_maps.pop(root_node, None)
+    removed_map = _scope_parent_maps.pop(root_node, None)
+    if removed_map is not None:
+        _parent_map_total_nodes[0] = max(
+            0, _parent_map_total_nodes[0] - len(removed_map)
+        )
     _prune_reverse_index_buckets(root_node, _parent_map_root_nodes, _node_to_parent_map_roots)
 
 
@@ -733,88 +742,98 @@ class _TrackedScopeCache(OrderedDict[Any, _CacheValT]):
         )
 
     def __setitem__(self, key: Any, value: _CacheValT) -> None:
-        val_nodes = _extract_value_ast_nodes(value)
-        key_nodes = _extract_key_ast_nodes(key)
-        if isinstance(value, dict) and not isinstance(value, _TrackedCachedDict):
-            value = cast(_CacheValT, _TrackedCachedDict(cast(Dict[Any, Any], value)))
-        was_present = key in self
-        if was_present:
-            prev_val = dict.__getitem__(self, key)
-            if isinstance(prev_val, _TrackedCachedDict) and prev_val is not value:
-                prev_val.unbind_owner(self, key)
-        if isinstance(value, _TrackedCachedDict):
-            value.bind_owner(self, key)
-        super().__setitem__(key, value)
-        if isinstance(key, _ScopeCacheKey):
-            kind_ring = self.ensure_kind_keys().setdefault(key.kind, OrderedDict())
-            kind_ring[key] = None
-            kind_ring.move_to_end(key)
-            if not val_nodes and isinstance(key.owner, _SCOPE_ROOT_TYPES):
-                _ensure_scope_owner_parent_map_locked(key.owner)
-        if was_present:
-            _resync_key_ast_nodes_locked(key, extra_caches=(self,))
-        else:
-            _register_key_ast_nodes(key, (*key_nodes, *val_nodes))
+        with _downstream_cache_lock:
+            val_nodes = _extract_value_ast_nodes(value)
+            key_nodes = _extract_key_ast_nodes(key)
+            if isinstance(value, dict) and not isinstance(value, _TrackedCachedDict):
+                value = cast(_CacheValT, _TrackedCachedDict(cast(Dict[Any, Any], value)))
+            was_present = key in self
+            if was_present:
+                prev_val = dict.__getitem__(self, key)
+                if isinstance(prev_val, _TrackedCachedDict) and prev_val is not value:
+                    prev_val.unbind_owner(self, key)
+            if isinstance(value, _TrackedCachedDict):
+                value.bind_owner(self, key)
+            super().__setitem__(key, value)
+            if isinstance(key, _ScopeCacheKey):
+                kind_ring = self.ensure_kind_keys().setdefault(key.kind, OrderedDict())
+                kind_ring[key] = None
+                kind_ring.move_to_end(key)
+            if was_present:
+                _resync_key_ast_nodes_locked(key, extra_caches=(self,))
+            else:
+                _register_key_ast_nodes(key, (*key_nodes, *val_nodes))
+            for n in key_nodes:
+                _ensure_scope_owner_parent_map_locked(n)
 
     def move_to_end(self, key: Any, last: bool = True) -> None:
-        super().move_to_end(key, last=last)
-        if isinstance(key, _ScopeCacheKey):
-            kind_ring = self.ensure_kind_keys().get(key.kind)
-            if kind_ring is not None and key in kind_ring:
-                kind_ring.move_to_end(key, last=last)
+        with _downstream_cache_lock:
+            super().move_to_end(key, last=last)
+            if isinstance(key, _ScopeCacheKey):
+                kind_ring = self.ensure_kind_keys().get(key.kind)
+                if kind_ring is not None and key in kind_ring:
+                    kind_ring.move_to_end(key, last=last)
 
     def __delitem__(self, key: Any) -> None:
-        if key in self:
-            prev_val = dict.__getitem__(self, key)
-            if isinstance(prev_val, _TrackedCachedDict):
-                prev_val.unbind_owner(self, key)
-        if isinstance(key, _ScopeCacheKey):
-            kind_ring = self.ensure_kind_keys().get(key.kind)
-            if kind_ring is not None:
-                kind_ring.pop(key, None)
-        super().__delitem__(key)
-        _unregister_key_if_absent(key)
-
-    def pop(self, key: Any, *args: Any) -> Any:
-        in_self = key in self
-        if in_self:
-            prev_val = dict.__getitem__(self, key)
-            if isinstance(prev_val, _TrackedCachedDict):
-                prev_val.unbind_owner(self, key)
+        with _downstream_cache_lock:
+            if key in self:
+                prev_val = dict.__getitem__(self, key)
+                if isinstance(prev_val, _TrackedCachedDict):
+                    prev_val.unbind_owner(self, key)
             if isinstance(key, _ScopeCacheKey):
                 kind_ring = self.ensure_kind_keys().get(key.kind)
                 if kind_ring is not None:
                     kind_ring.pop(key, None)
-        res = super().pop(key, *args)
-        if in_self:
+            super().__delitem__(key)
             _unregister_key_if_absent(key)
-        return res
+
+    def pop(self, key: Any, *args: Any) -> Any:
+        with _downstream_cache_lock:
+            in_self = key in self
+            if in_self:
+                prev_val = dict.__getitem__(self, key)
+                if isinstance(prev_val, _TrackedCachedDict):
+                    prev_val.unbind_owner(self, key)
+                if isinstance(key, _ScopeCacheKey):
+                    kind_ring = self.ensure_kind_keys().get(key.kind)
+                    if kind_ring is not None:
+                        kind_ring.pop(key, None)
+            res = super().pop(key, *args)
+            if in_self:
+                _unregister_key_if_absent(key)
+            return res
 
     def popitem(self, last: bool = True) -> Tuple[Any, _CacheValT]:
-        k, v = super().popitem(last=last)
-        if isinstance(v, _TrackedCachedDict):
-            v.unbind_owner(self, k)
-        if isinstance(k, _ScopeCacheKey):
-            kind_ring = self.ensure_kind_keys().get(k.kind)
-            if kind_ring is not None:
-                kind_ring.pop(k, None)
-        _unregister_key_if_absent(k)
-        return k, v
+        with _downstream_cache_lock:
+            k, v = super().popitem(last=last)
+            if isinstance(v, _TrackedCachedDict):
+                v.unbind_owner(self, k)
+            if isinstance(k, _ScopeCacheKey):
+                kind_ring = self.ensure_kind_keys().get(k.kind)
+                if kind_ring is not None:
+                    kind_ring.pop(k, None)
+            _unregister_key_if_absent(k)
+            return k, v
 
     def clear(self) -> None:
-        for k in list(self.keys()):
-            prev_val = dict.__getitem__(self, k)
-            if isinstance(prev_val, _TrackedCachedDict):
-                prev_val.unbind_owner(self, k)
-        self.ensure_kind_keys().clear()
-        super().clear()
-        other = _scope_cell_info_cache if self is _scope_closures_cache else _scope_closures_cache
-        if not other:
-            _scope_owner_keys_index.clear()
-            _scope_key_nodes_index.clear()
-        else:
-            for k in list(_scope_key_nodes_index.keys()):
-                _unregister_key_if_absent(k)
+        with _downstream_cache_lock:
+            for k in list(self.keys()):
+                prev_val = dict.__getitem__(self, k)
+                if isinstance(prev_val, _TrackedCachedDict):
+                    prev_val.unbind_owner(self, k)
+            self.ensure_kind_keys().clear()
+            super().clear()
+            other = (
+                _scope_cell_info_cache
+                if self is _scope_closures_cache
+                else _scope_closures_cache
+            )
+            if not other:
+                _scope_owner_keys_index.clear()
+                _scope_key_nodes_index.clear()
+            else:
+                for k in list(_scope_key_nodes_index.keys()):
+                    _unregister_key_if_absent(k)
 
 
 _scope_closures_cache: _TrackedScopeCache[Any] = _TrackedScopeCache()
@@ -865,6 +884,36 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
     scope_nodes: Set[ast.AST] = {node for node in tree_nodes if isinstance(node, _SCOPE_ROOT_TYPES)}
     scope_nodes.add(tree)
     with _downstream_cache_lock:
+        if not isinstance(tree, ast.Module):
+            t_start = getattr(tree, "lineno", None)
+            t_end = getattr(tree, "end_lineno", t_start)
+            for owner_node in list(_scope_owner_keys_index.keys()):
+                if (
+                    isinstance(owner_node, _SCOPE_ROOT_TYPES)
+                    and owner_node not in _scope_parent_maps
+                    and owner_node not in scope_nodes
+                ):
+                    o_start = getattr(owner_node, "lineno", None)
+                    o_end = getattr(owner_node, "end_lineno", o_start)
+                    decs = getattr(owner_node, "decorator_list", ())
+                    if decs and isinstance(o_start, int):
+                        dec_lines = [
+                            getattr(d, "lineno", o_start)
+                            for d in decs
+                            if isinstance(getattr(d, "lineno", None), int)
+                        ]
+                        if dec_lines:
+                            o_start = min(o_start, *dec_lines)
+                    if (
+                        not isinstance(t_start, int)
+                        or not isinstance(o_start, int)
+                        or not isinstance(o_end, int)
+                        or (
+                            o_start <= t_start
+                            and (not isinstance(t_end, int) or t_end <= o_end)
+                        )
+                    ):
+                        _ensure_scope_owner_parent_map_locked(owner_node)
         candidate_roots: Set[ast.AST] = set()
         if tree in _scope_parent_maps:
             candidate_roots.add(tree)
@@ -1005,27 +1054,19 @@ def _get_or_compute_scope_cached(
 ) -> _CacheValT:
     """Retrieves cached scope metadata or computes, caches, and returns it thread-safely."""
     try:
-        with _downstream_cache_lock:
-            if scope_node in cache:
-                cache.move_to_end(scope_node)
-                return cache[scope_node]
+        hash(scope_node)
     except TypeError:
         return compute_fn()
+    with _downstream_cache_lock:
+        if scope_node in cache:
+            cache.move_to_end(scope_node)
+            return cache[scope_node]
 
     # Concurrency Design Note: compute_fn() executes outside _downstream_cache_lock to
     # eliminate lock contention under multi-threading; transient duplicate computation during
     # concurrent misses is harmless because compute_fn is deterministic and pure.
     computed = compute_fn()
-    try:
-        return _store_lru_cache_entry(cache, scope_node, computed, _MAX_SCOPE_CACHE_SIZE)
-    except _MissingCachedAstNodesError:
-        raise
-    except TypeError as exc:
-        logger.debug(
-            "Skipping scope cache insertion due to unhashable key: %s",
-            exc,
-        )
-        return computed
+    return _store_lru_cache_entry(cache, scope_node, computed, _MAX_SCOPE_CACHE_SIZE)
 
 
 def _split_source_lines_stripped(source_text: str) -> Tuple[str, ...]:
@@ -1351,6 +1392,7 @@ def clear_dataflow_cache() -> None:
         _downstream_reads_cache.clear()
         _parsed_tree_cache.clear()
         _scope_parent_maps.clear()
+        _parent_map_total_nodes[0] = 0
         _node_to_parent_map_roots.clear()
         _parent_map_root_nodes.clear()
         _scope_stmts_by_end.clear()

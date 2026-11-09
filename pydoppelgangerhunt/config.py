@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import threading
 from typing import (
     Any,
     Dict,
+    Iterator,
     List,
     Mapping,
     NamedTuple,
@@ -28,8 +30,11 @@ from pydoppelgangerhunt.canonical_path import (
 logger = logging.getLogger(__name__)
 
 _warned_closure_lock: threading.Lock = threading.Lock()
+_MAX_WARNED_CLOSURE_EVENTS: int = 4096
+_MAX_HEURISTIC_CTX_MANAGERS: int = 1024
 _warned_closure_strictness_values: Set[str] = set()
 _heuristic_non_suppressing_ctx_managers: Set[str] = set()
+_defer_heuristic_summary_depth: List[int] = [0]
 
 _CONFIG_KEY_NAMES: Tuple[str, ...] = (
     "threshold",
@@ -66,12 +71,22 @@ class PairClosureFlags(NamedTuple):
     unit2: UnitClosureEndpointConfig
     effective_skip_pre_unit_closures: bool
 
+    @property
+    def effective_strict_with_suppression(self) -> bool:
+        """Returns True if either endpoint requires pedantic strict_with_suppression."""
+        return bool(
+            self.unit1.strict_with_suppression
+            or self.unit2.strict_with_suppression
+        )
+
 
 def should_warn_closure_event(event_key: str) -> bool:
     """Returns True the first time *event_key* is seen since cache reset."""
     with _warned_closure_lock:
         if event_key in _warned_closure_strictness_values:
             return False
+        if len(_warned_closure_strictness_values) >= _MAX_WARNED_CLOSURE_EVENTS:
+            _warned_closure_strictness_values.clear()
         _warned_closure_strictness_values.add(event_key)
         return True
 
@@ -85,14 +100,54 @@ def _warn_closure_event_once(event_key: str, msg: str, *args: Any) -> None:
 def record_heuristic_non_suppressing_ctx_manager(mgr_name: str) -> None:
     """Records an unproven context manager accepted by the strict-mode name heuristic."""
     with _warned_closure_lock:
+        if mgr_name in _heuristic_non_suppressing_ctx_managers:
+            return
+        if len(_heuristic_non_suppressing_ctx_managers) >= _MAX_HEURISTIC_CTX_MANAGERS:
+            return
         _heuristic_non_suppressing_ctx_managers.add(mgr_name)
 
 
-def log_heuristic_ctx_manager_summary() -> Tuple[str, ...]:
+def peek_heuristic_non_suppressing_ctx_managers() -> Tuple[str, ...]:
+    """Returns sorted unproven context managers recorded since last reset without clearing."""
+    with _warned_closure_lock:
+        if not _heuristic_non_suppressing_ctx_managers:
+            return ()
+        return tuple(sorted(_heuristic_non_suppressing_ctx_managers))
+
+
+def format_heuristic_ctx_manager_comment(names: Sequence[str]) -> str:
+    """Formats a summary comment line for unproven context managers accepted via name heuristic."""
+    if not names:
+        return ""
+    preview = ", ".join(repr(n) for n in names[:10])
+    if len(names) > 10:
+        preview += f", ... ({len(names)} total)"
+    return (
+        f"# Note: {len(names)} unproven context manager(s) ({preview}) were treated as "
+        f"non-suppressing via name heuristic in strict mode; use --closure-strictness "
+        f"pedantic to fail closed or list known-safe managers in --non-suppressing-ctx-managers."
+    )
+
+
+@contextlib.contextmanager
+def defer_heuristic_ctx_manager_summary() -> Iterator[None]:
+    """Defers mid-run log_heuristic_ctx_manager_summary() draining until an outer CLI boundary."""
+    with _warned_closure_lock:
+        _defer_heuristic_summary_depth[0] += 1
+    try:
+        yield
+    finally:
+        with _warned_closure_lock:
+            _defer_heuristic_summary_depth[0] = max(0, _defer_heuristic_summary_depth[0] - 1)
+
+
+def log_heuristic_ctx_manager_summary(*, force: bool = False) -> Tuple[str, ...]:
     """Logs a consolidated summary of unproven context managers accepted via name heuristic."""
     with _warned_closure_lock:
         if not _heuristic_non_suppressing_ctx_managers:
             return ()
+        if _defer_heuristic_summary_depth[0] > 0 and not force:
+            return tuple(sorted(_heuristic_non_suppressing_ctx_managers))
         names = tuple(sorted(_heuristic_non_suppressing_ctx_managers))
         _heuristic_non_suppressing_ctx_managers.clear()
     preview = ", ".join(repr(n) for n in names[:10])
@@ -142,7 +197,15 @@ def resolve_closure_strictness_mode(
                 if is_lenient_mode
                 else ("pedantic" if c_mode in ("pedantic", "fail_closed") else "strict")
             )
-            if c_mode in ("fail_closed", "fast", "skip"):
+            if c_mode == "fail_closed":
+                _warn_closure_event_once(
+                    f"deprecated_strictness_alias:{c_mode}",
+                    "closure_strictness alias '%s' is deprecated and maps to 'pedantic' "
+                    "(which fails closed on unproven with-blocks and arbitrary calls); "
+                    "use 'pedantic' or 'strict' (previous default-strict behavior) instead",
+                    closure_strictness,
+                )
+            elif c_mode in ("fast", "skip"):
                 _warn_closure_event_once(
                     f"deprecated_strictness_alias:{c_mode}",
                     "closure_strictness alias '%s' is deprecated; use '%s' instead",
@@ -242,24 +305,44 @@ def resolve_unit_closure_flags(
         ========================  ======  ===========  ==================
     """
     if closure_strictness is not None:
-        eff_strictness: Optional[str] = closure_strictness
-    elif skip_pre_unit_closures is not None or strict_with_suppression is not None:
-        eff_strictness = None
-    else:
-        eff_strictness = unit.get("closure_strictness")
+        eff_skip_in = (
+            skip_pre_unit_closures
+            if skip_pre_unit_closures is not None
+            else unit.get("skip_pre_unit_closures", False)
+        )
+        eff_sw_in = (
+            strict_with_suppression
+            if strict_with_suppression is not None
+            else unit.get("strict_with_suppression")
+        )
+        resolved_mode, eff_skip = resolve_closure_strictness_mode(
+            closure_strictness=closure_strictness,
+            skip_pre_unit_closures=bool(eff_skip_in),
+            strict_with_suppression=eff_sw_in,
+        )
+        return UnitClosureFlags(eff_skip, resolved_mode == "pedantic")
+
+    unit_mode, unit_skip = resolve_closure_strictness_mode(
+        closure_strictness=unit.get("closure_strictness"),
+        skip_pre_unit_closures=bool(unit.get("skip_pre_unit_closures", False)),
+        strict_with_suppression=unit.get("strict_with_suppression"),
+    )
+    unit_strict_with = unit_mode == "pedantic"
+    if skip_pre_unit_closures is None and strict_with_suppression is None:
+        return UnitClosureFlags(unit_skip, unit_strict_with)
+
     eff_skip_in = (
         skip_pre_unit_closures
         if skip_pre_unit_closures is not None
-        else unit.get("skip_pre_unit_closures", False)
+        else (False if strict_with_suppression else unit_skip)
     )
     eff_sw_in = (
         strict_with_suppression
         if strict_with_suppression is not None
-        else unit.get("strict_with_suppression")
+        else (False if skip_pre_unit_closures else unit_strict_with)
     )
-
     resolved_mode, eff_skip = resolve_closure_strictness_mode(
-        closure_strictness=eff_strictness,
+        closure_strictness=None,
         skip_pre_unit_closures=bool(eff_skip_in),
         strict_with_suppression=eff_sw_in,
     )
@@ -272,6 +355,7 @@ def resolve_pair_closure_flags(
     *,
     closure_strictness: Optional[str] = None,
     skip_pre_unit_closures: Optional[bool] = None,
+    strict_with_suppression: Optional[bool] = None,
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> PairClosureFlags:
     """Resolves per-unit and pair-level closure and context-manager flags for two clone units."""
@@ -279,11 +363,13 @@ def resolve_pair_closure_flags(
         u1,
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
+        strict_with_suppression=strict_with_suppression,
     )
     skip2, strict_with2 = resolve_unit_closure_flags(
         u2,
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
+        strict_with_suppression=strict_with_suppression,
     )
     eff_non_sup1 = normalize_non_suppressing_ctx_managers(
         non_suppressing_ctx_managers,

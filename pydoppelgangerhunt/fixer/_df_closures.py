@@ -59,9 +59,11 @@ def _node_earliest_start_pos(
         Python's AST records decorator positions on the decorator expression node
         rather than the ``@`` token, while Python's grammar places ``@`` at the same
         indentation column as ``def``/``class`` (``node.col_offset``). When
-        ``source_lines`` is provided, this helper scans upward from each decorator
-        expression to locate the ``@`` line; otherwise it uses ``dec.lineno`` and
-        ``node.col_offset``.
+        ``source_lines`` is provided (or cached on the enclosing tree via
+        ``_register_tree_source_lines`` / ``_get_or_parse_tree``), this helper scans
+        upward from each decorator expression to locate the ``@`` line; for raw
+        unregistered ``ast.parse()`` trees without ``source_lines``, it falls back to
+        ``dec.lineno`` and ``node.col_offset``.
     """
     n_line = getattr(node, "lineno", None)
     n_col = getattr(node, "col_offset", None)
@@ -102,6 +104,85 @@ def _node_earliest_start_pos(
             ):
                 best_col = at_col
     return best_line, best_col
+
+
+def _node_scope_bounds(
+    node: ast.AST, source_lines: Optional[Sequence[str]] = None
+) -> Tuple[int, int]:
+    """Computes (earliest_start, n_end) line bounds for a scope AST node."""
+    n_start = getattr(node, "lineno", 0) or 0
+    n_end = getattr(node, "end_lineno", None) or n_start
+    estart, _ = _node_earliest_start_pos(node, source_lines=source_lines)
+    return (estart if isinstance(estart, int) and estart > 0 else n_start), n_end
+
+
+def _get_tree_scope_intervals(
+    tree: ast.AST,
+    source_lines: Optional[Sequence[str]] = None,
+) -> Sequence[Tuple[int, int, int, ast.AST]]:
+    """Builds and caches sorted intervals (earliest_start, n_end, span, node) for scope nodes in tree.
+
+    Note:
+        AST trees passed via ``tree=`` are assumed immutable while cached. Callers that
+        mutate a cached AST in place must call ``evict_tree_scopes(tree)`` (or
+        ``clear_dataflow_cache()``) after mutation so cached scope intervals and parent
+        maps are invalidated.
+    """
+    if source_lines is not None:
+        _register_tree_source_lines(tree, source_lines)
+    else:
+        source_lines = _get_cached_tree_source_lines(tree)
+
+    def _compute() -> Tuple[Tuple[int, int, int, ast.AST], ...]:
+        intervals: List[Tuple[int, int, int, ast.AST]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                earliest_start, n_end = _node_scope_bounds(node, source_lines)
+                intervals.append((earliest_start, n_end, n_end - earliest_start, node))
+        intervals.sort(
+            key=lambda item: (item[2], -item[0], -getattr(item[3], "col_offset", 0))
+        )
+        return tuple(intervals)
+
+    if getattr(tree, "_is_ephemeral_unit_mod", False):
+        return _compute()
+    cache_key = _make_trusted_scope_cache_key(
+        owner=tree,
+        kind="tree_scope_intervals",
+        params=(bool(source_lines),),
+    )
+    return cast(
+        Tuple[Tuple[int, int, int, ast.AST], ...],
+        _get_or_compute_scope_cached(_scope_cell_info_cache, cache_key, _compute),
+    )
+
+
+def _get_tree_expr_scope_intervals(
+    tree: ast.AST,
+) -> Tuple[Tuple[int, int, int, ast.AST], ...]:
+    """Returns cached (start, end, col_offset, node) tuples for Lambda and comprehension scopes."""
+
+    def _compute() -> Tuple[Tuple[int, int, int, ast.AST], ...]:
+        out: List[Tuple[int, int, int, ast.AST]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Lambda, *_COMPREHENSION_TYPES)):
+                n_start = int(getattr(node, "lineno", 0) or 0)
+                n_end = int(getattr(node, "end_lineno", n_start) or n_start)
+                n_col = int(getattr(node, "col_offset", 0) or 0)
+                if n_start > 0:
+                    out.append((n_start, n_end, n_col, node))
+        return tuple(out)
+
+    if getattr(tree, "_is_ephemeral_unit_mod", False):
+        return _compute()
+    return cast(
+        Tuple[Tuple[int, int, int, ast.AST], ...],
+        _get_or_compute_scope_cached(
+            _scope_cell_info_cache,
+            _make_trusted_scope_cache_key(tree, "tree_expr_scope_intervals"),
+            _compute,
+        ),
+    )
 
 
 def _node_strictly_encloses_bounds(
@@ -483,19 +564,10 @@ def _resolve_enclosing_scopes_by_coords(
         and isinstance(e_line, int)
         and 1 <= s_line <= e_line
     )
-    all_sub_scopes = [
-        node
-        for node in ast.walk(module_tree)
-        if isinstance(
-            node,
-            (
-                ast.FunctionDef,
-                ast.AsyncFunctionDef,
-                ast.Lambda,
-                *_COMPREHENSION_TYPES,
-                ast.ClassDef,
-            ),
-        )
+    all_sub_scopes: List[ast.AST] = [
+        node for _, _, _, node in _get_tree_scope_intervals(module_tree)
+    ] + [
+        node for _, _, _, node in _get_tree_expr_scope_intervals(module_tree)
     ]
     is_ambiguous_rel_coords = (
         not has_valid_lines
@@ -1432,8 +1504,8 @@ def _extract_scope_nonlocals_and_outer_globals(
     u_start_col: Optional[int] = None,
     u_end_col: Optional[int] = None,
 ) -> Tuple[Set[str], Set[str]]:
-    """Extracts (nonlocal_names, outer_only_globals) declared in the unit's immediate scope."""
-    _, nonlocal_names, outer_globals, intra_globals = (
+    """Extracts (nonlocal_names, outer_globals) declared in the unit's immediate scope."""
+    _, nonlocal_names, outer_globals, _ = (
         _extract_scope_nonlocals_and_globals_sets(
             scope_node,
             u_start,
@@ -1442,7 +1514,7 @@ def _extract_scope_nonlocals_and_outer_globals(
             u_end_col=u_end_col,
         )
     )
-    return nonlocal_names, outer_globals - intra_globals
+    return nonlocal_names, outer_globals
 
 
 def _has_escaped_intra_unit_global_declarations(
@@ -1468,10 +1540,23 @@ def _has_escaped_intra_unit_global_declarations(
         return False
     if not is_subroutine:
         return True
-    intra_only_globals = intra_globals - outer_globals
-    if not intra_only_globals:
-        return False
     body = getattr(target_scope, "body", [])
+    shared_globals = intra_globals & outer_globals
+    if shared_globals and isinstance(body, list):
+        u_stack: List[ast.AST] = list(body)
+        while u_stack:
+            u_curr = u_stack.pop()
+            if isinstance(u_curr, _INNER_SCOPE_TYPES):
+                continue
+            if _is_ast_node_within_unit_bounds(
+                u_curr, u_start, u_end, u_end_col=u_end_col, u_start_col=u_start_col
+            ) and isinstance(u_curr, ast.Name) and isinstance(u_curr.ctx, (ast.Store, ast.Del)):
+                if u_curr.id in shared_globals:
+                    return True
+            u_stack.extend(ast.iter_child_nodes(u_curr))
+    intra_globals -= outer_globals
+    if not intra_globals:
+        return False
     stack: List[ast.AST] = list(body) if isinstance(body, list) else []
     while stack:
         curr = stack.pop()
@@ -1482,9 +1567,9 @@ def _has_escaped_intra_unit_global_declarations(
         ):
             continue
         if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if curr.name in intra_only_globals:
+            if curr.name in intra_globals:
                 return True
-            if _extract_nested_scope_free_reads(curr) & intra_only_globals:
+            if _extract_nested_scope_free_reads(curr) & intra_globals:
                 return True
             stack.extend(iter_nested_scope_header_nodes(curr))
             continue
@@ -1498,7 +1583,7 @@ def _has_escaped_intra_unit_global_declarations(
             ):
                 if (
                     _extract_nested_scope_free_reads(curr, include_header=True)
-                    & intra_only_globals
+                    & intra_globals
                 ):
                     return True
                 if (
@@ -1506,34 +1591,34 @@ def _has_escaped_intra_unit_global_declarations(
                     and not isinstance(target_scope, ast.ClassDef)
                     and (
                         _extract_comprehension_walrus_names(curr)
-                        & intra_only_globals
+                        & intra_globals
                     )
                 ):
                     return True
                 continue
-        if isinstance(curr, ast.Name) and curr.id in intra_only_globals:
+        if isinstance(curr, ast.Name) and curr.id in intra_globals:
             return True
         if isinstance(curr, (ast.Import, ast.ImportFrom)):
             imp_names: Set[str] = set()
             _record_import_names(curr, imp_names)
-            if imp_names & intra_only_globals:
+            if imp_names & intra_globals:
                 return True
         elif (
             isinstance(curr, ast.ExceptHandler)
             and isinstance(curr.name, str)
-            and curr.name in intra_only_globals
+            and curr.name in intra_globals
         ):
             return True
         elif is_type_alias_node(curr):
             alias_name = getattr(curr, "name", None)
             if (
                 isinstance(alias_name, ast.Name)
-                and alias_name.id in intra_only_globals
+                and alias_name.id in intra_globals
             ):
                 return True
         else:
             pat_name = _extract_pattern_bound_name(curr)
-            if pat_name is not None and pat_name in intra_only_globals:
+            if pat_name is not None and pat_name in intra_globals:
                 return True
         stack.extend(ast.iter_child_nodes(curr))
     return False

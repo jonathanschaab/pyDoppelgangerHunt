@@ -319,38 +319,30 @@ def _ensure_pair_scopes_closure_mode(
     repo_root: Optional[str],
 ) -> Tuple[Dict[str, Any], Dict[str, Any], bool]:
     """Ensures both clone units' scopes match the requested closure strictness mode."""
-    (
-        (skip1, strict_with1, eff_non_sup1),
-        (skip2, strict_with2, eff_non_sup2),
-        effective_skip_closures,
-    ) = resolve_pair_closure_flags(
+    pair_flags = resolve_pair_closure_flags(
         u1,
         u2,
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
         non_suppressing_ctx_managers=non_suppressing_ctx_managers,
     )
-    resolved_s1 = ensure_unit_scope_closure_mode(
-        u1,
-        scope1,
-        skip1,
-        strict_with_suppression=strict_with1,
-        non_suppressing_ctx_managers=eff_non_sup1,
-        source_text=source_text1,
-        tree=tree1,
-        repo_root=repo_root,
-    )
-    resolved_s2 = ensure_unit_scope_closure_mode(
-        u2,
-        scope2,
-        skip2,
-        strict_with_suppression=strict_with2,
-        non_suppressing_ctx_managers=eff_non_sup2,
-        source_text=source_text2,
-        tree=tree2,
-        repo_root=repo_root,
-    )
-    return resolved_s1, resolved_s2, effective_skip_closures
+    resolved_pair = [
+        ensure_unit_scope_closure_mode(
+            unit_item,
+            scope_item,
+            pair_flags.effective_skip_pre_unit_closures,
+            strict_with_suppression=pair_flags.effective_strict_with_suppression,
+            non_suppressing_ctx_managers=u_flags.non_suppressing_ctx_managers,
+            source_text=src_item,
+            tree=tree_item,
+            repo_root=repo_root,
+        )
+        for unit_item, scope_item, src_item, tree_item, u_flags in (
+            (u1, scope1, source_text1, tree1, pair_flags.unit1),
+            (u2, scope2, source_text2, tree2, pair_flags.unit2),
+        )
+    ]
+    return resolved_pair[0], resolved_pair[1], pair_flags.effective_skip_pre_unit_closures
 
 
 @overload
@@ -487,7 +479,6 @@ def resolve_clone_generator_subroutine_outputs(
                 "ambiguous scope outputs lack positional ordering",
             )
         for hazard_key, reason_str in (
-            ("deleted_output", "deleted output hazard"),
             ("severed_closure_cell", "severed closure cell"),
             ("stale_source_code", "stale source code"),
             ("pathological_ast", "pathological ast"),

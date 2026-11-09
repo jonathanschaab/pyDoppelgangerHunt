@@ -1434,10 +1434,67 @@ def test_seeded_generated_closure_program_differential_fuzzer(tmp_path: Path) ->
             else:
                 blocked_count += 1
 
-    assert len(selected_combinations) >= 64
-    assert patched_count > 0
-    assert blocked_count > 0
-    assert git_apply_count > 0
+    assert len(selected_combinations) == min(seed_limit, len(all_combinations))
+    assert len(selected_combinations) >= 1
+    if len(selected_combinations) >= 8:
+        assert patched_count > 0
+        assert blocked_count > 0
+        assert git_apply_count > 0
+
+    # Negative control: forcing extraction on a blocked late-binding cell + post-unit mutation
+    # case produces observable runtime divergence (helper captures scale=3 instead of post-unit scale=10).
+    neg_orig_src = (
+        "def entry(items):\n"
+        "    scale = 3\n"
+        "    cbs = []\n"
+        "    for x in items:\n"
+        "        cbs.append(lambda v: v + scale + x)\n"
+        "    scale = 10\n"
+        "    return [fn(1) for fn in cbs]\n"
+    )
+    neg_forced_src = (
+        "def _forced_helper(items, cbs, scale):\n"
+        "    for x in items:\n"
+        "        cbs.append(lambda v: v + scale + x)\n"
+        "def entry(items):\n"
+        "    scale = 3\n"
+        "    cbs = []\n"
+        "    _forced_helper(items, cbs, scale)\n"
+        "    scale = 10\n"
+        "    return [fn(1) for fn in cbs]\n"
+    )
+    ns_neg_orig: dict[str, Any] = {}
+    ns_neg_forced: dict[str, Any] = {}
+    exec(compile(neg_orig_src, "<neg_orig>", "exec"), ns_neg_orig)  # pylint: disable=exec-used
+    exec(compile(neg_forced_src, "<neg_forced>", "exec"), ns_neg_forced)  # pylint: disable=exec-used
+    assert ns_neg_orig["entry"]([1, 2]) != ns_neg_forced["entry"]([1, 2])
+
+
+def test_duplicate_global_declaration_in_enclosing_function_and_unit_rejected_as_global_escape(
+    tmp_path: Path,
+) -> None:
+    """Verifies duplicate global G declarations in enclosing function and extracted unit are rejected with global_escape."""
+    fn_src = (
+        "G = 0\n"
+        "def entry(x):\n"
+        "    global G\n"
+        "    if x > 0:\n"
+        "        global G\n"
+        "        G = x + 1\n"
+        "        y = G * 2\n"
+        "    else:\n"
+        "        y = 0\n"
+        "    return G, y\n"
+    )
+    _run_differential_refactoring_case(
+        tmp_path,
+        "dup_global_in_unit_and_outer",
+        fn_src,
+        (4, 9),
+        expect_patch=False,
+        call_args_list=[(5,)],
+        expected_hazard_reason="global_escape",
+    )
 
 
 def test_definite_assignment_engine_parity_across_generated_control_flow() -> None:

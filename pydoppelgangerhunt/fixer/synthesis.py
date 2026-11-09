@@ -1346,10 +1346,10 @@ def synthesize_shared_helper_code(
             u_target["source_text"] = src_override
     if not _align_pair_expr_kinds(u1, u2):
         return ""
-    raw_lines1, is_sliced1 = extract_unit_source_lines_with_state(
+    raw_lines1, origin1 = extract_unit_source_lines_with_state(
         u1, repo_root=repo_root
     )
-    raw_lines2, is_sliced2 = extract_unit_source_lines_with_state(
+    raw_lines2, origin2 = extract_unit_source_lines_with_state(
         u2, repo_root=repo_root
     )
     lines1 = _slice_unit_token_lines(
@@ -1357,14 +1357,14 @@ def synthesize_shared_helper_code(
         _extract_unit_body_lines(
             u1, [ln.rstrip("\r\n") for ln in raw_lines1]
         ),
-        is_pre_sliced=is_sliced1,
+        is_pre_sliced=origin1.is_pre_sliced or origin1.is_placeholder,
     )
     lines2 = _slice_unit_token_lines(
         u2,
         _extract_unit_body_lines(
             u2, [ln.rstrip("\r\n") for ln in raw_lines2]
         ),
-        is_pre_sliced=is_sliced2,
+        is_pre_sliced=origin2.is_pre_sliced or origin2.is_placeholder,
     )
 
     base_name1 = _base_unit_name(u1)
@@ -1408,34 +1408,34 @@ def synthesize_shared_helper_code(
         common_lines = _attach_pragmas(common_lines, pragmas1 + pragmas2)
 
     # Variable scope analysis for concrete parameter signatures.
-    (
-        (skip1, effective_strict_with1, eff_non_sup1),
-        (skip2, effective_strict_with2, eff_non_sup2),
-        effective_skip_closures,
-    ) = resolve_pair_closure_flags(
+    pair_flags = resolve_pair_closure_flags(
         u1,
         u2,
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
         non_suppressing_ctx_managers=non_suppressing_ctx_managers,
     )
+    eff_non_sup1 = pair_flags.unit1.non_suppressing_ctx_managers
+    eff_non_sup2 = pair_flags.unit2.non_suppressing_ctx_managers
+    effective_skip_closures = pair_flags.effective_skip_pre_unit_closures
+    effective_strict_with = pair_flags.effective_strict_with_suppression
     has_precomputed_scopes = (
         scope_matches_closure_mode(
             scope1,
-            skip1,
-            strict_with_suppression=effective_strict_with1,
+            effective_skip_closures,
+            strict_with_suppression=effective_strict_with,
             non_suppressing_ctx_managers=eff_non_sup1,
         )
         and scope_matches_closure_mode(
             scope2,
-            skip2,
-            strict_with_suppression=effective_strict_with2,
+            effective_skip_closures,
+            strict_with_suppression=effective_strict_with,
             non_suppressing_ctx_managers=eff_non_sup2,
         )
         and scope_matches_closure_mode(
             scope,
             effective_skip_closures,
-            strict_with_suppression=effective_strict_with1 or effective_strict_with2,
+            strict_with_suppression=effective_strict_with,
             non_suppressing_ctx_managers=sorted(set(eff_non_sup1) & set(eff_non_sup2)),
         )
     )
@@ -1490,8 +1490,8 @@ def synthesize_shared_helper_code(
             source_text1,
             tree1,
             scope1,
-            skip1,
-            effective_strict_with1,
+            effective_skip_closures,
+            effective_strict_with,
             eff_non_sup1,
         ),
         (
@@ -1499,8 +1499,8 @@ def synthesize_shared_helper_code(
             source_text2,
             tree2,
             scope2,
-            skip2,
-            effective_strict_with2,
+            effective_skip_closures,
+            effective_strict_with,
             eff_non_sup2,
         ),
     ):

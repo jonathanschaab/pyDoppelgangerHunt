@@ -36,6 +36,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _INNER_SCOPE_TYPES,
     _extract_node_type_param_names,
     _extract_strict_fn_local_names,
+    _get_tree_expr_scope_intervals,
     _is_span_in_scope_header,
     _node_earliest_start_pos,
     _node_strictly_encloses_bounds,
@@ -46,32 +47,6 @@ from pydoppelgangerhunt.fixer._df_visitors import (
 )
 from pydoppelgangerhunt.fixer.source import _get_tree_scope_intervals
 from pydoppelgangerhunt.parser import iter_nested_scope_header_nodes
-
-
-def _get_tree_expr_scope_intervals(
-    tree: ast.AST,
-) -> Tuple[Tuple[int, int, int, ast.AST], ...]:
-    """Returns cached (start, end, col_offset, node) tuples for Lambda and comprehension scopes."""
-
-    def _compute() -> Tuple[Tuple[int, int, int, ast.AST], ...]:
-        out: List[Tuple[int, int, int, ast.AST]] = []
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Lambda, *_COMPREHENSION_TYPES)):
-                n_start = int(getattr(node, "lineno", 0) or 0)
-                n_end = int(getattr(node, "end_lineno", n_start) or n_start)
-                n_col = int(getattr(node, "col_offset", 0) or 0)
-                if n_start > 0:
-                    out.append((n_start, n_end, n_col, node))
-        return tuple(out)
-
-    return cast(
-        Tuple[Tuple[int, int, int, ast.AST], ...],
-        _get_or_compute_scope_cached(
-            _scope_cell_info_cache,
-            _make_trusted_scope_cache_key(tree, "expr_scope_intervals"),
-            _compute,
-        ),
-    )
 
 
 def _find_enclosing_function_chain(

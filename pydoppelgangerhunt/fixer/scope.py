@@ -24,6 +24,7 @@ from typing import (
 
 from pydoppelgangerhunt.config import (
     normalize_non_suppressing_ctx_managers,
+    resolve_pair_closure_flags,
     resolve_unit_closure_flags,
 )
 from pydoppelgangerhunt.fixer._ast_compat import (
@@ -93,6 +94,7 @@ from pydoppelgangerhunt.reporters import (
 from pydoppelgangerhunt.fixer.source import (
     _SUBROUTINE_KINDS,
     _WHOLE_UNIT_KINDS,
+    _extract_slice_col_offset,
     _get_tree_scope_intervals,
     _is_valid_eval_expr,
     _load_unit_file_text,
@@ -1778,18 +1780,9 @@ def _get_tree_sha256_digest(mod_tree: ast.AST) -> str:
                 hasher.update(line.encode("utf-8"))
                 hasher.update(b"\n")
             return hasher.hexdigest()
-        for node in ast.walk(mod_tree):
-            hasher.update(type(node).__name__.encode("ascii"))
-            for attr in ("id", "name", "attr", "arg", "module"):
-                val = getattr(node, attr, None)
-                if isinstance(val, str):
-                    hasher.update(val.encode("utf-8"))
-            if isinstance(node, ast.Constant):
-                hasher.update(repr(node.value).encode("utf-8"))
-            lineno = getattr(node, "lineno", None)
-            col = getattr(node, "col_offset", None)
-            if isinstance(lineno, int):
-                hasher.update(f":{lineno}:{col}".encode("ascii"))
+        hasher.update(
+            ast.dump(mod_tree, include_attributes=True).encode("utf-8")
+        )
         return hasher.hexdigest()
 
     if getattr(mod_tree, "_is_ephemeral_unit_mod", False):
@@ -1944,6 +1937,64 @@ def _unit_source_code_matches_tree(
     return False
 
 
+def _has_out_of_bounds_unit_cols(
+    unit: Dict[str, Any],
+    unit_code_lines: Sequence[str],
+    *,
+    is_pre_sliced: bool,
+    is_placeholder_origin: bool,
+    explicit_col_sliced: bool,
+) -> bool:
+    """Returns True if explicit column coordinates on unit are invalid or out of bounds for unit_code_lines."""
+    raw_s_col = _extract_slice_col_offset(
+        unit, ("start_col", "start_col_offset", "col_offset"), default=None
+    )
+    raw_e_col = _extract_slice_col_offset(
+        unit, ("end_col", "end_col_offset"), default=None
+    )
+    if raw_s_col == -1 or raw_e_col == -1:
+        return True
+    if (
+        is_placeholder_origin
+        or explicit_col_sliced
+        or not unit_code_lines
+        or (raw_s_col is None and raw_e_col is None)
+    ):
+        return False
+    first_b = len(unit_code_lines[0].rstrip("\r\n").encode("utf-8"))
+    last_b = len(unit_code_lines[-1].rstrip("\r\n").encode("utf-8"))
+    s_in_bounds = raw_s_col is None or (0 <= raw_s_col < first_b)
+    e_in_bounds = raw_e_col is None or (0 < raw_e_col <= last_b + 1)
+    order_ok = (
+        len(unit_code_lines) > 1
+        or raw_s_col is None
+        or raw_e_col is None
+        or raw_s_col < raw_e_col
+    )
+    if s_in_bounds and e_in_bounds and order_ok:
+        return False
+    if is_pre_sliced and not unit_code_lines[0][:1].isspace():
+        if len(unit_code_lines) == 1:
+            if (
+                raw_s_col is not None
+                and raw_e_col is not None
+                and 0 < raw_s_col < raw_e_col
+                and first_b == raw_e_col - raw_s_col
+            ) or (
+                "source_lines" not in unit
+                and raw_e_col is None
+                and _is_valid_eval_expr(unit_code_lines[0])
+            ):
+                return False
+        elif (
+            raw_e_col is not None
+            and last_b == raw_e_col
+            and _is_valid_eval_expr("".join(unit_code_lines))
+        ):
+            return False
+    return True
+
+
 def _inspect_unit_scope(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
@@ -1961,9 +2012,16 @@ def _inspect_unit_scope(
     unit_code_lines, line_origin = extract_unit_source_lines_with_state(
         unit, repo_root=repo_root
     )
-    is_pre_sliced = bool(line_origin)
-    is_placeholder_origin = bool(getattr(line_origin, "is_placeholder", False))
+    is_pre_sliced = line_origin.is_pre_sliced or line_origin.is_placeholder
+    is_placeholder_origin = line_origin.is_placeholder
     explicit_col_sliced = bool(unit.get("source_lines_is_sliced"))
+    col_bounds_invalid = _has_out_of_bounds_unit_cols(
+        unit,
+        unit_code_lines,
+        is_pre_sliced=is_pre_sliced,
+        is_placeholder_origin=is_placeholder_origin,
+        explicit_col_sliced=explicit_col_sliced,
+    )
     src_code_str = (
         unit["source_code"].strip()
         if isinstance(unit.get("source_code"), str)
@@ -1979,15 +2037,21 @@ def _inspect_unit_scope(
         else unit
     )
     raw_lines = (
-        split_source_lines(str(unit["source_code"]))
-        if is_placeholder_origin and src_code_str
-        else _slice_unit_token_lines(
-            slice_unit,
-            unit_code_lines,
-            is_pre_sliced=is_pre_sliced,
-            explicit_col_sliced=explicit_col_sliced,
+        []
+        if col_bounds_invalid
+        else (
+            split_source_lines(str(unit["source_code"]))
+            if is_placeholder_origin and src_code_str
+            else _slice_unit_token_lines(
+                slice_unit,
+                unit_code_lines,
+                is_pre_sliced=is_pre_sliced,
+                explicit_col_sliced=explicit_col_sliced,
+            )
         )
     )
+    if not is_placeholder_origin and unit_code_lines and not raw_lines:
+        col_bounds_invalid = True
     if (
         not is_placeholder_origin
         and raw_lines
@@ -2042,8 +2106,10 @@ def _inspect_unit_scope(
     # the module lines at (start, end, start_col, end_col). When no backing module is
     # available (e.g., an in-memory unit carrying only source_code), raw_lines falls
     # back to unit["source_code"].
-    stale_source_code_mismatch = False
-    if is_placeholder_origin and src_code_str:
+    stale_source_code_mismatch = col_bounds_invalid
+    if stale_source_code_mismatch:
+        pass
+    elif is_placeholder_origin and src_code_str:
         if file_tree is not None and not _unit_source_code_matches_tree(
             unit, str(unit["source_code"]), file_tree
         ):
@@ -2671,6 +2737,9 @@ def _inspect_unit_scope(
                                     ds_unit["start_col"] = u_start_col
                                 if u_end_col is not None:
                                     ds_unit["end_col"] = u_end_col
+                                # Always include pre-unit closures when checking whether a
+                                # write-only conditional variable is live downstream: pruning
+                                # a required output in lenient mode would break callers.
                                 ds_live = collect_downstream_read_names(
                                     full_src_text,
                                     ds_unit,
@@ -2825,9 +2894,7 @@ def _inspect_unit_scope(
                     unit,
                     candidates=alias_cands,
                     tree=file_tree,
-                    skip_pre_unit_closures=bool(
-                        unit.get("skip_pre_unit_closures")
-                    ),
+                    skip_pre_unit_closures=skip_pre_unit_closures_flag,
                     unit_inputs=set(inputs),
                 )
                 downstream_aliases = (
@@ -3329,42 +3396,32 @@ def analyze_unit_variable_scope(
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
-    expected_skip1, expected_strict_with1 = resolve_unit_closure_flags(
-        u1,
-        closure_strictness=closure_strictness,
-        skip_pre_unit_closures=skip_pre_unit_closures,
-        strict_with_suppression=strict_with_suppression,
-    )
-    expected_non_sup1 = normalize_non_suppressing_ctx_managers(
-        non_suppressing_ctx_managers,
-        u1.get("non_suppressing_ctx_managers"),
-    )
-    info1 = ensure_unit_scope_closure_mode(
-        u1,
-        scope1,
-        expected_skip1,
-        strict_with_suppression=expected_strict_with1,
-        non_suppressing_ctx_managers=expected_non_sup1,
-        repo_root=repo_root,
-        tree=tree1,
-    )
     if u2 is not None:
-        expected_skip2, expected_strict_with2 = resolve_unit_closure_flags(
+        pair_flags = resolve_pair_closure_flags(
+            u1,
             u2,
             closure_strictness=closure_strictness,
             skip_pre_unit_closures=skip_pre_unit_closures,
             strict_with_suppression=strict_with_suppression,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
         )
-        expected_non_sup2 = normalize_non_suppressing_ctx_managers(
-            non_suppressing_ctx_managers,
-            u2.get("non_suppressing_ctx_managers"),
+        eff_skip = pair_flags.effective_skip_pre_unit_closures
+        eff_strict_with = pair_flags.effective_strict_with_suppression
+        info1 = ensure_unit_scope_closure_mode(
+            u1,
+            scope1,
+            eff_skip,
+            strict_with_suppression=eff_strict_with,
+            non_suppressing_ctx_managers=pair_flags.unit1.non_suppressing_ctx_managers,
+            repo_root=repo_root,
+            tree=tree1,
         )
         info2 = ensure_unit_scope_closure_mode(
             u2,
             scope2,
-            expected_skip2,
-            strict_with_suppression=expected_strict_with2,
-            non_suppressing_ctx_managers=expected_non_sup2,
+            eff_skip,
+            strict_with_suppression=eff_strict_with,
+            non_suppressing_ctx_managers=pair_flags.unit2.non_suppressing_ctx_managers,
             repo_root=repo_root,
             tree=tree2,
         )
@@ -3422,6 +3479,25 @@ def analyze_unit_variable_scope(
             )
         )
     else:
+        expected_skip1, expected_strict_with1 = resolve_unit_closure_flags(
+            u1,
+            closure_strictness=closure_strictness,
+            skip_pre_unit_closures=skip_pre_unit_closures,
+            strict_with_suppression=strict_with_suppression,
+        )
+        expected_non_sup1 = normalize_non_suppressing_ctx_managers(
+            non_suppressing_ctx_managers,
+            u1.get("non_suppressing_ctx_managers"),
+        )
+        info1 = ensure_unit_scope_closure_mode(
+            u1,
+            scope1,
+            expected_skip1,
+            strict_with_suppression=expected_strict_with1,
+            non_suppressing_ctx_managers=expected_non_sup1,
+            repo_root=repo_root,
+            tree=tree1,
+        )
         inputs = info1["inputs"]
         outputs = info1["outputs"]
         free_vars = info1["free_vars"]

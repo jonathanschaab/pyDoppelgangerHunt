@@ -25,6 +25,8 @@ from pydoppelgangerhunt.baseline import (
 from pydoppelgangerhunt.clustering import cluster_clone_families
 from pydoppelgangerhunt.config import (
     DEFAULT_EXCLUDES,
+    defer_heuristic_ctx_manager_summary,
+    format_heuristic_ctx_manager_comment,
     init_tool_configuration,
     load_tool_config,
     log_heuristic_ctx_manager_summary,
@@ -1550,86 +1552,92 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         _write_artifact_file(args.html, html_report, "HTML", args.format == "text")
 
-    if args.patch:
-        patch_text = (
-            generate_refactoring_patch(
+    with defer_heuristic_ctx_manager_summary():
+        try:
+            if args.patch:
+                patch_text = (
+                    generate_refactoring_patch(
+                        clones,
+                        repo_root=git_worktree_root,
+                        type_merge_strategy=type_merge_strategy,
+                        replace_clones=replace_clones,
+                        method_binding=method_binding,
+                        cross_file_strategy=cross_file_strategy,
+                        shared_module_name=shared_module_name,
+                        skip_pre_unit_closures=skip_pre_unit_closures,
+                        closure_strictness=closure_strictness,
+                        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+                    )
+                    if clones
+                    else ""
+                )
+                _write_artifact_file(args.patch, patch_text, "PATCH", args.format == "text")
+            elif args.replace_clones and args.format == "text":
+                print(
+                    colorize(
+                        "Warning: --replace-clones specified without --patch; no patch will be generated.",
+                        COLOR_BOLD + COLOR_YELLOW,
+                        use_color,
+                    )
+                )
+
+            if args.github_annotations and clones:
+                annotations = format_github_annotations(clones)
+                if annotations:
+                    print("\n".join(annotations))
+
+            if args.format in ("sarif", "json"):
+                report_data = (
+                    format_sarif_report(clones, target, threshold)
+                    if args.format == "sarif"
+                    else format_json_report(clones, target, threshold, families=families, stats=stats)
+                )
+                emit_structured_report(
+                    report_data, "SARIF 2.1.0" if args.format == "sarif" else "JSON", args.output
+                )
+                return 0 if not clones else 1
+
+            # Text format
+            if stats and args.stats:
+                _render_dry_scorecard(stats, use_color)
+
+            if not clones:
+                ok_msg = colorize(f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!", COLOR_BOLD + COLOR_GREEN, use_color)
+                print(ok_msg)
+                if args.output:
+                    out_p = Path(args.output)
+                    out_p.parent.mkdir(parents=True, exist_ok=True)
+                    with open(out_p, "w", encoding="utf-8") as fh:
+                        fh.write(f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!\n")
+                return 0
+
+            report_lines = _render_text_violations(
                 clones,
-                repo_root=git_worktree_root,
-                type_merge_strategy=type_merge_strategy,
-                replace_clones=replace_clones,
-                method_binding=method_binding,
-                cross_file_strategy=cross_file_strategy,
-                shared_module_name=shared_module_name,
-                skip_pre_unit_closures=skip_pre_unit_closures,
+                threshold,
+                sort_by,
+                args=args,
+                families=families,
+                cov_data=cov_data,
+                use_color=use_color,
+                target_repo_root=git_worktree_root,
+                audit_tests_enabled=audit_tests_enabled,
                 closure_strictness=closure_strictness,
+                skip_pre_unit_closures=skip_pre_unit_closures,
                 non_suppressing_ctx_managers=non_suppressing_ctx_managers,
             )
-            if clones
-            else ""
-        )
-        _write_artifact_file(args.patch, patch_text, "PATCH", args.format == "text")
-    elif args.replace_clones and args.format == "text":
-        print(
-            colorize(
-                "Warning: --replace-clones specified without --patch; no patch will be generated.",
-                COLOR_BOLD + COLOR_YELLOW,
-                use_color,
-            )
-        )
+            summary_names = log_heuristic_ctx_manager_summary(force=True)
+            if summary_names:
+                report_lines.append(format_heuristic_ctx_manager_comment(summary_names))
 
-    if args.github_annotations and clones:
-        annotations = format_github_annotations(clones)
-        if annotations:
-            print("\n".join(annotations))
+            if args.output:
+                out_p = Path(args.output)
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+                with open(out_p, "w", encoding="utf-8") as fh:
+                    fh.write("\n".join(report_lines) + "\n")
 
-    if args.format in ("sarif", "json"):
-        report_data = (
-            format_sarif_report(clones, target, threshold)
-            if args.format == "sarif"
-            else format_json_report(clones, target, threshold, families=families, stats=stats)
-        )
-        emit_structured_report(
-            report_data, "SARIF 2.1.0" if args.format == "sarif" else "JSON", args.output
-        )
-        return 0 if not clones else 1
-
-    # Text format
-    if stats and args.stats:
-        _render_dry_scorecard(stats, use_color)
-
-    if not clones:
-        ok_msg = colorize(f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!", COLOR_BOLD + COLOR_GREEN, use_color)
-        print(ok_msg)
-        if args.output:
-            out_p = Path(args.output)
-            out_p.parent.mkdir(parents=True, exist_ok=True)
-            with open(out_p, "w", encoding="utf-8") as fh:
-                fh.write(f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!\n")
-        return 0
-
-    report_lines = _render_text_violations(
-        clones,
-        threshold,
-        sort_by,
-        args=args,
-        families=families,
-        cov_data=cov_data,
-        use_color=use_color,
-        target_repo_root=git_worktree_root,
-        audit_tests_enabled=audit_tests_enabled,
-        closure_strictness=closure_strictness,
-        skip_pre_unit_closures=skip_pre_unit_closures,
-        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
-    )
-    log_heuristic_ctx_manager_summary()
-
-    if args.output:
-        out_p = Path(args.output)
-        out_p.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_p, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(report_lines) + "\n")
-
-    return 1
+            return 1
+        finally:
+            log_heuristic_ctx_manager_summary(force=True)
 
 
 if __name__ == "__main__":

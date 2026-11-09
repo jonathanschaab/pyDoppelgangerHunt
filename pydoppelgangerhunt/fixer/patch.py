@@ -14,11 +14,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, TypedDict, Union
 
 from pydoppelgangerhunt.config import (
+    format_heuristic_ctx_manager_comment,
     log_heuristic_ctx_manager_summary,
     normalize_non_suppressing_ctx_managers,
     normalize_path_string,
+    peek_heuristic_non_suppressing_ctx_managers,
     resolve_closure_strictness_mode,
-    resolve_unit_closure_flags,
+    resolve_pair_closure_flags,
 )
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
@@ -3489,21 +3491,23 @@ def _generate_refactoring_patch_impl(
                     (fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static"))
                 )
 
-            (
-                u1_eff["skip_pre_unit_closures"],
-                u1_eff["strict_with_suppression"],
-            ) = resolve_unit_closure_flags(
+            pair_flags = resolve_pair_closure_flags(
                 u1,
-                closure_strictness=closure_strictness,
-                skip_pre_unit_closures=skip_pre_unit_closures,
-            )
-            (
-                u2_eff["skip_pre_unit_closures"],
-                u2_eff["strict_with_suppression"],
-            ) = resolve_unit_closure_flags(
                 u2,
                 closure_strictness=closure_strictness,
                 skip_pre_unit_closures=skip_pre_unit_closures,
+            )
+            u1_eff["skip_pre_unit_closures"] = (
+                pair_flags.effective_skip_pre_unit_closures
+            )
+            u1_eff["strict_with_suppression"] = (
+                pair_flags.effective_strict_with_suppression
+            )
+            u2_eff["skip_pre_unit_closures"] = (
+                pair_flags.effective_skip_pre_unit_closures
+            )
+            u2_eff["strict_with_suppression"] = (
+                pair_flags.effective_strict_with_suppression
             )
             u1_eff.pop("closure_strictness", None)
             u2_eff.pop("closure_strictness", None)
@@ -3522,10 +3526,10 @@ def _generate_refactoring_patch_impl(
             if u1_eff.get("kind") in ("comprehension", "complex_expr") or u2_eff.get(
                 "kind"
             ) in ("comprehension", "complex_expr"):
-                raw_l1, is_sl1 = extract_unit_source_lines_with_state(
+                raw_l1, origin1 = extract_unit_source_lines_with_state(
                     u1_eff, repo_root=str(root)
                 )
-                raw_l2, is_sl2 = extract_unit_source_lines_with_state(
+                raw_l2, origin2 = extract_unit_source_lines_with_state(
                     u2_eff, repo_root=str(root)
                 )
                 stmt_lines1 = _slice_unit_token_lines(
@@ -3534,7 +3538,7 @@ def _generate_refactoring_patch_impl(
                         u1_eff,
                         [ln.rstrip("\r\n") for ln in raw_l1],
                     ),
-                    is_pre_sliced=is_sl1,
+                    is_pre_sliced=origin1.is_pre_sliced or origin1.is_placeholder,
                 )
                 stmt_lines2 = _slice_unit_token_lines(
                     u2_eff,
@@ -3542,7 +3546,7 @@ def _generate_refactoring_patch_impl(
                         u2_eff,
                         [ln.rstrip("\r\n") for ln in raw_l2],
                     ),
-                    is_pre_sliced=is_sl2,
+                    is_pre_sliced=origin2.is_pre_sliced or origin2.is_placeholder,
                 )
                 if not _prune_pair_lhs_and_augassign_scopes(
                     u1_eff, u2_eff, s1, s2, stmt_lines1, stmt_lines2
@@ -4443,7 +4447,10 @@ def _generate_refactoring_patch_impl(
                 seen_comments.add(chunk)
             patch_chunks.append(chunk)
 
+    heuristic_names = peek_heuristic_non_suppressing_ctx_managers()
     log_heuristic_ctx_manager_summary()
+    if patch_chunks and heuristic_names:
+        patch_chunks.insert(0, format_heuristic_ctx_manager_comment(heuristic_names))
     return "\n".join(patch_chunks)
 
 

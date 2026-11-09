@@ -234,6 +234,18 @@ _SUSPICIOUS_SUPPRESS_SUBSTRINGS: Tuple[str, ...] = (
     "move_on_after",
     "fail_after",
     "catch",
+    "swallow",
+    "silen",
+    "quiet",
+    "tolerat",
+    "best_effort",
+    "absorb",
+    "trap",
+    "fallback",
+    "noop",
+    "shield",
+    "retry",
+    "attempt",
 )
 
 
@@ -567,11 +579,9 @@ def _matches_extra_non_suppressing_symbol(
     """Returns True if base_id (with optional attribute tail_parts) matches extra_non_suppressing_ctx_managers.
 
     Note:
-        Entries prefixed with ``*.`` (e.g. ``"*.atomic"``) or ``.`` (e.g. ``".atomic"``)
-        match any attribute chain or imported symbol ending in that suffix. A leading
-        single-dot entry ``".Name"`` matches both relative imports (``from . import Name``)
-        and attribute suffixes; prefer ``"*.Name"`` when configuring an explicit
-        attribute-suffix wildcard.
+        Entries prefixed with ``*.`` (e.g. ``"*.atomic"``) match any attribute chain or
+        imported symbol ending in that suffix. A leading single-dot entry ``".Name"``
+        matches relative imports (``from . import Name`` or ``from .mod import Name``).
     """
     if (
         not extra_non_suppressing_ctx_managers
@@ -594,13 +604,16 @@ def _matches_extra_non_suppressing_symbol(
                 or (stripped and stripped in extra_non_suppressing_ctx_managers)
                 or candidate in extra_non_suppressing_ctx_managers
                 or (
+                    resolved.startswith(".")
+                    and last_part
+                    and last_part not in _SUPPRESSING_CTX_MANAGER_NAMES
+                    and f".{last_part}" in extra_non_suppressing_ctx_managers
+                )
+                or (
                     "." in resolved
                     and last_part
                     and last_part not in _SUPPRESSING_CTX_MANAGER_NAMES
-                    and (
-                        f".{last_part}" in extra_non_suppressing_ctx_managers
-                        or f"*.{last_part}" in extra_non_suppressing_ctx_managers
-                    )
+                    and f"*.{last_part}" in extra_non_suppressing_ctx_managers
                 )
             ):
                 return True
@@ -640,9 +653,9 @@ def _is_proven_non_suppressing_target_expr(
             curr_val = curr_val.value
         chain_parts = tuple(reversed(parts))
         if extra_non_suppressing_ctx_managers and attr_name not in _SUPPRESSING_CTX_MANAGER_NAMES:
-            if not (isinstance(curr_val, ast.Name) and curr_val.id in prov.suppressors) and (
-                f"*.{attr_name}" in extra_non_suppressing_ctx_managers
-                or f".{attr_name}" in extra_non_suppressing_ctx_managers
+            if (
+                not (isinstance(curr_val, ast.Name) and curr_val.id in prov.suppressors)
+                and f"*.{attr_name}" in extra_non_suppressing_ctx_managers
             ):
                 return True
             if isinstance(curr_val, ast.Name) and _matches_extra_non_suppressing_symbol(
@@ -1422,8 +1435,14 @@ def _update_suppress_provenance_from_stmt(
             allow_positive=False,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         )
+        iter_is_suspicious = _looks_like_suppressing_ctx_manager(
+            stmt.iter, prov
+        )
         for t_name in _extract_store_names_in_node(stmt.target):
-            iter_prov = iter_prov.clear_name(t_name)
+            if iter_is_suspicious and isinstance(stmt.target, ast.Name):
+                iter_prov = iter_prov.with_suppressor(t_name, allow_positive=True)
+            else:
+                iter_prov = iter_prov.clear_name(t_name)
         b_prov = _update_suppress_provenance_from_stmts(
             stmt.body,
             iter_prov,
@@ -1493,6 +1512,10 @@ def _update_suppress_provenance_from_stmt(
         )
         if not risky_suffix:
             return prefix_prov
+        # Statements in risky_suffix execute after a potentially raising expression inside a
+        # potentially exception-suppressing with-block; if an exception is raised and suppressed,
+        # the remainder of risky_suffix is skipped, so bindings in risky_suffix are conditional
+        # (in_branch=True) relative to code following the with-block.
         suffix_prov = _update_suppress_provenance_from_stmts(
             risky_suffix,
             prefix_prov,
@@ -2018,8 +2041,14 @@ def _advance_enclosing_compound_stmt_seed(
         prov = _update_suppress_provenance_from_expr_walrus(
             (stmt.target,), prov, allow_positive=False
         )
+        iter_is_suspicious = _looks_like_suppressing_ctx_manager(
+            stmt.iter, prov
+        )
         for t_name in _extract_store_names_in_node(stmt.target):
-            prov = prov.clear_name(t_name)
+            if iter_is_suspicious and isinstance(stmt.target, ast.Name):
+                prov = prov.with_suppressor(t_name, allow_positive=True)
+            else:
+                prov = prov.clear_name(t_name)
     elif isinstance(stmt, (ast.With, ast.AsyncWith)):
         prov = _advance_prov_through_with_items(stmt, prov)
     elif is_match_node(stmt):
@@ -2483,6 +2512,8 @@ def _looks_like_suppressing_ctx_manager(
             stack.append(sub.orelse)
         elif isinstance(sub, ast.BoolOp):
             stack.extend(sub.values)
+        elif isinstance(sub, (ast.List, ast.Tuple, ast.Set)):
+            stack.extend(sub.elts)
         if ident is not None and ident != "catch_warnings":
             low = ident.lower()
             if any(tok in low for tok in _SUSPICIOUS_SUPPRESS_SUBSTRINGS):

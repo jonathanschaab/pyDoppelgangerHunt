@@ -24,15 +24,14 @@ from typing import (
 
 from pydoppelgangerhunt.fixer._ast_compat import is_trystar_node
 from pydoppelgangerhunt.fixer._df_cache import (
-    _get_cached_tree_source_lines,
-    _get_or_compute_scope_cached,
     _get_or_parse_tree,
-    _make_trusted_scope_cache_key,
-    _register_tree_source_lines,
-    _scope_cell_info_cache,
     _suppress_syntax_warnings,
 )
-from pydoppelgangerhunt.fixer._df_closures import _node_earliest_start_pos
+from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=unused-import
+    _get_tree_scope_intervals,
+    _node_earliest_start_pos,
+    _node_scope_bounds,
+)
 from pydoppelgangerhunt.source_lines import (
     SourceLinesOrigin,
     count_physical_newlines,
@@ -776,94 +775,82 @@ def _slice_unit_token_lines(
     )
     if eff_col_sliced is True:
         return list(lines)
-    effective_pre_sliced: Optional[bool] = (
-        bool(is_pre_sliced)
-        if is_pre_sliced is not None
-        else eff_col_sliced
-    )
+    if isinstance(is_pre_sliced, SourceLinesOrigin):
+        effective_pre_sliced = (
+            is_pre_sliced.is_pre_sliced or is_pre_sliced.is_placeholder
+        )
+    elif is_pre_sliced is not None:
+        effective_pre_sliced = bool(is_pre_sliced)
+    elif eff_col_sliced is not None:
+        effective_pre_sliced = bool(eff_col_sliced)
+    else:
+        effective_pre_sliced = is_sliced_unit_source_lines(unit)
     s_col_opt = _extract_slice_col_offset(
         unit, ("start_col", "start_col_offset"), default=0
     )
     e_col = _extract_slice_col_offset(
         unit, ("end_col", "end_col_offset"), default=None
     )
-    if s_col_opt is None or s_col_opt < 0 or e_col == -1:
+    if s_col_opt is None or s_col_opt < 0:
         return lines
     s_col = s_col_opt
     res = list(lines)
-    first_byte_len = len(res[0].rstrip("\r\n").encode("utf-8"))
-    if effective_pre_sliced is True and len(res) == 1:
+    first_stripped = res[0].rstrip("\r\n")
+    first_byte_len = len(first_stripped.encode("utf-8"))
+    if len(res) == 1 and not first_stripped[:1].isspace():
         if (
             s_col > 0
             and e_col is not None
             and first_byte_len == e_col - s_col
-            and not res[0][:1].isspace()
         ) or (
-            "source_lines" not in unit
+            s_col >= first_byte_len
+            and (e_col is None or e_col > first_byte_len)
+            and _is_valid_eval_expr(res[0])
+        ) or (
+            effective_pre_sliced
+            and "source_lines" not in unit
             and e_col is None
-            and not res[0][:1].isspace()
             and _is_valid_eval_expr(res[0])
         ):
             return res
-    if effective_pre_sliced is None:
-        src_code = unit.get("source_code")
-        if isinstance(src_code, str) and src_code.strip():
-            code_lines = [
-                ln.rstrip("\r\n") for ln in split_source_lines(src_code)
-            ]
-            res_stripped = [ln.rstrip("\r\n") for ln in res]
-            if (
-                res_stripped == code_lines
-                and not res_stripped[0][:1].isspace()
-                and _is_valid_eval_expr("\n".join(res_stripped))
-                and (
-                    (
-                        len(res_stripped) == 1
-                        and s_col > 0
-                        and e_col is not None
-                        and len(res_stripped[0].encode("utf-8")) == e_col - s_col
-                    )
-                    or (
-                        len(res_stripped) > 1
-                        and (
-                            e_col is None
-                            or len(res_stripped[-1].encode("utf-8")) == e_col
-                        )
-                    )
-                )
-            ):
-                return res
     if len(res) == 1:
         if (
             s_col > first_byte_len
-            or (e_col is not None and e_col > first_byte_len)
-            or (
-                s_col == first_byte_len
-                and (e_col is None or e_col > first_byte_len)
-            )
+            or (s_col == first_byte_len and e_col != first_byte_len)
+            or (e_col is not None and e_col > first_byte_len + 1)
         ):
-            return res
+            return []
         res[0] = _slice_utf8_line(res[0], s_col, e_col)
     else:
         last_byte_len = len(res[-1].rstrip("\r\n").encode("utf-8"))
+        res_stripped = [ln.rstrip("\r\n") for ln in res]
+        if (
+            effective_pre_sliced
+            and (s_col == 0 or not first_stripped[:1].isspace())
+            and (e_col is None or last_byte_len == e_col)
+            and _is_valid_eval_expr("\n".join(res_stripped))
+        ):
+            clipped_probe = list(res)
+            if 0 < s_col < first_byte_len:
+                clipped_probe[0] = _slice_utf8_line(clipped_probe[0], s_col, None)
+            if e_col is not None and 0 < e_col <= last_byte_len:
+                clipped_probe[-1] = _slice_utf8_line(
+                    clipped_probe[-1].rstrip("\r\n"), 0, e_col
+                )
+            clipped_stripped = [ln.rstrip("\r\n") for ln in clipped_probe]
+            if clipped_stripped == res_stripped or not _is_valid_eval_expr(
+                "\n".join(clipped_stripped)
+            ):
+                return res
+        if (s_col >= first_byte_len and first_stripped[:1].isspace()) or (
+            e_col is not None and e_col > last_byte_len + 1
+        ):
+            return []
         clipped = list(res)
         if 0 < s_col < first_byte_len:
             clipped[0] = _slice_utf8_line(clipped[0], s_col, None)
-        if e_col is not None and e_col <= last_byte_len:
+        if e_col is not None and 0 <= e_col <= last_byte_len:
             clipped[-1] = _slice_utf8_line(clipped[-1].rstrip("\r\n"), 0, e_col)
-        res_stripped = [ln.rstrip("\r\n") for ln in res]
-        clipped_stripped = [ln.rstrip("\r\n") for ln in clipped]
-        if (
-            effective_pre_sliced is True
-            and (s_col == 0 or not res[0][:1].isspace())
-            and (e_col is None or last_byte_len == e_col)
-            and _is_valid_eval_expr("\n".join(res_stripped))
-            and (
-                clipped_stripped == res_stripped
-                or not _is_valid_eval_expr("\n".join(clipped_stripped))
-            )
-        ):
-            return res
         res = clipped
     return res
 
@@ -1728,56 +1715,6 @@ def _find_sig_colon(line: str) -> int:
     if colon_idx != -1:
         return colon_idx
     return line.rfind(":")
-
-
-def _node_scope_bounds(
-    node: ast.AST, source_lines: Optional[Sequence[str]] = None
-) -> Tuple[int, int]:
-    """Computes (earliest_start, n_end) line bounds for a scope AST node."""
-    n_start = getattr(node, "lineno", 0) or 0
-    n_end = getattr(node, "end_lineno", None) or n_start
-    estart, _ = _node_earliest_start_pos(node, source_lines=source_lines)
-    return (estart if isinstance(estart, int) and estart > 0 else n_start), n_end
-
-
-def _get_tree_scope_intervals(
-    tree: ast.AST,
-    source_lines: Optional[Sequence[str]] = None,
-) -> List[Tuple[int, int, int, ast.AST]]:
-    """Builds and caches sorted intervals (earliest_start, n_end, span, node) for scope nodes in tree.
-
-    Note:
-        AST trees passed via ``tree=`` are assumed immutable while cached. Callers that
-        mutate a cached AST in place must call ``evict_tree_scopes(tree)`` (or
-        ``clear_dataflow_cache()``) after mutation so cached scope intervals and parent
-        maps are invalidated.
-    """
-    if source_lines is not None:
-        _register_tree_source_lines(tree, source_lines)
-    else:
-        source_lines = _get_cached_tree_source_lines(tree)
-
-    def _compute() -> Tuple[Tuple[int, int, int, ast.AST], ...]:
-        intervals: List[Tuple[int, int, int, ast.AST]] = []
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                earliest_start, n_end = _node_scope_bounds(node, source_lines)
-                intervals.append((earliest_start, n_end, n_end - earliest_start, node))
-        intervals.sort(
-            key=lambda item: (item[2], -item[0], -getattr(item[3], "col_offset", 0))
-        )
-        return tuple(intervals)
-
-    if getattr(tree, "_is_ephemeral_unit_mod", False):
-        return list(_compute())
-    cache_key = _make_trusted_scope_cache_key(
-        owner=tree,
-        kind="tree_scope_intervals",
-        params=(bool(source_lines),),
-    )
-    return list(
-        _get_or_compute_scope_cached(_scope_cell_info_cache, cache_key, _compute)
-    )
 
 
 def _find_innermost_enclosing_node(

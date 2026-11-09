@@ -127,6 +127,7 @@ from pydoppelgangerhunt.fixer._df_cell_traversal import (
     _build_enclosing_chain_cell_infos,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
+    _COMPREHENSION_TYPES,
     _collect_scope_closures_uncached,
     _extract_comprehension_walrus_names,
     _extract_scope_nonlocals_and_outer_globals,
@@ -483,23 +484,44 @@ def _unit_has_global_mutating_call(
     (``allow_heuristic_builtins=False``), only ``_PROVEN_PURE_GLOBAL_SAFE_BUILTINS``
     are permitted because dunder-invoking built-ins (such as ``len()``, ``bool()``,
     ``int()``, ``isinstance()``) can execute arbitrary user code in ``__len__``,
-    ``__bool__``, ``__int__``, ``__index__``, or ``__instancecheck__``.
+    ``__bool__``, ``__int__``, ``__index__``, or ``__instancecheck__``. Non-call
+    AST operations (operators, subscripts, attribute/``@property`` reads, and
+    synchronous ``for`` iteration) are not treated as global-mutating even in
+    ``pedantic`` mode.
     """
     allowed_builtins = (
         _PURE_GLOBAL_SAFE_BUILTINS
         if allow_heuristic_builtins
         else _PROVEN_PURE_GLOBAL_SAFE_BUILTINS
     )
-    effective_shadowed: Set[str] = set(shadowed_names)
+    unit_stmt_mod = ast.Module(
+        body=[s for s in candidate_stmts if isinstance(s, ast.stmt)],
+        type_ignores=[],
+    )
+    effective_shadowed: Set[str] = set(shadowed_names) | _extract_single_node_local_names(
+        unit_stmt_mod, include_globals=True
+    )
     for st in candidate_stmts:
         for node in ast.walk(st):
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
                 effective_shadowed.add(node.id)
+            elif isinstance(node, ast.ExceptHandler) and isinstance(node.name, str):
+                effective_shadowed.add(node.name)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                effective_shadowed.update(node.names)
             elif isinstance(
                 node,
-                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+                (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.ClassDef,
+                    ast.Lambda,
+                    *_COMPREHENSION_TYPES,
+                ),
             ):
-                effective_shadowed.update(_extract_single_node_local_names(node))
+                effective_shadowed.update(
+                    _extract_single_node_local_names(node, include_globals=True)
+                )
     all_builtins_shadowed = has_star_import or ("*" in effective_shadowed)
     for st in candidate_stmts:
         for node in ast.walk(st):
