@@ -272,7 +272,7 @@ class _SuppressProvenance:
             tuple(sorted(self.shadowed_builtins)),
             self.has_star_import,
             tuple(sorted(self.imported_symbols)),
-            tuple(sorted(self.shadowed_names & _TRACKED_SHADOW_NAMES)),
+            tuple(sorted(self.shadowed_names)),
         )
 
     def __bool__(self) -> bool:
@@ -573,10 +573,16 @@ def _matches_extra_non_suppressing_symbol(
         and attribute suffixes; prefer ``"*.Name"`` when configuring an explicit
         attribute-suffix wildcard.
     """
-    if not extra_non_suppressing_ctx_managers or base_id in prov.suppressors:
+    if (
+        not extra_non_suppressing_ctx_managers
+        or base_id in prov.suppressors
+        or base_id in prov.shadowed_builtins
+        or base_id in prov.shadowed_names
+        or prov.has_star_import
+    ):
         return False
     candidate = ".".join((base_id, *tail_parts))
-    if candidate in extra_non_suppressing_ctx_managers and base_id not in prov.shadowed_builtins:
+    if candidate in extra_non_suppressing_ctx_managers:
         return True
     for alias, qual in prov.imported_symbols:
         if alias == base_id:
@@ -634,7 +640,7 @@ def _is_proven_non_suppressing_target_expr(
             curr_val = curr_val.value
         chain_parts = tuple(reversed(parts))
         if extra_non_suppressing_ctx_managers and attr_name not in _SUPPRESSING_CTX_MANAGER_NAMES:
-            if (
+            if not (isinstance(curr_val, ast.Name) and curr_val.id in prov.suppressors) and (
                 f"*.{attr_name}" in extra_non_suppressing_ctx_managers
                 or f".{attr_name}" in extra_non_suppressing_ctx_managers
             ):
@@ -3574,6 +3580,17 @@ def _block_terminates(
     strict_with_suppression: bool = False,
 ) -> bool:
     """Returns True if the statement sequence unconditionally terminates."""
+    if strict_names:
+        _, _, term, _ = _analyze_block_assignment_impl(
+            statements,
+            definite=set(safe_names),
+            suppress_aliases=suppress_aliases,
+            loop_control_terminates=loop_control_terminates,
+            known_safe_names=safe_names,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+            strict_with_suppression=strict_with_suppression,
+        )
+        return term
     local_prov = _coerce_suppress_provenance(suppress_aliases)
     cur_safe: Set[str] = set(safe_names)
     for stmt in statements:
@@ -3704,6 +3721,15 @@ def _block_terminates(
                 return True
             handlers = getattr(stmt, "handlers", [])
             o_stmts = getattr(stmt, "orelse", [])
+            raw_try_del = _extract_block_Combined_deletions(t_body_seq)
+            t_def = _extract_block_definite_bindings(
+                t_body_seq,
+                None,
+                cur_safe,
+                suppress_aliases=local_prov,
+                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                strict_with_suppression=strict_with_suppression,
+            )
             body_terminates = _block_terminates(
                 t_body_seq,
                 suppress_aliases=local_prov,
@@ -3718,7 +3744,7 @@ def _block_terminates(
                     o_stmts,
                     suppress_aliases=try_prov,
                     loop_control_terminates=loop_control_terminates,
-                    safe_names=cur_safe,
+                    safe_names=cur_safe | t_def,
                     strict_names=strict_names,
                     extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
                     strict_with_suppression=strict_with_suppression,
@@ -3739,7 +3765,12 @@ def _block_terminates(
                             else handler_prov
                         ),
                         loop_control_terminates=loop_control_terminates,
-                        safe_names=cur_safe,
+                        safe_names=(cur_safe - raw_try_del)
+                        | (
+                            {h.name}
+                            if isinstance(getattr(h, "name", None), str)
+                            else set()
+                        ),
                         strict_names=strict_names,
                         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
                         strict_with_suppression=strict_with_suppression,
@@ -4010,7 +4041,8 @@ def _analyze_try_stmt_assignment(
     o_stmts = list(getattr(stmt, "orelse", []))
     o_try_may: Set[str] = set()
     o_def: Set[str] = set()
-    if o_stmts:
+    try_body_term = t_term
+    if o_stmts and not try_body_term:
         o_try_live: Set[str] = set()
         o_def, o_cond, o_term, try_body_prov = _analyze_block_assignment_impl(
             o_stmts,
@@ -4024,8 +4056,7 @@ def _analyze_try_stmt_assignment(
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
             strict_with_suppression=strict_with_suppression,
         )
-        if not t_term:
-            live_in_del.update(o_try_live - (definite | t_def))
+        live_in_del.update(o_try_live - (definite | t_def))
         try_def = t_def | o_def
         try_cond = (t_cond | o_cond) - try_def
         if not o_term:
@@ -4106,7 +4137,7 @@ def _analyze_try_stmt_assignment(
         elif h_defs:
             common = try_def.intersection(*h_defs) if not t_term else set.intersection(*h_defs)
             definite.update(common)
-            cond_pool = (try_def | try_cond) if not t_term else try_cond
+            cond_pool = try_def | try_cond
             conditional.update(cond_pool - definite)
             may_del.difference_update(common)
             if not t_term:
@@ -4115,7 +4146,11 @@ def _analyze_try_stmt_assignment(
                 may_del.update(hm)
 
     eff_try_del = raw_try_del - t_def
-    eff_o_del = _extract_block_Combined_deletions(o_stmts) - o_def
+    eff_o_del = (
+        (_extract_block_Combined_deletions(o_stmts) - o_def)
+        if not try_body_term
+        else set()
+    )
     succ_del = eff_try_del | eff_o_del
 
     surviving_uncond_dels: List[Set[str]] = []

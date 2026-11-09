@@ -11,7 +11,10 @@ import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
-from pydoppelgangerhunt.config import normalize_path_string
+from pydoppelgangerhunt.config import (
+    log_heuristic_ctx_manager_summary,
+    normalize_path_string,
+)
 from pydoppelgangerhunt.source_lines import (
     SourceLinesOrigin,
     is_sliced_unit_source_lines,
@@ -259,9 +262,6 @@ def synthesize_refactoring_suggestion(
     ]
     diff_summary = f"{len(diff_lines)} varying line(s) detected between clone blocks."
 
-    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
-        log_heuristic_ctx_manager_summary,
-    )
     from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
         synthesize_shared_helper_code,
     )
@@ -278,8 +278,6 @@ def synthesize_refactoring_suggestion(
         )
     except Exception:  # pylint: disable=broad-exception-caught
         helper_code = ""
-    finally:
-        log_heuristic_ctx_manager_summary()
     if helper_code:
         indented_helper = "\n".join(
             f"    {ln}" if ln.strip() else ""
@@ -650,6 +648,7 @@ def generate_html_report(
         </div>
         """
         cards_html.append(card)
+    log_heuristic_ctx_manager_summary()
 
     families_html: List[str] = []
     if families:

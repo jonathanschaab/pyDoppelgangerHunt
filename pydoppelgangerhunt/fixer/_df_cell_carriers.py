@@ -26,8 +26,8 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
     _make_trusted_scope_cache_key,
-    _params_contain_ast,
     _scope_cell_info_cache,
+    _validate_scope_cache_params,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
     _BUILTIN_NAMES,
@@ -229,10 +229,8 @@ def _make_scope_ctx_cache_key(
     extra_params: Tuple[Any, ...] = (),
 ) -> _ScopeCacheKey:
     """Builds a _ScopeCacheKey incorporating full _FnScopeContext identity and AST owners."""
-    if extra_params and _params_contain_ast(extra_params):
-        raise ValueError(
-            "_ScopeCacheKey.params must not contain ast.AST nodes; use owner or aux_ast_nodes"
-        )
+    if extra_params:
+        _validate_scope_cache_params(extra_params)
     if scope_ctx is None:
         return _make_trusted_scope_cache_key(
             owner, kind, params=(*extra_params, None)

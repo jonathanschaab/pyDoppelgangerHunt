@@ -181,7 +181,6 @@ def resolve_closure_strictness_mode(
             closure_strictness,
             fallback,
         )
-        return fallback, bool(skip_pre_unit_closures)
     is_lenient = bool(skip_pre_unit_closures)
     if is_lenient and strict_with_suppression:
         _warn_closure_event_once(
@@ -206,33 +205,11 @@ def resolve_strict_with_suppression(
     ``closure_strictness`` takes precedence and logs a warning on conflict, matching
     ``resolve_closure_strictness_mode``.
     """
-    if closure_strictness is not None:
-        c_mode = str(closure_strictness).strip().lower()
-        mode_strict_map = {
-            "pedantic": True,
-            "fail_closed": True,
-            "strict": False,
-            "lenient": False,
-            "fast": False,
-            "skip": False,
-        }
-        if c_mode in mode_strict_map:
-            resolved_flag = mode_strict_map[c_mode]
-            if (
-                strict_with_suppression is not None
-                and bool(strict_with_suppression) != resolved_flag
-            ):
-                _warn_closure_event_once(
-                    f"conflict_strict_with:{closure_strictness}:{bool(strict_with_suppression)}",
-                    "Conflicting configuration: closure_strictness '%s' takes precedence over "
-                    "strict_with_suppression=%s",
-                    closure_strictness,
-                    bool(strict_with_suppression),
-                )
-            return resolved_flag
-    if strict_with_suppression is not None:
-        return bool(strict_with_suppression)
-    return False
+    resolved_mode, _ = resolve_closure_strictness_mode(
+        closure_strictness=closure_strictness,
+        strict_with_suppression=strict_with_suppression,
+    )
+    return resolved_mode == "pedantic"
 
 
 def resolve_unit_closure_flags(

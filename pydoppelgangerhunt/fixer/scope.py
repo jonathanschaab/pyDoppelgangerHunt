@@ -1392,6 +1392,12 @@ def _unit_cols(
     e_col = parse_unit_coord(unit, "end_col", default=None)
     if e_col is None:
         e_col = parse_unit_coord(unit, "end_col_offset", default=None)
+    u_kind_str = str(unit.get("kind") or "")
+    is_inline_expr_kind = u_kind_str in (
+        "comprehension",
+        "complex_expr",
+        "closure",
+    )
     if (
         (s_col is None or e_col is None)
         and unit_code_lines
@@ -1401,9 +1407,12 @@ def _unit_cols(
         if len(unit_code_lines) == 1 and snippet and "\n" not in snippet:
             line0 = unit_code_lines[0]
             if (
-                snippet != line0.strip()
-                or s_col is not None
+                s_col is not None
                 or e_col is not None
+                or (
+                    snippet != line0.strip()
+                    and (";" in line0 or is_inline_expr_kind)
+                )
             ):
                 start_id = snippet[0].isalnum() or snippet[0] == "_"
                 end_id = snippet[-1].isalnum() or snippet[-1] == "_"
@@ -1448,62 +1457,76 @@ def _unit_cols(
                 )
             ):
                 had_explicit_col = s_col is not None or e_col is not None
-                ml_cand_s: Optional[int] = s_col
-                ml_cand_e: Optional[int] = e_col
                 line_first = unit_code_lines[0].rstrip("\r\n")
-                snip_first = snip_lines[0]
-                if ml_cand_s is None:
-                    start_id = snip_first[0].isalnum() or snip_first[0] == "_"
-                    s_matches: List[int] = []
-                    idx = 0
-                    while True:
-                        pos = line_first.find(snip_first, idx)
-                        if pos < 0:
-                            break
-                        tail = line_first[pos + len(snip_first) :].strip()
-                        left_ok = not start_id or pos == 0 or not (
-                            line_first[pos - 1].isalnum()
-                            or line_first[pos - 1] == "_"
-                        )
-                        if left_ok and (not tail or tail.startswith("#")):
-                            s_matches.append(
-                                len(line_first[:pos].encode("utf-8"))
-                            )
-                        idx = pos + 1
-                    if len(s_matches) == 1:
-                        ml_cand_s = s_matches[0]
                 line_last = unit_code_lines[-1].rstrip("\r\n")
-                snip_last = snip_lines[-1].lstrip()
-                if ml_cand_e is None and snip_last:
-                    end_id = snip_last[-1].isalnum() or snip_last[-1] == "_"
-                    l_stripped = line_last.lstrip()
-                    if l_stripped.startswith(snip_last):
-                        end_pos = (
-                            len(line_last) - len(l_stripped) + len(snip_last)
-                        )
-                        right_ok = (
-                            not end_id
-                            or end_pos >= len(line_last)
-                            or not (
-                                line_last[end_pos].isalnum()
-                                or line_last[end_pos] == "_"
-                            )
-                        )
-                        if right_ok:
-                            ml_cand_e = len(line_last[:end_pos].encode("utf-8"))
-                if had_explicit_col or (
-                    ml_cand_s is not None and ml_cand_e is not None
+                if (
+                    had_explicit_col
+                    or ";" in line_first
+                    or ";" in line_last
+                    or is_inline_expr_kind
                 ):
-                    s_col, e_col = ml_cand_s, ml_cand_e
+                    ml_cand_s: Optional[int] = s_col
+                    ml_cand_e: Optional[int] = e_col
+                    snip_first = snip_lines[0]
+                    if ml_cand_s is None:
+                        start_id = (
+                            snip_first[0].isalnum() or snip_first[0] == "_"
+                        )
+                        s_matches: List[int] = []
+                        idx = 0
+                        while True:
+                            pos = line_first.find(snip_first, idx)
+                            if pos < 0:
+                                break
+                            tail = line_first[
+                                pos + len(snip_first) :
+                            ].strip()
+                            left_ok = not start_id or pos == 0 or not (
+                                line_first[pos - 1].isalnum()
+                                or line_first[pos - 1] == "_"
+                            )
+                            if left_ok and (not tail or tail.startswith("#")):
+                                s_matches.append(
+                                    len(line_first[:pos].encode("utf-8"))
+                                )
+                            idx = pos + 1
+                        if len(s_matches) == 1:
+                            ml_cand_s = s_matches[0]
+                    snip_last = snip_lines[-1].lstrip()
+                    if ml_cand_e is None and snip_last:
+                        end_id = (
+                            snip_last[-1].isalnum() or snip_last[-1] == "_"
+                        )
+                        l_stripped = line_last.lstrip()
+                        if l_stripped.startswith(snip_last):
+                            end_pos = (
+                                len(line_last)
+                                - len(l_stripped)
+                                + len(snip_last)
+                            )
+                            right_ok = (
+                                not end_id
+                                or end_pos >= len(line_last)
+                                or not (
+                                    line_last[end_pos].isalnum()
+                                    or line_last[end_pos] == "_"
+                                )
+                            )
+                            if right_ok:
+                                ml_cand_e = len(
+                                    line_last[:end_pos].encode("utf-8")
+                                )
+                    if had_explicit_col or (
+                        ml_cand_s is not None and ml_cand_e is not None
+                    ):
+                        s_col, e_col = ml_cand_s, ml_cand_e
     if (s_col is None) != (e_col is None) and unit_code_lines:
-        u_kind_str = str(unit.get("kind") or "")
         s_col, e_col = _infer_missing_col_from_line_ast(
             unit_code_lines,
             s_col,
             e_col,
             unit_kind=u_kind_str,
-            allow_expr_fallback=u_kind_str
-            in ("comprehension", "complex_expr", "closure"),
+            allow_expr_fallback=is_inline_expr_kind,
         )
     return s_col, e_col
 
@@ -1556,41 +1579,35 @@ def _has_token_boundary_subslice(
 def _is_ordered_contiguous_source_match(
     src_code_lines: Sequence[str],
     raw_lines: Sequence[str],
+    *,
+    allow_subwindow: bool = True,
 ) -> bool:
-    """Checks whether src_code_lines matches an ordered contiguous window in raw_lines."""
+    """Checks whether src_code_lines matches raw_lines (with token-boundary boundary lines when allow_subwindow is True)."""
     raw_nonempty = [ln.strip() for ln in raw_lines if ln.strip()]
     k = len(src_code_lines)
-    if k == 0 or k > len(raw_nonempty):
+    if k == 0 or k != len(raw_nonempty):
         return False
+    if not allow_subwindow:
+        return list(src_code_lines) == raw_nonempty
     if k == 1:
         target = src_code_lines[0]
         is_stmt_like = not _is_valid_eval_expr(target)
-        return any(
-            _has_token_boundary_subslice(
-                target,
-                r_ln,
-                require_stmt_delimiters=is_stmt_like,
-            )
-            for r_ln in raw_nonempty
+        return _has_token_boundary_subslice(
+            target,
+            raw_nonempty[0],
+            require_stmt_delimiters=is_stmt_like,
         )
-    max_start = len(raw_nonempty) - k
-    for start_idx in range(max_start + 1):
-        first_raw = raw_nonempty[start_idx]
-        if not _has_token_boundary_subslice(
-            src_code_lines[0], first_raw, anchor_end=True
-        ):
-            continue
-        last_raw = raw_nonempty[start_idx + k - 1]
-        if not _has_token_boundary_subslice(
-            src_code_lines[-1], last_raw, anchor_start=True
-        ):
-            continue
-        if all(
-            raw_nonempty[start_idx + i] == src_code_lines[i]
-            for i in range(1, k - 1)
-        ):
-            return True
-    return False
+    if not _has_token_boundary_subslice(
+        src_code_lines[0], raw_nonempty[0], anchor_end=True
+    ):
+        return False
+    if not _has_token_boundary_subslice(
+        src_code_lines[-1], raw_nonempty[-1], anchor_start=True
+    ):
+        return False
+    return all(
+        raw_nonempty[i] == src_code_lines[i] for i in range(1, k - 1)
+    )
 
 
 def _normalize_clause_header_snippet(dedented: str) -> str:
@@ -1720,21 +1737,34 @@ def _strip_comments_from_lines(lines: Sequence[str]) -> List[str]:
 def _is_normalized_source_equivalent(
     src_code: str,
     raw_lines: Sequence[str],
+    *,
+    allow_subwindow: bool = False,
 ) -> bool:
     """Checks whether normalized or comment-stripped src_code matches raw_lines."""
     src_dumps = _parse_normalized_stmt_dumps(src_code)
     raw_dumps = _parse_normalized_stmt_dumps("".join(raw_lines))
-    if src_dumps and raw_dumps and len(src_dumps) <= len(raw_dumps):
-        k = len(src_dumps)
-        if any(
-            raw_dumps[i : i + k] == src_dumps
-            for i in range(len(raw_dumps) - k + 1)
-        ):
-            return True
+    has_boundary_semicolon = bool(
+        raw_lines and (";" in raw_lines[0] or ";" in raw_lines[-1])
+    )
+    if src_dumps and raw_dumps:
+        if not (allow_subwindow and has_boundary_semicolon):
+            if src_dumps == raw_dumps:
+                return True
+        elif len(src_dumps) <= len(raw_dumps):
+            k = len(src_dumps)
+            if any(
+                raw_dumps[i : i + k] == src_dumps
+                for i in range(len(raw_dumps) - k + 1)
+            ):
+                return True
     norm_src_lines = _strip_comments_from_lines(split_source_lines(src_code))
     norm_raw_lines = _strip_comments_from_lines(raw_lines)
     if norm_src_lines and norm_raw_lines:
-        return _is_ordered_contiguous_source_match(norm_src_lines, norm_raw_lines)
+        return _is_ordered_contiguous_source_match(
+            norm_src_lines,
+            norm_raw_lines,
+            allow_subwindow=allow_subwindow,
+        )
     return False
 
 
@@ -1776,27 +1806,29 @@ def _unit_source_code_matches_tree(
     src_code: str,
     file_tree: ast.AST,
 ) -> bool:
-    """Checks whether unit['source_code'] matches AST nodes in file_tree at (start, end)."""
+    """Checks whether unit['source_code'] matches the ordered AST nodes in file_tree spanning (start, end)."""
     u_start = parse_unit_coord(unit, "start", default=1)
     u_end = parse_unit_coord(unit, "end", default=u_start)
+    s_col = parse_unit_coord(
+        unit,
+        "start_col",
+        default=parse_unit_coord(unit, "col_offset", default=None),
+    )
+    e_col = parse_unit_coord(
+        unit,
+        "end_col",
+        default=parse_unit_coord(unit, "end_col_offset", default=None),
+    )
+    has_explicit_cols = s_col is not None or e_col is not None
+    u_kind_str = str(unit.get("kind") or "")
+    is_inline_expr_kind = u_kind_str in (
+        "comprehension",
+        "complex_expr",
+        "closure",
+    )
     src_dumps = _parse_normalized_stmt_dumps(src_code)
     if src_dumps:
-        tree_stmt_dumps: Set[str] = set()
-        for node in ast.walk(file_tree):
-            if isinstance(node, (ast.stmt, ast.ExceptHandler)):
-                n_s = getattr(node, "lineno", None)
-                n_e = getattr(node, "end_lineno", n_s)
-                if (
-                    isinstance(n_s, int)
-                    and isinstance(n_e, int)
-                    and n_s <= u_end
-                    and n_e >= u_start
-                ):
-                    tree_stmt_dumps.add(
-                        ast.dump(node, include_attributes=False)
-                    )
-        if all(d in tree_stmt_dumps for d in src_dumps):
-            return True
+        candidate_dump_seqs: List[List[str]] = [src_dumps]
         raw_dedented = dedent_source_text(src_code).strip()
         norm_dedented = _normalize_clause_header_snippet(raw_dedented)
         if norm_dedented != raw_dedented:
@@ -1813,15 +1845,84 @@ def _unit_source_code_matches_tree(
                     elif is_match_node(top_s):
                         for c_node in getattr(top_s, "cases", ()):
                             inner_nodes.extend(getattr(c_node, "body", ()))
-                if inner_nodes and all(
-                    ast.dump(n, include_attributes=False) in tree_stmt_dumps
-                    for n in inner_nodes
-                ):
-                    return True
-            except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
+                if inner_nodes:
+                    candidate_dump_seqs.append(
+                        [
+                            ast.dump(n, include_attributes=False)
+                            for n in inner_nodes
+                        ]
+                    )
+            except (
+                SyntaxError,
+                ValueError,
+                UnicodeDecodeError,
+                RecursionError,
+                MemoryError,
+            ):
                 pass
+        for node in ast.walk(file_tree):
+            if isinstance(node, (ast.stmt, ast.ExceptHandler)):
+                estart, _ = _node_earliest_start_pos(node)
+                n_s = getattr(node, "lineno", estart)
+                n_e = getattr(node, "end_lineno", n_s)
+                if (
+                    isinstance(n_s, int)
+                    and isinstance(n_e, int)
+                    and u_start in (n_s, estart)
+                    and n_e == u_end
+                ):
+                    single_dump = [ast.dump(node, include_attributes=False)]
+                    if single_dump in candidate_dump_seqs:
+                        return True
+            for attr_name in ("body", "orelse", "finalbody", "handlers"):
+                seq = getattr(node, attr_name, None)
+                if not isinstance(seq, list) or not seq:
+                    continue
+                in_span: List[ast.AST] = []
+                for s in seq:
+                    s_estart, _ = _node_earliest_start_pos(s)
+                    s_lineno = getattr(s, "lineno", s_estart)
+                    s_end = getattr(s, "end_lineno", s_lineno)
+                    if (
+                        isinstance(s_lineno, int)
+                        and isinstance(s_end, int)
+                        and (s_lineno >= u_start or (isinstance(s_estart, int) and s_estart >= u_start))
+                        and s_end <= u_end
+                    ):
+                        in_span.append(s)
+                if not in_span:
+                    continue
+                first_estart, _ = _node_earliest_start_pos(in_span[0])
+                first_lineno = getattr(in_span[0], "lineno", first_estart)
+                last_end = getattr(
+                    in_span[-1],
+                    "end_lineno",
+                    getattr(in_span[-1], "lineno", None),
+                )
+                starts_at_u_start = u_start in (first_lineno, first_estart) or (
+                    attr_name in ("body", "orelse", "finalbody")
+                    and first_lineno == u_start + 1
+                )
+                if not (starts_at_u_start and last_end == u_end):
+                    continue
+                span_dumps = [
+                    ast.dump(s, include_attributes=False) for s in in_span
+                ]
+                for target_dumps in candidate_dump_seqs:
+                    if span_dumps == target_dumps:
+                        return True
+                    if (
+                        (has_explicit_cols or (u_start == u_end and len(span_dumps) > 1))
+                        and len(target_dumps) <= len(span_dumps)
+                    ):
+                        k = len(target_dumps)
+                        if any(
+                            span_dumps[i : i + k] == target_dumps
+                            for i in range(len(span_dumps) - k + 1)
+                        ):
+                            return True
     dedented = dedent_source_text(src_code).strip()
-    if dedented:
+    if dedented and (is_inline_expr_kind or has_explicit_cols or not src_dumps):
         try:
             with _suppress_syntax_warnings():
                 expr_node = ast.parse(dedented, mode="eval").body
@@ -1833,8 +1934,8 @@ def _unit_source_code_matches_tree(
                     if (
                         isinstance(n_s, int)
                         and isinstance(n_e, int)
-                        and n_s <= u_end
-                        and n_e >= u_start
+                        and n_s == u_start
+                        and n_e == u_end
                         and ast.dump(node, include_attributes=False) == expr_dump
                     ):
                         return True
@@ -1957,6 +2058,16 @@ def _inspect_unit_scope(
             for ln in split_source_lines(str(unit["source_code"]))
             if ln.strip()
         ]
+        has_boundary_semicolon = bool(
+            raw_lines and (";" in raw_lines[0] or ";" in raw_lines[-1])
+        )
+        allow_subwindow = (
+            inferred_s_col is not None
+            or inferred_e_col is not None
+            or has_boundary_semicolon
+            or str(unit.get("kind") or "")
+            in ("comprehension", "complex_expr", "closure")
+        )
         candidate_line_windows: List[Sequence[str]] = [raw_lines]
         if (
             inferred_s_col is not None or inferred_e_col is not None
@@ -1981,8 +2092,12 @@ def _inspect_unit_scope(
         matches_backing_source = any(
             dedent_source_text("".join(win)).strip()
             == dedent_source_text(str(unit["source_code"])).strip()
-            or _is_ordered_contiguous_source_match(src_code_lines, win)
-            or _is_normalized_source_equivalent(str(unit["source_code"]), win)
+            or _is_ordered_contiguous_source_match(
+                src_code_lines, win, allow_subwindow=allow_subwindow
+            )
+            or _is_normalized_source_equivalent(
+                str(unit["source_code"]), win, allow_subwindow=allow_subwindow
+            )
             for win in candidate_line_windows
         )
         if (
@@ -1991,7 +2106,7 @@ def _inspect_unit_scope(
             and not matches_backing_source
         ):
             stale_source_code_mismatch = True
-        else:
+        elif not raw_lines or allow_subwindow:
             raw_lines = split_source_lines(str(unit["source_code"]))
     dedented = dedent_source_text("".join(raw_lines))
     skip_pre_unit_closures_flag, strict_with_flag = resolve_unit_closure_flags(
@@ -2561,7 +2676,7 @@ def _inspect_unit_scope(
                                     ds_unit,
                                     candidates=write_only_cond_cands,
                                     tree=mod_tree,
-                                    skip_pre_unit_closures=skip_pre_unit_closures_flag,
+                                    skip_pre_unit_closures=False,
                                     source_digest=(
                                         None
                                         if full_src_text

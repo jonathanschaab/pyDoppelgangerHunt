@@ -9,7 +9,6 @@ import typing
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.config import (
-    log_heuristic_ctx_manager_summary,
     normalize_path_string,
     resolve_pair_closure_flags,
 )
@@ -1556,7 +1555,6 @@ def synthesize_shared_helper_code(
             closure_strictness=closure_strictness,
             non_suppressing_ctx_managers=non_suppressing_ctx_managers,
         )
-        log_heuristic_ctx_manager_summary()
 
     if scope1.get("is_async") or scope2.get("is_async"):
         scope["is_async"] = True

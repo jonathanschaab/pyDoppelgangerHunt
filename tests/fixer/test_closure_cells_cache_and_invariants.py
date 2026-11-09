@@ -6638,7 +6638,7 @@ def test_synthesize_shared_helper_code_does_not_mutate_unit_allowlist_across_cal
     import copy
 
     src = (
-        "def f1(custom_cm, flag):\n"
+        "def f1(flag):\n"
         "    with custom_cm():\n"
         "        if flag:\n"
         "            raise ValueError('boom')\n"
@@ -6646,7 +6646,7 @@ def test_synthesize_shared_helper_code_does_not_mutate_unit_allowlist_across_cal
         "    cb = lambda: x\n"
         "    out = cb() + 1\n"
         "    return out\n\n"
-        "def f2(custom_cm, flag):\n"
+        "def f2(flag):\n"
         "    with custom_cm():\n"
         "        if flag:\n"
         "            raise ValueError('boom')\n"
@@ -7062,3 +7062,471 @@ def test_suppress_syntax_warnings_exception_and_nested_thread_restoration() -> N
 
         assert _syntax_warning_active_count[0] == 0
         assert list(warnings.filters) == baseline_filters
+
+
+@pytest.mark.parametrize(
+    "stale_code",
+    [
+        "    b = a + 2\n",
+        "    a = x + 1\n    b = a + 2\n",
+        "    c = b + 3\n    b = a + 2\n    a = x + 1\n",
+        "    b = a + 2\n    b = a + 2\n    b = a + 2\n",
+    ],
+)
+def test_stale_source_code_partial_slice_and_tree_mismatch_rejected(
+    stale_code: str,
+) -> None:
+    """Verifies partial, truncated, reordered, or duplicated unit['source_code'] is rejected as stale_source_code."""
+    src = (
+        "def compute(x):\n"
+        "    a = x + 1\n"
+        "    b = a + 2\n"
+        "    c = b + 3\n"
+        "    return c\n"
+    )
+    mod_tree = ast.parse(src)
+
+    sc_with_text = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 4,
+            "kind": "compound_block",
+            "source_text": src,
+            "source_code": stale_code,
+        },
+        tree=mod_tree,
+    )
+    assert "stale_source_code" in sc_with_text["control_flow_hazards"]
+    assert sc_with_text["is_control_flow_safe"] is False
+
+    sc_tree_only = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 4,
+            "kind": "compound_block",
+            "source_code": stale_code,
+        },
+        tree=mod_tree,
+    )
+    assert "stale_source_code" in sc_tree_only["control_flow_hazards"]
+    assert sc_tree_only["is_control_flow_safe"] is False
+
+    sc_single_line_partial = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 2,
+            "kind": "basic_block",
+            "source_text": src,
+            "source_code": "x + 1",
+        },
+        tree=mod_tree,
+    )
+    assert "stale_source_code" in sc_single_line_partial["control_flow_hazards"]
+    assert sc_single_line_partial["is_control_flow_safe"] is False
+
+    sc_matching = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 4,
+            "kind": "compound_block",
+            "source_text": src,
+            "source_code": "    a = x + 1\n    b = a + 2\n    c = b + 3\n",
+        },
+        tree=mod_tree,
+    )
+    assert "stale_source_code" not in sc_matching["control_flow_hazards"]
+    assert sc_matching["is_control_flow_safe"] is True
+    assert sc_matching["inputs"] == ["x"]
+    assert sc_matching["outputs"] == ["a", "b", "c"]
+
+
+def test_write_only_conditional_store_strictness_monotonicity_with_returned_closure() -> None:
+    """Verifies write-only conditional store captured by a post-unit referenced closure preserves strictness monotonicity."""
+    src = (
+        "def work(items, flag):\n"
+        "    tmp = 0\n"
+        "    cb = lambda: tmp\n"
+        "    acc = 1\n"
+        "    if flag:\n"
+        "        tmp = 2\n"
+        "    acc = acc + len(items)\n"
+        "    return acc, cb\n"
+    )
+    mod_tree = ast.parse(src)
+    unit_base = {
+        "start": 5,
+        "end": 7,
+        "kind": "compound_block",
+        "source_text": src,
+        "source_code": "    if flag:\n        tmp = 2\n    acc = acc + len(items)\n",
+    }
+    scopes = {
+        mode: inspect_single_unit_scope(
+            {**unit_base, "closure_strictness": mode},
+            tree=mod_tree,
+        )
+        for mode in ("lenient", "strict", "pedantic")
+    }
+    for mode, sc in scopes.items():
+        assert "tmp" in sc["inputs"], mode
+        assert "severed_closure_cell" not in sc["control_flow_hazards"], mode
+        assert sc["is_control_flow_safe"] is True, mode
+
+
+def test_terminating_try_block_preserves_try_def_in_conditional_and_skips_unreachable_orelse() -> None:
+    """Verifies terminating try blocks keep try_def in conditional when a handler falls through and ignore unreachable else blocks."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _analyze_block_assignment,
+    )
+
+    try_src = (
+        "try:\n"
+        "    x = 20\n"
+        "    may_raise()\n"
+        "    return 0\n"
+        "except Exception:\n"
+        "    pass\n"
+        "else:\n"
+        "    unreachable_else = 99\n"
+    )
+    defs, conds = _analyze_block_assignment(ast.parse(try_src).body)
+    assert "x" not in defs
+    assert "x" in conds
+    assert "unreachable_else" not in defs
+    assert "unreachable_else" not in conds
+
+    fn_src = (
+        "def run(may_raise):\n"
+        "    try:\n"
+        "        x = 20\n"
+        "        may_raise()\n"
+        "        return 0\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    return x\n"
+    )
+    sc = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 7,
+            "kind": "compound_block",
+            "source_text": fn_src,
+            "source_code": (
+                "    try:\n"
+                "        x = 20\n"
+                "        may_raise()\n"
+                "        return 0\n"
+                "    except Exception:\n"
+                "        pass\n"
+            ),
+        },
+        tree=ast.parse(fn_src),
+    )
+    assert "x" in sc["conditional_outputs"]
+    assert "x" not in sc["definite_stores"]
+
+
+@pytest.mark.parametrize(
+    "shadow_src,expect_hazard",
+    [
+        (
+            "def f(SafeTx, flag):\n"
+            "    with SafeTx():\n"
+            "        if flag:\n"
+            "            raise ValueError('boom')\n"
+            "        x = 2\n"
+            "    cb = lambda: x\n"
+            "    return cb()\n",
+            True,
+        ),
+        (
+            "def f(custom_cm, flag):\n"
+            "    SafeTx = custom_cm\n"
+            "    with SafeTx():\n"
+            "        if flag:\n"
+            "            raise ValueError('boom')\n"
+            "        x = 2\n"
+            "    cb = lambda: x\n"
+            "    return cb()\n",
+            True,
+        ),
+        (
+            "from unknown_pkg import *\n"
+            "def f(flag):\n"
+            "    with SafeTx():\n"
+            "        if flag:\n"
+            "            raise ValueError('boom')\n"
+            "        x = 2\n"
+            "    cb = lambda: x\n"
+            "    return cb()\n",
+            True,
+        ),
+        (
+            "import contextlib\n"
+            "def f(flag):\n"
+            "    sup = contextlib.suppress\n"
+            "    with sup.atomic():\n"
+            "        if flag:\n"
+            "            raise ValueError('boom')\n"
+            "        x = 2\n"
+            "    cb = lambda: x\n"
+            "    return cb()\n",
+            True,
+        ),
+        (
+            "def f(flag):\n"
+            "    with SafeTx():\n"
+            "        if flag:\n"
+            "            raise ValueError('boom')\n"
+            "        x = 2\n"
+            "    cb = lambda: x\n"
+            "    return cb()\n",
+            False,
+        ),
+    ],
+)
+def test_extra_non_suppressing_allowlist_shadowing_and_suppressor_wildcard_receiver(
+    shadow_src: str,
+    expect_hazard: bool,
+) -> None:
+    """Verifies non_suppressing_ctx_managers rejects locally shadowed names, star imports, and suppressor wildcard receivers."""
+    lines = shadow_src.splitlines(keepends=True)
+    cb_line = next(i for i, ln in enumerate(lines, 1) if "cb = lambda: x" in ln)
+    sc = inspect_single_unit_scope(
+        {
+            "start": cb_line,
+            "end": cb_line,
+            "kind": "basic_block",
+            "source_text": shadow_src,
+            "source_code": "    cb = lambda: x\n",
+            "closure_strictness": "pedantic",
+            "non_suppressing_ctx_managers": ["SafeTx", "*.atomic", ".atomic"],
+        },
+        tree=ast.parse(shadow_src),
+    )
+    assert ("severed_closure_cell" in sc["control_flow_hazards"]) is expect_hazard
+
+
+def test_heuristic_ctx_manager_summary_logged_once_at_batch_boundary(
+    tmp_path: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies per-pair helpers do not flush heuristic summary mid-run and batch entrypoints log one consolidated summary."""
+    import logging
+    from pydoppelgangerhunt.config import (
+        clear_closure_warning_cache,
+        log_heuristic_ctx_manager_summary,
+    )
+    from pydoppelgangerhunt.fixer import generate_refactoring_patch
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    src_a = (
+        "def fa1(x):\n"
+        "    with CustomMgrAlpha():\n"
+        "        v = x + 1\n"
+        "    out = v * 2\n"
+        "    return out\n\n"
+        "def fa2(x):\n"
+        "    with CustomMgrAlpha():\n"
+        "        v = x + 1\n"
+        "    out = v * 2\n"
+        "    return out\n"
+    )
+    src_b = (
+        "def fb1(x):\n"
+        "    with CustomMgrBeta():\n"
+        "        v = x + 3\n"
+        "    out = v * 4\n"
+        "    return out\n\n"
+        "def fb2(x):\n"
+        "    with CustomMgrBeta():\n"
+        "        v = x + 3\n"
+        "    out = v * 4\n"
+        "    return out\n"
+    )
+    file_a = tmp_path / "mod_a.py"
+    file_b = tmp_path / "mod_b.py"
+    file_a.write_text(src_a, encoding="utf-8")
+    file_b.write_text(src_b, encoding="utf-8")
+
+    ua1 = {
+        "name": "fa1:block",
+        "file": str(file_a),
+        "start": 2,
+        "end": 4,
+        "kind": "compound_block",
+        "source_text": src_a,
+    }
+    ua2 = {
+        "name": "fa2:block",
+        "file": str(file_a),
+        "start": 8,
+        "end": 10,
+        "kind": "compound_block",
+        "source_text": src_a,
+    }
+    ub1 = {
+        "name": "fb1:block",
+        "file": str(file_b),
+        "start": 2,
+        "end": 4,
+        "kind": "compound_block",
+        "source_text": src_b,
+    }
+    ub2 = {
+        "name": "fb2:block",
+        "file": str(file_b),
+        "start": 8,
+        "end": 10,
+        "kind": "compound_block",
+        "source_text": src_b,
+    }
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt.config"):
+        synthesize_refactoring_suggestion(ua1, ua2, repo_root=str(tmp_path))
+        synthesize_refactoring_suggestion(ub1, ub2, repo_root=str(tmp_path))
+        assert not [r for r in caplog.records if "Summary:" in r.message]
+        flushed = log_heuristic_ctx_manager_summary()
+    assert set(flushed) == {"CustomMgrAlpha", "CustomMgrBeta"}
+    summary_records = [r for r in caplog.records if "Summary:" in r.message]
+    assert len(summary_records) == 1
+    assert "2 unproven context manager(s)" in summary_records[0].message
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt.config"):
+        patch = generate_refactoring_patch(
+            [(1.0, dict(ua1), dict(ua2)), (1.0, dict(ub1), dict(ub2))],
+            repo_root=str(tmp_path),
+        )
+    assert "def _shared_" in patch
+    patch_summaries = [r for r in caplog.records if "Summary:" in r.message]
+    assert len(patch_summaries) == 1
+    assert "2 unproven context manager(s)" in patch_summaries[0].message
+
+
+@pytest.mark.parametrize(
+    "block_src",
+    [
+        (
+            "from contextlib import suppress\n"
+            "if cond:\n"
+            "    d = 1\n"
+            "else:\n"
+            "    d = 2\n"
+            "with suppress(ZeroDivisionError):\n"
+            "    _ = d\n"
+            "    return 1\n"
+        ),
+        (
+            "from contextlib import suppress, nullcontext\n"
+            "with nullcontext() as d:\n"
+            "    pass\n"
+            "with suppress(ZeroDivisionError):\n"
+            "    _ = d\n"
+            "    return 1\n"
+        ),
+        (
+            "from contextlib import suppress\n"
+            "try:\n"
+            "    d = 1\n"
+            "except Exception as exc:\n"
+            "    with suppress(ZeroDivisionError):\n"
+            "        _ = exc\n"
+            "        return 2\n"
+            "else:\n"
+            "    with suppress(ZeroDivisionError):\n"
+            "        _ = d\n"
+            "        return 1\n"
+        ),
+        (
+            "from contextlib import suppress\n"
+            "_ = (d := 1)\n"
+            "with suppress(ZeroDivisionError):\n"
+            "    _ = d\n"
+            "    return 1\n"
+        ),
+    ],
+)
+def test_block_terminates_matches_analyze_block_assignment_across_compound_safe_names(
+    block_src: str,
+) -> None:
+    """Verifies _block_terminates and _analyze_block_assignment_impl agree on safe_names across compound statements."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _analyze_block_assignment_impl,
+        _block_terminates,
+        _seed_scope_suppress_aliases,
+    )
+
+    mod_tree = ast.parse(block_src)
+    prov = _seed_scope_suppress_aliases(mod_tree, mod_tree)
+    _, _, impl_term, _ = _analyze_block_assignment_impl(
+        mod_tree.body,
+        suppress_aliases=prov,
+    )
+    bt_strict = _block_terminates(
+        mod_tree.body,
+        suppress_aliases=prov,
+        strict_names=True,
+    )
+    bt_non_strict = _block_terminates(
+        mod_tree.body,
+        suppress_aliases=prov,
+        strict_names=False,
+    )
+    assert impl_term is True
+    assert bt_strict == impl_term
+    assert bt_non_strict is True
+
+
+def test_make_scope_ctx_cache_key_validates_extra_params_and_strict_with_warnings(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies _make_scope_ctx_cache_key rejects mutable extra_params and config helpers emit all expected warnings."""
+    import logging
+    from pydoppelgangerhunt.config import (
+        clear_closure_warning_cache,
+        resolve_closure_strictness_mode,
+        resolve_strict_with_suppression,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _make_scope_ctx_cache_key,
+    )
+
+    mod = ast.parse("x = 1\n")
+    with pytest.raises(TypeError, match="immutable"):
+        _make_scope_ctx_cache_key(mod, "test_kind", None, extra_params=([1, 2],))
+    with pytest.raises(TypeError, match="immutable"):
+        _make_scope_ctx_cache_key(mod, "test_kind", None, extra_params=({"a": 1},))
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt.config"):
+        assert resolve_strict_with_suppression(closure_strictness="fail_closed") is True
+        assert (
+            resolve_strict_with_suppression(
+                closure_strictness="unknown_mode_xyz",
+                strict_with_suppression=True,
+            )
+            is True
+        )
+    assert any("deprecated" in r.message.lower() for r in caplog.records)
+    assert any("unrecognized closure_strictness" in r.message.lower() for r in caplog.records)
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt.config"):
+        mode, is_lenient = resolve_closure_strictness_mode(
+            closure_strictness="bogus_mode",
+            skip_pre_unit_closures=True,
+            strict_with_suppression=True,
+        )
+    assert (mode, is_lenient) == ("lenient", True)
+    assert any("unrecognized closure_strictness" in r.message.lower() for r in caplog.records)
+    assert any(
+        "strict_with_suppression=True and skip_pre_unit_closures=True" in r.message
+        for r in caplog.records
+    )
+
