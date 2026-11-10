@@ -173,9 +173,7 @@ def _check_captured_cell_mutations(
 ) -> bool:
     """Checks 1 & 2: captured cell variable is unbound before unit or mutated outside unit."""
     actual_closure_reads = (
-        captured_candidates
-        if unit_closure_reads is None
-        else unit_closure_reads
+        captured_candidates if unit_closure_reads is None else unit_closure_reads
     )
     for var in captured_candidates:
         acc_ext_muts: Set[str] = set()
@@ -204,9 +202,7 @@ def _check_captured_cell_mutations(
 
 def _check_intra_unit_nonlocal_mutators(
     candidate_stmts: Sequence[ast.stmt],
-    intra_nl_mutators: Sequence[
-        Union[_IntraUnitMutator, Tuple[str, Set[str], bool]]
-    ],
+    intra_nl_mutators: Sequence[Union[_IntraUnitMutator, Tuple[str, Set[str], bool]]],
     unit_top_locals: AbstractSet[str],
     nonlocal_set: AbstractSet[str],
     chain_infos: Sequence[_EnclosingFnCellInfo],
@@ -220,14 +216,10 @@ def _check_intra_unit_nonlocal_mutators(
     if not intra_nl_mutators:
         return False
     all_chain_locals: Set[str] = (
-        set().union(*(info.fn_locals for info in chain_infos))
-        if chain_infos
-        else set()
+        set().union(*(info.fn_locals for info in chain_infos)) if chain_infos else set()
     )
     top_locals_set = set(unit_top_locals)
-    outer_escape_targets = (
-        all_chain_locals | set(enc_escaping) | set(nonlocal_set)
-    )
+    outer_escape_targets = all_chain_locals | set(enc_escaping) | set(nonlocal_set)
     for mut_entry in intra_nl_mutators:
         mutated_vars = mut_entry[1]
         escaping_nl_muts = (mutated_vars - top_locals_set) | (
@@ -273,8 +265,7 @@ def _check_intra_unit_nonlocal_mutators(
             else mut_fn_name in escaped_unit_names
         )
         mut_fn_executed = mut_fn_escapes or (
-            id(mut_node) in executed_def_ids
-            and not isinstance(mut_node, ast.ClassDef)
+            id(mut_node) in executed_def_ids and not isinstance(mut_node, ast.ClassDef)
             if isinstance(mut_node, ast.AST)
             else True
         )
@@ -307,17 +298,12 @@ def _collect_unshadowed_chain_closure_info(
     chain_locals: Set[str] = set()
     concurrent_vars: Set[str] = set()
     post_reads: Set[str] = set()
-    unshadowed_sibs: List[
-        Tuple[Optional[str], AbstractSet[str], AbstractSet[str]]
-    ] = []
+    unshadowed_sibs: List[Tuple[Optional[str], AbstractSet[str], AbstractSet[str]]] = []
     unshadowed_edges: List[Tuple[str, AbstractSet[str]]] = []
     for idx, info in enumerate(chain_infos):
         inner_shadowed: Set[str] = (
             set().union(
-                *(
-                    chain_infos[j].fn_locals
-                    for j in range(idx + 1, len(chain_infos))
-                )
+                *(chain_infos[j].fn_locals for j in range(idx + 1, len(chain_infos)))
             )
             if idx + 1 < len(chain_infos)
             else set()
@@ -325,8 +311,7 @@ def _collect_unshadowed_chain_closure_info(
         unshadowed_fn_locals = set(info.fn_locals) - inner_shadowed
         chain_locals.update(unshadowed_fn_locals)
         concurrent_vars.update(
-            unshadowed_fn_locals
-            & (set(info.concurrent_sibling_vars) - inner_shadowed)
+            unshadowed_fn_locals & (set(info.concurrent_sibling_vars) - inner_shadowed)
         )
         post_reads.update(
             unshadowed_fn_locals & (set(info.post_reads) - inner_shadowed)
@@ -375,9 +360,7 @@ def _check_sibling_closure_sharing(
     sub_touched = set(eff_input_set) | mutated_set
     for sib_name, sib_reads, sib_nl_muts in unshadowed.sib_closures:
         is_ref_sib = sib_name is not None and sib_name in eff_input_set
-        if not is_ref_sib and (
-            not unreturned_mutations or skip_pre_unit_closures
-        ):
+        if not is_ref_sib and (not unreturned_mutations or skip_pre_unit_closures):
             continue
         if bool(sib_reads & unshadowed.chain_locals & mutated_set):
             return True
@@ -477,6 +460,146 @@ def _iter_immediate_unit_exec_nodes(
 
 
 _PRIMITIVE_ACCUMULATOR_CONST_TYPES = (int, float, complex, str, bytes, bool)
+_PRIMITIVE_ACCUMULATOR_AUG_OPS = (
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.FloorDiv,
+    ast.Mod,
+    ast.Pow,
+    ast.LShift,
+    ast.RShift,
+    ast.BitOr,
+    ast.BitXor,
+    ast.BitAnd,
+)
+_STATIC_NON_DESCRIPTOR_VALUE_TYPES = (
+    ast.Constant,
+    ast.JoinedStr,
+    ast.Tuple,
+    ast.List,
+    ast.Set,
+    ast.Dict,
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+    ast.Lambda,
+)
+
+
+def _node_contains_named_expr(node: ast.AST) -> bool:
+    """Returns True if node or any immediate sub-expression (excluding deferred scopes) contains a walrus operator."""
+    for sub in _iter_immediate_unit_exec_nodes((node,)):
+        if isinstance(sub, ast.NamedExpr):
+            return True
+    return False
+
+
+def _is_safe_non_descriptor_class_body_stmt(stmt: ast.stmt) -> bool:
+    """Returns True when a class-body statement cannot bind a custom descriptor with __set_name__."""
+    if isinstance(stmt, ast.Pass):
+        return True
+    if isinstance(stmt, ast.Expr):
+        return not _node_contains_named_expr(stmt.value)
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return not stmt.decorator_list and not _node_contains_named_expr(stmt)
+    if isinstance(stmt, ast.ClassDef):
+        return not stmt.decorator_list and not stmt.bases and not stmt.keywords
+    if isinstance(stmt, ast.Assign):
+        return (
+            all(isinstance(t, ast.Name) for t in stmt.targets)
+            and isinstance(stmt.value, _STATIC_NON_DESCRIPTOR_VALUE_TYPES)
+            and not _node_contains_named_expr(stmt.value)
+        )
+    if isinstance(stmt, ast.AnnAssign):
+        return (
+            isinstance(stmt.target, ast.Name)
+            and not _node_contains_named_expr(stmt.annotation)
+            and (
+                stmt.value is None
+                or (
+                    isinstance(stmt.value, _STATIC_NON_DESCRIPTOR_VALUE_TYPES)
+                    and not _node_contains_named_expr(stmt.value)
+                )
+            )
+        )
+    return False
+
+
+_IMMEDIATE_GLOBAL_HAZARD_NODES = (
+    ast.With,
+    ast.AsyncWith,
+    ast.Await,
+    ast.Yield,
+    ast.YieldFrom,
+    ast.AsyncFor,
+    ast.Delete,
+)
+
+
+def _extract_immediate_bool_test_exprs(node: ast.AST) -> Tuple[ast.AST, ...]:
+    """Returns sub-expressions of node that Python implicitly evaluates for truthiness."""
+    if isinstance(node, (ast.If, ast.While, ast.Assert, ast.IfExp)):
+        return (node.test,)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return (node.operand,)
+    if isinstance(node, ast.BoolOp):
+        return tuple(node.values)
+    if isinstance(node, ast.comprehension):
+        return tuple(node.ifs)
+    if type(node).__name__ == "match_case":
+        guard = getattr(node, "guard", None)
+        if isinstance(guard, ast.AST):
+            return (guard,)
+    return ()
+
+
+def _is_proven_primitive_bool_expr(
+    expr: ast.AST,
+    local_accumulators: AbstractSet[str],
+    *,
+    effective_shadowed: AbstractSet[str] = frozenset(),
+    all_builtins_shadowed: bool = False,
+) -> bool:
+    """Returns True when evaluating expr in a boolean context cannot invoke user-defined __bool__ or __len__."""
+    if isinstance(expr, _STATIC_NON_DESCRIPTOR_VALUE_TYPES):
+        return True
+    sub_bool_exprs: Tuple[ast.AST, ...] = ()
+    if isinstance(expr, ast.NamedExpr):
+        sub_bool_exprs = (expr.value,)
+    elif isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not):
+        sub_bool_exprs = (expr.operand,)
+    elif isinstance(expr, ast.BoolOp):
+        sub_bool_exprs = tuple(expr.values)
+    elif isinstance(expr, ast.IfExp):
+        sub_bool_exprs = (expr.test, expr.body, expr.orelse)
+    if sub_bool_exprs:
+        return all(
+            _is_proven_primitive_bool_expr(
+                sub_e,
+                local_accumulators,
+                effective_shadowed=effective_shadowed,
+                all_builtins_shadowed=all_builtins_shadowed,
+            )
+            for sub_e in sub_bool_exprs
+        )
+    if (
+        isinstance(expr, ast.Compare)
+        and len(expr.ops) == 1
+        and isinstance(expr.ops[0], (ast.Is, ast.IsNot))
+    ):
+        return True
+    if (
+        isinstance(expr, ast.Call)
+        and not all_builtins_shadowed
+        and isinstance(expr.func, ast.Name)
+        and expr.func.id == "callable"
+        and "callable" not in effective_shadowed
+    ):
+        return True
+    return isinstance(expr, ast.Name) and expr.id in local_accumulators
 
 
 def _collect_local_primitive_accumulators(
@@ -518,11 +641,18 @@ def _collect_local_primitive_accumulators(
     for node in immediate_nodes:
         if isinstance(node, (ast.Global, ast.Nonlocal)):
             disqualified.update(node.names)
+        elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+            if not isinstance(node.op, _PRIMITIVE_ACCUMULATOR_AUG_OPS):
+                disqualified.add(node.target.id)
         elif isinstance(node, ast.Assign):
             is_prim = isinstance(node.value, ast.Constant) and isinstance(
                 node.value.value, _PRIMITIVE_ACCUMULATOR_CONST_TYPES
             )
-            if not is_prim or len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            if (
+                not is_prim
+                or len(node.targets) != 1
+                or not isinstance(node.targets[0], ast.Name)
+            ):
                 for t in node.targets:
                     disqualified.update(_extract_root_target_names(t))
         elif isinstance(node, ast.AnnAssign):
@@ -568,6 +698,7 @@ def _unit_has_global_mutating_call(
     function, the helper receives that global's value as a snapshot parameter at
     call entry. Any impure or user-defined call, setter/augmented-assignment
     protocol hook (``__setattr__``, ``__setitem__``, ``__iadd__``, etc.),
+    class-body descriptor hook (``__set_name__`` invoked by ``type.__new__``),
     context-manager protocol hook (``with`` / ``async with``), coroutine/generator
     suspension point (``await``, ``yield``, ``yield from``, ``async for``), or
     deletion (``del``) executed during the unit could mutate the module-level
@@ -578,17 +709,23 @@ def _unit_has_global_mutating_call(
 
     In ``strict`` mode (``allow_heuristic_builtins=True``), both
     ``_PROVEN_PURE_GLOBAL_SAFE_BUILTINS`` and ``_HEURISTIC_GLOBAL_SAFE_BUILTINS``
-    are permitted when unshadowed, along with augmented assignments on local
-    variables unconditionally initialized inside the unit to a primitive constant
-    (e.g., ``total = 0; total += x``). In ``pedantic`` mode
+    are permitted when unshadowed, along with implicit boolean truth-value tests
+    and arithmetic/bitwise augmented assignments (``_PRIMITIVE_ACCUMULATOR_AUG_OPS``,
+    excluding ``@=``) on local variables unconditionally initialized inside the unit
+    to a primitive constant (e.g., ``total = 0; total += x``, under the heuristic
+    assumption that the right-hand operand does not implement a global-mutating
+    reflected operator dunder such as ``__radd__``). In ``pedantic`` mode
     (``allow_heuristic_builtins=False``), only ``_PROVEN_PURE_GLOBAL_SAFE_BUILTINS``
-    are permitted and all augmented assignments are rejected because dunder-invoking
-    built-ins (such as ``len()``, ``bool()``, ``int()``, ``isinstance()``) and
-    in-place operators can execute arbitrary user code in ``__len__``, ``__bool__``,
-    ``__int__``, ``__index__``, ``__instancecheck__``, or ``__iadd__``. Read-only
-    non-call AST operations (operators, subscript reads, attribute/``@property``
-    reads, and synchronous ``for`` iteration) remain permitted as a documented
-    static-analysis trade-off.
+    are permitted, implicit boolean truthiness on non-primitive operands (``if``,
+    ``while``, ``assert``, ``not``, ``and``/``or``, ``IfExp``, comprehension ``ifs``,
+    and ``match`` guards) is rejected, and all augmented assignments are rejected
+    because dunder-invoking built-ins (such as ``len()``, ``bool()``, ``int()``,
+    ``isinstance()``), implicit truth-value evaluation, and in-place/reflected
+    operators can execute arbitrary user code in ``__len__``, ``__bool__``,
+    ``__int__``, ``__index__``, ``__instancecheck__``, ``__iadd__``, or ``__radd__``.
+    Read-only non-call AST operations (binary/comparison operators, subscript reads,
+    attribute/``@property`` reads, and synchronous ``for`` iteration) remain
+    permitted as a documented static-analysis trade-off.
     """
     allowed_builtins = (
         _PURE_GLOBAL_SAFE_BUILTINS
@@ -599,14 +736,12 @@ def _unit_has_global_mutating_call(
         body=[s for s in candidate_stmts if isinstance(s, ast.stmt)],
         type_ignores=[],
     )
-    effective_shadowed: Set[str] = set(shadowed_names) | _extract_single_node_local_names(
-        unit_stmt_mod, include_globals=True
-    )
+    effective_shadowed: Set[str] = set(
+        shadowed_names
+    ) | _extract_single_node_local_names(unit_stmt_mod, include_globals=True)
     immediate_nodes = tuple(_iter_immediate_unit_exec_nodes(candidate_stmts))
-    local_accumulators = (
-        _collect_local_primitive_accumulators(candidate_stmts, immediate_nodes)
-        if allow_heuristic_builtins
-        else set()
+    local_accumulators = _collect_local_primitive_accumulators(
+        candidate_stmts, immediate_nodes
     )
     for node in immediate_nodes:
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
@@ -627,23 +762,13 @@ def _unit_has_global_mutating_call(
             )
     all_builtins_shadowed = has_star_import or ("*" in effective_shadowed)
     for node in immediate_nodes:
-        if isinstance(
-            node,
-            (
-                ast.With,
-                ast.AsyncWith,
-                ast.Await,
-                ast.Yield,
-                ast.YieldFrom,
-                ast.AsyncFor,
-                ast.Delete,
-            ),
-        ):
+        if isinstance(node, _IMMEDIATE_GLOBAL_HAZARD_NODES):
             return True
         if isinstance(node, ast.AugAssign):
             if not (
                 allow_heuristic_builtins
                 and isinstance(node.target, ast.Name)
+                and isinstance(node.op, _PRIMITIVE_ACCUMULATOR_AUG_OPS)
                 and node.target.id in local_accumulators
             ):
                 return True
@@ -656,7 +781,20 @@ def _unit_has_global_mutating_call(
             and node.decorator_list
         ):
             return True
-        if isinstance(node, ast.ClassDef) and (node.bases or node.keywords):
+        if isinstance(node, ast.ClassDef):
+            if node.bases or node.keywords:
+                return True
+            if not all(_is_safe_non_descriptor_class_body_stmt(s) for s in node.body):
+                return True
+        if not allow_heuristic_builtins and any(
+            not _is_proven_primitive_bool_expr(
+                b_expr,
+                local_accumulators,
+                effective_shadowed=effective_shadowed,
+                all_builtins_shadowed=all_builtins_shadowed,
+            )
+            for b_expr in _extract_immediate_bool_test_exprs(node)
+        ):
             return True
         if isinstance(node, ast.Call):
             if all_builtins_shadowed or not (
@@ -788,8 +926,7 @@ def _evaluate_severed_closure_cell_hazard(
     unit_mod = ast.Module(body=list(ctx.candidate_stmts), type_ignores=[])
     _mark_ephemeral_unit_ast(unit_mod)
     is_expr_unit = (
-        ctx.unit_kind in ("comprehension", "complex_expr")
-        and not ctx.is_subroutine
+        ctx.unit_kind in ("comprehension", "complex_expr") and not ctx.is_subroutine
     )
     unit_stores_affect_enclosing = ctx.is_subroutine or is_expr_unit
     store_set = set(ctx.stores)
@@ -803,16 +940,11 @@ def _evaluate_severed_closure_cell_hazard(
         else set()
     )
     immediate_cell_mutations: Set[str] = (
-        (
-            _extract_comprehension_walrus_names(unit_mod)
-            | explicit_nonlocal_mutations
-        )
+        (_extract_comprehension_walrus_names(unit_mod) | explicit_nonlocal_mutations)
         if is_expr_unit
         else explicit_nonlocal_mutations
     )
-    escaping_unit_mutations: Set[str] = (
-        helper_rebound_vars | immediate_cell_mutations
-    )
+    escaping_unit_mutations: Set[str] = helper_rebound_vars | immediate_cell_mutations
     if not unit_stores_affect_enclosing and bool(explicit_nonlocal_mutations):
         _append_hazard_reason(reasons, "cell_severing")
         return _ClosureHazardResult(True, tuple(reasons))
@@ -842,6 +974,29 @@ def _evaluate_severed_closure_cell_hazard(
         u_start_col=u_start_col,
         u_end_col=u_end_col,
     )
+    fn_scopes_in_chain = [
+        fn_n
+        for _, _, fn_n in enclosing_chain
+        if isinstance(fn_n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    if len(fn_scopes_in_chain) > 1:
+        for idx_fn, outer_fn in enumerate(fn_scopes_in_chain[:-1]):
+            _, outer_og = _extract_scope_nonlocals_and_outer_globals(
+                outer_fn,
+                ctx.u_start,
+                ctx.u_end,
+                u_start_col=u_start_col,
+                u_end_col=u_end_col,
+            )
+            if outer_og:
+                inner_locals: Set[str] = set()
+                for inner_fn in fn_scopes_in_chain[idx_fn + 1 :]:
+                    inner_locals.update(
+                        _extract_single_node_local_names(
+                            inner_fn, include_globals=False
+                        )
+                    )
+                enc_outer_globals.update((outer_og - inner_locals) - enc_nonlocals)
     enc_escaping = enc_nonlocals | enc_outer_globals
     if unit_stores_affect_enclosing and bool(
         escaping_unit_mutations
@@ -871,21 +1026,21 @@ def _evaluate_severed_closure_cell_hazard(
         or (
             ctx.is_async
             and _node_is_effectively_async(
-                ctx.candidate_stmts[0].body
-                if len(ctx.candidate_stmts) == 1
-                and isinstance(
-                    ctx.candidate_stmts[0],
-                    (ast.FunctionDef, ast.AsyncFunctionDef),
-                )
-                else ctx.candidate_stmts,
+                (
+                    ctx.candidate_stmts[0].body
+                    if len(ctx.candidate_stmts) == 1
+                    and isinstance(
+                        ctx.candidate_stmts[0],
+                        (ast.FunctionDef, ast.AsyncFunctionDef),
+                    )
+                    else ctx.candidate_stmts
+                ),
                 True,
             )
         )
     )
     if is_suspended and bool(unit_mutated_names & (enc_escaping | nonlocal_set)):
-        _append_global_or_cell_hazard(
-            reasons, unit_mutated_names, enc_outer_globals
-        )
+        _append_global_or_cell_hazard(reasons, unit_mutated_names, enc_outer_globals)
         return _ClosureHazardResult(True, tuple(reasons))
 
     if ctx.is_subroutine and _extract_direct_nonlocals(unit_mod):
@@ -899,9 +1054,7 @@ def _evaluate_severed_closure_cell_hazard(
         enclosing_scopes=unit_enclosing_scopes,
     )
     unit_closure_reads: Set[str] = (
-        set().union(*(reads for _, reads in unit_closures))
-        if unit_closures
-        else set()
+        set().union(*(reads for _, reads in unit_closures)) if unit_closures else set()
     )
     if ctx.is_subroutine:
         if is_suspended:
@@ -916,9 +1069,7 @@ def _evaluate_severed_closure_cell_hazard(
     )
 
     eff_input_set = set(ctx.inputs) | set(ctx.free_vars) | nonlocal_set
-    if unit_stores_affect_enclosing and bool(
-        eff_input_set & enc_outer_globals
-    ):
+    if unit_stores_affect_enclosing and bool(eff_input_set & enc_outer_globals):
         shadowed_builtin_names: Set[str] = (
             set(eff_input_set)
             | store_set
@@ -955,9 +1106,7 @@ def _evaluate_severed_closure_cell_hazard(
             | (enc_outer_globals & eff_input_set)
         )
     ):
-        _append_global_or_cell_hazard(
-            reasons, unit_closure_reads, enc_outer_globals
-        )
+        _append_global_or_cell_hazard(reasons, unit_closure_reads, enc_outer_globals)
         return _ClosureHazardResult(True, tuple(reasons))
     unit_mutations = (
         (escaping_unit_mutations | (unit_mutated_names & unit_closure_reads))
@@ -990,9 +1139,7 @@ def _evaluate_severed_closure_cell_hazard(
         and not ctx.has_yield
         and chain_infos
     ):
-        unseeded_cond_stores = (
-            store_set - set(ctx.definite_stores)
-        ) - set(ctx.inputs)
+        unseeded_cond_stores = (store_set - set(ctx.definite_stores)) - set(ctx.inputs)
         if unseeded_cond_stores:
             imm_info = chain_infos[-1]
             imm_sib_reads: Set[str] = (
@@ -1005,15 +1152,15 @@ def _evaluate_severed_closure_cell_hazard(
                 if ctx.skip_pre_unit_closures
                 else imm_sib_reads
             )
-            cond_pre_post = (
-                imm_info.pre_mutated - imm_info.pre_bound
-            ) & (imm_info.post_reads | unit_closure_reads)
+            cond_pre_post = (imm_info.pre_mutated - imm_info.pre_bound) & (
+                imm_info.post_reads | unit_closure_reads
+            )
             cond_exported_closure_capture = (
                 output_set & set(imm_info.post_reads) & unit_closure_reads
             )
             unexported_pre_post = (
-                (imm_info.pre_mutated & imm_info.post_reads) - output_set
-            )
+                imm_info.pre_mutated & imm_info.post_reads
+            ) - output_set
             if bool(
                 unseeded_cond_stores
                 & imm_info.fn_locals

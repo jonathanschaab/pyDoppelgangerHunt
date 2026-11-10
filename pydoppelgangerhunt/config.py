@@ -33,10 +33,38 @@ _warned_closure_lock: threading.Lock = threading.Lock()
 _MAX_WARNED_CLOSURE_EVENTS: int = 4096
 _MAX_HEURISTIC_CTX_MANAGERS: int = 16384
 _warned_closure_strictness_values: Set[str] = set()
-_heuristic_non_suppressing_ctx_managers: Set[str] = set()
-_heuristic_ctx_managers_overflow_count: List[int] = [0]
-_defer_heuristic_summary_depth: List[int] = [0]
+_heuristic_reset_epoch: List[int] = [0]
 _heuristic_collector_tls: threading.local = threading.local()
+
+
+def _get_thread_heuristic_summary_state() -> Tuple[Set[str], List[int], List[int]]:
+    """Returns the current thread's (summary_names, overflow_count_box, defer_depth_box), resetting on epoch advance."""
+    with _warned_closure_lock:
+        current_epoch = _heuristic_reset_epoch[0]
+    tls_epoch = getattr(_heuristic_collector_tls, "epoch", -1)
+    names: Optional[Set[str]] = getattr(_heuristic_collector_tls, "summary_names", None)
+    overflow: Optional[List[int]] = getattr(
+        _heuristic_collector_tls, "overflow_count", None
+    )
+    defer_depth: Optional[List[int]] = getattr(
+        _heuristic_collector_tls, "defer_depth", None
+    )
+    if (
+        names is None
+        or overflow is None
+        or defer_depth is None
+        or tls_epoch != current_epoch
+    ):
+        names = set()
+        overflow = [0]
+        if defer_depth is None or tls_epoch != current_epoch:
+            defer_depth = [0]
+        _heuristic_collector_tls.summary_names = names
+        _heuristic_collector_tls.overflow_count = overflow
+        _heuristic_collector_tls.defer_depth = defer_depth
+        _heuristic_collector_tls.epoch = current_epoch
+    return names, overflow, defer_depth
+
 
 _CONFIG_KEY_NAMES: Tuple[str, ...] = (
     "threshold",
@@ -77,8 +105,7 @@ class PairClosureFlags(NamedTuple):
     def effective_strict_with_suppression(self) -> bool:
         """Returns True if either endpoint requires pedantic strict_with_suppression."""
         return bool(
-            self.unit1.strict_with_suppression
-            or self.unit2.strict_with_suppression
+            self.unit1.strict_with_suppression or self.unit2.strict_with_suppression
         )
 
 
@@ -115,26 +142,26 @@ def collect_heuristic_ctx_managers() -> Iterator[Set[str]]:
 
 
 def record_heuristic_non_suppressing_ctx_manager(mgr_name: str) -> None:
-    """Records an unproven context manager accepted by the strict-mode name heuristic."""
+    """Records an unproven context manager accepted by the strict-mode name heuristic on the current thread."""
     stack: Optional[List[Set[str]]] = getattr(_heuristic_collector_tls, "stack", None)
     if stack:
         for bucket in stack:
             bucket.add(mgr_name)
-    with _warned_closure_lock:
-        if mgr_name in _heuristic_non_suppressing_ctx_managers:
-            return
-        if len(_heuristic_non_suppressing_ctx_managers) >= _MAX_HEURISTIC_CTX_MANAGERS:
-            _heuristic_ctx_managers_overflow_count[0] += 1
-            return
-        _heuristic_non_suppressing_ctx_managers.add(mgr_name)
+    names, overflow, _ = _get_thread_heuristic_summary_state()
+    if mgr_name in names:
+        return
+    if len(names) >= _MAX_HEURISTIC_CTX_MANAGERS:
+        overflow[0] += 1
+        return
+    names.add(mgr_name)
 
 
 def peek_heuristic_non_suppressing_ctx_managers() -> Tuple[str, ...]:
-    """Returns sorted unproven context managers recorded since last reset without clearing."""
-    with _warned_closure_lock:
-        if not _heuristic_non_suppressing_ctx_managers:
-            return ()
-        return tuple(sorted(_heuristic_non_suppressing_ctx_managers))
+    """Returns sorted unproven context managers recorded on the current thread since last reset without clearing."""
+    names, _, _ = _get_thread_heuristic_summary_state()
+    if not names:
+        return ()
+    return tuple(sorted(names))
 
 
 def format_heuristic_ctx_manager_comment(names: Sequence[str]) -> str:
@@ -153,27 +180,27 @@ def format_heuristic_ctx_manager_comment(names: Sequence[str]) -> str:
 
 @contextlib.contextmanager
 def defer_heuristic_ctx_manager_summary() -> Iterator[None]:
-    """Defers mid-run log_heuristic_ctx_manager_summary() draining until an outer CLI boundary."""
-    with _warned_closure_lock:
-        _defer_heuristic_summary_depth[0] += 1
+    """Defers mid-run log_heuristic_ctx_manager_summary() draining on the current thread until an outer boundary."""
+    _, _, defer_depth = _get_thread_heuristic_summary_state()
+    defer_depth[0] += 1
     try:
         yield
     finally:
-        with _warned_closure_lock:
-            _defer_heuristic_summary_depth[0] = max(0, _defer_heuristic_summary_depth[0] - 1)
+        _, _, after_depth = _get_thread_heuristic_summary_state()
+        after_depth[0] = max(0, after_depth[0] - 1)
 
 
 def log_heuristic_ctx_manager_summary(*, force: bool = False) -> Tuple[str, ...]:
-    """Logs a consolidated summary of unproven context managers accepted via name heuristic."""
-    with _warned_closure_lock:
-        if not _heuristic_non_suppressing_ctx_managers:
-            return ()
-        if _defer_heuristic_summary_depth[0] > 0 and not force:
-            return tuple(sorted(_heuristic_non_suppressing_ctx_managers))
-        names = tuple(sorted(_heuristic_non_suppressing_ctx_managers))
-        overflow = _heuristic_ctx_managers_overflow_count[0]
-        _heuristic_non_suppressing_ctx_managers.clear()
-        _heuristic_ctx_managers_overflow_count[0] = 0
+    """Logs a consolidated summary of unproven context managers accepted via name heuristic on the current thread."""
+    names_set, overflow_box, defer_depth = _get_thread_heuristic_summary_state()
+    if not names_set:
+        return ()
+    if defer_depth[0] > 0 and not force:
+        return tuple(sorted(names_set))
+    names = tuple(sorted(names_set))
+    overflow = overflow_box[0]
+    names_set.clear()
+    overflow_box[0] = 0
     distinct_count = len(names)
     preview = ", ".join(repr(n) for n in names[:10])
     if distinct_count > 10:
@@ -203,17 +230,21 @@ def resolve_closure_strictness_mode(
     for unproven unknown context managers (treating them as non-suppressing unless their
     name matches one of the 22 suppression idioms in _SUSPICIOUS_SUPPRESS_SUBSTRINGS or is
     proven suppressing via local/function/class __exit__ provenance), and in global-reading
-    units rejects attribute/subscript mutations, deletions, and external augmented
-    assignments while permitting dunder-invoking inspection/conversion built-ins and local
-    primitive-initialized accumulator augmented assignments (e.g., total = 0; total += x).
+    units rejects attribute/subscript mutations, deletions, non-static class-body attributes
+    (__set_name__ descriptors), and external or @= augmented assignments while permitting
+    dunder-invoking inspection/conversion built-ins, implicit boolean truthiness, and local
+    primitive-initialized arithmetic/bitwise accumulator augmented assignments (e.g.,
+    total = 0; total += x, under the heuristic that the RHS operand does not implement a
+    global-mutating reflected operator dunder such as __radd__).
     'pedantic' (deprecated alias 'fail_closed') is the fail-closed mode for context-manager
     suppression and global-reading calls/setters: it treats all unproven unknown context
     managers as potentially exception-suppressing unless explicitly listed in
-    non_suppressing_ctx_managers, and additionally rejects dunder-invoking built-in calls
-    and local accumulator augmented assignments in global-reading units alongside the
-    attribute/subscript and external augmented-assignment mutations rejected in 'strict'
-    mode (while still permitting read-only protocol syntax such as synchronous
-    for-iteration, attribute/subscript reads, and operators).
+    non_suppressing_ctx_managers, and additionally rejects dunder-invoking built-in calls,
+    implicit truth-value evaluations on non-primitive operands (__bool__ / __len__), and
+    all local accumulator augmented assignments in global-reading units alongside the
+    attribute/subscript, class-body descriptor, and external augmented-assignment mutations
+    rejected in 'strict' mode (while still permitting read-only protocol syntax such as
+    synchronous for-iteration, attribute/subscript reads, and binary/comparison operators).
     'lenient' (deprecated aliases 'fast', 'skip') relaxes speculative unreferenced-sibling closure
     checks while still enforcing direct cell-capture, intra-unit nonlocal mutator, and
     referenced-sibling closure checks.
@@ -448,11 +479,15 @@ def normalize_non_suppressing_ctx_managers(*sources: Any) -> Tuple[str, ...]:
 
 
 def clear_closure_warning_cache() -> None:
-    """Clears the set of warned closure strictness values for multi-run lifecycle."""
+    """Clears the set of warned closure strictness values and resets thread-local heuristic summaries."""
     with _warned_closure_lock:
         _warned_closure_strictness_values.clear()
-        _heuristic_non_suppressing_ctx_managers.clear()
-        _heuristic_ctx_managers_overflow_count[0] = 0
+        _heuristic_reset_epoch[0] += 1
+        new_epoch = _heuristic_reset_epoch[0]
+    _heuristic_collector_tls.summary_names = set()
+    _heuristic_collector_tls.overflow_count = [0]
+    _heuristic_collector_tls.defer_depth = [0]
+    _heuristic_collector_tls.epoch = new_epoch
 
 
 DEFAULT_EXCLUDES: List[str] = [
@@ -533,36 +568,23 @@ def find_matching_path_value(
     direct = path_map.get(target_path)
     if direct is not None:
         return direct
-    # 1. Match exact normalized path (preserving anchors)
-    norm_exact = normalize_path_string(target_path, strip_anchor=False)
-    if norm_exact in path_map:
-        return path_map[norm_exact]
-    key_exact = canonical_path_key(norm_exact, strip_anchor=False)
-    for k, val in path_map.items():
-        k_clean = normalize_path_string(k, strip_anchor=False)
-        if norm_exact == k_clean or key_exact == canonical_path_key(k_clean, strip_anchor=False):
-            return val
-    for k, val in path_map.items():
-        if paths_match_boundary(norm_exact, k, strip_anchor=False):
-            return val
-
-    # 2. If target_path contains a notebook cell anchor, fallback to stripped anchor matching
+    candidates = [normalize_path_string(target_path, strip_anchor=False)]
     target_raw = str(target_path)
     if parse_notebook_cell_anchor(target_raw) is not None:
         target_stripped = normalize_path_string(target_raw, strip_anchor=True)
-        if target_stripped:
-            if target_stripped in path_map:
-                return path_map[target_stripped]
-            key_stripped = canonical_path_key(target_stripped, strip_anchor=False)
-            for k, val in path_map.items():
-                k_clean = normalize_path_string(k, strip_anchor=False)
-                if target_stripped == k_clean or key_stripped == canonical_path_key(
-                    k_clean, strip_anchor=False
-                ):
-                    return val
-            for k, val in path_map.items():
-                if paths_match_boundary(target_stripped, k, strip_anchor=False):
-                    return val
+        if target_stripped and target_stripped not in candidates:
+            candidates.append(target_stripped)
+    for cand in candidates:
+        if cand in path_map:
+            return path_map[cand]
+        cand_key = canonical_path_key(cand, strip_anchor=False)
+        for k, val in path_map.items():
+            k_clean = normalize_path_string(k, strip_anchor=False)
+            if cand == k_clean or cand_key == canonical_path_key(k_clean, strip_anchor=False):
+                return val
+        for k, val in path_map.items():
+            if paths_match_boundary(cand, k, strip_anchor=False):
+                return val
     return None
 
 
@@ -729,7 +751,9 @@ def _parse_toml_array_value(val_str: str) -> List[Any]:
     return elems
 
 
-def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[str, Any]:
+def load_toml_section(
+    target_file: Union[str, Path], section_name: str
+) -> Dict[str, Any]:
     """Loads a specific tool configuration section from a TOML file with fallbacks."""
     target_path = Path(target_file)
     if not target_path.is_file():
@@ -779,7 +803,9 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
                 multiline_tokens.append(stripped)
                 multiline_depth = _count_bracket_depth(stripped, multiline_depth)
                 if multiline_depth == 0:
-                    config[in_multiline_key] = _parse_toml_array_value(" ".join(multiline_tokens))
+                    config[in_multiline_key] = _parse_toml_array_value(
+                        " ".join(multiline_tokens)
+                    )
                     in_multiline_key = None
                     multiline_tokens = []
                 continue
