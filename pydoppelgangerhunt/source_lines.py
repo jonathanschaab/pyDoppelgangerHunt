@@ -62,6 +62,7 @@ class SourceLinesOrigin(enum.Enum):
         return not self._is_placeholder
 
     def __bool__(self) -> bool:
+        """Returns is_pre_sliced for backward compatibility with tuple-unpacking callers (lines, is_sliced = ...)."""
         return self._is_pre_sliced
 
 _COORD_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {

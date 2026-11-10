@@ -1187,17 +1187,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.closure_strictness is not None:
         cli_strictness: Optional[str] = args.closure_strictness
         cli_skip: bool = _safe_bool(args.skip_pre_unit_closures)
-        if (
-            str(cli_strictness).strip().lower()
-            in ("strict", "fail_closed", "pedantic")
-            and args.skip_pre_unit_closures
-        ):
-            cli_skip = False
-            logger.warning(
-                "Conflicting flags: --closure-strictness '%s' takes precedence over "
-                "--skip-pre-unit-closures",
-                cli_strictness,
-            )
     elif args.skip_pre_unit_closures:
         cli_strictness = "lenient"
         cli_skip = True
@@ -1627,7 +1616,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             summary_names = log_heuristic_ctx_manager_summary(force=True)
             if summary_names:
-                report_lines.append(format_heuristic_ctx_manager_comment(summary_names))
+                summary_comment = format_heuristic_ctx_manager_comment(summary_names)
+                print(summary_comment)
+                report_lines.append(summary_comment)
 
             if args.output:
                 out_p = Path(args.output)

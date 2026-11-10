@@ -201,15 +201,19 @@ def resolve_closure_strictness_mode(
     'strict' (default) is a heuristic safety mode for context managers: it enforces all
     escaping closure and callback hazard checks while using a name-and-provenance heuristic
     for unproven unknown context managers (treating them as non-suppressing unless their
-    name matches suppression idioms such as suppress/raises/ignore/subTest/ExitStack or is
-    proven suppressing via local/function/class __exit__ provenance).
+    name matches one of the 22 suppression idioms in _SUSPICIOUS_SUPPRESS_SUBSTRINGS or is
+    proven suppressing via local/function/class __exit__ provenance), and in global-reading
+    units rejects attribute/subscript mutations, deletions, and external augmented
+    assignments while permitting dunder-invoking inspection/conversion built-ins and local
+    primitive-initialized accumulator augmented assignments (e.g., total = 0; total += x).
     'pedantic' (deprecated alias 'fail_closed') is the fail-closed mode for context-manager
     suppression and global-reading calls/setters: it treats all unproven unknown context
     managers as potentially exception-suppressing unless explicitly listed in
-    non_suppressing_ctx_managers, and rejects dunder-invoking built-in calls and
-    attribute/subscript/augmented-assignment mutations in global-reading units (while still
-    permitting read-only protocol syntax such as synchronous for-iteration, attribute/subscript
-    reads, and operators).
+    non_suppressing_ctx_managers, and additionally rejects dunder-invoking built-in calls
+    and local accumulator augmented assignments in global-reading units alongside the
+    attribute/subscript and external augmented-assignment mutations rejected in 'strict'
+    mode (while still permitting read-only protocol syntax such as synchronous
+    for-iteration, attribute/subscript reads, and operators).
     'lenient' (deprecated aliases 'fast', 'skip') relaxes speculative unreferenced-sibling closure
     checks while still enforcing direct cell-capture, intra-unit nonlocal mutator, and
     referenced-sibling closure checks.
@@ -247,7 +251,7 @@ def resolve_closure_strictness_mode(
                 _warn_closure_event_once(
                     f"conflict_skip:{closure_strictness}",
                     "Conflicting configuration: closure_strictness '%s' takes precedence over "
-                    "skip_pre_unit_closures=True",
+                    "skip_pre_unit_closures=True (--skip-pre-unit-closures)",
                     closure_strictness,
                 )
             expected_strict_with = resolved_mode == "pedantic"

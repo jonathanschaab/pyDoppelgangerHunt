@@ -11,6 +11,7 @@ import math
 import threading
 from types import MappingProxyType
 import warnings
+import weakref
 from typing import (
     Any,
     Callable,
@@ -51,14 +52,16 @@ class _MissingCachedAstNodesError(TypeError):
 
 @contextlib.contextmanager
 def _suppress_syntax_warnings() -> Iterator[None]:
-    """Suppresses SyntaxWarning during AST/symtable parsing under a reentrant lock.
+    """Suppresses SyntaxWarning and invalid-escape DeprecationWarning during parsing/compiling under a reentrant lock.
 
     Holds ``_syntax_warning_lock`` across ``warnings.catch_warnings()`` for the brief
-    ``ast.parse`` / ``symtable.symtable`` call so cooperating internal callers of
-    ``_suppress_syntax_warnings()`` across threads are serialized and do not race with
-    one another. Because Python's ``warnings.catch_warnings()`` mutates process-global
-    ``warnings.filters`` without a standard-library lock, uncoordinated external threads
-    calling ``warnings.catch_warnings()`` directly are not synchronized by this lock.
+    ``ast.parse`` / ``symtable.symtable`` / ``compile`` call so cooperating internal
+    callers of ``_suppress_syntax_warnings()`` across threads are serialized and do not
+    race with one another. Because Python's ``warnings.catch_warnings()`` mutates
+    process-global ``warnings.filters`` without a standard-library lock, the filter
+    change is process-wide for the duration of the parse/compile call and uncoordinated
+    external threads calling ``warnings.catch_warnings()`` directly are not synchronized
+    by this lock.
     """
     with _syntax_warning_lock:
         if _syntax_warning_active_count[0] > 0:
@@ -72,6 +75,11 @@ def _suppress_syntax_warnings() -> Iterator[None]:
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", SyntaxWarning)
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r".*invalid escape sequence.*",
+                    category=DeprecationWarning,
+                )
                 yield
         finally:
             _syntax_warning_active_count[0] = 0
@@ -103,7 +111,30 @@ _debug_ast_immutability: List[bool] = [False]
 _scope_loops_cache: OrderedDict[ast.AST, List[Tuple[int, int, int]]] = OrderedDict()
 _scope_try_with_cache: OrderedDict[ast.AST, List[ast.AST]] = OrderedDict()
 _stmt_with_summary_cache: OrderedDict[ast.stmt, Tuple[bool, frozenset[str]]] = OrderedDict()
+_tree_raw_source_cache: Dict[ast.AST, Tuple[int, str]] = {}
+_ephemeral_unit_asts: weakref.WeakSet[ast.AST] = weakref.WeakSet()
 _warned_lenient_closure: List[bool] = [False]
+
+
+def _mark_ephemeral_unit_ast(node: ast.AST) -> ast.AST:
+    """Marks an ephemeral synthetic AST wrapper so node-keyed caches skip it without setting AST attributes."""
+    with _downstream_cache_lock:
+        try:
+            _ephemeral_unit_asts.add(node)
+        except TypeError:
+            pass
+    return node
+
+
+def _is_ephemeral_unit_ast(node: Optional[ast.AST]) -> bool:
+    """Returns True when node was registered as an ephemeral synthetic unit AST wrapper."""
+    if node is None or not isinstance(node, ast.AST):
+        return False
+    with _downstream_cache_lock:
+        try:
+            return node in _ephemeral_unit_asts
+        except TypeError:
+            return False
 
 
 _SCOPE_ROOT_TYPES: Tuple[Type[ast.AST], ...] = (
@@ -261,10 +292,10 @@ class _ScopeCacheKey:
         Cache keys and ``_scope_parent_maps`` hold strong references to live ``ast.AST``
         objects until LRU eviction or an explicit ``clear_dataflow_cache()`` /
         ``_evict_tree_scopes(tree)`` call. Synthesized ephemeral unit modules must always
-        set ``_is_ephemeral_unit_mod = True`` and bypass node-keyed caches so detached AST
-        nodes never enter ``_scope_owner_keys_index``. Any future code path that mutates a
-        cached AST in place must call ``_evict_tree_scopes(tree)`` prior to mutation so
-        reverse owner and parent-map indexes never become stale.
+        be registered via ``_mark_ephemeral_unit_ast(unit_mod)`` and bypass node-keyed
+        caches so detached AST nodes never enter ``_scope_owner_keys_index``. Any future
+        code path that mutates a cached AST in place must call ``_evict_tree_scopes(tree)``
+        prior to mutation so reverse owner and parent-map indexes never become stale.
     """
 
     __slots__ = ("owner", "kind", "params", "aux_ast_nodes", "cached_hash")
@@ -525,21 +556,42 @@ def _pop_parent_map_locked(root_node: ast.AST) -> None:
     _prune_reverse_index_buckets(root_node, _parent_map_root_nodes, _node_to_parent_map_roots)
 
 
-def _ensure_scope_owner_parent_map_locked(owner: ast.AST) -> None:
-    """Ensures a scope root has a parent map recorded in O(1) if already indexed, else builds and caches it."""
-    if (
-        not isinstance(owner, _SCOPE_ROOT_TYPES)
-        or getattr(owner, "_is_ephemeral_unit_mod", False)
-        or owner in _scope_parent_maps
-        or owner in _node_to_parent_map_roots
-    ):
-        return
+def _needs_scope_owner_parent_map_locked(owner: ast.AST) -> bool:
+    """Returns True if owner is a cacheable scope root that lacks a parent map under lock."""
+    return (
+        isinstance(owner, _SCOPE_ROOT_TYPES)
+        and not _is_ephemeral_unit_ast(owner)
+        and owner not in _scope_parent_maps
+        and owner not in _node_to_parent_map_roots
+    )
+
+
+def _build_parent_map_unlocked(owner: ast.AST) -> Dict[ast.AST, ast.AST]:
+    """Walks owner to construct a child-to-parent AST map without holding _downstream_cache_lock."""
     parent_map: Dict[ast.AST, ast.AST] = {}
     for parent in ast.walk(owner):
         for child in ast.iter_child_nodes(parent):
             if not isinstance(child, _SINGLETON_AST_TYPES):
                 parent_map[child] = parent
-    _store_parent_map_locked(owner, parent_map)
+    return parent_map
+
+
+def _ensure_scope_owner_parent_map_locked(owner: ast.AST) -> None:
+    """Ensures a scope root has a parent map recorded in O(1) if already indexed, else builds and caches it."""
+    if not _needs_scope_owner_parent_map_locked(owner):
+        return
+    _store_parent_map_locked(owner, _build_parent_map_unlocked(owner))
+
+
+def _ensure_scope_owner_parent_map(owner: ast.AST) -> None:
+    """Ensures a scope root has a cached parent map, walking the AST outside _downstream_cache_lock."""
+    with _downstream_cache_lock:
+        if not _needs_scope_owner_parent_map_locked(owner):
+            return
+    built_map = _build_parent_map_unlocked(owner)
+    with _downstream_cache_lock:
+        if _needs_scope_owner_parent_map_locked(owner):
+            _store_parent_map_locked(owner, built_map)
 
 
 def _register_key_ast_nodes(key: Any, nodes: Sequence[ast.AST]) -> None:
@@ -763,9 +815,11 @@ class _TrackedScopeCache(OrderedDict[Any, _CacheValT]):
         )
 
     def __setitem__(self, key: Any, value: _CacheValT) -> None:
+        key_nodes = _extract_key_ast_nodes(key)
+        for n in key_nodes:
+            _ensure_scope_owner_parent_map(n)
         with _downstream_cache_lock:
             val_nodes = _extract_value_ast_nodes(value)
-            key_nodes = _extract_key_ast_nodes(key)
             if isinstance(value, dict) and not isinstance(value, _TrackedCachedDict):
                 value = cast(_CacheValT, _TrackedCachedDict(cast(Dict[Any, Any], value)))
             was_present = key in self
@@ -888,22 +942,19 @@ def _key_references_scope_nodes(
 
 
 def _compute_scope_fingerprint(node: ast.AST) -> Tuple[Any, ...]:
-    """Computes a bounded O(1) structural fingerprint of a scope root and its direct body."""
+    """Computes an O(1) structural header and endpoint fingerprint of a scope root."""
     body = getattr(node, "body", None)
     if isinstance(body, list):
-        body_sig: Any = tuple(
-            (
-                id(stmt),
-                type(stmt),
-                getattr(stmt, "lineno", None),
-                getattr(stmt, "end_lineno", None),
-                id(getattr(stmt, "value", None)),
-                len(getattr(stmt, "body", ()))
-                if isinstance(getattr(stmt, "body", None), list)
-                else 0,
-            )
-            for stmt in body[:64]
-        ) + (len(body), id(body[-1]) if body else 0)
+        n_body = len(body)
+        first_stmt = body[0] if n_body else None
+        last_stmt = body[-1] if n_body else None
+        body_sig: Any = (
+            n_body,
+            id(first_stmt),
+            getattr(first_stmt, "lineno", None) if first_stmt is not None else None,
+            id(last_stmt),
+            getattr(last_stmt, "end_lineno", None) if last_stmt is not None else None,
+        )
     else:
         body_sig = id(body)
     decs = getattr(node, "decorator_list", None)
@@ -1041,6 +1092,7 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
         for node in scope_nodes:
             _pop_parent_map_locked(node)
             _cached_scope_fingerprints.pop(node, None)
+            _tree_raw_source_cache.pop(node, None)
             _scope_stmts_by_end.pop(node, None)
             _scope_stmts_by_start.pop(node, None)
             _scope_loops_cache.pop(node, None)
@@ -1048,6 +1100,26 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
 
 
 evict_tree_scopes = _evict_tree_scopes
+
+
+def _ensure_cache_key_parent_maps(
+    cache: OrderedDict[Any, Any],
+    key: Any,
+    ensure_fn: Callable[[ast.AST], Any],
+) -> None:
+    """Ensures parent maps are registered for AST scope roots referenced by ``cache`` and ``key``."""
+    if (
+        cache is _scope_stmts_by_end or cache is _scope_stmts_by_start
+    ) and isinstance(key, ast.AST):
+        ensure_fn(key)
+    elif (
+        cache is _scope_closures_cache or cache is _scope_cell_info_cache
+    ) and isinstance(key, _ScopeCacheKey):
+        for aux_node in key.aux_ast_nodes:
+            if isinstance(aux_node, _SCOPE_ROOT_TYPES):
+                ensure_fn(aux_node)
+        if isinstance(key.owner, _SCOPE_ROOT_TYPES):
+            ensure_fn(key.owner)
 
 
 def _store_lru_cache_entry(
@@ -1074,20 +1146,12 @@ def _store_lru_cache_entry(
             holding the lock are safe; callers that release the lock across ``compute_fn()``
             and re-acquire here tolerate intermediate insertions or evictions cleanly.
     """
+    _ensure_cache_key_parent_maps(cache, key, _ensure_scope_owner_parent_map)
     evicted_trees: List[ast.AST] = []
     with _downstream_cache_lock:
         if cache is _scope_parent_maps and isinstance(key, ast.AST) and isinstance(value, dict):
             return cast(_CacheValT, _store_parent_map_locked(key, value))
-        if cache in (_scope_stmts_by_end, _scope_stmts_by_start) and isinstance(key, ast.AST):
-            _ensure_scope_owner_parent_map_locked(key)
-        elif cache in (_scope_closures_cache, _scope_cell_info_cache) and isinstance(
-            key, _ScopeCacheKey
-        ):
-            for aux_node in key.aux_ast_nodes:
-                if isinstance(aux_node, _SCOPE_ROOT_TYPES):
-                    _ensure_scope_owner_parent_map_locked(aux_node)
-            if isinstance(key.owner, _SCOPE_ROOT_TYPES):
-                _ensure_scope_owner_parent_map_locked(key.owner)
+        _ensure_cache_key_parent_maps(cache, key, _ensure_scope_owner_parent_map_locked)
         if key in cache:
             cache.move_to_end(key)
             return cache[key]
@@ -1136,10 +1200,12 @@ def _get_or_compute_scope_cached(
                         "evict_tree_scopes(tree)"
                     )
                 _evict_tree_scopes(owner_ast)
-            _cached_scope_fingerprints[owner_ast] = curr_fp
-            _cached_scope_fingerprints.move_to_end(owner_ast)
-            while len(_cached_scope_fingerprints) > _MAX_SCOPE_CACHE_SIZE:
-                _cached_scope_fingerprints.popitem(last=False)
+                prev_fp = None
+            if prev_fp is None:
+                _cached_scope_fingerprints[owner_ast] = curr_fp
+                _cached_scope_fingerprints.move_to_end(owner_ast)
+                while len(_cached_scope_fingerprints) > _MAX_SCOPE_CACHE_SIZE:
+                    _cached_scope_fingerprints.popitem(last=False)
         if scope_node in cache:
             cache.move_to_end(scope_node)
             return cache[scope_node]
@@ -1171,10 +1237,26 @@ def _register_tree_source_lines(
     if (
         tree is None
         or not isinstance(tree, ast.AST)
-        or getattr(tree, "_is_ephemeral_unit_mod", False)
+        or _is_ephemeral_unit_ast(tree)
         or (not source_lines and not source_text)
     ):
         return None
+    ck = _make_trusted_scope_cache_key(owner=tree, kind="tree_source_lines")
+    text_hash: Optional[int] = hash(source_text) if source_text is not None else None
+    with _downstream_cache_lock:
+        if ck in _scope_cell_info_cache:
+            existing_lines = cast(Tuple[str, ...], _scope_cell_info_cache[ck])
+            if source_lines is not None and existing_lines is source_lines:
+                _scope_cell_info_cache.move_to_end(ck)
+                return existing_lines
+            if source_lines is None and source_text is not None:
+                cached_raw = _tree_raw_source_cache.get(tree)
+                if cached_raw is not None and (
+                    cached_raw[1] is source_text
+                    or (cached_raw[0] == text_hash and cached_raw[1] == source_text)
+                ):
+                    _scope_cell_info_cache.move_to_end(ck)
+                    return existing_lines
     norm_lines = (
         tuple(ln.rstrip("\r\n") for ln in source_lines)
         if source_lines is not None
@@ -1182,14 +1264,19 @@ def _register_tree_source_lines(
     )
     if not norm_lines:
         return None
-    ck = _make_trusted_scope_cache_key(owner=tree, kind="tree_source_lines")
     with _downstream_cache_lock:
         if ck in _scope_cell_info_cache:
             existing_lines = cast(Tuple[str, ...], _scope_cell_info_cache[ck])
             if existing_lines == norm_lines:
+                if source_text is not None and text_hash is not None:
+                    _tree_raw_source_cache[tree] = (text_hash, source_text)
                 _scope_cell_info_cache.move_to_end(ck)
                 return existing_lines
             _evict_tree_scopes(tree)
+        if source_text is not None and text_hash is not None:
+            _tree_raw_source_cache[tree] = (text_hash, source_text)
+            while len(_tree_raw_source_cache) > _MAX_SCOPE_CACHE_SIZE:
+                _tree_raw_source_cache.pop(next(iter(_tree_raw_source_cache)), None)
     _get_scope_parent_map(tree)
     return cast(
         Tuple[str, ...],
@@ -1313,16 +1400,8 @@ def _get_scope_parent_map(scope_node: ast.AST, *, use_cache: bool = True) -> Dic
         read-only and never mutate it after construction.
     """
 
-    def _compute() -> Dict[ast.AST, ast.AST]:
-        parent_map: Dict[ast.AST, ast.AST] = {}
-        for parent in ast.walk(scope_node):
-            for child in ast.iter_child_nodes(parent):
-                if not isinstance(child, _SINGLETON_AST_TYPES):
-                    parent_map[child] = parent
-        return parent_map
-
     if not use_cache:
-        return _compute()
+        return _build_parent_map_unlocked(scope_node)
     with _downstream_cache_lock:
         if scope_node not in _scope_parent_maps:
             roots = _node_to_parent_map_roots.get(scope_node)
@@ -1348,7 +1427,9 @@ def _get_scope_parent_map(scope_node: ast.AST, *, use_cache: bool = True) -> Dic
                     else:
                         _scope_parent_maps.move_to_end(chosen_root)
                         return _scope_parent_maps[chosen_root]
-    return _get_or_compute_scope_cached(_scope_parent_maps, scope_node, _compute)
+    return _get_or_compute_scope_cached(
+        _scope_parent_maps, scope_node, lambda: _build_parent_map_unlocked(scope_node)
+    )
 
 
 def _index_scope_stmts(scope_node: ast.AST, *, use_end_lineno: bool) -> Dict[int, List[ast.stmt]]:
@@ -1514,6 +1595,8 @@ def clear_dataflow_cache() -> None:
         _scope_loops_cache.clear()
         _scope_try_with_cache.clear()
         _stmt_with_summary_cache.clear()
+        _tree_raw_source_cache.clear()
+        _ephemeral_unit_asts.clear()
         _warned_lenient_closure[0] = False
     clear_closure_warning_cache()
 

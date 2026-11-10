@@ -265,6 +265,12 @@ def synthesize_refactoring_suggestion(
     ]
     diff_summary = f"{len(diff_lines)} varying line(s) detected between clone blocks."
 
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
+        _suppress_syntax_warnings,
+    )
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        inspect_single_unit_scope,
+    )
     from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
         synthesize_shared_helper_code,
     )
@@ -280,7 +286,8 @@ def synthesize_refactoring_suggestion(
             non_suppressing_ctx_managers=non_suppressing_ctx_managers,
         )
         if helper_code:
-            compile(helper_code, "<synthesized_suggestion>", "exec")
+            with _suppress_syntax_warnings():
+                compile(helper_code, "<synthesized_suggestion>", "exec")
     except Exception as exc:  # pylint: disable=broad-exception-caught
         logger.debug(
             "Failed to synthesize refactoring suggestion for (%s, %s): %s",
@@ -301,12 +308,35 @@ def synthesize_refactoring_suggestion(
             f"{indented_helper}"
         )
 
+    rejection_reasons: List[str] = []
+    try:
+        for u_cand in (u1, u2):
+            sc_cand = inspect_single_unit_scope(
+                u_cand,
+                repo_root=repo_root,
+                closure_strictness=closure_strictness,
+                skip_pre_unit_closures=skip_pre_unit_closures,
+                non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+            )
+            for h in sc_cand.get("control_flow_hazards", ()):
+                h_fmt = str(h).replace("_", " ")
+                if h_fmt not in rejection_reasons:
+                    rejection_reasons.append(h_fmt)
+            for cr in sc_cand.get("closure_hazard_reasons", ()):
+                cr_fmt = str(cr).replace("_", " ")
+                if cr_fmt not in rejection_reasons:
+                    rejection_reasons.append(cr_fmt)
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+    reason_suffix = (
+        f" [{', '.join(rejection_reasons)}]" if rejection_reasons else ""
+    )
     return (
         f"[REFACTOR SUGGESTION] Automatic extraction into '{helper_name}' rejected as unsafe "
         f"or structurally incompatible (safety hazard, scope conflict, or incompatible structure "
-        f"detected for {n1} and {n2}); manual review required:\n"
+        f"detected for {n1} and {n2}{reason_suffix}); manual review required:\n"
         f"    # {diff_summary}\n"
-        f"    # WARNING: Automatic helper synthesis was skipped due to a safety hazard or structural incompatibility."
+        f"    # WARNING: Automatic helper synthesis was skipped due to a safety hazard or structural incompatibility{reason_suffix}."
     )
 
 

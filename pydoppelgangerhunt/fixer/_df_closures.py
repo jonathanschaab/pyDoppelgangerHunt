@@ -31,6 +31,7 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _get_cached_tree_source_lines,
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
+    _is_ephemeral_unit_ast,
     _make_trusted_scope_cache_key,
     _register_tree_source_lines,
     _scope_cell_info_cache,
@@ -145,7 +146,7 @@ def _get_tree_scope_intervals(
         )
         return tuple(intervals)
 
-    if getattr(tree, "_is_ephemeral_unit_mod", False):
+    if _is_ephemeral_unit_ast(tree):
         return _compute()
     cache_key = _make_trusted_scope_cache_key(
         owner=tree,
@@ -174,7 +175,7 @@ def _get_tree_expr_scope_intervals(
                     out.append((n_start, n_end, n_col, node))
         return tuple(out)
 
-    if getattr(tree, "_is_ephemeral_unit_mod", False):
+    if _is_ephemeral_unit_ast(tree):
         return _compute()
     return cast(
         Tuple[Tuple[int, int, int, ast.AST], ...],

@@ -44,6 +44,7 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _get_scope_parent_map,
     _register_tree_source_lines,
     _scope_cell_info_cache,
+    _split_source_lines_stripped,
     _suppress_syntax_warnings,
 )
 from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context
@@ -1661,7 +1662,13 @@ def _scan_line_unquoted_comment(
     line: str,
     in_quote: Optional[str] = None,
 ) -> Tuple[str, Optional[str]]:
-    """Strips an unquoted trailing '#' comment while tracking triple-quote state across lines."""
+    """Strips an unquoted trailing '#' comment while tracking triple-quote state across lines.
+
+    Note:
+        Used as a lightweight line-by-line fallback when ``tokenize.generate_tokens``
+        cannot tokenize an incomplete fragment; does not parse Python 3.12 nested
+        f-string quotes or raw-string trailing backslashes.
+    """
     i = 0
     n = len(line)
     while i < n:
@@ -2456,9 +2463,8 @@ def _inspect_unit_scope(
             if parsed_tree is not None:
                 full_src_for_lines = _get_full_source()
                 mod_src_lines: Optional[Tuple[str, ...]] = (
-                    tuple(
-                        ln.rstrip("\r\n")
-                        for ln in split_source_lines(full_src_for_lines)
+                    _register_tree_source_lines(
+                        parsed_tree, source_text=full_src_for_lines
                     )
                     if full_src_for_lines
                     else None
@@ -2571,13 +2577,16 @@ def _inspect_unit_scope(
         cols_resolved = False
         enclosing_chain: List[Tuple[int, int, ast.AST]] = []
         full_mod_src = _get_full_source()
-        full_mod_lines: Optional[Tuple[str, ...]] = (
-            tuple(ln.rstrip("\r\n") for ln in split_source_lines(full_mod_src))
-            if full_mod_src
-            else None
-        )
-        if mod_tree is not None and full_mod_lines is not None:
-            _register_tree_source_lines(mod_tree, full_mod_lines)
+        if mod_tree is not None and full_mod_src:
+            full_mod_lines: Optional[Tuple[str, ...]] = _register_tree_source_lines(
+                mod_tree, source_text=full_mod_src
+            )
+        else:
+            full_mod_lines = (
+                _split_source_lines_stripped(full_mod_src)
+                if full_mod_src
+                else None
+            )
         if mod_tree is not None and u_start > 0:
             resolved_s_col, resolved_e_col = _resolve_unit_col_bounds(
                 candidate_stmts,
@@ -3178,24 +3187,28 @@ def inspect_single_unit_scope(
     repo_root: Optional[str] = None,
     tree: Optional[ast.AST] = None,
     *,
+    closure_strictness: Optional[str] = None,
     skip_pre_unit_closures: Optional[bool] = None,
     strict_with_suppression: Optional[bool] = None,
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping for an individual code unit."""
     if (
-        skip_pre_unit_closures is not None
+        closure_strictness is not None
+        or skip_pre_unit_closures is not None
         or strict_with_suppression is not None
         or non_suppressing_ctx_managers is not None
     ):
         resolved_flags = resolve_unit_closure_flags(
             unit,
+            closure_strictness=closure_strictness,
             skip_pre_unit_closures=skip_pre_unit_closures,
             strict_with_suppression=strict_with_suppression,
         )
         unit = dict(unit)
         if (
-            skip_pre_unit_closures is not None
+            closure_strictness is not None
+            or skip_pre_unit_closures is not None
             or strict_with_suppression is not None
         ):
             unit.pop("closure_strictness", None)

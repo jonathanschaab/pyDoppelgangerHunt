@@ -117,11 +117,13 @@ from typing import (
     Union,
 )
 
+from pydoppelgangerhunt.fixer._df_cache import _mark_ephemeral_unit_ast
 from pydoppelgangerhunt.fixer._df_cell_carriers import (
     _EnclosingFnCellInfo,
     _IntraUnitMutator,
     _collect_escaped_and_executed_intra_unit_defs,
     _collect_unit_nonlocal_mutators,
+    _extract_root_target_names,
     _propagate_sibling_closures,
 )
 from pydoppelgangerhunt.fixer._df_cell_traversal import (
@@ -474,6 +476,85 @@ def _iter_immediate_unit_exec_nodes(
     )
 
 
+_PRIMITIVE_ACCUMULATOR_CONST_TYPES = (int, float, complex, str, bytes, bool)
+
+
+def _collect_local_primitive_accumulators(
+    candidate_stmts: Sequence[ast.stmt],
+    immediate_nodes: Sequence[ast.AST],
+) -> Set[str]:
+    """Identifies local variables unconditionally initialized to a primitive constant before any read or augassign."""
+    seen_before_init: Set[str] = set()
+    initialized_primitives: Set[str] = set()
+    for stmt in candidate_stmts:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, _PRIMITIVE_ACCUMULATOR_CONST_TYPES)
+        ):
+            t_name = stmt.targets[0].id
+            if t_name not in seen_before_init:
+                initialized_primitives.add(t_name)
+                continue
+        elif (
+            isinstance(stmt, ast.AnnAssign)
+            and isinstance(stmt.target, ast.Name)
+            and stmt.value is not None
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, _PRIMITIVE_ACCUMULATOR_CONST_TYPES)
+        ):
+            t_name = stmt.target.id
+            if t_name not in seen_before_init:
+                initialized_primitives.add(t_name)
+                continue
+        for sub in _iter_immediate_unit_exec_nodes((stmt,)):
+            if isinstance(sub, ast.Name):
+                seen_before_init.add(sub.id)
+    if not initialized_primitives:
+        return set()
+    disqualified: Set[str] = set()
+    for node in immediate_nodes:
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            disqualified.update(node.names)
+        elif isinstance(node, ast.Assign):
+            is_prim = isinstance(node.value, ast.Constant) and isinstance(
+                node.value.value, _PRIMITIVE_ACCUMULATOR_CONST_TYPES
+            )
+            if not is_prim or len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+                for t in node.targets:
+                    disqualified.update(_extract_root_target_names(t))
+        elif isinstance(node, ast.AnnAssign):
+            is_prim = (
+                node.value is not None
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, _PRIMITIVE_ACCUMULATOR_CONST_TYPES)
+            )
+            if not is_prim or not isinstance(node.target, ast.Name):
+                disqualified.update(_extract_root_target_names(node.target))
+        elif isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
+            if not (
+                isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, _PRIMITIVE_ACCUMULATOR_CONST_TYPES)
+            ):
+                disqualified.add(node.target.id)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            disqualified.update(_extract_root_target_names(node.target))
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    disqualified.update(_extract_root_target_names(item.optional_vars))
+        elif isinstance(node, ast.ExceptHandler) and isinstance(node.name, str):
+            disqualified.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                disqualified.add(alias.asname or alias.name.split(".", 1)[0])
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            disqualified.add(node.name)
+    return initialized_primitives - disqualified
+
+
 def _unit_has_global_mutating_call(
     candidate_stmts: Sequence[ast.stmt],
     shadowed_names: AbstractSet[str],
@@ -497,11 +578,14 @@ def _unit_has_global_mutating_call(
 
     In ``strict`` mode (``allow_heuristic_builtins=True``), both
     ``_PROVEN_PURE_GLOBAL_SAFE_BUILTINS`` and ``_HEURISTIC_GLOBAL_SAFE_BUILTINS``
-    are permitted when unshadowed. In ``pedantic`` mode
+    are permitted when unshadowed, along with augmented assignments on local
+    variables unconditionally initialized inside the unit to a primitive constant
+    (e.g., ``total = 0; total += x``). In ``pedantic`` mode
     (``allow_heuristic_builtins=False``), only ``_PROVEN_PURE_GLOBAL_SAFE_BUILTINS``
-    are permitted because dunder-invoking built-ins (such as ``len()``, ``bool()``,
-    ``int()``, ``isinstance()``) can execute arbitrary user code in ``__len__``,
-    ``__bool__``, ``__int__``, ``__index__``, or ``__instancecheck__``. Read-only
+    are permitted and all augmented assignments are rejected because dunder-invoking
+    built-ins (such as ``len()``, ``bool()``, ``int()``, ``isinstance()``) and
+    in-place operators can execute arbitrary user code in ``__len__``, ``__bool__``,
+    ``__int__``, ``__index__``, ``__instancecheck__``, or ``__iadd__``. Read-only
     non-call AST operations (operators, subscript reads, attribute/``@property``
     reads, and synchronous ``for`` iteration) remain permitted as a documented
     static-analysis trade-off.
@@ -519,6 +603,11 @@ def _unit_has_global_mutating_call(
         unit_stmt_mod, include_globals=True
     )
     immediate_nodes = tuple(_iter_immediate_unit_exec_nodes(candidate_stmts))
+    local_accumulators = (
+        _collect_local_primitive_accumulators(candidate_stmts, immediate_nodes)
+        if allow_heuristic_builtins
+        else set()
+    )
     for node in immediate_nodes:
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
             effective_shadowed.add(node.id)
@@ -548,10 +637,16 @@ def _unit_has_global_mutating_call(
                 ast.YieldFrom,
                 ast.AsyncFor,
                 ast.Delete,
-                ast.AugAssign,
             ),
         ):
             return True
+        if isinstance(node, ast.AugAssign):
+            if not (
+                allow_heuristic_builtins
+                and isinstance(node.target, ast.Name)
+                and node.target.id in local_accumulators
+            ):
+                return True
         if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(
             node.ctx, (ast.Store, ast.Del)
         ):
@@ -691,7 +786,7 @@ def _evaluate_severed_closure_cell_hazard(
         return _ClosureHazardResult(True, tuple(reasons))
 
     unit_mod = ast.Module(body=list(ctx.candidate_stmts), type_ignores=[])
-    setattr(unit_mod, "_is_ephemeral_unit_mod", True)
+    _mark_ephemeral_unit_ast(unit_mod)
     is_expr_unit = (
         ctx.unit_kind in ("comprehension", "complex_expr")
         and not ctx.is_subroutine

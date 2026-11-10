@@ -3490,6 +3490,9 @@ def _generate_refactoring_patch_impl(
                     (fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static"))
                 )
 
+            # Apply monotone strict-wins pair resolution (pedantic > strict > lenient)
+            # across both units so u1_eff and u2_eff are inspected under a single
+            # consistent closure and context-manager suppression policy.
             pair_flags = resolve_pair_closure_flags(
                 u1,
                 u2,

@@ -25,7 +25,9 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _ScopeCacheKey,
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
+    _is_ephemeral_unit_ast,
     _make_trusted_scope_cache_key,
+    _mark_ephemeral_unit_ast,
     _scope_cell_info_cache,
     _validate_scope_cache_params,
 )
@@ -263,7 +265,7 @@ def _get_fn_scope_context_uncached(
         if (
             cache_parent_map
             and isinstance(mod_tree, ast.AST)
-            and not getattr(mod_tree, "_is_ephemeral_unit_mod", False)
+            and not _is_ephemeral_unit_ast(mod_tree)
             and scope_node is not mod_tree
         ):
             _get_scope_parent_map(mod_tree, use_cache=True)
@@ -563,7 +565,7 @@ def _ensure_subtree_scope_ctx(
             body=[node if isinstance(node, ast.stmt) else ast.Expr(value=cast(ast.expr, node))],
             type_ignores=[],
         )
-        setattr(wrap, "_is_ephemeral_unit_mod", True)
+        _mark_ephemeral_unit_ast(wrap)
     return _get_fn_scope_context_uncached(wrap, cache_parent_map=False)
 
 
@@ -748,7 +750,7 @@ def _collect_unit_nonlocal_mutators(
         body=[s for s in candidate_stmts if isinstance(s, ast.stmt)],
         type_ignores=[],
     )
-    setattr(unit_mod, "_is_ephemeral_unit_mod", True)
+    _mark_ephemeral_unit_ast(unit_mod)
     mod_parent_map = (
         _get_scope_parent_map(mod_tree) if mod_tree is not None else None
     )
@@ -1063,13 +1065,15 @@ def _extract_mutated_target_names(target: ast.AST) -> Set[str]:
     return _collect_target_names(target, mode="mutated")
 
 
-# Built-in functions whose return types are strictly enforced by the CPython runtime
-# to be primitive scalars, booleans, strings, byte sequences, ranges, file streams, or None
+# Built-in functions used in _is_non_closure_scalar_expr (for closure carrier tracking, not
+# side-effect purity) whose return types are enforced by the CPython C runtime to be
+# non-callable scalars, booleans, strings, byte sequences, ranges, file streams, or None
 # (e.g., TypeError is raised in C if __int__, __index__, __len__, __bool__, __str__,
-# __repr__, __format__, __float__, __complex__, or __hash__ returns a non-primitive).
-# Built-ins that delegate to unconstrained user dunders (abs -> __abs__, round -> __round__,
-# divmod -> __divmod__, pow -> __pow__, sum -> __add__) are intentionally excluded so custom
-# objects whose dunders return closures are never misclassified as non-closure scalars.
+# __repr__, __format__, __float__, __complex__, or __hash__ returns an arbitrary callable
+# instead of the required base type). Built-ins that delegate to unconstrained user dunders
+# (abs -> __abs__, round -> __round__, divmod -> __divmod__, pow -> __pow__, sum -> __add__)
+# are intentionally excluded so custom objects whose dunders return closures are never
+# misclassified as non-closure values.
 _NON_CLOSURE_RETURN_BUILTINS: frozenset[str] = frozenset(
     {
         "all",

@@ -24,7 +24,10 @@ from pydoppelgangerhunt.fixer.binding import (
     _prune_unshared_receivers,
     _resolve_effective_binding,
 )
-from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
+from pydoppelgangerhunt.fixer._df_cache import (
+    _get_or_parse_tree,
+    _suppress_syntax_warnings,
+)
 from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor
 from pydoppelgangerhunt.fixer.dataflow import (
     _load_unit_file_text,
@@ -1975,10 +1978,11 @@ def synthesize_shared_helper_code(
     has_naked_ctrl = any(h in ("naked_break", "naked_continue") for h in hazards)
     if not has_naked_ctrl:
         try:
-            if indent:
-                compile("if 1:\n" + helper_def, "<synthesized_helper>", "exec")
-            else:
-                compile(helper_def, "<synthesized_helper>", "exec")
+            with _suppress_syntax_warnings():
+                if indent:
+                    compile("if 1:\n" + helper_def, "<synthesized_helper>", "exec")
+                else:
+                    compile(helper_def, "<synthesized_helper>", "exec")
         except (SyntaxError, ValueError, RecursionError, MemoryError):
             return ""
 
@@ -1993,7 +1997,8 @@ def synthesize_shared_helper_code(
         if import_header_parts:
             combined = "\n".join(import_header_parts) + "\n\n\n" + helper_def
             try:
-                compile("\n".join(import_header_parts), "<synthesized_imports>", "exec")
+                with _suppress_syntax_warnings():
+                    compile("\n".join(import_header_parts), "<synthesized_imports>", "exec")
             except (SyntaxError, ValueError, RecursionError, MemoryError):
                 return ""
             return combined

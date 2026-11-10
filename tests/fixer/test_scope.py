@@ -560,7 +560,7 @@ def test_comprehension_multi_generator_scoping(tmp_path: Path) -> None:
         "start": 2,
         "end": 2,
         "start_col": 7,
-        "end_col": 41,
+        "end_col": 41,  # Byte length of line 2 ("flat = [x for row in matrix for x in row]") without trailing newline
         "name": "flat_comp",
         "kind": "comprehension",
     }

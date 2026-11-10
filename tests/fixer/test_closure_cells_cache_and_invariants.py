@@ -5834,6 +5834,7 @@ def test_concurrent_suppress_syntax_warnings_and_stmt_deltas_cap(
         _ScopeCacheKey,
         _scope_cell_info_cache,
         _suppress_syntax_warnings,
+        _syntax_warning_lock,
     )
     from pydoppelgangerhunt.fixer._df_cell_carriers import _SpanBounds
     from pydoppelgangerhunt.fixer._df_cell_traversal import (
@@ -5844,11 +5845,12 @@ def test_concurrent_suppress_syntax_warnings_and_stmt_deltas_cap(
         suppressed_syntax = 0
         kept_user = 0
         for _ in range(10):
-            with warnings.catch_warnings(record=True) as rec:
-                warnings.simplefilter("always")
-                with _suppress_syntax_warnings():
-                    ast.parse(r"s = '\d+'")
-                    warnings.warn("user_msg", UserWarning, stacklevel=1)
+            with _syntax_warning_lock:
+                with warnings.catch_warnings(record=True) as rec:
+                    warnings.simplefilter("always")
+                    with _suppress_syntax_warnings():
+                        ast.parse(r"s = '\d+'")
+                        warnings.warn("user_msg", UserWarning, stacklevel=1)
             suppressed_syntax += sum(
                 1 for w in rec if issubclass(w.category, SyntaxWarning)
             )
@@ -8879,8 +8881,68 @@ def test_public_entrypoints_configuration_consistency_matrix(
         assert helper == ""
         assert patch == ""
         assert "rejected as unsafe" in suggestion.lower()
+        assert "severed closure cell" in suggestion.lower()
 
 
+def test_docs_sync_with_suspicious_suppress_substrings_and_local_accumulator_strict_vs_pedantic() -> None:
+    """Verifies README/CHANGELOG match _SUSPICIOUS_SUPPRESS_SUBSTRINGS, local primitive accumulators work in strict mode, and ephemeral AST tracking uses weakrefs."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _is_ephemeral_unit_ast,
+        _mark_ephemeral_unit_ast,
+    )
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _SUSPICIOUS_SUPPRESS_SUBSTRINGS,
+    )
 
+    repo_root = Path(__file__).resolve().parents[2]
+    readme_text = (repo_root / "README.md").read_text(encoding="utf-8")
+    changelog_text = (repo_root / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert len(_SUSPICIOUS_SUPPRESS_SUBSTRINGS) == 22
+    for sub in _SUSPICIOUS_SUPPRESS_SUBSTRINGS:
+        assert f"`{sub}`" in readme_text, sub
+        assert f"`{sub}`" in changelog_text, sub
 
+    # Local primitive-initialized accumulator in a global-reading unit is permitted in strict mode and rejected in pedantic mode
+    acc_src = (
+        "SCALE = 3\n"
+        "def sum_scaled(items):\n"
+        "    global SCALE\n"
+        "    total = 0\n"
+        "    for item in items:\n"
+        "        total += item * SCALE\n"
+        "    return total\n"
+    )
+    acc_tree = ast.parse(acc_src)
+    sc_strict = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 6,
+            "kind": "compound_block",
+            "source_text": acc_src,
+            "closure_strictness": "strict",
+        },
+        tree=acc_tree,
+    )
+    assert sc_strict["is_control_flow_safe"] is True
+    assert "global_escape" not in sc_strict["closure_hazard_reasons"]
+
+    sc_pedantic = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 6,
+            "kind": "compound_block",
+            "source_text": acc_src,
+            "closure_strictness": "pedantic",
+        },
+        tree=acc_tree,
+    )
+    assert sc_pedantic["is_control_flow_safe"] is False
+    assert "global_escape" in sc_pedantic["closure_hazard_reasons"]
+
+    # Ephemeral AST tracking uses weakref set rather than setting ad hoc attributes on ast.AST
+    ephem_mod = ast.Module(body=[], type_ignores=[])
+    assert _is_ephemeral_unit_ast(ephem_mod) is False
+    _mark_ephemeral_unit_ast(ephem_mod)
+    assert _is_ephemeral_unit_ast(ephem_mod) is True
+    assert not hasattr(ephem_mod, "_is_ephemeral_unit_mod")
 

@@ -238,7 +238,7 @@ except UnitCollisionError as exc:
 #### Performance & Algorithmic Bounds
 
 Refactoring executes in linear-logarithmic time with incremental validation:
-- **Incremental Collision Checking**: Delegation checks candidate units incrementally ($O(K)$ per unit against existing replacements and physical items), eliminating expensive $O(K \log K)$ buffer dry-runs per clone pair.
+- **Incremental Collision Checking**: Delegation checks candidate units incrementally (`O(K)` per unit against existing replacements and physical items), eliminating expensive `O(K log K)` buffer dry-runs per clone pair.
 - **Micro-Benchmark**: For modules with 100+ replacements and 10,000+ lines, dual-tier validation and single-pass descending buffer slicing executes in under 5 ms on modern hardware.
 
 ##### Precision & Soundness Trade-off: Closure Scanning
@@ -265,7 +265,7 @@ escaping callbacks across lexical scopes.
   periodically between scan runs or batch boundaries to release memoized AST trees and parent node maps.
 - **Precision vs. Soundness Trade-off**: Pre-unit closure and context-manager exception-suppression
   analysis can be configured via `--closure-strictness {strict,pedantic,lenient}`
-  (deprecated aliases: `fail_closed` $\to$ `pedantic`, `fast`/`skip` $\to$ `lenient`; or `--skip-pre-unit-closures`,
+  (deprecated aliases: `fail_closed` -> `pedantic`, `fast`/`skip` -> `lenient`; or `--skip-pre-unit-closures`,
   or setting `closure_strictness = "strict"|"pedantic"|"lenient"`, `strict_with_suppression = true|false`,
   and `non_suppressing_ctx_managers = [...]` in `pyproject.toml` or per-unit `UnitSchema` dicts):
   - `strict` (default): **Heuristic context-manager safety mode** with conservative closure-cell
@@ -283,13 +283,14 @@ escaping callbacks across lexical scopes.
     strictly static class body whose `__exit__`/`__aexit__` returns only `False`/`None` are
     proven non-suppressing. Unproven context managers use a name-and-provenance heuristic:
     managers are treated as non-suppressing unless their identifier matches one of the 22
-    case-insensitive suppression-idiom substrings (`suppress`, `ignore`, `swallow`, `silent`,
-    `noop`, `no_op`, `null_error`, `catch`, `trap`, `absorb`, `tolerat`, `forgiv`, `eat_`,
-    `mute`, `quench`, `squelch`, `masked`, `subtest`, `raises`, `exitstack`, `enter_context`,
-    `may_suppress`) or is proven suppressing via local/function/class `__exit__` provenance.
+    case-insensitive suppression-idiom substrings (`suppress`, `raises`, `ignore`, `subtest`,
+    `exitstack`, `enter_context`, `cancelscope`, `move_on_after`, `fail_after`, `catch`,
+    `swallow`, `silen`, `quiet`, `tolerat`, `best_effort`, `absorb`, `trap`, `fallback`,
+    `noop`, `shield`, `retry`, `attempt`) or is proven suppressing via local/function/class
+    `__exit__` provenance.
     **Note**: because this heuristic is name-based, `strict` mode is **fail-open for neutrally
     named custom exception-suppressing context managers** (such as `Transaction()`, `Guard()`,
-    `fallback()`, `shield()`, `retry()`, `attempt()`, or `best_effort()`).
+    `SpanContext()`, `SessionScope()`, or `BatchContext()`).
     Whenever an unproven context manager is accepted via the name heuristic, `pyDoppelgangerHunt`
     logs a deduplicated `INFO` diagnostic and an end-of-run summary (and records a per-hunk
     advisory comment in `--patch` / `--output` artifacts); use `--closure-strictness pedantic` to
@@ -300,10 +301,11 @@ escaping callbacks across lexical scopes.
     exception-suppressing unless explicitly allowlisted via `--non-suppressing-ctx-managers` or
     `non_suppressing_ctx_managers` (merged across global config and per-unit overrides), and
     rejects dunder-invoking built-in calls (`len`, `bool`, `int`, `bin`, `hex`, `oct`, `isinstance`,
-    `issubclass`, `range`) as well as attribute, subscript, and augmented-assignment mutations
-    inside global-reading units (while read-only Python protocol syntax such as synchronous `for`
-    iteration, attribute/property reads, subscript reads, and binary/unary operators remains
-    permitted by static convention). Allowlist entries support bare names (including locally defined classes), relative
+    `issubclass`, `range`) as well as local primitive-initialized accumulator augmented assignments
+    (`total += x`) inside global-reading units, in addition to the attribute, subscript, and
+    external augmented-assignment mutations rejected in `strict` mode (while read-only Python
+    protocol syntax such as synchronous `for` iteration, attribute/property reads, subscript reads,
+    and binary/unary operators remains permitted by static convention). Allowlist entries support bare names (including locally defined classes), relative
     imports (`.Name` matching `from . import Name`), dotted paths (e.g., `pkg.tx.atomic` or
     `unittest.mock.patch.object`), and wildcard attribute suffixes (`*.atomic` or `*.lock` matching
     `<any_receiver>.atomic` / `<any_receiver>.lock(...)`).
@@ -340,10 +342,13 @@ strict fail-closed safety invariants:
   module-level refactorings do not alter globals exported as public module API. When a subroutine
   inside an enclosing function reads a variable declared `global` in that enclosing scope, calls to
   arbitrary functions, context-manager blocks (`with` / `async with`), coroutine/generator
-  suspension points (`await`, `yield`, `yield from`, `async for`), attribute/subscript/augmented
-  assignments (`obj.attr = ...`, `obj[k] = ...`, `x += ...`), and deletions (`del`) are
-  rejected as a `global_escape` hazard because they could rebind or mutate the module-level global
-  mid-execution. C-level built-ins that do not invoke user-defined Python dunders
+  suspension points (`await`, `yield`, `yield from`, `async for`), attribute/subscript
+  assignments (`obj.attr = ...`, `obj[k] = ...`), external or non-primitive augmented assignments
+  (`counter += 1`, `obj.attr += 1`, `obj[k] += 1`), and deletions (`del`) are
+  rejected in both `strict` and `pedantic` modes as a `global_escape` hazard because they could
+  rebind or mutate the module-level global mid-execution. Local augmented assignments on variables
+  initialized inside the unit to a primitive constant (`total = 0; total += x`) are permitted in
+  `strict` mode and rejected in `pedantic` mode. C-level built-ins that do not invoke user-defined Python dunders
   (`_PROVEN_PURE_GLOBAL_SAFE_BUILTINS`: `callable`, `id`, `ord`) are permitted when
   unshadowed in both `strict` and `pedantic` modes; dunder-invoking inspection/conversion built-ins
   (`_HEURISTIC_GLOBAL_SAFE_BUILTINS`: `bin`, `bool`, `chr`, `hex`, `int`, `isinstance`, `issubclass`,

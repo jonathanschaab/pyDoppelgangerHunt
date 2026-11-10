@@ -2837,10 +2837,13 @@ def test_cli_closure_strictness_and_skip_closures_precedence_warning(
             _, kwargs = mock_patch.call_args
             assert kwargs.get("skip_pre_unit_closures") is False
             assert kwargs.get("closure_strictness") == "strict"
-            assert any(
-                "takes precedence over --skip-pre-unit-closures" in r.message
+            precedence_warnings = [
+                r.message
                 for r in caplog.records
-            )
+                if "takes precedence over skip_pre_unit_closures=True (--skip-pre-unit-closures)"
+                in r.message
+            ]
+            assert len(precedence_warnings) == 1
 
             # 3. CLI --closure-strictness fail_closed maps to pedantic and overrides CLI --skip-pre-unit-closures
             caplog.clear()
@@ -2862,10 +2865,13 @@ def test_cli_closure_strictness_and_skip_closures_precedence_warning(
             assert kwargs.get("skip_pre_unit_closures") is False
             assert kwargs.get("closure_strictness") == "pedantic"
             assert kwargs.get("non_suppressing_ctx_managers") == ("SafeA", "SafeB")
-            assert any(
-                "takes precedence over --skip-pre-unit-closures" in r.message
+            precedence_warnings_fc = [
+                r.message
                 for r in caplog.records
-            )
+                if "takes precedence over skip_pre_unit_closures=True (--skip-pre-unit-closures)"
+                in r.message
+            ]
+            assert len(precedence_warnings_fc) == 1
 
 
 def test_cli_unrecognized_config_closure_strictness_falls_back(
