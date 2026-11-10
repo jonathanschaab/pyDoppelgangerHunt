@@ -107,6 +107,7 @@ from __future__ import annotations
 import ast
 from typing import (
     AbstractSet,
+    Iterator,
     List,
     NamedTuple,
     Optional,
@@ -134,6 +135,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _extract_single_node_local_names,
     _has_escaped_intra_unit_global_declarations,
     _has_wildcard_star_import,
+    _iter_shallow_scope_nodes,
     _resolve_immediate_scope_in_fn,
 )
 from pydoppelgangerhunt.fixer._df_span_index import (
@@ -462,6 +464,16 @@ _PURE_GLOBAL_SAFE_BUILTINS: frozenset[str] = (
 )
 
 
+def _iter_immediate_unit_exec_nodes(
+    stmts: Sequence[ast.AST],
+) -> Iterator[ast.AST]:
+    """Yields AST nodes executed immediately by stmts, visiting nested function/lambda headers without descending into deferred bodies."""
+    return _iter_shallow_scope_nodes(
+        stmts,
+        deferred_scope_types=(ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda),
+    )
+
+
 def _unit_has_global_mutating_call(
     candidate_stmts: Sequence[ast.stmt],
     shadowed_names: AbstractSet[str],
@@ -469,16 +481,19 @@ def _unit_has_global_mutating_call(
     has_star_import: bool = False,
     allow_heuristic_builtins: bool = True,
 ) -> bool:
-    """Returns True when candidate_stmts contain a call or protocol hook other than an allowed unshadowed builtin.
+    """Returns True when candidate_stmts contain an immediately executed call or mutation protocol hook other than an allowed unshadowed builtin.
 
     When an extracted helper reads a variable declared ``global`` in an enclosing
     function, the helper receives that global's value as a snapshot parameter at
-    call entry. Any impure or user-defined call, context-manager protocol hook
-    (``with`` / ``async with``), coroutine/generator suspension point (``await``,
-    ``yield``, ``yield from``, ``async for``), or deletion (``del``) inside the
-    helper could mutate the module-level global mid-execution, causing subsequent
-    reads inside the helper to observe the stale parameter rather than the updated
-    global.
+    call entry. Any impure or user-defined call, setter/augmented-assignment
+    protocol hook (``__setattr__``, ``__setitem__``, ``__iadd__``, etc.),
+    context-manager protocol hook (``with`` / ``async with``), coroutine/generator
+    suspension point (``await``, ``yield``, ``yield from``, ``async for``), or
+    deletion (``del``) executed during the unit could mutate the module-level
+    global mid-execution, causing subsequent reads inside the helper to observe
+    the stale parameter rather than the updated global. Deferred bodies of nested
+    functions and lambdas are not traversed here (their headers are traversed, and
+    any direct calls or closure escapes are handled separately).
 
     In ``strict`` mode (``allow_heuristic_builtins=True``), both
     ``_PROVEN_PURE_GLOBAL_SAFE_BUILTINS`` and ``_HEURISTIC_GLOBAL_SAFE_BUILTINS``
@@ -486,10 +501,10 @@ def _unit_has_global_mutating_call(
     (``allow_heuristic_builtins=False``), only ``_PROVEN_PURE_GLOBAL_SAFE_BUILTINS``
     are permitted because dunder-invoking built-ins (such as ``len()``, ``bool()``,
     ``int()``, ``isinstance()``) can execute arbitrary user code in ``__len__``,
-    ``__bool__``, ``__int__``, ``__index__``, or ``__instancecheck__``. Non-call
-    AST operations (operators, subscripts, attribute/``@property`` reads, and
-    synchronous ``for`` iteration) are not treated as global-mutating even in
-    ``pedantic`` mode.
+    ``__bool__``, ``__int__``, ``__index__``, or ``__instancecheck__``. Read-only
+    non-call AST operations (operators, subscript reads, attribute/``@property``
+    reads, and synchronous ``for`` iteration) remain permitted as a documented
+    static-analysis trade-off.
     """
     allowed_builtins = (
         _PURE_GLOBAL_SAFE_BUILTINS
@@ -503,50 +518,58 @@ def _unit_has_global_mutating_call(
     effective_shadowed: Set[str] = set(shadowed_names) | _extract_single_node_local_names(
         unit_stmt_mod, include_globals=True
     )
-    for st in candidate_stmts:
-        for node in ast.walk(st):
-            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-                effective_shadowed.add(node.id)
-            elif isinstance(node, ast.ExceptHandler) and isinstance(node.name, str):
-                effective_shadowed.add(node.name)
-            elif isinstance(node, (ast.Global, ast.Nonlocal)):
-                effective_shadowed.update(node.names)
-            elif isinstance(
-                node,
-                (
-                    ast.FunctionDef,
-                    ast.AsyncFunctionDef,
-                    ast.ClassDef,
-                    ast.Lambda,
-                    *_COMPREHENSION_TYPES,
-                ),
-            ):
+    immediate_nodes = tuple(_iter_immediate_unit_exec_nodes(candidate_stmts))
+    for node in immediate_nodes:
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            effective_shadowed.add(node.id)
+        elif isinstance(node, ast.ExceptHandler) and isinstance(node.name, str):
+            effective_shadowed.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            effective_shadowed.update(node.names)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            effective_shadowed.add(node.name)
+            if isinstance(node, ast.ClassDef):
                 effective_shadowed.update(
                     _extract_single_node_local_names(node, include_globals=True)
                 )
+        elif isinstance(node, _COMPREHENSION_TYPES):
+            effective_shadowed.update(
+                _extract_single_node_local_names(node, include_globals=True)
+            )
     all_builtins_shadowed = has_star_import or ("*" in effective_shadowed)
-    for st in candidate_stmts:
-        for node in ast.walk(st):
-            if isinstance(
-                node,
-                (
-                    ast.With,
-                    ast.AsyncWith,
-                    ast.Await,
-                    ast.Yield,
-                    ast.YieldFrom,
-                    ast.AsyncFor,
-                    ast.Delete,
-                ),
+    for node in immediate_nodes:
+        if isinstance(
+            node,
+            (
+                ast.With,
+                ast.AsyncWith,
+                ast.Await,
+                ast.Yield,
+                ast.YieldFrom,
+                ast.AsyncFor,
+                ast.Delete,
+                ast.AugAssign,
+            ),
+        ):
+            return True
+        if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(
+            node.ctx, (ast.Store, ast.Del)
+        ):
+            return True
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.decorator_list
+        ):
+            return True
+        if isinstance(node, ast.ClassDef) and (node.bases or node.keywords):
+            return True
+        if isinstance(node, ast.Call):
+            if all_builtins_shadowed or not (
+                isinstance(node.func, ast.Name)
+                and node.func.id in allowed_builtins
+                and node.func.id not in effective_shadowed
             ):
                 return True
-            if isinstance(node, ast.Call):
-                if all_builtins_shadowed or not (
-                    isinstance(node.func, ast.Name)
-                    and node.func.id in allowed_builtins
-                    and node.func.id not in effective_shadowed
-                ):
-                    return True
     return False
 
 

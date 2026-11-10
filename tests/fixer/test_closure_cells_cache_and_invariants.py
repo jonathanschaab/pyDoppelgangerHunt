@@ -8327,5 +8327,560 @@ def test_ast_immutability_fingerprint_and_unavailable_source_closure_mode(
     assert seed_res.suffix_delta_by_top_stmt_id[last_id].suppressors == frozenset()
 
 
+def test_with_item_provenance_advances_across_chained_walrus_and_as_target_shadowing() -> None:
+    """Verifies _iter_with_item_provenance_steps advances item_prov across chained items."""
+    # 1. Chained safe walrus manager: (manager := contextlib.nullcontext()) as resource, manager
+    chained_safe_src = (
+        "import contextlib\n"
+        "def run_chained(calculate):\n"
+        "    with (manager := contextlib.nullcontext()) as resource, manager:\n"
+        "        result = calculate()\n"
+        "    cb = lambda: result\n"
+        "    return cb()\n"
+    )
+    chained_safe_tree = ast.parse(chained_safe_src)
+    sc_chained_safe = inspect_single_unit_scope(
+        {
+            "start": 5,
+            "end": 5,
+            "kind": "basic_block",
+            "source_text": chained_safe_src,
+            "source_code": "    cb = lambda: result\n",
+            "closure_strictness": "pedantic",
+        },
+        tree=chained_safe_tree,
+    )
+    assert "severed_closure_cell" not in sc_chained_safe["control_flow_hazards"]
+    assert sc_chained_safe["is_control_flow_safe"] is True
+
+    # 2. Chained walrus suppressor alias: (alias := contextlib.suppress)(ValueError), alias(KeyError)
+    chained_sup_src = (
+        "import contextlib\n"
+        "def run_chained_sup(risky):\n"
+        "    with (alias := contextlib.suppress)(ValueError), alias(KeyError):\n"
+        "        result = risky()\n"
+        "    cb = lambda: result\n"
+        "    return cb()\n"
+    )
+    chained_sup_tree = ast.parse(chained_sup_src)
+    sc_chained_sup = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 4,
+            "kind": "compound_block",
+            "source_text": chained_sup_src,
+            "closure_strictness": "strict",
+        },
+        tree=chained_sup_tree,
+    )
+    assert "result" not in sc_chained_sup["definite_stores"]
+    assert "result" in sc_chained_sup["conditional_outputs"]
+
+    # 3. Earlier item `as open` shadows builtin open in subsequent item `open("path")`
+    shadow_open_src = (
+        "import contextlib\n"
+        "def run_shadow_open( custom_cm, compute ):\n"
+        "    with custom_cm() as open, open('path'):\n"
+        "        result = compute()\n"
+        "    cb = lambda: result\n"
+        "    return cb()\n"
+    )
+    shadow_open_tree = ast.parse(shadow_open_src)
+    sc_shadow_open = inspect_single_unit_scope(
+        {
+            "start": 5,
+            "end": 5,
+            "kind": "basic_block",
+            "source_text": shadow_open_src,
+            "source_code": "    cb = lambda: result\n",
+            "closure_strictness": "pedantic",
+            "non_suppressing_ctx_managers": ["custom_cm"],
+        },
+        tree=shadow_open_tree,
+    )
+    assert "severed_closure_cell" in sc_shadow_open["control_flow_hazards"]
+
+
+def test_async_with_nested_nullcontext_provenance_and_definite_assignment() -> None:
+    """Verifies ast.AsyncWith with contextlib.nullcontext is recognized across provenance and definite-assignment helpers."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _analyze_block_assignment,
+        _block_terminates,
+        _extract_block_definite_bindings_and_term,
+        _seed_scope_suppress_aliases,
+    )
+
+    async_src = (
+        "import contextlib\n"
+        "async def run_async(compute):\n"
+        "    with contextlib.suppress(ValueError):\n"
+        "        async with contextlib.nullcontext():\n"
+        "            x = 1\n"
+        "            return x\n"
+        "    after = 2\n"
+        "    async with contextlib.nullcontext():\n"
+        "        y = compute()\n"
+        "    cb = lambda: y\n"
+        "    return cb()\n"
+    )
+    async_tree = ast.parse(async_src)
+    async_fn = async_tree.body[1]
+    assert isinstance(async_fn, ast.AsyncFunctionDef)
+    prov_async = _seed_scope_suppress_aliases(async_fn, mod_tree=async_tree)
+
+    assert (
+        _block_terminates(
+            [async_fn.body[0]],
+            suppress_aliases=prov_async,
+            strict_with_suppression=True,
+        )
+        is True
+    )
+    defs_a, conds_a = _analyze_block_assignment(
+        async_fn.body[:1],
+        suppress_aliases=prov_async,
+        strict_with_suppression=True,
+    )
+    assert "x" in defs_a
+    assert "x" not in conds_a
+
+    bound_a, term_a = _extract_block_definite_bindings_and_term(
+        async_fn.body[:1],
+        None,
+        suppress_aliases=prov_async,
+        strict_with_suppression=True,
+    )
+    assert bound_a == {"x"}
+    assert term_a is True
+
+    sc_async_cb = inspect_single_unit_scope(
+        {
+            "start": 10,
+            "end": 10,
+            "kind": "basic_block",
+            "source_text": async_src,
+            "source_code": "    cb = lambda: y\n",
+            "closure_strictness": "pedantic",
+        },
+        tree=async_tree,
+    )
+    assert "severed_closure_cell" not in sc_async_cb["control_flow_hazards"]
+
+
+@pytest.mark.parametrize(
+    "mutating_stmt",
+    [
+        "holder.value = 1",
+        "mapping['k'] = 1",
+        "counter += 1",
+        "del holder.value",
+        "del mapping['k']",
+    ],
+)
+def test_global_reading_unit_rejects_attribute_subscript_and_augassign_mutations(
+    mutating_stmt: str,
+) -> None:
+    """Verifies global-reading units reject attribute, subscript, and augmented-assignment mutations as global_escape."""
+    src = (
+        "STATE = 1\n"
+        "def run_global(holder, mapping, counter):\n"
+        "    global STATE\n"
+        "    before = STATE\n"
+        f"    {mutating_stmt}\n"
+        "    after = STATE\n"
+        "    return before, after, counter\n"
+    )
+    tree = ast.parse(src)
+    for mode in ("strict", "pedantic"):
+        sc = inspect_single_unit_scope(
+            {
+                "start": 4,
+                "end": 6,
+                "kind": "linear_block",
+                "source_text": src,
+                "closure_strictness": mode,
+            },
+            tree=tree,
+        )
+        assert "severed_closure_cell" in sc["control_flow_hazards"], (mutating_stmt, mode)
+        assert "global_escape" in sc["closure_hazard_reasons"], (mutating_stmt, mode)
+        assert sc["is_control_flow_safe"] is False
+
+
+def test_global_reading_unit_permits_deferred_nested_function_and_lambda_bodies() -> None:
+    """Verifies deferred calls inside nested def/lambda bodies do not trigger false-positive global_escape."""
+    deferred_safe_src = (
+        "STATE = 10\n"
+        "def make_callbacks(offset):\n"
+        "    global STATE\n"
+        "    snap = STATE + offset\n"
+        "    def callback():\n"
+        "        print(snap)\n"
+        "        return snap\n"
+        "    lam = lambda: print(snap)\n"
+        "    return callback, lam\n"
+    )
+    deferred_tree = ast.parse(deferred_safe_src)
+    for mode in ("strict", "pedantic"):
+        sc_safe = inspect_single_unit_scope(
+            {
+                "start": 4,
+                "end": 8,
+                "kind": "compound_block",
+                "source_text": deferred_safe_src,
+                "closure_strictness": mode,
+            },
+            tree=deferred_tree,
+        )
+        assert "global_escape" not in sc_safe["closure_hazard_reasons"], mode
+        assert sc_safe["is_control_flow_safe"] is True, mode
+
+    # Positive control: call inside a nested function's default argument IS executed at def time
+    eager_default_src = (
+        "STATE = 10\n"
+        "def make_eager_default(impure_fn):\n"
+        "    global STATE\n"
+        "    snap = STATE\n"
+        "    def callback(v=impure_fn()):\n"
+        "        return snap + v\n"
+        "    return callback\n"
+    )
+    eager_tree = ast.parse(eager_default_src)
+    sc_eager = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 6,
+            "kind": "compound_block",
+            "source_text": eager_default_src,
+            "closure_strictness": "strict",
+        },
+        tree=eager_tree,
+    )
+    assert "severed_closure_cell" in sc_eager["control_flow_hazards"]
+    assert "global_escape" in sc_eager["closure_hazard_reasons"]
+
+
+def test_register_tree_source_lines_refreshes_and_invalidates_on_changed_source_text() -> None:
+    """Verifies re-registering the same AST tree with updated source text refreshes cached lines and evicts stale scope entries."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _get_cached_tree_source_lines,
+        _make_trusted_scope_cache_key,
+        _register_tree_source_lines,
+        _scope_cell_info_cache,
+        _store_lru_cache_entry,
+        clear_dataflow_cache,
+    )
+
+    clear_dataflow_cache()
+    src_v1 = "def f():\n    return 1\n"
+    src_v2 = "def f():\n    return 2\n"
+    tree = ast.parse(src_v1)
+
+    lines_v1 = _register_tree_source_lines(tree, source_text=src_v1)
+    assert lines_v1 == ("def f():", "    return 1")
+    assert _get_cached_tree_source_lines(tree) == ("def f():", "    return 1")
+
+    dummy_ck = _make_trusted_scope_cache_key(owner=tree, kind="tree_scope_intervals")
+    _store_lru_cache_entry(_scope_cell_info_cache, dummy_ck, ("stale_intervals",), 128)
+    assert dummy_ck in _scope_cell_info_cache
+
+    # Re-registering with identical text preserves dependent cache entries
+    assert _register_tree_source_lines(tree, source_text=src_v1) == ("def f():", "    return 1")
+    assert dummy_ck in _scope_cell_info_cache
+
+    # Re-registering the same AST object with different source text updates lines and evicts stale entries
+    lines_v2 = _register_tree_source_lines(tree, source_text=src_v2)
+    assert lines_v2 == ("def f():", "    return 2")
+    assert _get_cached_tree_source_lines(tree) == ("def f():", "    return 2")
+    assert dummy_ck not in _scope_cell_info_cache
+
+
+def test_evict_tree_scopes_purges_detached_child_owner_only_cache_entries() -> None:
+    """Verifies evict_tree_scopes(root) evicts owner-only cache entries for AST children detached prior to eviction."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _make_trusted_scope_cache_key,
+        _scope_cell_info_cache,
+        _scope_owner_keys_index,
+        _store_lru_cache_entry,
+        clear_dataflow_cache,
+        evict_tree_scopes,
+    )
+
+    clear_dataflow_cache()
+    mod_src = (
+        "def outer_fn(x):\n"
+        "    def inner_fn(y):\n"
+        "        return x + y\n"
+        "    return inner_fn(1)\n"
+        "def sibling_fn(z):\n"
+        "    return z * 2\n"
+    )
+    mod_tree = ast.parse(mod_src)
+    outer_fn = mod_tree.body[0]
+    sibling_fn = mod_tree.body[1]
+    assert isinstance(outer_fn, ast.FunctionDef)
+    assert isinstance(sibling_fn, ast.FunctionDef)
+    inner_fn = outer_fn.body[0]
+    assert isinstance(inner_fn, ast.FunctionDef)
+
+    # Populate scope caches for outer_fn, inner_fn (owner-only), and sibling_fn
+    outer_ck = _make_trusted_scope_cache_key(owner=outer_fn, kind="cell_info")
+    inner_owner_only_ck = _make_trusted_scope_cache_key(owner=inner_fn, kind="cell_info")
+    sibling_owner_only_ck = _make_trusted_scope_cache_key(owner=sibling_fn, kind="cell_info")
+    _store_lru_cache_entry(_scope_cell_info_cache, outer_ck, ("outer",), 128)
+    _store_lru_cache_entry(_scope_cell_info_cache, inner_owner_only_ck, ("inner",), 128)
+    _store_lru_cache_entry(_scope_cell_info_cache, sibling_owner_only_ck, ("sibling",), 128)
+    assert inner_owner_only_ck in _scope_cell_info_cache
+    assert sibling_owner_only_ck in _scope_cell_info_cache
+
+    # Detach inner_fn from outer_fn.body BEFORE calling evict_tree_scopes(outer_fn)
+    outer_fn.body.remove(inner_fn)
+    evict_tree_scopes(outer_fn)
+
+    assert inner_owner_only_ck not in _scope_cell_info_cache
+    assert inner_fn not in _scope_owner_keys_index
+    # Unrelated sibling_fn in mod_tree remains cached
+    assert sibling_owner_only_ck in _scope_cell_info_cache
+
+    # Now populate mod_tree and detach sibling_fn from mod_tree.body BEFORE calling evict_tree_scopes(mod_tree)
+    mod_ck = _make_trusted_scope_cache_key(owner=mod_tree, kind="cell_info")
+    _store_lru_cache_entry(_scope_cell_info_cache, mod_ck, ("mod",), 128)
+    mod_tree.body.remove(sibling_fn)
+    evict_tree_scopes(mod_tree)
+    assert sibling_owner_only_ck not in _scope_cell_info_cache
+    assert sibling_fn not in _scope_owner_keys_index
+
+
+def test_multi_item_with_heuristic_telemetry_and_overflow_summary(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies heuristic context-manager telemetry is recorded across multi-item with headers and overflow summary distinguishes retained vs omitted counts."""
+    import logging
+    from pydoppelgangerhunt.config import (
+        _MAX_HEURISTIC_CTX_MANAGERS,
+        clear_closure_warning_cache,
+        collect_heuristic_ctx_managers,
+        log_heuristic_ctx_manager_summary,
+        peek_heuristic_non_suppressing_ctx_managers,
+        record_heuristic_non_suppressing_ctx_manager,
+    )
+
+    clear_closure_warning_cache()
+    multi_with_src = (
+        "import contextlib\n"
+        "def run_multi(compute):\n"
+        "    with UnknownBefore(), contextlib.suppress(ValueError), UnknownAfter():\n"
+        "        val = compute()\n"
+        "    cb = lambda: val\n"
+        "    return cb()\n"
+    )
+    multi_tree = ast.parse(multi_with_src)
+    with collect_heuristic_ctx_managers() as collected:
+        sc = inspect_single_unit_scope(
+            {
+                "start": 5,
+                "end": 5,
+                "kind": "basic_block",
+                "source_text": multi_with_src,
+                "source_code": "    cb = lambda: val\n",
+                "closure_strictness": "strict",
+            },
+            tree=multi_tree,
+        )
+    assert "severed_closure_cell" in sc["control_flow_hazards"]
+    assert {"UnknownBefore", "UnknownAfter"} <= collected
+    assert {"UnknownBefore", "UnknownAfter"} <= set(peek_heuristic_non_suppressing_ctx_managers())
+
+    # Verify overflow reporting in log_heuristic_ctx_manager_summary distinguishes retained names vs overflow occurrences
+    clear_closure_warning_cache()
+    for idx in range(_MAX_HEURISTIC_CTX_MANAGERS + 5):
+        record_heuristic_non_suppressing_ctx_manager(f"CustomMgr_{idx:04d}")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        retained = log_heuristic_ctx_manager_summary()
+    assert len(retained) == _MAX_HEURISTIC_CTX_MANAGERS
+    assert any(
+        f"Summary: {_MAX_HEURISTIC_CTX_MANAGERS} unproven context manager(s)" in rec.message
+        and "5 additional occurrence(s) omitted beyond cap" in rec.message
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.parametrize(
+    ("bad_unit", "err_pattern"),
+    [
+        ({"start": "not_an_int", "end": 2}, "Invalid coordinate value"),
+        ({"start": 0, "end": 2}, "Invalid coordinate value"),
+        ({"start": 5, "end": 3}, "Inverted line coordinates"),
+        ({"start": 1, "end": 2, "start_col": -1}, "Invalid coordinate value"),
+        ({"start": 1, "end": 2, "skip_pre_unit_closures": "yes"}, "Expected bool"),
+        ({"start": 1, "end": 2, "strict_with_suppression": 1}, "Expected bool"),
+        ({"start": 1, "end": 2, "closure_strictness": "bogus_mode"}, "Invalid closure_strictness"),
+        (
+            {"start": 1, "end": 2, "non_suppressing_ctx_managers": "SafeTx"},
+            "Expected sequence of str",
+        ),
+        (
+            {"start": 1, "end": 2, "non_suppressing_ctx_managers": [123]},
+            "Expected sequence of str",
+        ),
+        ({"start": 1, "end": 2, "token_count": -1}, "Expected non-negative int"),
+        ({"start": 1, "end": 2, "token_count": True}, "Expected non-negative int"),
+        ({"start": 1, "end": 2, "tokens": -5}, "Expected non-negative int or sequence of str"),
+        ({"start": 1, "end": 2, "scope": "not_a_dict"}, "Expected mapping for 'scope'"),
+        ({"start": 1, "end": 2, "ast_node": "not_an_ast"}, "Expected ast.AST for 'ast_node'"),
+    ],
+)
+def test_validate_unit_schema_validates_field_value_types_and_bounds(
+    bad_unit: dict[str, Any],
+    err_pattern: str,
+) -> None:
+    """Verifies validate_unit_schema validates field types, coordinate bounds, and enum values."""
+    from pydoppelgangerhunt.fixer.source import validate_unit_schema
+
+    with pytest.raises(ValueError, match=err_pattern):
+        validate_unit_schema(bad_unit, strict=True)
+
+
+@pytest.mark.parametrize(
+    ("mode", "allowlist", "expect_safe"),
+    [
+        ("strict", (), True),
+        ("pedantic", (), False),
+        ("pedantic", ("NeutralTx",), True),
+        ("lenient", (), True),
+    ],
+)
+def test_public_entrypoints_configuration_consistency_matrix(
+    tmp_path: Path,
+    mode: str,
+    allowlist: tuple[str, ...],
+    expect_safe: bool,
+) -> None:
+    """Verifies all public fixer entry points agree across closure_strictness and non_suppressing_ctx_managers."""
+    from pydoppelgangerhunt import synthesize_refactoring_suggestion
+    from pydoppelgangerhunt.fixer import (
+        analyze_unit_variable_scope,
+        generate_refactoring_patch,
+        inspect_single_unit_scope,
+        resolve_clone_generator_subroutine_outputs,
+        resolve_clone_pair_outputs,
+        synthesize_shared_helper_code,
+    )
+
+    src = (
+        "def work_a(items, compute):\n"
+        "    with NeutralTx():\n"
+        "        seed = compute(items)\n"
+        "    cb = lambda x: x + seed\n"
+        "    total = cb(10) + len(items)\n"
+        "    return total\n\n"
+        "def work_b(items, compute):\n"
+        "    with NeutralTx():\n"
+        "        seed = compute(items)\n"
+        "    cb = lambda x: x + seed\n"
+        "    total = cb(10) + len(items)\n"
+        "    return total\n"
+    )
+    mod_file = tmp_path / "matrix_mod.py"
+    mod_file.write_text(src, encoding="utf-8")
+    tree = ast.parse(src)
+
+    u1: dict[str, Any] = {
+        "name": "work_a:block",
+        "file": str(mod_file),
+        "start": 4,
+        "end": 5,
+        "kind": "compound_block",
+        "source_text": src,
+        "source_code": "    cb = lambda x: x + seed\n    total = cb(10) + len(items)\n",
+        "closure_strictness": mode,
+        "non_suppressing_ctx_managers": list(allowlist),
+    }
+    u2: dict[str, Any] = {
+        "name": "work_b:block",
+        "file": str(mod_file),
+        "start": 11,
+        "end": 12,
+        "kind": "compound_block",
+        "source_text": src,
+        "source_code": "    cb = lambda x: x + seed\n    total = cb(10) + len(items)\n",
+        "closure_strictness": mode,
+        "non_suppressing_ctx_managers": list(allowlist),
+    }
+
+    sc1 = inspect_single_unit_scope(u1, tree=tree)
+    sc2 = inspect_single_unit_scope(u2, tree=tree)
+    assert sc1["is_control_flow_safe"] is expect_safe
+    assert sc2["is_control_flow_safe"] is expect_safe
+
+    comb = analyze_unit_variable_scope(u1, u2, tree1=tree, tree2=tree)
+    assert comb["is_control_flow_safe"] is expect_safe
+
+    pair_out = resolve_clone_pair_outputs(
+        u1,
+        u2,
+        sc1,
+        sc2,
+        source_text1=src,
+        source_text2=src,
+        tree1=tree,
+        tree2=tree,
+        return_details=True,
+    )
+    if expect_safe:
+        assert pair_out.outputs is not None
+    else:
+        assert pair_out.outputs is None
+
+    gen_u1 = {**u1, "has_yield": True}
+    gen_u2 = {**u2, "has_yield": True}
+    gen_out = resolve_clone_generator_subroutine_outputs(
+        gen_u1,
+        gen_u2,
+        sc1,
+        sc2,
+        source_text1=src,
+        source_text2=src,
+        tree1=tree,
+        tree2=tree,
+        return_details=True,
+    )
+    if expect_safe:
+        assert gen_out.outputs is not None
+    else:
+        assert gen_out.outputs is None
+
+    helper = synthesize_shared_helper_code(
+        u1,
+        u2,
+        helper_name="_shared_matrix_work",
+        scope=comb,
+        outputs=["total"],
+        outputs2=["total"],
+        source_text1=src,
+        source_text2=src,
+        tree1=tree,
+        tree2=tree,
+    )
+    patch = generate_refactoring_patch(
+        [(1.0, dict(u1), dict(u2))],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        closure_strictness=mode,
+        non_suppressing_ctx_managers=list(allowlist),
+    )
+    suggestion = synthesize_refactoring_suggestion(dict(u1), dict(u2))
+    if expect_safe:
+        assert "def _shared_matrix_work(" in helper
+        assert "_shared_" in patch
+        assert "def _shared_" in suggestion
+    else:
+        assert helper == ""
+        assert patch == ""
+        assert "rejected as unsafe" in suggestion.lower()
+
+
+
 
 

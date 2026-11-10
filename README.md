@@ -295,12 +295,15 @@ escaping callbacks across lexical scopes.
     advisory comment in `--patch` / `--output` artifacts); use `--closure-strictness pedantic` to
     fail closed on all unproven context managers.
   - `pedantic` (deprecated alias: `fail_closed`; or `strict_with_suppression = true` in programmatic
-    `UnitSchema` dicts when `closure_strictness` is omitted): **Fail-closed mode** that treats all
-    unproven unknown `with` context managers as potentially exception-suppressing unless explicitly
-    allowlisted via `--non-suppressing-ctx-managers` or `non_suppressing_ctx_managers` (merged
-    across global config and per-unit overrides), and rejects dunder-invoking built-in calls (`len`,
-    `bool`, `int`, `bin`, `hex`, `oct`, `isinstance`, `issubclass`, `range`) inside global-reading
-    units. Allowlist entries support bare names (including locally defined classes), relative
+    `UnitSchema` dicts when `closure_strictness` is omitted): **Fail-closed context-manager and call/setter mode**
+    that treats all unproven unknown `with` / `async with` context managers as potentially
+    exception-suppressing unless explicitly allowlisted via `--non-suppressing-ctx-managers` or
+    `non_suppressing_ctx_managers` (merged across global config and per-unit overrides), and
+    rejects dunder-invoking built-in calls (`len`, `bool`, `int`, `bin`, `hex`, `oct`, `isinstance`,
+    `issubclass`, `range`) as well as attribute, subscript, and augmented-assignment mutations
+    inside global-reading units (while read-only Python protocol syntax such as synchronous `for`
+    iteration, attribute/property reads, subscript reads, and binary/unary operators remains
+    permitted by static convention). Allowlist entries support bare names (including locally defined classes), relative
     imports (`.Name` matching `from . import Name`), dotted paths (e.g., `pkg.tx.atomic` or
     `unittest.mock.patch.object`), and wildcard attribute suffixes (`*.atomic` or `*.lock` matching
     `<any_receiver>.atomic` / `<any_receiver>.lock(...)`).
@@ -337,7 +340,8 @@ strict fail-closed safety invariants:
   module-level refactorings do not alter globals exported as public module API. When a subroutine
   inside an enclosing function reads a variable declared `global` in that enclosing scope, calls to
   arbitrary functions, context-manager blocks (`with` / `async with`), coroutine/generator
-  suspension points (`await`, `yield`, `yield from`, `async for`), and deletions (`del`) are
+  suspension points (`await`, `yield`, `yield from`, `async for`), attribute/subscript/augmented
+  assignments (`obj.attr = ...`, `obj[k] = ...`, `x += ...`), and deletions (`del`) are
   rejected as a `global_escape` hazard because they could rebind or mutate the module-level global
   mid-execution. C-level built-ins that do not invoke user-defined Python dunders
   (`_PROVEN_PURE_GLOBAL_SAFE_BUILTINS`: `callable`, `id`, `ord`) are permitted when
@@ -345,9 +349,10 @@ strict fail-closed safety invariants:
   (`_HEURISTIC_GLOBAL_SAFE_BUILTINS`: `bin`, `bool`, `chr`, `hex`, `int`, `isinstance`, `issubclass`,
   `len`, `oct`, `range`) are permitted in `strict` mode under the heuristic assumption that user
   types do not mutate module-level globals inside `__len__`/`__bool__`/`__int__`/`__index__`/
-  `__instancecheck__`/`__subclasscheck__`, and are rejected in `pedantic` mode. Remaining non-call
-  AST operations (operators, subscripts, attribute/`@property` reads, and synchronous `for`
-  iteration) are likewise assumed by heuristic not to mutate module-level globals.
+  `__instancecheck__`/`__subclasscheck__`, and are rejected in `pedantic` mode. Read-only
+  AST protocol operations (operators, subscript reads, attribute/`@property` reads, and synchronous `for`
+  iteration) are assumed by static convention not to mutate module-level globals in both `strict` and
+  `pedantic` modes.
 - **Dynamic Scope Reflection Limitations**: Downstream variable liveness analysis statically
   identifies dynamic local and global reads via `locals()`, `vars()`, `eval()`, `exec()`, `dir()`,
   and `globals()`. Dynamic reflection via runtime stack frame introspection (such as

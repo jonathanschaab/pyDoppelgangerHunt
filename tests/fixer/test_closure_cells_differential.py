@@ -1549,3 +1549,348 @@ def test_definite_assignment_engine_parity_across_generated_control_flow() -> No
             assert ext_term == block_term
             assert def_assign == ext_bound
             assert def_assign.isdisjoint(cond_assign)
+
+
+def test_differential_extended_runtime_semantics_equivalence(tmp_path: Path) -> None:
+    """Verifies differential runtime equivalence across exceptions, globals, shared mutation, callbacks, generators, ctx managers, and async cleanup."""
+    import asyncio  # pylint: disable=import-outside-toplevel
+    import shutil  # pylint: disable=import-outside-toplevel
+    import subprocess  # pylint: disable=import-outside-toplevel
+    import pytest  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer import generate_refactoring_patch
+
+    if shutil.which("git") is None:
+        pytest.skip("git executable is required for differential patch application")
+
+    # 1. Exception type/message propagation, shared object mutation, callback invocation, and context-manager enter/exit counts
+    import types  # pylint: disable=import-outside-toplevel
+
+    class _TrackedNullCtx:
+        def __init__(self, log: list[Any]) -> None:
+            self.log = log
+
+        def __enter__(self) -> "_TrackedNullCtx":
+            self.log.append("enter")
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            self.log.append(("exit", None if exc_type is None else exc_type.__name__))
+
+    tx_helpers_mod = types.ModuleType("tx_helpers")
+    tx_helpers_mod.TrackedNullCtx = _TrackedNullCtx  # type: ignore[attr-defined]
+    sys.modules["tx_helpers"] = tx_helpers_mod
+    try:
+        sync_mod_src = (
+            "from tx_helpers import TrackedNullCtx\n"
+            "GLOBAL_COUNT = 10\n"
+            "def run_a(items, shared_list, ctx_log, fail_at):\n"
+            "    acc = 0\n"
+            "    cbs = []\n"
+            "    with TrackedNullCtx(ctx_log):\n"
+            "        for idx, item in enumerate(items):\n"
+            "            if idx == fail_at:\n"
+            "                raise ValueError(f'boom:{item}')\n"
+            "            acc += item\n"
+            "            shared_list.append(item * 2)\n"
+            "            cbs.append(lambda delta, captured=item: captured + delta)\n"
+            "    return acc, [fn(1) for fn in cbs], GLOBAL_COUNT\n"
+            "def run_b(items, shared_list, ctx_log, fail_at):\n"
+            "    acc = 0\n"
+            "    cbs = []\n"
+            "    with TrackedNullCtx(ctx_log):\n"
+            "        for idx, item in enumerate(items):\n"
+            "            if idx == fail_at:\n"
+            "                raise ValueError(f'boom:{item}')\n"
+            "            acc += item\n"
+            "            shared_list.append(item * 2)\n"
+            "            cbs.append(lambda delta, captured=item: captured + delta)\n"
+            "    return acc, [fn(1) for fn in cbs], GLOBAL_COUNT\n"
+        )
+        sync_dir = tmp_path / "ext_sync"
+        sync_dir.mkdir(parents=True, exist_ok=True)
+        (sync_dir / ".git").mkdir(exist_ok=True)
+        sync_file = sync_dir / "sync_mod.py"
+        sync_file.write_text(sync_mod_src, encoding="utf-8")
+        sync_tree = ast.parse(sync_mod_src)
+        run_a_node = sync_tree.body[2]
+        run_b_node = sync_tree.body[3]
+        assert isinstance(run_a_node, ast.FunctionDef)
+        assert isinstance(run_b_node, ast.FunctionDef)
+        u1_sync = {
+            "file": str(sync_file),
+            "start": run_a_node.body[0].lineno,
+            "end": run_a_node.body[-2].end_lineno,
+            "name": "run_a:with",
+            "kind": "compound_block",
+        }
+        u2_sync = {
+            "file": str(sync_file),
+            "start": run_b_node.body[0].lineno,
+            "end": run_b_node.body[-2].end_lineno,
+            "name": "run_b:with",
+            "kind": "compound_block",
+        }
+        patch_sync = generate_refactoring_patch(
+            [(1.0, u1_sync, u2_sync)],
+            repo_root=str(sync_dir),
+            replace_clones=True,
+            closure_strictness="pedantic",
+            non_suppressing_ctx_managers=["TrackedNullCtx"],
+        )
+        assert "_shared_" in patch_sync
+        subprocess.run(
+            ["git", "apply", "--whitespace=nowarn"],
+            input=patch_sync,
+            text=True,
+            cwd=str(sync_dir),
+            check=True,
+            capture_output=True,
+        )
+        ref_sync_src = sync_file.read_text(encoding="utf-8")
+
+        ns_sync_orig: dict[str, Any] = {}
+        ns_sync_ref: dict[str, Any] = {}
+        exec(compile(sync_mod_src, "<sync_orig>", "exec"), ns_sync_orig)  # pylint: disable=exec-used
+        exec(compile(ref_sync_src, "<sync_ref>", "exec"), ns_sync_ref)  # pylint: disable=exec-used
+
+        # Normal execution: compare return values, shared list mutation, callback results, global state, and CM enter/exit log
+        shared_o: list[int] = []
+        shared_r: list[int] = []
+        log_o: list[Any] = []
+        log_r: list[Any] = []
+        res_o = ns_sync_orig["run_a"]([2, 4, 6], shared_o, log_o, -1)
+        res_r = ns_sync_ref["run_a"]([2, 4, 6], shared_r, log_r, -1)
+        assert res_o == res_r == (12, [3, 5, 7], 10)
+        assert shared_o == shared_r == [4, 8, 12]
+        assert log_o == log_r == ["enter", ("exit", None)]
+        assert ns_sync_orig["GLOBAL_COUNT"] == ns_sync_ref["GLOBAL_COUNT"] == 10
+
+        # Raising execution: compare exception type, message, partial shared mutation, and CM __exit__ exception record
+        shared_exc_o: list[int] = []
+        shared_exc_r: list[int] = []
+        log_exc_o: list[Any] = []
+        log_exc_r: list[Any] = []
+        with pytest.raises(ValueError) as exc_info_o:
+            ns_sync_orig["run_b"]([5, 9, 11], shared_exc_o, log_exc_o, 1)
+        with pytest.raises(ValueError) as exc_info_r:
+            ns_sync_ref["run_b"]([5, 9, 11], shared_exc_r, log_exc_r, 1)
+        assert type(exc_info_o.value) is type(exc_info_r.value)
+        assert str(exc_info_o.value) == str(exc_info_r.value) == "boom:9"
+        assert shared_exc_o == shared_exc_r == [10]
+        assert log_exc_o == log_exc_r == ["enter", ("exit", "ValueError")]
+    finally:
+        sys.modules.pop("tx_helpers", None)
+
+    # 2. Global setter/subscript/augassign rebinding hazard blocked (and negative control proving divergence)
+    setter_hazard_src = (
+        "STATE = 1\n"
+        "def entry(holder):\n"
+        "    global STATE\n"
+        "    before = STATE\n"
+        "    holder.value = 99\n"
+        "    after = STATE\n"
+        "    return before, after\n"
+    )
+    _run_differential_refactoring_case(
+        tmp_path,
+        "global_setter_rebinding_blocked",
+        setter_hazard_src,
+        (4, 6),
+        expect_patch=False,
+        call_args_list=[(types.SimpleNamespace(),)],
+        expected_hazard_reason="global_escape",
+    )
+
+    # 3. Generator completion and .close() / .throw() behavior
+    gen_mod_src = (
+        "def gen_a(items):\n"
+        "    acc = 0\n"
+        "    for item in items:\n"
+        "        acc += item\n"
+        "        yield acc\n"
+        "    return acc\n"
+        "def gen_b(items):\n"
+        "    acc = 0\n"
+        "    for item in items:\n"
+        "        acc += item\n"
+        "        yield acc\n"
+        "    return acc\n"
+    )
+    gen_dir = tmp_path / "ext_gen"
+    gen_dir.mkdir(parents=True, exist_ok=True)
+    (gen_dir / ".git").mkdir(exist_ok=True)
+    gen_file = gen_dir / "gen_mod.py"
+    gen_file.write_text(gen_mod_src, encoding="utf-8")
+    patch_gen = generate_refactoring_patch(
+        [
+            (
+                1.0,
+                {
+                    "file": str(gen_file),
+                    "start": 2,
+                    "end": 5,
+                    "name": "gen_a:loop",
+                    "kind": "compound_block",
+                    "has_yield": True,
+                },
+                {
+                    "file": str(gen_file),
+                    "start": 8,
+                    "end": 11,
+                    "name": "gen_b:loop",
+                    "kind": "compound_block",
+                    "has_yield": True,
+                },
+            )
+        ],
+        repo_root=str(gen_dir),
+        replace_clones=True,
+    )
+    assert "_shared_" in patch_gen
+    subprocess.run(
+        ["git", "apply", "--whitespace=nowarn"],
+        input=patch_gen,
+        text=True,
+        cwd=str(gen_dir),
+        check=True,
+        capture_output=True,
+    )
+    ref_gen_src = gen_file.read_text(encoding="utf-8")
+    ns_gen_orig: dict[str, Any] = {}
+    ns_gen_ref: dict[str, Any] = {}
+    exec(compile(gen_mod_src, "<gen_orig>", "exec"), ns_gen_orig)  # pylint: disable=exec-used
+    exec(compile(ref_gen_src, "<gen_ref>", "exec"), ns_gen_ref)  # pylint: disable=exec-used
+
+    # Exhaustion + StopIteration.value equivalence
+    g_o = ns_gen_orig["gen_a"]([1, 2, 3])
+    g_r = ns_gen_ref["gen_a"]([1, 2, 3])
+    yielded_o: list[int] = []
+    yielded_r: list[int] = []
+    ret_o = None
+    ret_r = None
+    try:
+        while True:
+            yielded_o.append(next(g_o))
+    except StopIteration as stop_o:
+        ret_o = stop_o.value
+    try:
+        while True:
+            yielded_r.append(next(g_r))
+    except StopIteration as stop_r:
+        ret_r = stop_r.value
+    assert yielded_o == yielded_r == [1, 3, 6]
+    assert ret_o == ret_r == 6
+
+    # .throw() and .close() equivalence
+    g_throw_o = ns_gen_orig["gen_b"]([10, 20])
+    g_throw_r = ns_gen_ref["gen_b"]([10, 20])
+    assert next(g_throw_o) == next(g_throw_r) == 10
+    with pytest.raises(RuntimeError, match="injected"):
+        g_throw_o.throw(RuntimeError("injected"))
+    with pytest.raises(RuntimeError, match="injected"):
+        g_throw_r.throw(RuntimeError("injected"))
+    g_close_o = ns_gen_orig["gen_a"]([7, 8])
+    g_close_r = ns_gen_ref["gen_a"]([7, 8])
+    assert next(g_close_o) == next(g_close_r) == 7
+    g_close_o.close()
+    g_close_r.close()
+    with pytest.raises(StopIteration):
+        next(g_close_o)
+    with pytest.raises(StopIteration):
+        next(g_close_r)
+
+    # 4. Async execution and cancellation/cleanup equivalence
+    async_mod_src = (
+        "import asyncio\n"
+        "import contextlib\n"
+        "async def async_work_a(items, cleanup_log):\n"
+        "    try:\n"
+        "        async with contextlib.nullcontext():\n"
+        "            total = 0\n"
+        "            for v in items:\n"
+        "                await asyncio.sleep(0)\n"
+        "                total += v\n"
+        "        return total\n"
+        "    finally:\n"
+        "        cleanup_log.append('cleaned')\n"
+        "async def async_work_b(items, cleanup_log):\n"
+        "    try:\n"
+        "        async with contextlib.nullcontext():\n"
+        "            total = 0\n"
+        "            for v in items:\n"
+        "                await asyncio.sleep(0)\n"
+        "                total += v\n"
+        "        return total\n"
+        "    finally:\n"
+        "        cleanup_log.append('cleaned')\n"
+    )
+    async_dir = tmp_path / "ext_async"
+    async_dir.mkdir(parents=True, exist_ok=True)
+    (async_dir / ".git").mkdir(exist_ok=True)
+    async_file = async_dir / "async_mod.py"
+    async_file.write_text(async_mod_src, encoding="utf-8")
+    patch_async = generate_refactoring_patch(
+        [
+            (
+                1.0,
+                {
+                    "file": str(async_file),
+                    "start": 5,
+                    "end": 9,
+                    "name": "async_work_a:block",
+                    "kind": "compound_block",
+                    "has_await": True,
+                },
+                {
+                    "file": str(async_file),
+                    "start": 15,
+                    "end": 19,
+                    "name": "async_work_b:block",
+                    "kind": "compound_block",
+                    "has_await": True,
+                },
+            )
+        ],
+        repo_root=str(async_dir),
+        replace_clones=True,
+        closure_strictness="pedantic",
+    )
+    assert "_shared_" in patch_async
+    subprocess.run(
+        ["git", "apply", "--whitespace=nowarn"],
+        input=patch_async,
+        text=True,
+        cwd=str(async_dir),
+        check=True,
+        capture_output=True,
+    )
+    ref_async_src = async_file.read_text(encoding="utf-8")
+    ns_async_orig: dict[str, Any] = {}
+    ns_async_ref: dict[str, Any] = {}
+    exec(compile(async_mod_src, "<async_orig>", "exec"), ns_async_orig)  # pylint: disable=exec-used
+    exec(compile(ref_async_src, "<async_ref>", "exec"), ns_async_ref)  # pylint: disable=exec-used
+
+    async def _verify_async_parity() -> None:
+        clean_o: list[str] = []
+        clean_r: list[str] = []
+        val_o = await ns_async_orig["async_work_a"]([3, 4, 5], clean_o)
+        val_r = await ns_async_ref["async_work_a"]([3, 4, 5], clean_r)
+        assert val_o == val_r == 12
+        assert clean_o == clean_r == ["cleaned"]
+
+        # Cancellation mid-coroutine triggers identical finally cleanup and CancelledError
+        cancel_log_o: list[str] = []
+        cancel_log_r: list[str] = []
+        task_o = asyncio.create_task(ns_async_orig["async_work_b"]([1, 2, 3], cancel_log_o))
+        task_r = asyncio.create_task(ns_async_ref["async_work_b"]([1, 2, 3], cancel_log_r))
+        await asyncio.sleep(0)
+        task_o.cancel()
+        task_r.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task_o
+        with pytest.raises(asyncio.CancelledError):
+            await task_r
+        assert cancel_log_o == cancel_log_r == ["cleaned"]
+
+    asyncio.run(_verify_async_parity())
+

@@ -8,6 +8,7 @@ from typing import (
     AbstractSet,
     Any,
     Iterable,
+    Iterator,
     List,
     Mapping,
     NamedTuple,
@@ -1640,3 +1641,21 @@ def _extract_scope_escaping_bindings(
         u_end_col=u_end_col,
     )
     return nonlocal_names | outer_globals
+
+
+def _iter_shallow_scope_nodes(
+    nodes: Sequence[ast.AST],
+    *,
+    deferred_scope_types: Tuple[type, ...] = _INNER_SCOPE_TYPES,
+) -> Iterator[ast.AST]:
+    """Yields AST nodes in nodes, visiting headers of deferred_scope_types without descending into their bodies."""
+    stack: List[ast.AST] = list(reversed(nodes))
+    while stack:
+        curr = stack.pop()
+        yield curr
+        if isinstance(curr, deferred_scope_types):
+            for hdr in reversed(tuple(iter_nested_scope_header_nodes(curr))):
+                stack.append(hdr)
+            continue
+        for ch in reversed(tuple(ast.iter_child_nodes(curr))):
+            stack.append(ch)

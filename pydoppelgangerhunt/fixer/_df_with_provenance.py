@@ -54,6 +54,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _extract_scope_local_names,
     _extract_single_node_local_names,
     _is_irrefutable_case,
+    _iter_shallow_scope_nodes,
     _node_has_star_import,
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
@@ -720,16 +721,7 @@ def _iter_shallow_scope_body_nodes(scope_node: ast.AST) -> Iterator[ast.AST]:
     body_attr = getattr(scope_node, "body", ())
     if not isinstance(body_attr, (list, tuple)):
         return
-    stack: List[ast.AST] = list(reversed(body_attr))
-    while stack:
-        curr = stack.pop()
-        yield curr
-        if isinstance(curr, _INNER_SCOPE_TYPES):
-            for hdr in reversed(tuple(iter_nested_scope_header_nodes(curr))):
-                stack.append(hdr)
-            continue
-        for ch in reversed(tuple(ast.iter_child_nodes(curr))):
-            stack.append(ch)
+    yield from _iter_shallow_scope_nodes(body_attr)
 
 
 _DYNAMIC_CLASS_NAMESPACE_CALLS: frozenset[str] = frozenset(
@@ -1158,10 +1150,17 @@ def _bind_expr_target_provenance(
         return prov.with_suppressor(
             name, allow_positive=allow_positive, imported_qualname=target_qual
         )
-    if _is_proven_non_suppressing_target_expr(
-        value_expr,
-        prov,
-        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+    if value_expr is not None and (
+        _is_proven_non_suppressing_target_expr(
+            value_expr,
+            prov,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+        )
+        or _is_proven_non_suppressing_call(
+            value_expr,
+            prov,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+        )
     ):
         return prov.with_non_suppressor(
             name, allow_positive=allow_positive, imported_qualname=target_qual
@@ -2490,8 +2489,7 @@ def _classify_with_item_suppression(
         prov,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
     ) or (
-        bool(extra_non_suppressing_ctx_managers)
-        and isinstance(expr, (ast.Name, ast.Attribute))
+        isinstance(expr, (ast.Name, ast.Attribute))
         and _is_proven_non_suppressing_target_expr(
             expr,
             prov,
@@ -2513,20 +2511,20 @@ def _classify_with_suppression(
         return "non_suppressing"
     prov = _coerce_suppress_provenance(suppress_aliases)
     all_non_suppressing = True
-    for item in stmt.items:
-        prov = _update_suppress_provenance_from_expr_walrus((item.context_expr,), prov)
+    for step in _iter_with_item_provenance_steps(
+        stmt,
+        prov,
+        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+    ):
         item_mode = _classify_with_item_suppression(
-            item.context_expr,
-            prov,
+            step.item.context_expr,
+            step.post_expr_prov,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         )
         if item_mode == "suppressing":
             return "suppressing"
         if item_mode != "non_suppressing":
             all_non_suppressing = False
-        if item.optional_vars is not None:
-            for o_n in _extract_store_names_in_node(item.optional_vars):
-                prov = prov.clear_name(o_n)
     return "non_suppressing" if all_non_suppressing else "unknown"
 
 
@@ -2657,6 +2655,7 @@ def _iter_with_item_provenance_steps(
         )
         if item_sup:
             after_sup = True
+        item_prov = post_item_prov
 
 
 def _with_header_has_post_suppress_risk(
@@ -2710,20 +2709,22 @@ def _with_stmt_looks_suppressing(
 ) -> bool:
     """Returns True if any unproven item in stmt looks like an exception-suppressing manager."""
     prov = _coerce_suppress_provenance(suppress_aliases)
-    for item in stmt.items:
-        prov = _update_suppress_provenance_from_expr_walrus((item.context_expr,), prov)
+    for step in _iter_with_item_provenance_steps(
+        stmt,
+        prov,
+        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+    ):
         item_mode = _classify_with_item_suppression(
-            item.context_expr,
-            prov,
+            step.item.context_expr,
+            step.post_expr_prov,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         )
         if item_mode == "suppressing":
             return True
-        if item_mode == "unknown" and _looks_like_suppressing_ctx_manager(item.context_expr, prov):
+        if item_mode == "unknown" and _looks_like_suppressing_ctx_manager(
+            step.item.context_expr, step.post_expr_prov
+        ):
             return True
-        if item.optional_vars is not None:
-            for o_n in _extract_store_names_in_node(item.optional_vars):
-                prov = prov.clear_name(o_n)
     return False
 
 
@@ -3047,16 +3048,18 @@ def _is_non_raising_suppress_or_null_with(
     stmt: ast.AST,
     prov: _SuppressProvenance = _EMPTY_SUPPRESS_PROVENANCE,
 ) -> bool:
-    """Returns True if stmt is a sync With whose items are unshadowed contextlib.suppress or nullcontext calls."""
-    if not isinstance(stmt, ast.With) or not stmt.items:
+    """Returns True if stmt is a sync With (suppress/nullcontext) or AsyncWith (nullcontext) with proven non-raising entry/exit."""
+    if not isinstance(stmt, (ast.With, ast.AsyncWith)) or not stmt.items:
         return False
+    is_async = isinstance(stmt, ast.AsyncWith)
     cur_prov = prov
     for item in stmt.items:
         call = item.context_expr
         if not isinstance(call, ast.Call):
             return False
         cur_prov = _update_suppress_provenance_from_expr_walrus((call,), cur_prov)
-        if _resolve_suppress_or_null_qualname(call.func, cur_prov) is None:
+        qual = _resolve_suppress_or_null_qualname(call.func, cur_prov)
+        if qual is None or (is_async and qual != "contextlib.nullcontext"):
             return False
         if item.optional_vars is not None:
             cur_prov = _clear_store_target_provenance(item.optional_vars, cur_prov)
@@ -3067,7 +3070,7 @@ def _non_raising_stmt_terminates(stmt: ast.AST) -> bool:
     """Returns True if a proven non-raising statement unconditionally exits the block."""
     if isinstance(stmt, (ast.Return, ast.Break, ast.Continue)):
         return True
-    if isinstance(stmt, ast.With):
+    if isinstance(stmt, (ast.With, ast.AsyncWith)):
         return any(_non_raising_stmt_terminates(s) for s in stmt.body)
     if isinstance(stmt, ast.If) and stmt.orelse:
         return any(_non_raising_stmt_terminates(s) for s in stmt.body) and any(
@@ -3168,55 +3171,56 @@ def _stmt_cannot_raise_in_suppress(
         )
     if isinstance(stmt, (ast.With, ast.AsyncWith)):
         prov = _coerce_suppress_provenance(suppress_aliases)
-        if _is_non_raising_suppress_or_null_with(stmt, prov) and all(
-            (item.optional_vars is None or isinstance(item.optional_vars, ast.Name))
-            and isinstance(item.context_expr, ast.Call)
-            and not any(
+        if not _is_non_raising_suppress_or_null_with(stmt, prov):
+            return False
+        inner_safe = set(safe_names)
+        inner_bool = set(safe_bool_names)
+        inner_prov = prov
+        for item in stmt.items:
+            if not (
+                (item.optional_vars is None or isinstance(item.optional_vars, ast.Name))
+                and isinstance(item.context_expr, ast.Call)
+            ):
+                return False
+            call_args = (*item.context_expr.args, *item.context_expr.keywords)
+            if any(
                 isinstance(a, ast.Starred) or getattr(a, "arg", "k") is None
-                for a in (
-                    *item.context_expr.args,
-                    *item.context_expr.keywords,
-                )
+                for a in call_args
+            ):
+                return False
+            arg_exprs = tuple(
+                a.value if isinstance(a, ast.keyword) else a for a in call_args
             )
-            and all(
-                _is_non_raising_expr(
-                    a.value if isinstance(a, ast.keyword) else a,
-                    safe_names | _SAFE_EXCEPTION_TYPE_NAMES,
-                    safe_bool_names,
-                    strict_names=strict_names,
-                )
-                for a in (
-                    *item.context_expr.args,
-                    *item.context_expr.keywords,
-                )
-            )
-            for item in stmt.items
-        ):
-            inner_safe = set(safe_names)
-            inner_bool = set(safe_bool_names)
-            inner_prov = prov
-            for item in stmt.items:
-                _apply_non_raising_expr_walrus_updates(
-                    item.context_expr,
-                    inner_safe,
+            if (
+                _check_and_advance_non_raising_seq(
+                    arg_exprs,
+                    inner_safe | _SAFE_EXCEPTION_TYPE_NAMES,
                     inner_bool,
                     strict_names=strict_names,
                 )
-                inner_prov = _update_suppress_provenance_from_expr_walrus(
-                    (item.context_expr,), inner_prov
-                )
-                if isinstance(item.optional_vars, ast.Name):
-                    inner_safe.add(item.optional_vars.id)
-                    inner_bool.discard(item.optional_vars.id)
-                    inner_prov = _clear_store_target_provenance(item.optional_vars, inner_prov)
-            return not _split_suppress_with_body(
-                stmt.body,
-                safe_names=inner_safe,
-                safe_bool_names=inner_bool,
+                is None
+            ):
+                return False
+            _apply_non_raising_expr_walrus_updates(
+                item.context_expr,
+                inner_safe,
+                inner_bool,
                 strict_names=strict_names,
-                suppress_aliases=inner_prov,
-            )[1]
-        return False
+            )
+            inner_prov = _update_suppress_provenance_from_expr_walrus(
+                (item.context_expr,), inner_prov
+            )
+            if isinstance(item.optional_vars, ast.Name):
+                inner_safe.add(item.optional_vars.id)
+                inner_bool.discard(item.optional_vars.id)
+                inner_prov = _clear_store_target_provenance(item.optional_vars, inner_prov)
+        return not _split_suppress_with_body(
+            stmt.body,
+            safe_names=inner_safe,
+            safe_bool_names=inner_bool,
+            strict_names=strict_names,
+            suppress_aliases=inner_prov,
+        )[1]
     return False
 
 
@@ -3331,7 +3335,7 @@ def _apply_non_raising_stmt_safe_updates(
             _apply_non_raising_expr_walrus_updates(h, cur_safe, cur_bool, strict_names=strict_names)
         cur_safe.add(b_stmt.name)
         cur_bool.add(b_stmt.name)
-    elif isinstance(b_stmt, ast.With):
+    elif isinstance(b_stmt, (ast.With, ast.AsyncWith)):
         for item in b_stmt.items:
             _apply_non_raising_expr_walrus_updates(
                 item.context_expr,
@@ -3444,6 +3448,35 @@ def _advance_prov_through_with_items(
     return item_prov
 
 
+def _record_with_items_heuristic_ctx_managers(
+    stmt: Union[ast.With, ast.AsyncWith],
+    suppress_aliases: Union[_SuppressProvenance, Iterable[str]] = _EMPTY_SUPPRESS_PROVENANCE,
+    *,
+    extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
+    strict_with_suppression: bool = False,
+) -> None:
+    """Records any unknown context-manager items in stmt that rely on the strict-mode name heuristic."""
+    if strict_with_suppression:
+        return
+    prov = _coerce_suppress_provenance(suppress_aliases)
+    for step in _iter_with_item_provenance_steps(
+        stmt,
+        prov,
+        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+        strict_with_suppression=strict_with_suppression,
+    ):
+        expr = step.item.context_expr
+        item_mode = _classify_with_item_suppression(
+            expr,
+            step.post_expr_prov,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+        )
+        if item_mode == "unknown" and not _looks_like_suppressing_ctx_manager(
+            expr, step.post_expr_prov
+        ):
+            _warn_heuristic_non_suppressing_ctx_manager(expr)
+
+
 def _split_with_body_by_mode(
     stmt: Union[ast.With, ast.AsyncWith],
     suppress_aliases: Union[_SuppressProvenance, Iterable[str]] = _EMPTY_SUPPRESS_PROVENANCE,
@@ -3455,6 +3488,12 @@ def _split_with_body_by_mode(
     strict_with_suppression: bool = False,
 ) -> Tuple[List[ast.stmt], List[ast.stmt]]:
     """Splits a with-block body into (guaranteed_prefix, potentially_suppressed_suffix) across 3 suppression states."""
+    _record_with_items_heuristic_ctx_managers(
+        stmt,
+        suppress_aliases,
+        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+        strict_with_suppression=strict_with_suppression,
+    )
     if _with_header_has_post_suppress_risk(
         stmt,
         suppress_aliases,
@@ -3496,23 +3535,6 @@ def _split_with_body_by_mode(
                 strict_names=strict_names,
                 suppress_aliases=body_prov,
             )
-        prov_check = _coerce_suppress_provenance(suppress_aliases)
-        for item in stmt.items:
-            prov_check = _update_suppress_provenance_from_expr_walrus(
-                (item.context_expr,), prov_check
-            )
-            if (
-                _classify_with_item_suppression(
-                    item.context_expr,
-                    prov_check,
-                    extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-                )
-                == "unknown"
-            ):
-                _warn_heuristic_non_suppressing_ctx_manager(item.context_expr)
-            if item.optional_vars is not None:
-                for o_n in _extract_store_names_in_node(item.optional_vars):
-                    prov_check = prov_check.clear_name(o_n)
     return list(stmt.body), []
 
 

@@ -217,15 +217,158 @@ UnitDict = Dict[str, Any]
 
 _UNIT_SCHEMA_KEYS: frozenset[str] = frozenset(UnitSchema.__annotations__.keys())
 
+_UNIT_BOOL_KEYS: frozenset[str] = frozenset(
+    {
+        "is_subroutine",
+        "source_lines_is_sliced",
+        "source_lines_is_col_sliced",
+        "enclosing_is_async",
+        "enclosing_is_classmethod",
+        "enclosing_is_staticmethod",
+        "is_static",
+        "is_class_method",
+        "is_async",
+        "has_yield",
+        "has_await",
+        "skip_pre_unit_closures",
+        "strict_with_suppression",
+    }
+)
+_UNIT_STR_KEYS: frozenset[str] = frozenset(
+    {
+        "file",
+        "name",
+        "kind",
+        "type",
+        "source_code",
+        "source_text",
+        "file_source",
+        "receiver_param",
+        "receiver_kind",
+        "self_param",
+        "cls_param",
+        "enclosing_class",
+        "enclosing_function",
+        "closure_strictness",
+        "structural_hash",
+    }
+)
+_UNIT_NONNEG_INT_KEYS: frozenset[str] = frozenset(
+    {
+        "docstring_end",
+        "enclosing_class_start",
+        "token_count",
+        "lines",
+        "sloc",
+        "complexity",
+    }
+)
+_UNIT_LINE_COORD_KEYS: frozenset[str] = frozenset(
+    {"start", "end", "lineno", "end_lineno"}
+)
+_UNIT_COL_COORD_KEYS: frozenset[str] = frozenset(
+    {"start_col", "end_col", "col_offset", "start_col_offset", "end_col_offset"}
+)
+_UNIT_STR_SEQ_KEYS: frozenset[str] = frozenset(
+    {
+        "source_lines",
+        "inputs",
+        "outputs",
+        "precomputed_outputs",
+        "non_suppressing_ctx_managers",
+        "norm_tokens",
+        "calls",
+    }
+)
+_VALID_CLOSURE_STRICTNESS_VALUES: frozenset[str] = frozenset(
+    {"strict", "pedantic", "lenient", "fail_closed", "fast", "skip"}
+)
+
+
+def _is_valid_str_collection(val: Any) -> bool:
+    """Returns True if val is a non-string sequence or set of strings."""
+    if isinstance(val, (str, bytes, bytearray, Mapping)) or not isinstance(
+        val, (Sequence, Set)
+    ):
+        return False
+    return all(isinstance(item, str) for item in val)
+
+
+def _validate_known_unit_field_value(key: str, val: Any) -> None:
+    """Raises ValueError if a non-None value for a known UnitSchema key has an invalid type or domain."""
+    if key in _UNIT_BOOL_KEYS:
+        if not isinstance(val, bool):
+            raise ValueError(f"Expected bool for unit field {key!r}, got {val!r}")
+        return
+    if key in _UNIT_STR_KEYS:
+        if not isinstance(val, str):
+            raise ValueError(f"Expected str for unit field {key!r}, got {val!r}")
+        if (
+            key == "closure_strictness"
+            and val.strip().lower() not in _VALID_CLOSURE_STRICTNESS_VALUES
+        ):
+            raise ValueError(
+                f"Invalid closure_strictness value {val!r}; expected one of "
+                f"{sorted(_VALID_CLOSURE_STRICTNESS_VALUES)}"
+            )
+        return
+    if key in _UNIT_NONNEG_INT_KEYS:
+        if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+            raise ValueError(
+                f"Expected non-negative int for unit field {key!r}, got {val!r}"
+            )
+        return
+    if key in _UNIT_LINE_COORD_KEYS or key in _UNIT_COL_COORD_KEYS:
+        min_coord = 1 if key in _UNIT_LINE_COORD_KEYS else 0
+        if isinstance(val, bool) or not isinstance(val, (int, str)):
+            raise ValueError(
+                f"Expected coordinate int or str for unit field {key!r}, got {val!r}"
+            )
+        try:
+            parsed = parse_unit_coord({key: val}, key, default=None, strict=True)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid coordinate value for unit field {key!r}: {val!r}"
+            ) from exc
+        if parsed is None or parsed < min_coord:
+            raise ValueError(
+                f"Invalid coordinate value for unit field {key!r}: {val!r}"
+            )
+        return
+    if key in _UNIT_STR_SEQ_KEYS:
+        if not _is_valid_str_collection(val):
+            raise ValueError(
+                f"Expected sequence of str for unit field {key!r}, got {val!r}"
+            )
+        return
+    if key == "tokens":
+        is_nonneg_int = not isinstance(val, bool) and isinstance(val, int) and val >= 0
+        if not (is_nonneg_int or _is_valid_str_collection(val)):
+            raise ValueError(
+                f"Expected non-negative int or sequence of str for 'tokens', got {val!r}"
+            )
+        return
+    if key == "shingles":
+        if isinstance(val, (str, bytes, bytearray, Mapping)) or not isinstance(
+            val, (Sequence, Set)
+        ):
+            raise ValueError(f"Expected sequence for 'shingles', got {val!r}")
+        return
+    if key == "scope" and not isinstance(val, Mapping):
+        raise ValueError(f"Expected mapping for 'scope', got {val!r}")
+    if key == "ast_node" and not isinstance(val, ast.AST):
+        raise ValueError(f"Expected ast.AST for 'ast_node', got {val!r}")
+
 
 def validate_unit_schema(
     unit: Mapping[str, Any], *, strict: bool = False
 ) -> Set[str]:
-    """Validates a unit dictionary against documented UnitSchema keys.
+    """Validates a unit dictionary against documented UnitSchema keys and field types.
 
-    Raises ``TypeError`` if ``unit`` is not a mapping. Returns the set of
-    unrecognized keys not declared on ``UnitSchema``, or raises ``ValueError``
-    when ``strict=True`` and unrecognized keys are present.
+    Raises ``TypeError`` if ``unit`` is not a mapping, or ``ValueError`` if any
+    known field has an invalid value type/range (or when ``strict=True`` and
+    unrecognized keys are present). Returns the set of unrecognized keys not
+    declared on ``UnitSchema``.
     """
     if not isinstance(unit, Mapping):
         raise TypeError(f"Expected a unit mapping, got {type(unit).__name__}")
@@ -234,6 +377,18 @@ def validate_unit_schema(
         raise ValueError(
             f"Unrecognized keys in unit dictionary: {sorted(unknown)}"
         )
+    for k, v in unit.items():
+        if k in _UNIT_SCHEMA_KEYS and v is not None:
+            _validate_known_unit_field_value(str(k), v)
+    start_raw = unit.get("start") if unit.get("start") is not None else unit.get("lineno")
+    end_raw = unit.get("end") if unit.get("end") is not None else unit.get("end_lineno")
+    if start_raw is not None and end_raw is not None:
+        s_val = parse_unit_coord({"start": start_raw}, "start", default=None, strict=True)
+        e_val = parse_unit_coord({"end": end_raw}, "end", default=None, strict=True)
+        if s_val is not None and e_val is not None and e_val < s_val:
+            raise ValueError(
+                f"Inverted line coordinates in unit dictionary: start={s_val} > end={e_val}"
+            )
     return unknown
 
 _parse_unit_coord = parse_unit_coord

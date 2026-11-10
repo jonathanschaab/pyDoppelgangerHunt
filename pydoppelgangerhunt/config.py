@@ -174,15 +174,17 @@ def log_heuristic_ctx_manager_summary(*, force: bool = False) -> Tuple[str, ...]
         overflow = _heuristic_ctx_managers_overflow_count[0]
         _heuristic_non_suppressing_ctx_managers.clear()
         _heuristic_ctx_managers_overflow_count[0] = 0
-    total_count = len(names) + overflow
+    distinct_count = len(names)
     preview = ", ".join(repr(n) for n in names[:10])
-    if total_count > 10:
-        preview += f", ... ({total_count} total)"
+    if distinct_count > 10:
+        preview += f", ... ({distinct_count} retained)"
+    if overflow > 0:
+        preview += f"; {overflow} additional occurrence(s) omitted beyond cap"
     logger.warning(
         "Summary: %d unproven context manager(s) (%s) were treated as non-suppressing via "
         "name heuristic in strict mode; use --closure-strictness pedantic to fail closed or "
         "list known-safe managers in --non-suppressing-ctx-managers.",
-        total_count,
+        distinct_count,
         preview,
     )
     return names
@@ -201,10 +203,13 @@ def resolve_closure_strictness_mode(
     for unproven unknown context managers (treating them as non-suppressing unless their
     name matches suppression idioms such as suppress/raises/ignore/subTest/ExitStack or is
     proven suppressing via local/function/class __exit__ provenance).
-    'pedantic' (deprecated alias 'fail_closed') is the fail-closed mode that treats all
-    unproven unknown context managers as potentially exception-suppressing unless explicitly
-    listed in non_suppressing_ctx_managers, and rejects dunder-invoking built-in calls inside
-    global-reading units.
+    'pedantic' (deprecated alias 'fail_closed') is the fail-closed mode for context-manager
+    suppression and global-reading calls/setters: it treats all unproven unknown context
+    managers as potentially exception-suppressing unless explicitly listed in
+    non_suppressing_ctx_managers, and rejects dunder-invoking built-in calls and
+    attribute/subscript/augmented-assignment mutations in global-reading units (while still
+    permitting read-only protocol syntax such as synchronous for-iteration, attribute/subscript
+    reads, and operators).
     'lenient' (deprecated aliases 'fast', 'skip') relaxes speculative unreferenced-sibling closure
     checks while still enforcing direct cell-capture, intra-unit nonlocal mutator, and
     referenced-sibling closure checks.

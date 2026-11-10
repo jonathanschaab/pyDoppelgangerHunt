@@ -529,6 +529,7 @@ def _ensure_scope_owner_parent_map_locked(owner: ast.AST) -> None:
     """Ensures a scope root has a parent map recorded in O(1) if already indexed, else builds and caches it."""
     if (
         not isinstance(owner, _SCOPE_ROOT_TYPES)
+        or getattr(owner, "_is_ephemeral_unit_mod", False)
         or owner in _scope_parent_maps
         or owner in _node_to_parent_map_roots
     ):
@@ -932,9 +933,25 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
     tree_nodes: Set[ast.AST] = {
         n for n in ast.walk(tree) if not isinstance(n, _SINGLETON_AST_TYPES)
     }
+    initial_tree_nodes: Set[ast.AST] = set(tree_nodes)
     scope_nodes: Set[ast.AST] = {node for node in tree_nodes if isinstance(node, _SCOPE_ROOT_TYPES)}
     scope_nodes.add(tree)
     with _downstream_cache_lock:
+        worklist: List[ast.AST] = list(scope_nodes)
+        while worklist:
+            sc_root = worklist.pop()
+            indexed_children = _parent_map_root_nodes.get(sc_root)
+            if indexed_children:
+                for child_node in indexed_children:
+                    if child_node not in tree_nodes:
+                        tree_nodes.add(child_node)
+                        initial_tree_nodes.add(child_node)
+                        if (
+                            isinstance(child_node, _SCOPE_ROOT_TYPES)
+                            and child_node not in scope_nodes
+                        ):
+                            scope_nodes.add(child_node)
+                            worklist.append(child_node)
         candidate_roots: Set[ast.AST] = set()
         if tree in _scope_parent_maps:
             candidate_roots.add(tree)
@@ -960,6 +977,30 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
                         break
             if matched_child is None:
                 continue
+            if isinstance(tree, _SCOPE_ROOT_TYPES) and tree in pmap:
+                descends_cache: Dict[ast.AST, bool] = {}
+                for pnode in pmap:
+                    if pnode in initial_tree_nodes:
+                        descends_cache[pnode] = True
+                        continue
+                    chain: List[ast.AST] = []
+                    curr_p: Optional[ast.AST] = pnode
+                    hit = False
+                    while curr_p is not None:
+                        if curr_p in descends_cache:
+                            hit = descends_cache[curr_p]
+                            break
+                        if curr_p in initial_tree_nodes:
+                            hit = True
+                            break
+                        chain.append(curr_p)
+                        curr_p = pmap.get(curr_p)
+                    for cn in chain:
+                        descends_cache[cn] = hit
+                    if hit:
+                        tree_nodes.add(pnode)
+                        if isinstance(pnode, _SCOPE_ROOT_TYPES):
+                            scope_nodes.add(pnode)
             scope_nodes.add(root_node)
             has_inner_scope_anc = isinstance(
                 matched_child,
@@ -1039,6 +1080,14 @@ def _store_lru_cache_entry(
             return cast(_CacheValT, _store_parent_map_locked(key, value))
         if cache in (_scope_stmts_by_end, _scope_stmts_by_start) and isinstance(key, ast.AST):
             _ensure_scope_owner_parent_map_locked(key)
+        elif cache in (_scope_closures_cache, _scope_cell_info_cache) and isinstance(
+            key, _ScopeCacheKey
+        ):
+            for aux_node in key.aux_ast_nodes:
+                if isinstance(aux_node, _SCOPE_ROOT_TYPES):
+                    _ensure_scope_owner_parent_map_locked(aux_node)
+            if isinstance(key.owner, _SCOPE_ROOT_TYPES):
+                _ensure_scope_owner_parent_map_locked(key.owner)
         if key in cache:
             cache.move_to_end(key)
             return cache[key]
@@ -1126,11 +1175,6 @@ def _register_tree_source_lines(
         or (not source_lines and not source_text)
     ):
         return None
-    ck = _make_trusted_scope_cache_key(owner=tree, kind="tree_source_lines")
-    with _downstream_cache_lock:
-        if ck in _scope_cell_info_cache:
-            _scope_cell_info_cache.move_to_end(ck)
-            return cast(Tuple[str, ...], _scope_cell_info_cache[ck])
     norm_lines = (
         tuple(ln.rstrip("\r\n") for ln in source_lines)
         if source_lines is not None
@@ -1138,6 +1182,14 @@ def _register_tree_source_lines(
     )
     if not norm_lines:
         return None
+    ck = _make_trusted_scope_cache_key(owner=tree, kind="tree_source_lines")
+    with _downstream_cache_lock:
+        if ck in _scope_cell_info_cache:
+            existing_lines = cast(Tuple[str, ...], _scope_cell_info_cache[ck])
+            if existing_lines == norm_lines:
+                _scope_cell_info_cache.move_to_end(ck)
+                return existing_lines
+            _evict_tree_scopes(tree)
     _get_scope_parent_map(tree)
     return cast(
         Tuple[str, ...],
