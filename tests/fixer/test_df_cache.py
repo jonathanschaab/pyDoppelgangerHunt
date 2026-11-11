@@ -1242,6 +1242,7 @@ def test_syntax_warning_suppressed_across_parse_and_inference_paths() -> None:
     )
     with warnings.catch_warnings():
         warnings.simplefilter("error", SyntaxWarning)
+        warnings.simplefilter("error", DeprecationWarning)
         esc_tree = _get_or_parse_tree(escape_src)
         assert esc_tree is not None
         u_esc = {
@@ -2161,21 +2162,36 @@ def test_ephemeral_unit_ast_unified_tracking_and_non_weakref_fallback(
     assert custom_mod not in df_cache_mod._scope_parent_maps
 
 
-def test_suppress_syntax_warnings_fast_path_respects_preceding_error_filters() -> None:
+@pytest.mark.parametrize("sim_version", [(3, 11, 18), (3, 12, 0)])
+def test_suppress_syntax_warnings_fast_path_respects_preceding_error_filters(
+    monkeypatch: pytest.MonkeyPatch,
+    sim_version: tuple[int, int, int],
+) -> None:
     """Verifies _filters_already_ignore_syntax_warnings fast-paths unconditional ignores but not shadowed error rules."""
     import warnings
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
     from pydoppelgangerhunt.fixer._df_cache import (
         _filters_already_ignore_syntax_warnings,
         _suppress_syntax_warnings,
     )
 
+    monkeypatch.setattr(df_cache_mod.sys, "version_info", sim_version)
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore", SyntaxWarning)
+        if sim_version < (3, 12):
+            warnings.simplefilter("default", DeprecationWarning)
+            warnings.simplefilter("ignore", SyntaxWarning)
+            assert _filters_already_ignore_syntax_warnings() is False
+            warnings.simplefilter("ignore", DeprecationWarning)
+        else:
+            warnings.simplefilter("ignore", SyntaxWarning)
         assert _filters_already_ignore_syntax_warnings() is True
 
     with warnings.catch_warnings():
+        if sim_version < (3, 12):
+            warnings.simplefilter("ignore", DeprecationWarning)
         warnings.simplefilter("ignore", SyntaxWarning)
         warnings.simplefilter("error", SyntaxWarning)
+        warnings.simplefilter("error", DeprecationWarning)
         assert _filters_already_ignore_syntax_warnings() is False
         with _suppress_syntax_warnings():
             parsed = ast.parse(r"s = '\d+'")

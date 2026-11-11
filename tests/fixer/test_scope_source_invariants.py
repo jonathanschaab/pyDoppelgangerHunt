@@ -706,17 +706,25 @@ def test_slice_unit_token_lines_and_compile_warning_suppression() -> None:
     )
     assert res_multi == pre_sliced_multi
 
-    # 4. _has_invalid_lexical_scope_declarations suppresses SyntaxWarning from invalid escape sequences
+    # 4. _has_invalid_lexical_scope_declarations suppresses SyntaxWarning/DeprecationWarning from invalid escape sequences
+    warn_src = 'def f():\n    s = "\\d+"\n    return 1 is 1\n'
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", SyntaxWarning)
-        warn_mod = ast.parse('def f():\n    s = "\\d+"\n    return 1 is 1\n')
+        warnings.simplefilter("ignore", DeprecationWarning)
+        warn_mod = ast.parse(warn_src)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         is_invalid = _has_invalid_lexical_scope_declarations(
-            [warn_mod.body[0]], mod_tree=warn_mod
+            [warn_mod.body[0]],
+            mod_tree=warn_mod,
+            source_lines=warn_src.splitlines(),
         )
     assert is_invalid is False
-    assert not [w for w in caught if issubclass(w.category, SyntaxWarning)]
+    assert not [
+        w
+        for w in caught
+        if issubclass(w.category, (SyntaxWarning, DeprecationWarning))
+    ]
 
 
 def test_conditional_store_promoted_to_input_only_when_read_downstream() -> None:

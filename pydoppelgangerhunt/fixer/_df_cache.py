@@ -100,7 +100,8 @@ def _suppress_syntax_warnings() -> Iterator[None]:
     ``warnings.catch_warnings()`` is backed by a ``ContextVar`` and runs completely
     lock-free without mutating process-global ``warnings.filters`` (recommended for
     multi-threaded IDE and language-server hosts). When ``warnings.filters`` already
-    has an unconditional top-level ignore rule for ``SyntaxWarning``, filter mutation
+    has an unconditional top-level ignore rule for ``SyntaxWarning`` (and
+    ``DeprecationWarning`` on Python < 3.12), filter mutation
     and locking are also bypassed. Otherwise, ``_syntax_warning_lock`` serializes the
     brief ``ast.parse`` / ``symtable.symtable`` / ``compile`` call across cooperating
     threads.
