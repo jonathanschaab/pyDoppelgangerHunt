@@ -9,6 +9,7 @@ from types import MappingProxyType
 from typing import (
     AbstractSet,
     Any,
+    Callable,
     Iterable,
     Iterator,
     List,
@@ -34,10 +35,10 @@ from pydoppelgangerhunt.fixer._ast_compat import (
 )
 from pydoppelgangerhunt.fixer._df_cache import (
     _get_or_compute_scope_cached,
-    _get_scope_parent_map,
     _is_ephemeral_unit_ast,
     _make_trusted_scope_cache_key,
     _scope_cell_info_cache,
+    _tree_contains_scope_node,
 )
 from pydoppelgangerhunt.fixer._df_cell_carriers import (
     _FnScopeContext,
@@ -235,10 +236,11 @@ _TRACKED_SHADOW_NAMES: frozenset[str] = frozenset(
 _SUSPICIOUS_SUPPRESS_SUBSTRINGS: Tuple[str, ...] = (
     "suppress",
     "raises",
-    "ignore",
+    "ignor",
     "subtest",
     "exitstack",
     "enter_context",
+    "enter_async_context",
     "cancelscope",
     "move_on_after",
     "fail_after",
@@ -246,15 +248,26 @@ _SUSPICIOUS_SUPPRESS_SUBSTRINGS: Tuple[str, ...] = (
     "swallow",
     "silen",
     "quiet",
-    "tolerat",
+    "toler",
     "best_effort",
     "absorb",
     "trap",
     "fallback",
     "noop",
+    "no_op",
     "shield",
     "retry",
     "attempt",
+    "skip",
+    "mute",
+    "muting",
+    "maybe",
+    "hush",
+    "discard",
+    "forgiv",
+    "squelch",
+    "quench",
+    "mask",
 )
 
 
@@ -2800,9 +2813,9 @@ def _seed_scope_suppress_aliases(
         not _is_ephemeral_unit_ast(n) for n in aux_nodes
     )
     if can_cache and eff_mod is not None and fn_node is not eff_mod:
-        pmap = _get_scope_parent_map(eff_mod)
-        if fn_node not in pmap or any(
-            n is not eff_mod and n not in pmap for n in aux_nodes
+        if not _tree_contains_scope_node(eff_mod, fn_node) or any(
+            n is not eff_mod and not _tree_contains_scope_node(eff_mod, n)
+            for n in aux_nodes
         ):
             can_cache = False
     if not can_cache:
@@ -2895,7 +2908,13 @@ def _looks_like_suppressing_ctx_manager(
         _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
 ) -> bool:
-    """Returns True if an unknown context manager callee/target has a suppressor-like name or shadowed builtin."""
+    """Returns True if an unknown context manager callee/target has a suppressor-like name or shadowed builtin.
+
+    Attribute chains only inspect the terminal attribute name (plus proven suppressor
+    roots in ``prov.suppressors``) so intermediate receiver attributes such as
+    ``self.retry_budget.acquire()`` or ``svc.skip_list.lock`` do not trigger false
+    positives.
+    """
     prov = _coerce_suppress_provenance(suppress_aliases)
     call_name = _extract_ctx_manager_call_name(expr)
     if call_name == "open" and (
@@ -2914,14 +2933,21 @@ def _looks_like_suppressing_ctx_manager(
                 return True
         elif isinstance(sub, ast.Attribute):
             ident = sub.attr
-            stack.append(sub.value)
+            recv_root, _, _ = _unwind_attribute_chain(sub)
+            if isinstance(recv_root, ast.Name) and recv_root.id in prov.suppressors:
+                return True
         elif isinstance(sub, ast.Call):
             stack.append(sub.func)
-            if isinstance(sub.func, ast.Attribute) and sub.func.attr in (
-                "enter_context",
-                "enter_async_context",
-            ):
+            is_enter_ctx = (
+                isinstance(sub.func, ast.Name)
+                and sub.func.id in ("enter_context", "enter_async_context")
+            ) or (
+                isinstance(sub.func, ast.Attribute)
+                and sub.func.attr in ("enter_context", "enter_async_context")
+            )
+            if is_enter_ctx:
                 stack.extend(sub.args)
+                stack.extend(kw.value for kw in sub.keywords)
         elif isinstance(sub, (ast.Subscript, ast.Await)):
             stack.append(sub.value)
         elif isinstance(sub, ast.NamedExpr):
@@ -2935,8 +2961,8 @@ def _looks_like_suppressing_ctx_manager(
         elif isinstance(sub, (ast.List, ast.Tuple, ast.Set)):
             stack.extend(sub.elts)
         if ident is not None and ident != "catch_warnings":
-            low = ident.lower()
-            if any(tok in low for tok in _SUSPICIOUS_SUPPRESS_SUBSTRINGS):
+            low_sanitized = ident.lower().replace("mutex", "")
+            if any(tok in low_sanitized for tok in _SUSPICIOUS_SUPPRESS_SUBSTRINGS):
                 return True
     return False
 
@@ -3056,18 +3082,67 @@ def _with_header_has_post_suppress_risk(
     )
 
 
-def _warn_heuristic_non_suppressing_ctx_manager(expr: ast.AST) -> None:
-    """Logs a deduplicated info message when an unproven context manager is treated as non-suppressing via name heuristic."""
-    while isinstance(expr, ast.NamedExpr):
+def _resolve_unique_imported_qualname(
+    base_id: str,
+    prov: _SuppressProvenance,
+) -> Optional[str]:
+    """Returns the unique imported qualname for base_id when unshadowed, or None."""
+    if (
+        base_id in prov.shadowed_names
+        or base_id in prov.shadowed_builtins
+        or prov.has_star_import
+    ):
+        return None
+    matches = sorted(
+        {qual for alias, qual in prov.imported_symbols if alias == base_id and qual}
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
+def _format_ctx_manager_display_name(
+    expr: ast.AST,
+    prov: _SuppressProvenance = _EMPTY_SUPPRESS_PROVENANCE,
+) -> str:
+    """Formats a context-manager expression into an unambiguous qualified display name."""
+    while isinstance(expr, (ast.NamedExpr, ast.Await)):
         expr = expr.value
-    mgr_name = _extract_ctx_manager_call_name(expr)
-    if not mgr_name:
-        if isinstance(expr, ast.Name):
-            mgr_name = expr.id
-        elif isinstance(expr, ast.Attribute):
-            mgr_name = expr.attr
-        else:
-            mgr_name = "<expr>"
+    target = expr.func if isinstance(expr, ast.Call) else expr
+    if isinstance(target, ast.Name):
+        return _resolve_unique_imported_qualname(target.id, prov) or target.id
+    if isinstance(target, ast.Attribute):
+        curr_val, _, chain_parts = _unwind_attribute_chain(target)
+        if isinstance(curr_val, ast.Name):
+            root_qual = (
+                _resolve_unique_imported_qualname(curr_val.id, prov) or curr_val.id
+            )
+            return ".".join((root_qual, *chain_parts))
+        if isinstance(curr_val, ast.Call):
+            if isinstance(curr_val.func, ast.Name):
+                fn_qual = (
+                    _resolve_unique_imported_qualname(curr_val.func.id, prov)
+                    or curr_val.func.id
+                )
+                return f"{fn_qual}().{'.'.join(chain_parts)}"
+            if isinstance(curr_val.func, ast.Attribute):
+                r_val, _, r_parts = _unwind_attribute_chain(curr_val.func)
+                if isinstance(r_val, ast.Name):
+                    r_qual = (
+                        _resolve_unique_imported_qualname(r_val.id, prov) or r_val.id
+                    )
+                    return f"{'.'.join((r_qual, *r_parts))}().{'.'.join(chain_parts)}"
+        return f"*.{'.'.join(chain_parts)}"
+    return "<expr>"
+
+
+def _warn_heuristic_non_suppressing_ctx_manager(
+    expr: ast.AST,
+    suppress_aliases: Union[
+        _SuppressProvenance, Iterable[str]
+    ] = _EMPTY_SUPPRESS_PROVENANCE,
+) -> None:
+    """Logs a deduplicated info message when an unproven context manager is treated as non-suppressing via name heuristic."""
+    prov = _coerce_suppress_provenance(suppress_aliases)
+    mgr_name = _format_ctx_manager_display_name(expr, prov)
     record_heuristic_non_suppressing_ctx_manager(mgr_name)
     if should_warn_closure_event(f"heuristic_safe_ctx:{mgr_name}"):
         logger.info(
@@ -3407,10 +3482,14 @@ def _is_non_raising_expr(
 def _is_non_raising_store_target(
     target: ast.AST,
     value: Optional[ast.AST] = None,
+    *,
+    leaf_predicate: Optional[Callable[[ast.AST], bool]] = None,
 ) -> bool:
-    """Returns True if storing value into target cannot raise a runtime unpacking/target error."""
+    """Returns True if storing value into target avoids unpacking errors and satisfies any leaf predicate."""
+    while isinstance(value, ast.NamedExpr):
+        value = value.value
     if isinstance(target, ast.Name):
-        return True
+        return True if leaf_predicate is None else (value is not None and leaf_predicate(value))
     if (
         isinstance(target, (ast.Tuple, ast.List))
         and isinstance(value, (ast.Tuple, ast.List))
@@ -3418,7 +3497,8 @@ def _is_non_raising_store_target(
         and not any(isinstance(e, ast.Starred) for e in (*target.elts, *value.elts))
     ):
         return all(
-            _is_non_raising_store_target(t, v) for t, v in zip(target.elts, value.elts)
+            _is_non_raising_store_target(t, v, leaf_predicate=leaf_predicate)
+            for t, v in zip(target.elts, value.elts)
         )
     return False
 
@@ -3894,7 +3974,7 @@ def _record_with_items_heuristic_ctx_managers(
             )
             and not _looks_like_suppressing_ctx_manager(expr, step.post_expr_prov)
         ):
-            _warn_heuristic_non_suppressing_ctx_manager(expr)
+            _warn_heuristic_non_suppressing_ctx_manager(expr, step.post_expr_prov)
 
 
 def _split_with_body_by_mode(
@@ -4118,225 +4198,17 @@ def _block_terminates(
     strict_with_suppression: bool = False,
 ) -> bool:
     """Returns True if the statement sequence unconditionally terminates."""
-    if strict_names:
-        _, _, term, _ = _analyze_block_assignment_impl(
-            statements,
-            definite=set(safe_names),
-            suppress_aliases=suppress_aliases,
-            loop_control_terminates=loop_control_terminates,
-            known_safe_names=safe_names,
-            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-            strict_with_suppression=strict_with_suppression,
-        )
-        return term
-    local_prov = _coerce_suppress_provenance(suppress_aliases)
-    cur_safe: Set[str] = set(safe_names)
-    for stmt in statements:
-        if isinstance(stmt, (ast.Return, ast.Raise)) or (
-            loop_control_terminates and isinstance(stmt, (ast.Break, ast.Continue))
-        ):
-            return True
-        if isinstance(stmt, ast.If):
-            test_prov = _update_suppress_provenance_from_expr_walrus(
-                (stmt.test,), local_prov
-            )
-            if (
-                stmt.orelse
-                and _block_terminates(
-                    stmt.body,
-                    suppress_aliases=test_prov,
-                    loop_control_terminates=loop_control_terminates,
-                    safe_names=cur_safe,
-                    strict_names=strict_names,
-                    extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-                    strict_with_suppression=strict_with_suppression,
-                )
-                and _block_terminates(
-                    stmt.orelse,
-                    suppress_aliases=test_prov,
-                    loop_control_terminates=loop_control_terminates,
-                    safe_names=cur_safe,
-                    strict_names=strict_names,
-                    extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-                    strict_with_suppression=strict_with_suppression,
-                )
-            ):
-                return True
-            local_prov = _update_suppress_provenance_from_stmt(stmt, local_prov)
-        elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-            header_prov = local_prov
-            item_prov = _advance_prov_through_with_items(
-                stmt,
-                local_prov,
-                safe_names_out=cur_safe,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-                strict_with_suppression=strict_with_suppression,
-            )
-            w_body = _split_with_body_by_mode(
-                stmt,
-                header_prov,
-                body_suppress_aliases=item_prov,
-                safe_names=cur_safe,
-                strict_names=strict_names,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-                strict_with_suppression=strict_with_suppression,
-            )[0]
-            if _block_terminates(
-                w_body,
-                suppress_aliases=item_prov,
-                loop_control_terminates=loop_control_terminates,
-                safe_names=cur_safe,
-                strict_names=strict_names,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-                strict_with_suppression=strict_with_suppression,
-            ):
-                return True
-            local_prov = _update_suppress_provenance_from_stmt(stmt, local_prov)
-        elif is_match_node(stmt):  # pragma: no cover (py310+)
-            cases = getattr(stmt, "cases", [])
-            if cases:
-                reachable_cases: List[ast.AST] = []
-                has_irrefutable = False
-                for c in cases:
-                    reachable_cases.append(c)
-                    if _is_irrefutable_case(c):
-                        has_irrefutable = True
-                        break
-                if has_irrefutable and all(
-                    _block_terminates(
-                        getattr(c, "body", ()),
-                        suppress_aliases=local_prov,
-                        loop_control_terminates=loop_control_terminates,
-                        safe_names=cur_safe,
-                        strict_names=strict_names,
-                        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-                        strict_with_suppression=strict_with_suppression,
-                    )
-                    for c in reachable_cases
-                ):
-                    return True
-            local_prov = _update_suppress_provenance_from_stmt(stmt, local_prov)
-        elif is_try_or_trystar_node(stmt):
-            t_body_seq = getattr(stmt, "body", [])
-            t_safe_prefix, t_risky_suffix = _split_suppress_with_body(
-                t_body_seq,
-                safe_names=cur_safe,
-                strict_names=strict_names,
-                suppress_aliases=local_prov,
-            )
-            try_prefix_prov = _update_suppress_provenance_from_stmts(
-                t_safe_prefix,
-                local_prov,
-                in_branch=False,
-                strict_with_suppression=strict_with_suppression,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-            )
-            try_mid_prov = _update_suppress_provenance_from_stmts(
-                t_risky_suffix,
-                try_prefix_prov,
-                in_branch=True,
-                strict_with_suppression=strict_with_suppression,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-            )
-            try_prov = _update_suppress_provenance_from_stmts(
-                t_risky_suffix,
-                try_prefix_prov,
-                in_branch=False,
-                strict_with_suppression=strict_with_suppression,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-            )
-            handler_prov = try_prefix_prov.merge_branch_conservative(
-                try_mid_prov
-            ).merge_branch_conservative(try_prov)
-            f_body = getattr(stmt, "finalbody", [])
-            if f_body and _block_terminates(
-                f_body,
-                suppress_aliases=handler_prov,
-                loop_control_terminates=loop_control_terminates,
-                safe_names=cur_safe,
-                strict_names=strict_names,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-                strict_with_suppression=strict_with_suppression,
-            ):
-                return True
-            handlers = getattr(stmt, "handlers", [])
-            o_stmts = getattr(stmt, "orelse", [])
-            raw_try_del = _extract_block_Combined_deletions(t_body_seq)
-            t_def = _extract_block_definite_bindings(
-                t_body_seq,
-                None,
-                cur_safe,
-                suppress_aliases=local_prov,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-                strict_with_suppression=strict_with_suppression,
-            )
-            body_terminates = _block_terminates(
-                t_body_seq,
-                suppress_aliases=local_prov,
-                loop_control_terminates=loop_control_terminates,
-                safe_names=cur_safe,
-                strict_names=strict_names,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-                strict_with_suppression=strict_with_suppression,
-            ) or (
-                bool(o_stmts)
-                and _block_terminates(
-                    o_stmts,
-                    suppress_aliases=try_prov,
-                    loop_control_terminates=loop_control_terminates,
-                    safe_names=cur_safe | t_def,
-                    strict_names=strict_names,
-                    extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-                    strict_with_suppression=strict_with_suppression,
-                )
-            )
-            if not handlers and body_terminates:
-                return True
-            if (
-                handlers
-                and not is_trystar_node(stmt)
-                and body_terminates
-                and all(
-                    _block_terminates(
-                        getattr(h, "body", []),
-                        suppress_aliases=(
-                            handler_prov.clear_name(h.name)
-                            if isinstance(getattr(h, "name", None), str)
-                            else handler_prov
-                        ),
-                        loop_control_terminates=loop_control_terminates,
-                        safe_names=(cur_safe - raw_try_del)
-                        | (
-                            {h.name}
-                            if isinstance(getattr(h, "name", None), str)
-                            else set()
-                        ),
-                        strict_names=strict_names,
-                        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-                        strict_with_suppression=strict_with_suppression,
-                    )
-                    for h in handlers
-                )
-            ):
-                return True
-            local_prov = _update_suppress_provenance_from_stmt(stmt, local_prov)
-        else:
-            local_prov = _update_suppress_provenance_from_stmt(stmt, local_prov)
-            if isinstance(stmt, ast.Assign):
-                for tgt in stmt.targets:
-                    cur_safe.update(_extract_definite_target_names(tgt))
-            elif (
-                isinstance(stmt, (ast.AnnAssign, ast.AugAssign))
-                and stmt.value is not None
-            ):
-                cur_safe.update(_extract_definite_target_names(stmt.target))
-            elif isinstance(
-                stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-            ):
-                cur_safe.add(stmt.name)
-            elif isinstance(stmt, ast.Delete):
-                cur_safe.difference_update(_extract_shallow_deleted_names(stmt))
-    return False
+    _, _, term, _ = _analyze_block_assignment_impl(
+        statements,
+        definite=set(safe_names),
+        suppress_aliases=suppress_aliases,
+        loop_control_terminates=loop_control_terminates,
+        known_safe_names=safe_names,
+        strict_names=strict_names,
+        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+        strict_with_suppression=strict_with_suppression,
+    )
+    return term
 
 
 def _filter_scope_names(
@@ -4350,7 +4222,7 @@ def _filter_scope_names(
     return {n for n in names if _can_bind_in_fn_scope(n, active_nonlocals, fn_globals)}
 
 
-def _extract_block_Combined_deletions(stmts: Sequence[ast.AST]) -> Set[str]:
+def _extract_block_combined_deletions(stmts: Sequence[ast.AST]) -> Set[str]:
     """Returns combined deep and shallow deleted/unbound variable names for stmts."""
     if not stmts:
         return set()
@@ -4371,6 +4243,7 @@ def _analyze_if_stmt_assignment(
     fn_globals: AbstractSet[str],
     loop_control_terminates: bool,
     known_safe_names: AbstractSet[str],
+    strict_names: bool = True,
     extra_non_suppressing_ctx_managers: AbstractSet[str],
     strict_with_suppression: bool,
 ) -> Tuple[bool, _SuppressProvenance]:
@@ -4389,6 +4262,7 @@ def _analyze_if_stmt_assignment(
         fn_globals=fn_globals,
         loop_control_terminates=loop_control_terminates,
         known_safe_names=cur_safe,
+        strict_names=strict_names,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         strict_with_suppression=strict_with_suppression,
     )
@@ -4402,6 +4276,7 @@ def _analyze_if_stmt_assignment(
             fn_globals=fn_globals,
             loop_control_terminates=loop_control_terminates,
             known_safe_names=cur_safe,
+            strict_names=strict_names,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
             strict_with_suppression=strict_with_suppression,
         )
@@ -4409,8 +4284,8 @@ def _analyze_if_stmt_assignment(
         o_def, o_cond, o_term, o_prov = set(), set(), False, local_prov
     local_prov = b_prov.merge_branch_conservative(o_prov)
     live_in_del.update((b_live | o_live) - definite)
-    eff_b_del = _extract_block_Combined_deletions(stmt.body) - b_def
-    eff_o_del = _extract_block_Combined_deletions(stmt.orelse) - o_def
+    eff_b_del = _extract_block_combined_deletions(stmt.body) - b_def
+    eff_o_del = _extract_block_combined_deletions(stmt.orelse) - o_def
     if stmt.orelse:
         if o_term and not b_term:
             definite.update(b_def)
@@ -4453,6 +4328,7 @@ def _analyze_with_stmt_assignment(
     fn_globals: AbstractSet[str],
     loop_control_terminates: bool,
     known_safe_names: AbstractSet[str],
+    strict_names: bool = True,
     extra_non_suppressing_ctx_managers: AbstractSet[str],
     strict_with_suppression: bool,
     bind_def_cond: Any,
@@ -4481,6 +4357,7 @@ def _analyze_with_stmt_assignment(
         header_prov,
         body_suppress_aliases=local_prov,
         safe_names=cur_safe,
+        strict_names=strict_names,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         strict_with_suppression=strict_with_suppression,
     )
@@ -4495,6 +4372,7 @@ def _analyze_with_stmt_assignment(
         fn_globals=fn_globals,
         loop_control_terminates=loop_control_terminates,
         known_safe_names=cur_safe,
+        strict_names=strict_names,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         strict_with_suppression=strict_with_suppression,
     )
@@ -4512,6 +4390,7 @@ def _analyze_with_stmt_assignment(
             fn_globals=fn_globals,
             loop_control_terminates=loop_control_terminates,
             known_safe_names=definite | set(known_safe_names),
+            strict_names=strict_names,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
             strict_with_suppression=strict_with_suppression,
         )
@@ -4539,17 +4418,21 @@ def _analyze_try_stmt_assignment(
     fn_globals: AbstractSet[str],
     loop_control_terminates: bool,
     known_safe_names: AbstractSet[str],
+    strict_names: bool = True,
     extra_non_suppressing_ctx_managers: AbstractSet[str],
     strict_with_suppression: bool,
     apply_expr_effects: Any,
 ) -> Tuple[bool, _SuppressProvenance]:
     """Analyzes a Try/TryStar statement and updates definite, conditional, may_del, and live_in_del in place."""
     t_body = list(getattr(stmt, "body", []))
-    raw_try_del = _extract_block_Combined_deletions(t_body)
+    raw_try_del = _extract_block_combined_deletions(t_body)
     is_trystar = is_trystar_node(stmt)
     cur_safe = definite | set(known_safe_names)
     t_safe_prefix, t_risky_suffix = _split_suppress_with_body(
-        t_body, safe_names=cur_safe, suppress_aliases=local_prov
+        t_body,
+        safe_names=cur_safe,
+        strict_names=strict_names,
+        suppress_aliases=local_prov,
     )
     try_prefix_prov = _update_suppress_provenance_from_stmts(
         t_safe_prefix,
@@ -4576,6 +4459,7 @@ def _analyze_try_stmt_assignment(
         fn_globals=fn_globals,
         loop_control_terminates=loop_control_terminates,
         known_safe_names=cur_safe,
+        strict_names=strict_names,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         strict_with_suppression=strict_with_suppression,
     )
@@ -4598,6 +4482,7 @@ def _analyze_try_stmt_assignment(
             fn_globals=fn_globals,
             loop_control_terminates=loop_control_terminates,
             known_safe_names=cur_safe | t_def,
+            strict_names=strict_names,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
             strict_with_suppression=strict_with_suppression,
         )
@@ -4645,6 +4530,7 @@ def _analyze_try_stmt_assignment(
             fn_globals=fn_globals,
             loop_control_terminates=loop_control_terminates,
             known_safe_names=(cur_safe - raw_try_del) | h_bound,
+            strict_names=strict_names,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
             strict_with_suppression=strict_with_suppression,
         )
@@ -4654,7 +4540,7 @@ def _analyze_try_stmt_assignment(
         h_may.update(h_raw_bound)
         live_in_del.update((h_live - h_raw_bound) - definite)
         h_term = not is_trystar and h_raw_term
-        h_body_dels = _extract_block_Combined_deletions(h_body)
+        h_body_dels = _extract_block_combined_deletions(h_body)
         eff_h_del = (h_body_dels - h_d) | h_raw_bound
         reach_h_del = eff_h_del | (raw_try_del - h_d)
         h_dels.append((eff_h_del, reach_h_del, h_term))
@@ -4696,7 +4582,7 @@ def _analyze_try_stmt_assignment(
 
     eff_try_del = raw_try_del - t_def
     eff_o_del = (
-        (_extract_block_Combined_deletions(o_stmts) - o_def)
+        (_extract_block_combined_deletions(o_stmts) - o_def)
         if not try_body_term
         else set()
     )
@@ -4764,6 +4650,7 @@ def _analyze_try_stmt_assignment(
             fn_globals=fn_globals,
             loop_control_terminates=loop_control_terminates,
             known_safe_names=definite | set(known_safe_names),
+            strict_names=strict_names,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
             strict_with_suppression=strict_with_suppression,
         )
@@ -4804,6 +4691,7 @@ def _analyze_match_stmt_assignment(
     fn_globals: AbstractSet[str],
     loop_control_terminates: bool,
     known_safe_names: AbstractSet[str],
+    strict_names: bool = True,
     extra_non_suppressing_ctx_managers: AbstractSet[str],
     strict_with_suppression: bool,
     apply_expr_effects: Any,
@@ -4860,6 +4748,7 @@ def _analyze_match_stmt_assignment(
             fn_globals=fn_globals,
             loop_control_terminates=loop_control_terminates,
             known_safe_names=cur_safe | case_init_def,
+            strict_names=strict_names,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
             strict_with_suppression=strict_with_suppression,
         )
@@ -4867,7 +4756,7 @@ def _analyze_match_stmt_assignment(
         live_in_del.update((c_live - case_init_def) - definite)
         case_defs.append(c_def)
         case_conds.update(c_def | c_cond)
-        c_del = _extract_block_Combined_deletions(case_body) - c_def
+        c_del = _extract_block_combined_deletions(case_body) - c_def
         all_case_dels.update(c_del)
         if not c_term:
             case_dels.update(c_del)
@@ -4917,6 +4806,7 @@ def _analyze_block_assignment_impl(
     fn_globals: AbstractSet[str] = frozenset(),
     loop_control_terminates: bool = False,
     known_safe_names: AbstractSet[str] = frozenset(),
+    strict_names: bool = True,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
     strict_with_suppression: bool = False,
 ) -> Tuple[Set[str], Set[str], bool, _SuppressProvenance]:
@@ -5011,6 +4901,7 @@ def _analyze_block_assignment_impl(
                 fn_globals=fn_globals,
                 loop_control_terminates=loop_control_terminates,
                 known_safe_names=known_safe_names,
+                strict_names=strict_names,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
                 strict_with_suppression=strict_with_suppression,
             )
@@ -5036,6 +4927,7 @@ def _analyze_block_assignment_impl(
                 fn_globals=fn_globals,
                 loop_control_terminates=loop_control_terminates,
                 known_safe_names=definite | set(known_safe_names),
+                strict_names=strict_names,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
                 strict_with_suppression=strict_with_suppression,
             )
@@ -5072,6 +4964,7 @@ def _analyze_block_assignment_impl(
                 fn_globals=fn_globals,
                 loop_control_terminates=loop_control_terminates,
                 known_safe_names=definite | set(known_safe_names) | t_names,
+                strict_names=strict_names,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
                 strict_with_suppression=strict_with_suppression,
             )
@@ -5095,6 +4988,7 @@ def _analyze_block_assignment_impl(
                 fn_globals=fn_globals,
                 loop_control_terminates=loop_control_terminates,
                 known_safe_names=known_safe_names,
+                strict_names=strict_names,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
                 strict_with_suppression=strict_with_suppression,
                 bind_def_cond=_bind_def_cond,
@@ -5115,6 +5009,7 @@ def _analyze_block_assignment_impl(
                 fn_globals=fn_globals,
                 loop_control_terminates=loop_control_terminates,
                 known_safe_names=known_safe_names,
+                strict_names=strict_names,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
                 strict_with_suppression=strict_with_suppression,
                 apply_expr_effects=_apply_expr_effects,
@@ -5134,6 +5029,7 @@ def _analyze_block_assignment_impl(
                 fn_globals=fn_globals,
                 loop_control_terminates=loop_control_terminates,
                 known_safe_names=known_safe_names,
+                strict_names=strict_names,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
                 strict_with_suppression=strict_with_suppression,
                 apply_expr_effects=_apply_expr_effects,
@@ -5208,7 +5104,13 @@ def _extract_block_definite_bindings_and_term(
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
     strict_with_suppression: bool = False,
 ) -> Tuple[Set[str], bool]:
-    """Extracts (unconditionally_bound_names, block_terminates) across a statement sequence."""
+    """Extracts (unconditionally_bound_names, block_terminates) across a statement sequence.
+
+    Passes ``loop_control_terminates=True`` because callers inspect pre-unit or
+    intra-loop compound statements (``if``/``try``/``match``) where a ``break`` or
+    ``continue`` branch exits the clause without falling through to statements
+    immediately following the compound statement.
+    """
     def_out, _, term, _ = _analyze_block_assignment_impl(
         stmts,
         definite=set(initial_bound),

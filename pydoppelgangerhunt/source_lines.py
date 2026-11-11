@@ -31,9 +31,8 @@ __all__ = [
 class SourceLinesOrigin(enum.Enum):
     """Origin enum for unit source lines returned by extract_unit_source_lines_with_state.
 
-    Prefer explicit properties (``is_pre_sliced``, ``is_placeholder``, ``has_real_source``).
-    ``bool(origin)`` is retained only as a backwards-compatibility shim returning
-    ``self.is_pre_sliced``.
+    Query explicit properties (``is_pre_sliced``, ``is_placeholder``, ``has_real_source``)
+    rather than testing enum truthiness.
     """
 
     PRE_SLICED = ("PRE_SLICED", True, False)
@@ -60,10 +59,6 @@ class SourceLinesOrigin(enum.Enum):
     def has_real_source(self) -> bool:
         """True if lines come from actual source text rather than a synthetic placeholder."""
         return not self._is_placeholder
-
-    def __bool__(self) -> bool:
-        """Returns is_pre_sliced for backward compatibility with tuple-unpacking callers (lines, is_sliced = ...)."""
-        return self._is_pre_sliced
 
 _COORD_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
     "start_col": ("start_col", "start_col_offset"),

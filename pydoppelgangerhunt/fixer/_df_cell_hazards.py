@@ -107,6 +107,8 @@ from __future__ import annotations
 import ast
 from typing import (
     AbstractSet,
+    Callable,
+    Dict,
     Iterator,
     List,
     NamedTuple,
@@ -117,6 +119,7 @@ from typing import (
     Union,
 )
 
+from pydoppelgangerhunt.fixer._ast_compat import is_match_node
 from pydoppelgangerhunt.fixer._df_cache import _mark_ephemeral_unit_ast
 from pydoppelgangerhunt.fixer._df_cell_carriers import (
     _EnclosingFnCellInfo,
@@ -147,6 +150,10 @@ from pydoppelgangerhunt.fixer._df_span_index import (
     _has_invalid_lexical_scope_declarations,
     _has_unresolved_span_bounds,
     _resolve_unit_col_bounds,
+)
+from pydoppelgangerhunt.fixer._df_with_provenance import (
+    _SAFE_EXCEPTION_TYPE_NAMES,
+    _is_non_raising_store_target,
 )
 from pydoppelgangerhunt.parser import _node_is_effectively_async
 
@@ -556,15 +563,220 @@ def _extract_immediate_bool_test_exprs(node: ast.AST) -> Tuple[ast.AST, ...]:
     return ()
 
 
+class _PedanticPrimitiveEnv(NamedTuple):
+    """Statically proven scalar-primitive and primitive-tuple bindings for pedantic dunder checks."""
+
+    primitives: frozenset[str] = frozenset()
+    prim_tuples: frozenset[str] = frozenset()
+    effective_shadowed: frozenset[str] = frozenset()
+    all_builtins_shadowed: bool = False
+
+
+def _check_proven_sync_iter(
+    target: ast.AST,
+    iter_expr: ast.AST,
+    env: _PedanticPrimitiveEnv,
+    *,
+    require_primitive_elts: bool = False,
+) -> bool:
+    """Returns True when iterating iter_expr into target avoids user dunders (and optionally binds only scalar primitives)."""
+    while isinstance(iter_expr, ast.NamedExpr):
+        iter_expr = iter_expr.value
+    if (
+        isinstance(iter_expr, ast.Constant)
+        and isinstance(iter_expr.value, (str, bytes))
+    ) or (isinstance(iter_expr, ast.Name) and iter_expr.id in env.prim_tuples):
+        return isinstance(target, ast.Name)
+    if isinstance(iter_expr, (ast.Tuple, ast.List)) and not any(
+        isinstance(e, ast.Starred) for e in iter_expr.elts
+    ):
+        leaf_pred: Optional[Callable[[ast.AST], bool]] = (
+            (lambda leaf: _is_proven_primitive_dunder_expr(leaf, env))
+            if require_primitive_elts
+            else None
+        )
+        return all(
+            _is_non_raising_store_target(target, elt, leaf_predicate=leaf_pred)
+            for elt in iter_expr.elts
+        )
+    return False
+
+
+def _is_proven_primitive_subscript_expr(
+    expr: ast.Subscript,
+    env: _PedanticPrimitiveEnv,
+) -> bool:
+    """Returns True when a Load subscript avoids user dunders and yields a scalar primitive."""
+    if not isinstance(expr.ctx, ast.Load):
+        return False
+    val: ast.AST = expr.value
+    while isinstance(val, ast.NamedExpr):
+        val = val.value
+    slc = expr.slice
+    if isinstance(val, ast.Constant) and isinstance(val.value, (str, bytes)):
+        if isinstance(slc, ast.Slice):
+            return all(
+                bound is None or _is_proven_primitive_dunder_expr(bound, env)
+                for bound in (slc.lower, slc.upper, slc.step)
+            )
+        return _is_proven_primitive_dunder_expr(slc, env)
+    if isinstance(slc, ast.Slice) or not _is_proven_primitive_dunder_expr(slc, env):
+        return False
+    if isinstance(val, ast.Name) and val.id in env.prim_tuples:
+        return True
+    if isinstance(val, (ast.Tuple, ast.List)) and not any(
+        isinstance(elt, ast.Starred) for elt in val.elts
+    ):
+        return all(_is_proven_primitive_dunder_expr(elt, env) for elt in val.elts)
+    return False
+
+
+def _is_proven_primitive_dunder_expr(
+    expr: ast.AST,
+    env: _PedanticPrimitiveEnv,
+) -> bool:
+    """Returns True when expr evaluates to a built-in scalar primitive without invoking user dunders."""
+    if isinstance(expr, ast.Constant):
+        return True
+    if isinstance(expr, ast.Name):
+        return expr.id in env.primitives
+    if isinstance(expr, ast.NamedExpr):
+        return _is_proven_primitive_dunder_expr(expr.value, env)
+    if isinstance(expr, ast.Subscript):
+        return _is_proven_primitive_subscript_expr(expr, env)
+    if isinstance(expr, ast.UnaryOp):
+        if isinstance(expr.op, ast.Not):
+            return _is_proven_primitive_bool_expr(expr.operand, env)
+        return _is_proven_primitive_dunder_expr(expr.operand, env)
+    if isinstance(expr, ast.BinOp) and not isinstance(expr.op, ast.MatMult):
+        return _is_proven_primitive_dunder_expr(
+            expr.left, env
+        ) and _is_proven_primitive_dunder_expr(expr.right, env)
+    if isinstance(expr, ast.BoolOp):
+        return all(_is_proven_primitive_dunder_expr(val, env) for val in expr.values)
+    if isinstance(expr, ast.IfExp):
+        return (
+            _is_proven_primitive_bool_expr(expr.test, env)
+            and _is_proven_primitive_dunder_expr(expr.body, env)
+            and _is_proven_primitive_dunder_expr(expr.orelse, env)
+        )
+    if isinstance(expr, ast.Compare):
+        return _is_proven_safe_compare(expr, env)
+    if isinstance(expr, ast.JoinedStr):
+        return all(
+            isinstance(part, ast.Constant)
+            or (
+                isinstance(part, ast.FormattedValue)
+                and _is_proven_safe_formatted_value(part, env)
+            )
+            for part in expr.values
+        )
+    return (
+        isinstance(expr, ast.Call)
+        and not env.all_builtins_shadowed
+        and isinstance(expr.func, ast.Name)
+        and expr.func.id in _PROVEN_PURE_GLOBAL_SAFE_BUILTINS
+        and expr.func.id not in env.effective_shadowed
+        and len(expr.args) == 1
+        and not expr.keywords
+        and not isinstance(expr.args[0], ast.Starred)
+    )
+
+
+def _is_proven_safe_formatted_value(
+    node: ast.FormattedValue,
+    env: _PedanticPrimitiveEnv,
+) -> bool:
+    """Returns True when an f-string FormattedValue formats only a proven scalar primitive."""
+    return _is_proven_primitive_dunder_expr(node.value, env) and (
+        node.format_spec is None
+        or _is_proven_primitive_dunder_expr(node.format_spec, env)
+    )
+
+
+def _is_proven_primitive_container_for_in(
+    rhs: ast.AST,
+    env: _PedanticPrimitiveEnv,
+) -> bool:
+    """Returns True when rhs of 'in'/'not in' is a built-in container of proven primitives."""
+    while isinstance(rhs, ast.NamedExpr):
+        rhs = rhs.value
+    if isinstance(rhs, ast.Constant) and isinstance(rhs.value, (str, bytes)):
+        return True
+    if isinstance(rhs, ast.Name) and rhs.id in env.prim_tuples:
+        return True
+    if isinstance(rhs, (ast.Tuple, ast.List, ast.Set)):
+        return not any(isinstance(elt, ast.Starred) for elt in rhs.elts) and all(
+            _is_proven_primitive_dunder_expr(elt, env) for elt in rhs.elts
+        )
+    if isinstance(rhs, ast.Dict):
+        return all(
+            key is not None and _is_proven_primitive_dunder_expr(key, env)
+            for key in rhs.keys
+        )
+    return False
+
+
+def _is_proven_safe_compare(
+    node: ast.Compare,
+    env: _PedanticPrimitiveEnv,
+) -> bool:
+    """Returns True when every step of a Compare expression cannot invoke user comparison/containment dunders."""
+    operands = (node.left, *node.comparators)
+    for lhs, op, rhs in zip(operands, node.ops, node.comparators):
+        if isinstance(op, (ast.Is, ast.IsNot)):
+            continue
+        if isinstance(op, (ast.In, ast.NotIn)):
+            if not (
+                _is_proven_primitive_dunder_expr(lhs, env)
+                and _is_proven_primitive_container_for_in(rhs, env)
+            ):
+                return False
+        elif not (
+            _is_proven_primitive_dunder_expr(lhs, env)
+            and _is_proven_primitive_dunder_expr(rhs, env)
+        ):
+            return False
+    return True
+
+
+def _is_proven_safe_subscript_load(
+    node: ast.Subscript,
+    env: _PedanticPrimitiveEnv,
+) -> bool:
+    """Returns True when a Load subscript indexes a literal or proven sequence/string with primitive bounds."""
+    if not isinstance(node.ctx, ast.Load):
+        return False
+    val: ast.AST = node.value
+    while isinstance(val, ast.NamedExpr):
+        val = val.value
+    val_ok = (
+        (isinstance(val, ast.Constant) and isinstance(val.value, (str, bytes)))
+        or (isinstance(val, ast.Name) and val.id in env.prim_tuples)
+        or (
+            isinstance(val, (ast.Tuple, ast.List))
+            and not any(isinstance(elt, ast.Starred) for elt in val.elts)
+        )
+    )
+    if not val_ok:
+        return False
+    slc = node.slice
+    if isinstance(slc, ast.Slice):
+        return all(
+            bound is None or _is_proven_primitive_dunder_expr(bound, env)
+            for bound in (slc.lower, slc.upper, slc.step)
+        )
+    return _is_proven_primitive_dunder_expr(slc, env)
+
+
 def _is_proven_primitive_bool_expr(
     expr: ast.AST,
-    local_accumulators: AbstractSet[str],
-    *,
-    effective_shadowed: AbstractSet[str] = frozenset(),
-    all_builtins_shadowed: bool = False,
+    env: _PedanticPrimitiveEnv,
 ) -> bool:
     """Returns True when evaluating expr in a boolean context cannot invoke user-defined __bool__ or __len__."""
     if isinstance(expr, _STATIC_NON_DESCRIPTOR_VALUE_TYPES):
+        return True
+    if isinstance(expr, ast.Name) and expr.id in env.prim_tuples:
         return True
     sub_bool_exprs: Tuple[ast.AST, ...] = ()
     if isinstance(expr, ast.NamedExpr):
@@ -577,29 +789,373 @@ def _is_proven_primitive_bool_expr(
         sub_bool_exprs = (expr.test, expr.body, expr.orelse)
     if sub_bool_exprs:
         return all(
-            _is_proven_primitive_bool_expr(
-                sub_e,
-                local_accumulators,
-                effective_shadowed=effective_shadowed,
+            _is_proven_primitive_bool_expr(sub_e, env) for sub_e in sub_bool_exprs
+        )
+    return _is_proven_primitive_dunder_expr(expr, env)
+
+
+def _node_invokes_pedantic_dunder_protocol(
+    node: ast.AST,
+    env: _PedanticPrimitiveEnv,
+) -> bool:
+    """Returns True when an immediate AST node may invoke user-defined dunder or import hooks in pedantic mode."""
+    if any(
+        not _is_proven_primitive_bool_expr(b_expr, env)
+        for b_expr in _extract_immediate_bool_test_exprs(node)
+    ):
+        return True
+    if isinstance(node, (ast.Attribute, ast.Import, ast.ImportFrom)):
+        return True
+    if isinstance(node, ast.BinOp):
+        return not _is_proven_primitive_dunder_expr(node, env)
+    if isinstance(node, ast.UnaryOp) and not isinstance(node.op, ast.Not):
+        return not _is_proven_primitive_dunder_expr(node.operand, env)
+    if isinstance(node, ast.Compare):
+        return not _is_proven_safe_compare(node, env)
+    if isinstance(node, ast.Subscript):
+        return not _is_proven_safe_subscript_load(node, env)
+    if isinstance(node, (ast.For, ast.comprehension)):
+        return not _check_proven_sync_iter(node.target, node.iter, env)
+    if isinstance(node, ast.FormattedValue):
+        return not _is_proven_safe_formatted_value(node, env)
+    if isinstance(node, ast.Set):
+        return not all(_is_proven_primitive_dunder_expr(elt, env) for elt in node.elts)
+    if isinstance(node, ast.SetComp):
+        return not _is_proven_primitive_dunder_expr(node.elt, env)
+    if isinstance(node, ast.Dict):
+        return not all(
+            (key is not None and _is_proven_primitive_dunder_expr(key, env))
+            or (key is None and isinstance(val, ast.Dict))
+            for key, val in zip(node.keys, node.values)
+        )
+    if isinstance(node, ast.DictComp):
+        return not _is_proven_primitive_dunder_expr(node.key, env)
+    if isinstance(node, ast.Assign):
+        return any(
+            isinstance(tgt, (ast.Tuple, ast.List))
+            and not _is_non_raising_store_target(tgt, node.value)
+            for tgt in node.targets
+        )
+    if isinstance(node, ast.Starred) and isinstance(node.ctx, ast.Load):
+        return not isinstance(node.value, (ast.Tuple, ast.List))
+    if isinstance(node, ast.Call) and (
+        any(
+            isinstance(arg, ast.Starred)
+            and not isinstance(arg.value, (ast.Tuple, ast.List))
+            for arg in node.args
+        )
+        or any(
+            kw.arg is None and not isinstance(kw.value, ast.Dict)
+            for kw in node.keywords
+        )
+    ):
+        return True
+    if is_match_node(node):  # pragma: no cover (py310+)
+        subject = getattr(node, "subject", None)
+        return not (
+            isinstance(subject, ast.AST)
+            and _is_proven_primitive_dunder_expr(subject, env)
+            and not any(
+                type(sub).__name__ == "MatchClass"
+                for case in getattr(node, "cases", ())
+                for sub in ast.walk(getattr(case, "pattern", node))
+            )
+        )
+    if isinstance(node, ast.Raise) and node.exc is not None:
+        return not (
+            not env.all_builtins_shadowed
+            and isinstance(node.exc, ast.Name)
+            and node.exc.id in _SAFE_EXCEPTION_TYPE_NAMES
+            and node.exc.id not in env.effective_shadowed
+            and node.cause is None
+        )
+    return False
+
+
+def _extract_non_assign_bound_names(node: ast.AST) -> Set[str]:
+    """Returns variable names bound or re-routed by non-assignment/non-for AST nodes."""
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return set(node.names)
+    if isinstance(node, ast.Delete):
+        out: Set[str] = set()
+        for tgt in node.targets:
+            out.update(_extract_root_target_names(tgt))
+        return out
+    if isinstance(node, (ast.With, ast.AsyncWith)):
+        out = set()
+        for item in node.items:
+            if item.optional_vars is not None:
+                out.update(_extract_root_target_names(item.optional_vars))
+        return out
+    if isinstance(node, ast.ExceptHandler) and isinstance(node.name, str):
+        return {node.name}
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return {
+            alias.asname or alias.name.split(".", 1)[0]
+            for alias in node.names
+            if alias.name != "*"
+        }
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return {node.name}
+    cls_name = type(node).__name__
+    if cls_name in ("MatchAs", "MatchStar"):
+        m_name = getattr(node, "name", None)
+        return {m_name} if isinstance(m_name, str) else set()
+    if cls_name == "MatchMapping":
+        r_name = getattr(node, "rest", None)
+        return {r_name} if isinstance(r_name, str) else set()
+    return set()
+
+
+def _extract_unpack_leaf_names(target: ast.AST) -> Optional[Set[str]]:
+    """Returns leaf Name ids when target is a Name or unstarred nested Tuple/List of Names."""
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)) and not any(
+        isinstance(e, ast.Starred) for e in target.elts
+    ):
+        names: Set[str] = set()
+        for elt in target.elts:
+            sub = _extract_unpack_leaf_names(elt)
+            if sub is None:
+                return None
+            names.update(sub)
+        return names
+    return None
+
+
+def _is_proven_primitive_target_value(
+    target: ast.AST,
+    value: ast.AST,
+    env: _PedanticPrimitiveEnv,
+) -> bool:
+    """Returns True when assigning value to target binds every leaf Name to a proven scalar primitive."""
+    return _is_non_raising_store_target(
+        target,
+        value,
+        leaf_predicate=lambda leaf: _is_proven_primitive_dunder_expr(leaf, env),
+    )
+
+
+def _record_immediate_expr_names(nodes: Sequence[ast.AST], seen: Set[str]) -> None:
+    """Adds all immediate ast.Name identifiers under nodes into seen."""
+    for sub in _iter_immediate_unit_exec_nodes(nodes):
+        if isinstance(sub, ast.Name):
+            seen.add(sub.id)
+
+
+def _seed_pedantic_candidates(
+    candidate_stmts: Sequence[ast.stmt],
+    immediate_nodes: Sequence[ast.AST],
+    class_body_node_ids: AbstractSet[int],
+) -> Tuple[Set[str], Dict[str, ast.Tuple]]:
+    """Seeds candidate scalar primitives and primitive-tuple bindings unconditionally initialized before first read."""
+    seen_before_init: Set[str] = set()
+    cand_prims: Set[str] = set()
+    cand_tuples: Dict[str, ast.Tuple] = {}
+    for stmt in candidate_stmts:
+        if isinstance(stmt, ast.Assign):
+            _record_immediate_expr_names((stmt.value,), seen_before_init)
+            rhs: ast.AST = stmt.value
+            while isinstance(rhs, ast.NamedExpr):
+                rhs = rhs.value
+            if len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                t_name = stmt.targets[0].id
+                if t_name not in seen_before_init:
+                    if isinstance(rhs, ast.Tuple) and not any(
+                        isinstance(e, ast.Starred) for e in rhs.elts
+                    ):
+                        cand_tuples[t_name] = rhs
+                    else:
+                        cand_prims.add(t_name)
+            else:
+                for tgt in stmt.targets:
+                    leaf_names = _extract_unpack_leaf_names(tgt)
+                    if leaf_names is not None:
+                        for t_name in leaf_names:
+                            if t_name not in seen_before_init:
+                                cand_prims.add(t_name)
+                    else:
+                        _record_immediate_expr_names((tgt,), seen_before_init)
+            for tgt in stmt.targets:
+                seen_before_init.update(_extract_root_target_names(tgt))
+        elif isinstance(stmt, ast.AnnAssign):
+            _record_immediate_expr_names((stmt.annotation,), seen_before_init)
+            if stmt.value is not None:
+                _record_immediate_expr_names((stmt.value,), seen_before_init)
+                rhs = stmt.value
+                while isinstance(rhs, ast.NamedExpr):
+                    rhs = rhs.value
+                if (
+                    isinstance(stmt.target, ast.Name)
+                    and stmt.target.id not in seen_before_init
+                ):
+                    if isinstance(rhs, ast.Tuple) and not any(
+                        isinstance(e, ast.Starred) for e in rhs.elts
+                    ):
+                        cand_tuples[stmt.target.id] = rhs
+                    else:
+                        cand_prims.add(stmt.target.id)
+                else:
+                    _record_immediate_expr_names((stmt.target,), seen_before_init)
+                seen_before_init.update(_extract_root_target_names(stmt.target))
+            elif not isinstance(stmt.target, ast.Name):
+                _record_immediate_expr_names((stmt.target,), seen_before_init)
+        elif isinstance(stmt, ast.For):
+            _record_immediate_expr_names((stmt.iter,), seen_before_init)
+            it: ast.AST = stmt.iter
+            while isinstance(it, ast.NamedExpr):
+                it = it.value
+            is_nonempty = (
+                (
+                    isinstance(it, ast.Constant)
+                    and isinstance(it.value, (str, bytes))
+                    and len(it.value) > 0
+                )
+                or (
+                    isinstance(it, (ast.Tuple, ast.List))
+                    and len(it.elts) > 0
+                    and not any(isinstance(e, ast.Starred) for e in it.elts)
+                )
+                or (
+                    isinstance(it, ast.Name)
+                    and it.id in cand_tuples
+                    and len(cand_tuples[it.id].elts) > 0
+                )
+            )
+            leaf_names = _extract_unpack_leaf_names(stmt.target)
+            if (
+                is_nonempty
+                and leaf_names is not None
+                and not (leaf_names & seen_before_init)
+            ):
+                cand_prims.update(leaf_names)
+            _record_immediate_expr_names(
+                (stmt.target, *stmt.body, *stmt.orelse), seen_before_init
+            )
+        else:
+            _record_immediate_expr_names((stmt,), seen_before_init)
+
+    name_occ_counts: Dict[str, int] = {}
+    binding_counts: Dict[str, int] = {}
+    for node in immediate_nodes:
+        if isinstance(node, ast.Name):
+            name_occ_counts[node.id] = name_occ_counts.get(node.id, 0) + 1
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                binding_counts[node.id] = binding_counts.get(node.id, 0) + 1
+        for b_name in _extract_non_assign_bound_names(node):
+            binding_counts[b_name] = binding_counts.get(b_name, 0) + 1
+
+    for node in immediate_nodes:
+        if id(node) in class_body_node_ids:
+            continue
+        if isinstance(node, ast.For):
+            leaf_names = _extract_unpack_leaf_names(node.target)
+            if leaf_names:
+                scope_counts: Dict[str, int] = {}
+                for sub in _iter_immediate_unit_exec_nodes((node.target, *node.body)):
+                    if isinstance(sub, ast.Name):
+                        scope_counts[sub.id] = scope_counts.get(sub.id, 0) + 1
+                for t_name in leaf_names:
+                    if scope_counts.get(t_name, 0) == name_occ_counts.get(t_name, 0):
+                        cand_prims.add(t_name)
+        elif isinstance(node, _COMPREHENSION_TYPES) and node.generators:
+            comp_counts: Dict[str, int] = {}
+            for sub in _iter_immediate_unit_exec_nodes((node,)):
+                if isinstance(sub, ast.Name):
+                    comp_counts[sub.id] = comp_counts.get(sub.id, 0) + 1
+            prior_gen_names: Set[str] = set()
+            for gen in node.generators:
+                _record_immediate_expr_names((gen.iter,), prior_gen_names)
+                leaf_names = (
+                    _extract_unpack_leaf_names(gen.target)
+                    if not gen.is_async
+                    else None
+                )
+                if leaf_names:
+                    for t_name in leaf_names:
+                        if t_name not in prior_gen_names and comp_counts.get(
+                            t_name, 0
+                        ) == name_occ_counts.get(t_name, 0):
+                            cand_prims.add(t_name)
+                _record_immediate_expr_names((gen.target, *gen.ifs), prior_gen_names)
+
+    cand_tuples = {
+        k: v for k, v in cand_tuples.items() if binding_counts.get(k, 0) == 1
+    }
+    cand_prims -= set(cand_tuples)
+    return cand_prims, cand_tuples
+
+
+def _collect_pedantic_primitive_env(
+    candidate_stmts: Sequence[ast.stmt],
+    immediate_nodes: Sequence[ast.AST],
+    class_body_node_ids: AbstractSet[int],
+    *,
+    effective_shadowed: AbstractSet[str],
+    all_builtins_shadowed: bool,
+) -> _PedanticPrimitiveEnv:
+    """Computes the greatest fixed point of local scalar-primitive and primitive-tuple bindings."""
+    eff_shadowed_fs = frozenset(effective_shadowed)
+    empty_local_env = _PedanticPrimitiveEnv(
+        effective_shadowed=eff_shadowed_fs,
+        all_builtins_shadowed=all_builtins_shadowed,
+    )
+    cur_prims, cand_tuples = _seed_pedantic_candidates(
+        candidate_stmts, immediate_nodes, class_body_node_ids
+    )
+    cur_tuples: Set[str] = set(cand_tuples)
+    while cur_prims or cur_tuples:
+        env = _PedanticPrimitiveEnv(
+            primitives=frozenset(cur_prims),
+            prim_tuples=frozenset(cur_tuples),
+            effective_shadowed=eff_shadowed_fs,
+            all_builtins_shadowed=all_builtins_shadowed,
+        )
+        next_tuples = {
+            t_name
+            for t_name in cur_tuples
+            if all(
+                _is_proven_primitive_dunder_expr(elt, env)
+                for elt in cand_tuples[t_name].elts
+            )
+        }
+        disq_prims: Set[str] = set()
+        for node in immediate_nodes:
+            disq_prims.update(_extract_non_assign_bound_names(node))
+            node_env = empty_local_env if id(node) in class_body_node_ids else env
+            if isinstance(node, (ast.AugAssign, ast.AsyncFor)):
+                disq_prims.update(_extract_root_target_names(node.target))
+            elif isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if not _is_proven_primitive_target_value(tgt, node.value, node_env):
+                        disq_prims.update(_extract_root_target_names(tgt))
+            elif isinstance(node, ast.AnnAssign):
+                if node.value is not None:
+                    if not _is_proven_primitive_target_value(
+                        node.target, node.value, node_env
+                    ):
+                        disq_prims.update(_extract_root_target_names(node.target))
+                elif not isinstance(node.target, ast.Name):
+                    disq_prims.update(_extract_root_target_names(node.target))
+            elif isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
+                if not _is_proven_primitive_dunder_expr(node.value, node_env):
+                    disq_prims.add(node.target.id)
+            elif isinstance(node, (ast.For, ast.comprehension)):
+                if getattr(node, "is_async", 0) or not _check_proven_sync_iter(
+                    node.target, node.iter, node_env, require_primitive_elts=True
+                ):
+                    disq_prims.update(_extract_root_target_names(node.target))
+        next_prims = cur_prims - disq_prims
+        if next_prims == cur_prims and next_tuples == cur_tuples:
+            return _PedanticPrimitiveEnv(
+                primitives=frozenset(next_prims),
+                prim_tuples=frozenset(next_tuples),
+                effective_shadowed=eff_shadowed_fs,
                 all_builtins_shadowed=all_builtins_shadowed,
             )
-            for sub_e in sub_bool_exprs
-        )
-    if (
-        isinstance(expr, ast.Compare)
-        and len(expr.ops) == 1
-        and isinstance(expr.ops[0], (ast.Is, ast.IsNot))
-    ):
-        return True
-    if (
-        isinstance(expr, ast.Call)
-        and not all_builtins_shadowed
-        and isinstance(expr.func, ast.Name)
-        and expr.func.id == "callable"
-        and "callable" not in effective_shadowed
-    ):
-        return True
-    return isinstance(expr, ast.Name) and expr.id in local_accumulators
+        cur_prims, cur_tuples = next_prims, next_tuples
+    return empty_local_env
 
 
 def _collect_local_primitive_accumulators(
@@ -632,16 +1188,13 @@ def _collect_local_primitive_accumulators(
             if t_name not in seen_before_init:
                 initialized_primitives.add(t_name)
                 continue
-        for sub in _iter_immediate_unit_exec_nodes((stmt,)):
-            if isinstance(sub, ast.Name):
-                seen_before_init.add(sub.id)
+        _record_immediate_expr_names((stmt,), seen_before_init)
     if not initialized_primitives:
         return set()
     disqualified: Set[str] = set()
     for node in immediate_nodes:
-        if isinstance(node, (ast.Global, ast.Nonlocal)):
-            disqualified.update(node.names)
-        elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+        disqualified.update(_extract_non_assign_bound_names(node))
+        if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
             if not isinstance(node.op, _PRIMITIVE_ACCUMULATOR_AUG_OPS):
                 disqualified.add(node.target.id)
         elif isinstance(node, ast.Assign):
@@ -656,12 +1209,13 @@ def _collect_local_primitive_accumulators(
                 for t in node.targets:
                     disqualified.update(_extract_root_target_names(t))
         elif isinstance(node, ast.AnnAssign):
-            is_prim = (
-                node.value is not None
-                and isinstance(node.value, ast.Constant)
-                and isinstance(node.value.value, _PRIMITIVE_ACCUMULATOR_CONST_TYPES)
-            )
-            if not is_prim or not isinstance(node.target, ast.Name):
+            if node.value is not None:
+                is_prim = isinstance(node.value, ast.Constant) and isinstance(
+                    node.value.value, _PRIMITIVE_ACCUMULATOR_CONST_TYPES
+                )
+                if not is_prim or not isinstance(node.target, ast.Name):
+                    disqualified.update(_extract_root_target_names(node.target))
+            elif not isinstance(node.target, ast.Name):
                 disqualified.update(_extract_root_target_names(node.target))
         elif isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
             if not (
@@ -669,20 +1223,21 @@ def _collect_local_primitive_accumulators(
                 and isinstance(node.value.value, _PRIMITIVE_ACCUMULATOR_CONST_TYPES)
             ):
                 disqualified.add(node.target.id)
-        elif isinstance(node, (ast.For, ast.AsyncFor)):
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
             disqualified.update(_extract_root_target_names(node.target))
-        elif isinstance(node, (ast.With, ast.AsyncWith)):
-            for item in node.items:
-                if item.optional_vars is not None:
-                    disqualified.update(_extract_root_target_names(item.optional_vars))
-        elif isinstance(node, ast.ExceptHandler) and isinstance(node.name, str):
-            disqualified.add(node.name)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            for alias in node.names:
-                disqualified.add(alias.asname or alias.name.split(".", 1)[0])
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            disqualified.add(node.name)
     return initialized_primitives - disqualified
+
+
+def _collect_immediate_class_body_node_ids(
+    immediate_nodes: Sequence[ast.AST],
+) -> frozenset[int]:
+    """Returns object ids of immediate AST nodes nested inside any ClassDef body."""
+    ids: Set[int] = set()
+    for node in immediate_nodes:
+        if isinstance(node, ast.ClassDef):
+            for sub in _iter_immediate_unit_exec_nodes(node.body):
+                ids.add(id(sub))
+    return frozenset(ids)
 
 
 def _unit_has_global_mutating_call(
@@ -709,23 +1264,27 @@ def _unit_has_global_mutating_call(
 
     In ``strict`` mode (``allow_heuristic_builtins=True``), both
     ``_PROVEN_PURE_GLOBAL_SAFE_BUILTINS`` and ``_HEURISTIC_GLOBAL_SAFE_BUILTINS``
-    are permitted when unshadowed, along with implicit boolean truth-value tests
-    and arithmetic/bitwise augmented assignments (``_PRIMITIVE_ACCUMULATOR_AUG_OPS``,
+    are permitted when unshadowed, along with implicit boolean truth-value tests,
+    read-only non-call AST expressions (binary/comparison operators, attribute and
+    subscript reads, f-strings, and synchronous ``for`` iteration), and
+    arithmetic/bitwise augmented assignments (``_PRIMITIVE_ACCUMULATOR_AUG_OPS``,
     excluding ``@=``) on local variables unconditionally initialized inside the unit
-    to a primitive constant (e.g., ``total = 0; total += x``, under the heuristic
-    assumption that the right-hand operand does not implement a global-mutating
-    reflected operator dunder such as ``__radd__``). In ``pedantic`` mode
-    (``allow_heuristic_builtins=False``), only ``_PROVEN_PURE_GLOBAL_SAFE_BUILTINS``
-    are permitted, implicit boolean truthiness on non-primitive operands (``if``,
-    ``while``, ``assert``, ``not``, ``and``/``or``, ``IfExp``, comprehension ``ifs``,
-    and ``match`` guards) is rejected, and all augmented assignments are rejected
-    because dunder-invoking built-ins (such as ``len()``, ``bool()``, ``int()``,
-    ``isinstance()``), implicit truth-value evaluation, and in-place/reflected
-    operators can execute arbitrary user code in ``__len__``, ``__bool__``,
-    ``__int__``, ``__index__``, ``__instancecheck__``, ``__iadd__``, or ``__radd__``.
-    Read-only non-call AST operations (binary/comparison operators, subscript reads,
-    attribute/``@property`` reads, and synchronous ``for`` iteration) remain
-    permitted as a documented static-analysis trade-off.
+    to a primitive constant (e.g., ``total = 0; total += x``).
+
+    In ``pedantic`` mode (``allow_heuristic_builtins=False``), only
+    ``_PROVEN_PURE_GLOBAL_SAFE_BUILTINS`` (``callable``, ``id``, ``ord``) are
+    permitted when unshadowed, all augmented assignments are rejected, and all
+    implicit dunder-invoking AST operations on unproven operands — including binary
+    and unary operators (``__add__``/``__radd__``, ``__neg__``, etc.), non-identity
+    comparisons and membership tests (``__eq__``, ``__lt__``, ``__contains__``),
+    attribute reads (``@property``, descriptors, ``__getattribute__``/``__getattr__``),
+    subscript reads (``__getitem__``, ``__index__``), synchronous ``for`` and
+    comprehension iteration (``__iter__``/``__next__``), sequence/iterable/mapping
+    unpacking, f-string formatting (``__format__``/``__str__``/``__repr__``),
+    ``set``/``dict`` hashing (``__hash__``), ``match`` class/dunder patterns,
+    ``import`` statements, non-builtin ``raise`` instantiation, and implicit boolean
+    truthiness (``__bool__``/``__len__``) — are rejected unless their operands are
+    statically proven built-in primitives or literal containers.
     """
     allowed_builtins = (
         _PURE_GLOBAL_SAFE_BUILTINS
@@ -740,27 +1299,45 @@ def _unit_has_global_mutating_call(
         shadowed_names
     ) | _extract_single_node_local_names(unit_stmt_mod, include_globals=True)
     immediate_nodes = tuple(_iter_immediate_unit_exec_nodes(candidate_stmts))
-    local_accumulators = _collect_local_primitive_accumulators(
-        candidate_stmts, immediate_nodes
+    local_accumulators: Set[str] = (
+        _collect_local_primitive_accumulators(candidate_stmts, immediate_nodes)
+        if allow_heuristic_builtins
+        else set()
     )
     for node in immediate_nodes:
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
             effective_shadowed.add(node.id)
-        elif isinstance(node, ast.ExceptHandler) and isinstance(node.name, str):
-            effective_shadowed.add(node.name)
-        elif isinstance(node, (ast.Global, ast.Nonlocal)):
-            effective_shadowed.update(node.names)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            effective_shadowed.add(node.name)
-            if isinstance(node, ast.ClassDef):
-                effective_shadowed.update(
-                    _extract_single_node_local_names(node, include_globals=True)
-                )
+        else:
+            effective_shadowed.update(_extract_non_assign_bound_names(node))
+        if isinstance(node, ast.ClassDef):
+            effective_shadowed.update(
+                _extract_single_node_local_names(node, include_globals=True)
+            )
         elif isinstance(node, _COMPREHENSION_TYPES):
             effective_shadowed.update(
                 _extract_single_node_local_names(node, include_globals=True)
             )
     all_builtins_shadowed = has_star_import or ("*" in effective_shadowed)
+    class_body_node_ids = (
+        _collect_immediate_class_body_node_ids(immediate_nodes)
+        if not allow_heuristic_builtins
+        else frozenset()
+    )
+    pedantic_env = (
+        _collect_pedantic_primitive_env(
+            candidate_stmts,
+            immediate_nodes,
+            class_body_node_ids,
+            effective_shadowed=effective_shadowed,
+            all_builtins_shadowed=all_builtins_shadowed,
+        )
+        if not allow_heuristic_builtins
+        else _PedanticPrimitiveEnv()
+    )
+    empty_class_env = _PedanticPrimitiveEnv(
+        effective_shadowed=pedantic_env.effective_shadowed,
+        all_builtins_shadowed=all_builtins_shadowed,
+    )
     for node in immediate_nodes:
         if isinstance(node, _IMMEDIATE_GLOBAL_HAZARD_NODES):
             return True
@@ -786,14 +1363,9 @@ def _unit_has_global_mutating_call(
                 return True
             if not all(_is_safe_non_descriptor_class_body_stmt(s) for s in node.body):
                 return True
-        if not allow_heuristic_builtins and any(
-            not _is_proven_primitive_bool_expr(
-                b_expr,
-                local_accumulators,
-                effective_shadowed=effective_shadowed,
-                all_builtins_shadowed=all_builtins_shadowed,
-            )
-            for b_expr in _extract_immediate_bool_test_exprs(node)
+        if not allow_heuristic_builtins and _node_invokes_pedantic_dunder_protocol(
+            node,
+            empty_class_env if id(node) in class_body_node_ids else pedantic_env,
         ):
             return True
         if isinstance(node, ast.Call):

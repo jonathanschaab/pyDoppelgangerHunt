@@ -9,12 +9,13 @@ import logging
 import os
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
 from pydoppelgangerhunt.config import (
-    log_heuristic_ctx_manager_summary,
+    heuristic_ctx_manager_session,
     normalize_path_string,
+    resolve_pair_closure_flags,
 )
 from pydoppelgangerhunt.source_lines import (
     SourceLinesOrigin,
@@ -224,6 +225,103 @@ def generate_clone_diff(
     return "\n".join(colored_diff)
 
 
+class _SuggestionRejectionInfo(NamedTuple):
+    """Classified reasons explaining why automatic helper synthesis was skipped."""
+
+    reasons: Tuple[str, ...]
+    has_safety_hazard: bool
+
+
+_PAIR_SAFETY_HAZARD_REASONS = frozenset(
+    {
+        "enclosing try/with cleanup hazard",
+        "deleted output hazard",
+        "generator cleanup hazard",
+        "severed closure cell",
+        "stale source code",
+        "pathological ast",
+        "unavailable source for closure mode",
+        "unavailable source placeholder",
+    }
+)
+
+
+def _collect_suggestion_rejection_reasons(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    sc1: Dict[str, Any],
+    sc2: Dict[str, Any],
+    *,
+    pair_skip_reason: Optional[str],
+    has_async_gen_hazard: bool,
+    synthesis_failed_with_error: bool = False,
+) -> _SuggestionRejectionInfo:
+    """Classifies per-unit safety hazards and pair-level structural incompatibilities."""
+    safety_reasons: List[str] = []
+    structural_reasons: List[str] = []
+
+    def _add_unique(dest: List[str], item: str) -> None:
+        if item and item not in dest:
+            dest.append(item)
+
+    for sc_cand in (sc1, sc2):
+        for h in sc_cand.get("control_flow_hazards", ()):
+            _add_unique(safety_reasons, str(h).replace("_", " "))
+        for cr in sc_cand.get("closure_hazard_reasons", ()):
+            _add_unique(safety_reasons, str(cr).replace("_", " "))
+
+    if pair_skip_reason:
+        if pair_skip_reason in _PAIR_SAFETY_HAZARD_REASONS or "hazard" in pair_skip_reason:
+            _add_unique(safety_reasons, pair_skip_reason)
+        elif pair_skip_reason not in safety_reasons:
+            _add_unique(structural_reasons, pair_skip_reason)
+
+    if has_async_gen_hazard:
+        _add_unique(safety_reasons, "async generator delegation hazard")
+    if sc1.get("nonlocals") or sc2.get("nonlocals"):
+        _add_unique(safety_reasons, "nonlocal binding")
+
+    if (
+        sc1.get("is_async") is None
+        or sc2.get("is_async") is None
+        or bool(sc1.get("is_async")) != bool(sc2.get("is_async"))
+    ):
+        _add_unique(structural_reasons, "async mismatch")
+    if bool(sc1.get("has_yield")) != bool(sc2.get("has_yield")):
+        _add_unique(structural_reasons, "generator mismatch")
+    if (u1.get("kind") in ("comprehension", "complex_expr")) != (
+        u2.get("kind") in ("comprehension", "complex_expr")
+    ):
+        _add_unique(structural_reasons, "mismatched expression kinds")
+    f1 = normalize_path_string(str(u1.get("file") or ""))
+    f2 = normalize_path_string(str(u2.get("file") or ""))
+    if f1 and f2 and f1 != f2 and (sc1.get("globals") or sc2.get("globals")):
+        _add_unique(structural_reasons, "cross-file global access")
+    if not safety_reasons and not structural_reasons:
+        if (
+            sc1.get("attrs_read") != sc2.get("attrs_read")
+            or sc1.get("attrs_written") != sc2.get("attrs_written")
+        ):
+            _add_unique(structural_reasons, "mismatched attribute access")
+        elif (
+            sc1.get("has_super")
+            or sc2.get("has_super")
+            or sc1.get("has_mangled_names")
+            or sc2.get("has_mangled_names")
+            or sc1.get("has_class_scoped_type_params")
+            or sc2.get("has_class_scoped_type_params")
+        ):
+            _add_unique(structural_reasons, "incompatible class binding")
+        elif synthesis_failed_with_error:
+            _add_unique(structural_reasons, "unparseable or invalid syntax")
+
+    combined = tuple(dict.fromkeys([*safety_reasons, *structural_reasons]))
+    return _SuggestionRejectionInfo(
+        reasons=combined,
+        has_safety_hazard=bool(safety_reasons),
+    )
+
+
 def synthesize_refactoring_suggestion(
     u1: Dict[str, Any],
     u2: Dict[str, Any],
@@ -265,38 +363,114 @@ def synthesize_refactoring_suggestion(
     ]
     diff_summary = f"{len(diff_lines)} varying line(s) detected between clone blocks."
 
-    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
-        _suppress_syntax_warnings,
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        CloneOutputResolution,
+        has_async_generator_delegation_hazard,
+        resolve_clone_pair_outputs,
     )
     from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
-        inspect_single_unit_scope,
+        ensure_unit_scope_closure_mode,
     )
     from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
         synthesize_shared_helper_code,
     )
 
-    try:
-        helper_code = synthesize_shared_helper_code(
-            u1,
-            u2,
-            helper_name=helper_name,
-            repo_root=repo_root,
-            closure_strictness=closure_strictness,
-            skip_pre_unit_closures=skip_pre_unit_closures,
-            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
-        )
-        if helper_code:
-            with _suppress_syntax_warnings():
-                compile(helper_code, "<synthesized_suggestion>", "exec")
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        logger.debug(
-            "Failed to synthesize refactoring suggestion for (%s, %s): %s",
-            n1,
-            n2,
-            exc,
-            exc_info=True,
-        )
-        helper_code = ""
+    u1_eff = dict(u1)
+    u2_eff = dict(u2)
+    k1_expr = u1_eff.get("kind") in ("comprehension", "complex_expr")
+    k2_expr = u2_eff.get("kind") in ("comprehension", "complex_expr")
+    if k1_expr != k2_expr and not (u1_eff.get("kind") and u2_eff.get("kind")):
+        eff_expr_kind = u1_eff.get("kind") if k1_expr else u2_eff.get("kind")
+        u1_eff.setdefault("kind", eff_expr_kind)
+        u2_eff.setdefault("kind", eff_expr_kind)
+    is_expr_unit = u1_eff.get("kind") in ("comprehension", "complex_expr")
+
+    pair_flags = resolve_pair_closure_flags(
+        u1_eff,
+        u2_eff,
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+    )
+    pre_sc1 = u1_eff.get("scope") if isinstance(u1_eff.get("scope"), dict) else None
+    pre_sc2 = u2_eff.get("scope") if isinstance(u2_eff.get("scope"), dict) else None
+    sc1 = ensure_unit_scope_closure_mode(
+        u1_eff,
+        pre_sc1,
+        pair_flags.effective_skip_pre_unit_closures,
+        strict_with_suppression=pair_flags.effective_strict_with_suppression,
+        non_suppressing_ctx_managers=pair_flags.unit1.non_suppressing_ctx_managers,
+        repo_root=repo_root,
+    )
+    sc2 = ensure_unit_scope_closure_mode(
+        u2_eff,
+        pre_sc2,
+        pair_flags.effective_skip_pre_unit_closures,
+        strict_with_suppression=pair_flags.effective_strict_with_suppression,
+        non_suppressing_ctx_managers=pair_flags.unit2.non_suppressing_ctx_managers,
+        repo_root=repo_root,
+    )
+    has_naked_loop_jump = any(
+        h in ("naked_break", "naked_continue")
+        for h in (*sc1.get("control_flow_hazards", ()), *sc2.get("control_flow_hazards", ()))
+    )
+    pair_out_raw = resolve_clone_pair_outputs(
+        u1=u1_eff,
+        u2=u2_eff,
+        scope1=sc1,
+        scope2=sc2,
+        repo_root=repo_root,
+        skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
+        closure_strictness=closure_strictness,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        return_details=True,
+    )
+    pair_outputs: Optional[Tuple[List[str], List[str]]] = (
+        pair_out_raw.outputs
+        if isinstance(pair_out_raw, CloneOutputResolution)
+        else pair_out_raw
+    )
+    pair_skip_reason: Optional[str] = (
+        pair_out_raw.skip_reason
+        if isinstance(pair_out_raw, CloneOutputResolution)
+        else None
+    )
+
+    helper_code = ""
+    synthesis_failed_with_error = False
+    if not has_naked_loop_jump and (pair_outputs is not None or is_expr_unit):
+        try:
+            helper_code = synthesize_shared_helper_code(
+                u1_eff,
+                u2_eff,
+                helper_name=helper_name,
+                repo_root=repo_root,
+                closure_strictness=closure_strictness,
+                skip_pre_unit_closures=skip_pre_unit_closures,
+                non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+                outputs=None if is_expr_unit or pair_outputs is None else pair_outputs[0],
+                outputs2=None if is_expr_unit or pair_outputs is None else pair_outputs[1],
+                scope1=sc1,
+                scope2=sc2,
+            )
+        except (
+            SyntaxError,
+            ValueError,
+            TypeError,
+            OSError,
+            UnicodeDecodeError,
+            RecursionError,
+            MemoryError,
+        ) as exc:
+            logger.debug(
+                "Failed to synthesize refactoring suggestion for (%s, %s): %s",
+                n1,
+                n2,
+                exc,
+                exc_info=True,
+            )
+            helper_code = ""
+            synthesis_failed_with_error = True
     if helper_code:
         indented_helper = "\n".join(
             f"    {ln}" if ln.strip() else ""
@@ -308,35 +482,36 @@ def synthesize_refactoring_suggestion(
             f"{indented_helper}"
         )
 
-    rejection_reasons: List[str] = []
-    try:
-        for u_cand in (u1, u2):
-            sc_cand = inspect_single_unit_scope(
-                u_cand,
-                repo_root=repo_root,
-                closure_strictness=closure_strictness,
-                skip_pre_unit_closures=skip_pre_unit_closures,
-                non_suppressing_ctx_managers=non_suppressing_ctx_managers,
-            )
-            for h in sc_cand.get("control_flow_hazards", ()):
-                h_fmt = str(h).replace("_", " ")
-                if h_fmt not in rejection_reasons:
-                    rejection_reasons.append(h_fmt)
-            for cr in sc_cand.get("closure_hazard_reasons", ()):
-                cr_fmt = str(cr).replace("_", " ")
-                if cr_fmt not in rejection_reasons:
-                    rejection_reasons.append(cr_fmt)
-    except Exception:  # pylint: disable=broad-exception-caught
-        pass
-    reason_suffix = (
-        f" [{', '.join(rejection_reasons)}]" if rejection_reasons else ""
+    has_async_gen_hazard = has_async_generator_delegation_hazard(
+        sc1,
+        sc2,
+        has_outputs=bool(pair_outputs and (pair_outputs[0] or pair_outputs[1])),
     )
+    rejection = _collect_suggestion_rejection_reasons(
+        u1_eff,
+        u2_eff,
+        sc1,
+        sc2,
+        pair_skip_reason=pair_skip_reason,
+        has_async_gen_hazard=has_async_gen_hazard,
+        synthesis_failed_with_error=synthesis_failed_with_error,
+    )
+    reason_suffix = (
+        f" [{', '.join(rejection.reasons)}]" if rejection.reasons else ""
+    )
+    if rejection.has_safety_hazard:
+        return (
+            f"[REFACTOR SUGGESTION] Automatic extraction into '{helper_name}' rejected as unsafe "
+            f"(safety hazard detected for {n1} and {n2}{reason_suffix}); manual review required:\n"
+            f"    # {diff_summary}\n"
+            f"    # WARNING: Automatic helper synthesis was skipped due to a safety hazard{reason_suffix}."
+        )
     return (
-        f"[REFACTOR SUGGESTION] Automatic extraction into '{helper_name}' rejected as unsafe "
-        f"or structurally incompatible (safety hazard, scope conflict, or incompatible structure "
-        f"detected for {n1} and {n2}{reason_suffix}); manual review required:\n"
+        f"[REFACTOR SUGGESTION] Automatic extraction into '{helper_name}' skipped as structurally "
+        f"incompatible (incompatible pair structure or outputs for {n1} and {n2}{reason_suffix}); "
+        f"manual review required:\n"
         f"    # {diff_summary}\n"
-        f"    # WARNING: Automatic helper synthesis was skipped due to a safety hazard or structural incompatibility{reason_suffix}."
+        f"    # WARNING: Automatic helper synthesis was skipped due to structural incompatibility{reason_suffix}."
     )
 
 
@@ -642,32 +817,33 @@ def generate_html_report(
     dashoffset = circumference * (1.0 - (dry_score / 100.0))
 
     cards_html: List[str] = []
-    for idx, (sim, u1, u2) in enumerate(clones, 1):
-        diff_txt = generate_clone_diff(u1, u2, repo_root=effective_repo_root)
-        sug_txt = synthesize_refactoring_suggestion(u1, u2, repo_root=effective_repo_root)
-        diff_block = (
-            f"<pre class='diff'><code>{html.escape(diff_txt)}</code></pre>" if diff_txt else "<em>No textual diff</em>"
-        )
-        sug_block = (
-            f"<div class='sug'><strong>Refactoring Suggestion:</strong><pre><code>{html.escape(sug_txt)}</code></pre></div>"
-            if sug_txt
-            else ""
-        )
+    with heuristic_ctx_manager_session():
+        for idx, (sim, u1, u2) in enumerate(clones, 1):
+            diff_txt = generate_clone_diff(u1, u2, repo_root=effective_repo_root)
+            sug_txt = synthesize_refactoring_suggestion(u1, u2, repo_root=effective_repo_root)
+            diff_block = (
+                f"<pre class='diff'><code>{html.escape(diff_txt)}</code></pre>" if diff_txt else "<em>No textual diff</em>"
+            )
+            sug_block = (
+                f"<div class='sug'><strong>Refactoring Suggestion:</strong><pre><code>{html.escape(sug_txt)}</code></pre></div>"
+                if sug_txt
+                else ""
+            )
 
-        f1_norm = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
-        f2_norm = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
-        s1, e1 = _unit_line_bounds(u1)
-        s2, e2 = _unit_line_bounds(u2)
-        n1 = str(u1.get("name") or "unit1")
-        n2 = str(u2.get("name") or "unit2")
+            f1_norm = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+            f2_norm = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
+            s1, e1 = _unit_line_bounds(u1)
+            s2, e2 = _unit_line_bounds(u2)
+            n1 = str(u1.get("name") or "unit1")
+            n2 = str(u2.get("name") or "unit2")
 
-        f1_esc = html.escape(f1_norm)
-        f2_esc = html.escape(f2_norm)
-        n1_esc = html.escape(n1)
-        n2_esc = html.escape(n2)
-        search_attr = html.escape(f"{f1_norm} {n1} {f2_norm} {n2}", quote=True)
+            f1_esc = html.escape(f1_norm)
+            f2_esc = html.escape(f2_norm)
+            n1_esc = html.escape(n1)
+            n2_esc = html.escape(n2)
+            search_attr = html.escape(f"{f1_norm} {n1} {f2_norm} {n2}", quote=True)
 
-        card = f"""
+            card = f"""
         <div class="clone-card" data-search="{search_attr}">
             <div class="card-header">
                 <span class="sim-badge" style="background: {'#ef4444' if sim >= 0.85 else '#f59e0b'};">
@@ -689,8 +865,7 @@ def generate_html_report(
             </div>
         </div>
         """
-        cards_html.append(card)
-    log_heuristic_ctx_manager_summary()
+            cards_html.append(card)
 
     families_html: List[str] = []
     if families:

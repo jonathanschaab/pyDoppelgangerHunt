@@ -30,12 +30,14 @@ from pydoppelgangerhunt.fixer._ast_compat import (
 from pydoppelgangerhunt.fixer._df_cache import (
     _get_cached_tree_source_lines,
     _get_or_compute_scope_cached,
+    _get_scope_ancestor_map,
     _get_scope_parent_map,
     _is_ephemeral_unit_ast,
     _make_trusted_scope_cache_key,
     _register_tree_source_lines,
     _scope_cell_info_cache,
     _scope_closures_cache,
+    _tree_contains_scope_node,
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
     _BaseScopeVisitor,
@@ -690,7 +692,7 @@ def _extract_scope_local_names(
         )
     )
     if module_tree is not None and module_tree is not scope_node:
-        parent_map = _get_scope_parent_map(module_tree)
+        parent_map = _get_scope_ancestor_map(module_tree)
         curr: Optional[ast.AST] = parent_map.get(scope_node)
         if curr is None and not enclosing_scopes:
             for enc in _resolve_enclosing_scopes_by_coords(
@@ -789,8 +791,8 @@ def _has_wildcard_star_import(
     if module_tree is not None:
         if _node_has_star_import(module_tree, use_cache=True):
             return True
-        if scope_node is not module_tree and scope_node not in _get_scope_parent_map(
-            module_tree
+        if scope_node is not module_tree and not _tree_contains_scope_node(
+            module_tree, scope_node
         ):
             if _node_has_star_import(scope_node, use_cache=cache_scope_node):
                 return True
@@ -872,6 +874,17 @@ def _collect_scope_closures_uncached(
     enclosing_scopes: Sequence[ast.AST] = (),
     source_lines: Optional[Sequence[str]] = None,
 ) -> _FrozenClosureList:
+    """Walks ``scope_node`` to collect nested closures and their free outer reads.
+
+    Note:
+        ``genexp_include_header`` defaults to ``True`` so a single cached scan serves both
+        post-unit downstream-read analysis (where a post-unit generator expression's
+        outermost iterable evaluates after the unit) and pre-unit closure scanning. For
+        pre-unit generator expressions, including the outermost iterable is a conservative
+        over-approximation because Python evaluates the first ``for`` iterable eagerly at
+        generator construction time rather than capturing it in a deferred closure cell;
+        dedicated intra-unit cell analysis passes ``include_header=False`` directly.
+    """
     raw_scope_body = getattr(scope_node, "body", None)
     skip_root = isinstance(raw_scope_body, list)
     if not any(

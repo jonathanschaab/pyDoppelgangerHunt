@@ -73,7 +73,12 @@ def _run_differential_refactoring_case(
 
     case_dir = tmp_path / case_name
     case_dir.mkdir(parents=True, exist_ok=True)
-    (case_dir / ".git").mkdir(exist_ok=True)
+    subprocess.run(
+        ["git", "init", "-q"],
+        cwd=str(case_dir),
+        check=True,
+        capture_output=True,
+    )
     fn_b_src = fn_src.replace("def entry(", "def entry_b(", 1)
     line_offset = len(fn_src.splitlines()) + 1
     combined_src = f"{fn_src}\n{fn_b_src}"

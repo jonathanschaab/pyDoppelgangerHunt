@@ -1630,6 +1630,7 @@ def synthesize_shared_helper_code(
             "stale_source_code",
             "deleted_output",
             "severed_closure_cell",
+            "unavailable_source_for_closure_mode",
         )
     ):
         return ""

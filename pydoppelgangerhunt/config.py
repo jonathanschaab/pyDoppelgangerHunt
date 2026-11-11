@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import contextlib
+import itertools
 import logging
 import os
 from pathlib import Path
@@ -32,38 +34,72 @@ logger = logging.getLogger(__name__)
 _warned_closure_lock: threading.Lock = threading.Lock()
 _MAX_WARNED_CLOSURE_EVENTS: int = 4096
 _MAX_HEURISTIC_CTX_MANAGERS: int = 16384
-_warned_closure_strictness_values: Set[str] = set()
+_MAX_REGISTERED_THREAD_STATES: int = 1024
+_warned_closure_strictness_values: OrderedDict[str, None] = OrderedDict()
 _heuristic_reset_epoch: List[int] = [0]
+_heuristic_record_seq = itertools.count(1)
 _heuristic_collector_tls: threading.local = threading.local()
+
+
+class _ThreadHeuristicState:
+    """Per-thread lock-isolated heuristic context-manager accumulator."""
+
+    __slots__ = (
+        "defer_depth",
+        "epoch",
+        "last_record_seq",
+        "lock",
+        "names",
+        "overflow",
+        "session_depth",
+        "session_start_seq",
+    )
+
+    def __init__(self, epoch: int, defer_depth: int = 0, session_depth: int = 0) -> None:
+        self.names: Set[str] = set()
+        self.overflow: List[int] = [0]
+        self.defer_depth: List[int] = [defer_depth]
+        self.session_depth: int = session_depth
+        self.session_start_seq: int = 0
+        self.epoch: int = epoch
+        self.last_record_seq: int = 0
+        self.lock: threading.Lock = threading.Lock()
+
+
+_registered_thread_states: List[_ThreadHeuristicState] = []
+
+
+def _get_thread_heuristic_state_obj() -> _ThreadHeuristicState:
+    """Returns the current thread's _ThreadHeuristicState without taking the global lock on hits."""
+    current_epoch = _heuristic_reset_epoch[0]
+    state: Optional[_ThreadHeuristicState] = getattr(
+        _heuristic_collector_tls, "state", None
+    )
+    if state is None or state.epoch != current_epoch:
+        state = _ThreadHeuristicState(epoch=current_epoch)
+        _heuristic_collector_tls.state = state
+        with _warned_closure_lock:
+            if len(_registered_thread_states) >= _MAX_REGISTERED_THREAD_STATES:
+                _registered_thread_states[:] = [
+                    s
+                    for s in _registered_thread_states
+                    if s.epoch == current_epoch
+                    and (s.names or s.session_depth > 0 or s.defer_depth[0] > 0)
+                ]
+                if len(_registered_thread_states) >= _MAX_REGISTERED_THREAD_STATES:
+                    del _registered_thread_states[
+                        : len(_registered_thread_states)
+                        - _MAX_REGISTERED_THREAD_STATES
+                        + 1
+                    ]
+            _registered_thread_states.append(state)
+    return state
 
 
 def _get_thread_heuristic_summary_state() -> Tuple[Set[str], List[int], List[int]]:
     """Returns the current thread's (summary_names, overflow_count_box, defer_depth_box), resetting on epoch advance."""
-    with _warned_closure_lock:
-        current_epoch = _heuristic_reset_epoch[0]
-    tls_epoch = getattr(_heuristic_collector_tls, "epoch", -1)
-    names: Optional[Set[str]] = getattr(_heuristic_collector_tls, "summary_names", None)
-    overflow: Optional[List[int]] = getattr(
-        _heuristic_collector_tls, "overflow_count", None
-    )
-    defer_depth: Optional[List[int]] = getattr(
-        _heuristic_collector_tls, "defer_depth", None
-    )
-    if (
-        names is None
-        or overflow is None
-        or defer_depth is None
-        or tls_epoch != current_epoch
-    ):
-        names = set()
-        overflow = [0]
-        if defer_depth is None or tls_epoch != current_epoch:
-            defer_depth = [0]
-        _heuristic_collector_tls.summary_names = names
-        _heuristic_collector_tls.overflow_count = overflow
-        _heuristic_collector_tls.defer_depth = defer_depth
-        _heuristic_collector_tls.epoch = current_epoch
-    return names, overflow, defer_depth
+    state = _get_thread_heuristic_state_obj()
+    return state.names, state.overflow, state.defer_depth
 
 
 _CONFIG_KEY_NAMES: Tuple[str, ...] = (
@@ -113,10 +149,11 @@ def should_warn_closure_event(event_key: str) -> bool:
     """Returns True the first time *event_key* is seen since cache reset."""
     with _warned_closure_lock:
         if event_key in _warned_closure_strictness_values:
+            _warned_closure_strictness_values.move_to_end(event_key)
             return False
-        if len(_warned_closure_strictness_values) >= _MAX_WARNED_CLOSURE_EVENTS:
-            _warned_closure_strictness_values.clear()
-        _warned_closure_strictness_values.add(event_key)
+        while len(_warned_closure_strictness_values) >= _MAX_WARNED_CLOSURE_EVENTS:
+            _warned_closure_strictness_values.popitem(last=False)
+        _warned_closure_strictness_values[event_key] = None
         return True
 
 
@@ -142,26 +179,32 @@ def collect_heuristic_ctx_managers() -> Iterator[Set[str]]:
 
 
 def record_heuristic_non_suppressing_ctx_manager(mgr_name: str) -> None:
-    """Records an unproven context manager accepted by the strict-mode name heuristic on the current thread."""
+    """Records an unproven context manager accepted by the strict-mode name heuristic without global locking."""
     stack: Optional[List[Set[str]]] = getattr(_heuristic_collector_tls, "stack", None)
     if stack:
         for bucket in stack:
             bucket.add(mgr_name)
-    names, overflow, _ = _get_thread_heuristic_summary_state()
-    if mgr_name in names:
-        return
-    if len(names) >= _MAX_HEURISTIC_CTX_MANAGERS:
-        overflow[0] += 1
-        return
-    names.add(mgr_name)
+    state = _get_thread_heuristic_state_obj()
+    seq = next(_heuristic_record_seq)
+    with state.lock:
+        state.last_record_seq = seq
+        if mgr_name in state.names:
+            return
+        if len(state.names) >= _MAX_HEURISTIC_CTX_MANAGERS:
+            state.overflow[0] += 1
+            return
+        state.names.add(mgr_name)
 
 
 def peek_heuristic_non_suppressing_ctx_managers() -> Tuple[str, ...]:
     """Returns sorted unproven context managers recorded on the current thread since last reset without clearing."""
-    names, _, _ = _get_thread_heuristic_summary_state()
-    if not names:
-        return ()
-    return tuple(sorted(names))
+    state = _get_thread_heuristic_state_obj()
+    if state.session_depth > 0:
+        _harvest_worker_heuristic_states(state, state.session_start_seq)
+    with state.lock:
+        if not state.names:
+            return ()
+        return tuple(sorted(state.names))
 
 
 def format_heuristic_ctx_manager_comment(names: Sequence[str]) -> str:
@@ -181,26 +224,94 @@ def format_heuristic_ctx_manager_comment(names: Sequence[str]) -> str:
 @contextlib.contextmanager
 def defer_heuristic_ctx_manager_summary() -> Iterator[None]:
     """Defers mid-run log_heuristic_ctx_manager_summary() draining on the current thread until an outer boundary."""
-    _, _, defer_depth = _get_thread_heuristic_summary_state()
-    defer_depth[0] += 1
+    state = _get_thread_heuristic_state_obj()
+    state.defer_depth[0] += 1
     try:
         yield
     finally:
-        _, _, after_depth = _get_thread_heuristic_summary_state()
-        after_depth[0] = max(0, after_depth[0] - 1)
+        after_state = _get_thread_heuristic_state_obj()
+        after_state.defer_depth[0] = max(0, after_state.defer_depth[0] - 1)
+
+
+def _harvest_worker_heuristic_states(
+    owner_state: _ThreadHeuristicState,
+    session_start_seq: int,
+) -> None:
+    """Drains unowned worker-thread heuristic accumulators touched during an active session."""
+    current_epoch = _heuristic_reset_epoch[0]
+    with _warned_closure_lock:
+        candidates = list(_registered_thread_states)
+    harvested_names: List[str] = []
+    harvested_overflow = 0
+    for worker_state in candidates:
+        if worker_state is owner_state or worker_state.epoch != current_epoch:
+            continue
+        if worker_state.session_depth > 0 or worker_state.defer_depth[0] > 0:
+            continue
+        with worker_state.lock:
+            if (
+                worker_state.last_record_seq <= session_start_seq
+                or worker_state.session_depth > 0
+                or worker_state.defer_depth[0] > 0
+                or not worker_state.names
+            ):
+                continue
+            harvested_names.extend(worker_state.names)
+            harvested_overflow += worker_state.overflow[0]
+            worker_state.names.clear()
+            worker_state.overflow[0] = 0
+    if harvested_names or harvested_overflow:
+        with owner_state.lock:
+            owner_state.overflow[0] += harvested_overflow
+            for mgr_name in harvested_names:
+                if mgr_name in owner_state.names:
+                    continue
+                if len(owner_state.names) >= _MAX_HEURISTIC_CTX_MANAGERS:
+                    owner_state.overflow[0] += 1
+                else:
+                    owner_state.names.add(mgr_name)
+
+
+@contextlib.contextmanager
+def heuristic_ctx_manager_session() -> Iterator[None]:
+    """Scopes a batch CLI or patch-generation run, discarding prior leftovers and harvesting worker threads."""
+    state = _get_thread_heuristic_state_obj()
+    is_outermost = state.session_depth == 0 and state.defer_depth[0] == 0
+    if is_outermost:
+        session_start_seq = next(_heuristic_record_seq)
+        with state.lock:
+            state.names.clear()
+            state.overflow[0] = 0
+            state.session_start_seq = session_start_seq
+    else:
+        session_start_seq = state.session_start_seq
+    state.session_depth += 1
+    state.defer_depth[0] += 1
+    try:
+        yield
+    finally:
+        after_state = _get_thread_heuristic_state_obj()
+        after_state.defer_depth[0] = max(0, after_state.defer_depth[0] - 1)
+        after_state.session_depth = max(0, after_state.session_depth - 1)
+        if is_outermost and after_state is state:
+            _harvest_worker_heuristic_states(state, session_start_seq)
+            log_heuristic_ctx_manager_summary(force=True)
 
 
 def log_heuristic_ctx_manager_summary(*, force: bool = False) -> Tuple[str, ...]:
     """Logs a consolidated summary of unproven context managers accepted via name heuristic on the current thread."""
-    names_set, overflow_box, defer_depth = _get_thread_heuristic_summary_state()
-    if not names_set:
-        return ()
-    if defer_depth[0] > 0 and not force:
-        return tuple(sorted(names_set))
-    names = tuple(sorted(names_set))
-    overflow = overflow_box[0]
-    names_set.clear()
-    overflow_box[0] = 0
+    state = _get_thread_heuristic_state_obj()
+    if state.session_depth > 0:
+        _harvest_worker_heuristic_states(state, state.session_start_seq)
+    with state.lock:
+        if not state.names:
+            return ()
+        if state.defer_depth[0] > 0 and not force:
+            return tuple(sorted(state.names))
+        names = tuple(sorted(state.names))
+        overflow = state.overflow[0]
+        state.names.clear()
+        state.overflow[0] = 0
     distinct_count = len(names)
     preview = ", ".join(repr(n) for n in names[:10])
     if distinct_count > 10:
@@ -217,6 +328,18 @@ def log_heuristic_ctx_manager_summary(*, force: bool = False) -> Tuple[str, ...]
     return names
 
 
+def _maybe_warn_skip_conflict(
+    is_lenient: bool,
+    skip_requested: Optional[bool],
+    event_prefix: str,
+    message: str,
+    mode_label: str,
+) -> None:
+    """Logs a deduplicated warning when skip_pre_unit_closures=True conflicts with a non-lenient strictness mode."""
+    if not is_lenient and bool(skip_requested):
+        _warn_closure_event_once(f"{event_prefix}:{mode_label}", message, mode_label)
+
+
 def resolve_closure_strictness_mode(
     closure_strictness: Optional[str] = None,
     skip_pre_unit_closures: Optional[bool] = False,
@@ -225,26 +348,24 @@ def resolve_closure_strictness_mode(
     """Resolves canonical closure strictness mode ('strict', 'pedantic', or 'lenient') and boolean skip flag.
 
     Precision vs Soundness Trade-off:
-    'strict' (default) is a heuristic safety mode for context managers: it enforces all
-    escaping closure and callback hazard checks while using a name-and-provenance heuristic
-    for unproven unknown context managers (treating them as non-suppressing unless their
-    name matches one of the 22 suppression idioms in _SUSPICIOUS_SUPPRESS_SUBSTRINGS or is
-    proven suppressing via local/function/class __exit__ provenance), and in global-reading
-    units rejects attribute/subscript mutations, deletions, non-static class-body attributes
-    (__set_name__ descriptors), and external or @= augmented assignments while permitting
-    dunder-invoking inspection/conversion built-ins, implicit boolean truthiness, and local
-    primitive-initialized arithmetic/bitwise accumulator augmented assignments (e.g.,
-    total = 0; total += x, under the heuristic that the RHS operand does not implement a
-    global-mutating reflected operator dunder such as __radd__).
-    'pedantic' (deprecated alias 'fail_closed') is the fail-closed mode for context-manager
-    suppression and global-reading calls/setters: it treats all unproven unknown context
-    managers as potentially exception-suppressing unless explicitly listed in
-    non_suppressing_ctx_managers, and additionally rejects dunder-invoking built-in calls,
-    implicit truth-value evaluations on non-primitive operands (__bool__ / __len__), and
-    all local accumulator augmented assignments in global-reading units alongside the
-    attribute/subscript, class-body descriptor, and external augmented-assignment mutations
-    rejected in 'strict' mode (while still permitting read-only protocol syntax such as
-    synchronous for-iteration, attribute/subscript reads, and binary/comparison operators).
+    'strict' (default) is a heuristic safety mode for context managers and global-reading
+    operations: it enforces all escaping closure and callback hazard checks while using a
+    name-and-provenance heuristic for unproven unknown context managers (treating them as
+    non-suppressing unless their terminal manager/callee name matches a suppression idiom in
+    _SUSPICIOUS_SUPPRESS_SUBSTRINGS or is proven suppressing via local/function/class __exit__
+    provenance), and in global-reading units rejects attribute/subscript mutations, deletions,
+    non-static class-body attributes (__set_name__ descriptors), and external or @= augmented
+    assignments while permitting dunder-invoking inspection/conversion built-ins, implicit
+    operator/truthiness/iteration protocols, and local primitive-initialized arithmetic/bitwise
+    accumulator augmented assignments.
+    'pedantic' (deprecated alias 'fail_closed') is a stricter conservative mode for
+    context-manager suppression and global-reading dunder operations: it treats all unproven
+    unknown context managers as potentially exception-suppressing unless explicitly listed in
+    non_suppressing_ctx_managers, and in global-reading units rejects calls, attribute/subscript
+    loads and mutations, for-iteration over non-primitive iterables, f-string formatting,
+    starred unpacking of non-primitives, and binary/unary/comparison/truth-testing operations
+    unless operands are proven primitive values (excluding exotic import-hook or
+    metaclass/frame side effects).
     'lenient' (deprecated aliases 'fast', 'skip') relaxes speculative unreferenced-sibling closure
     checks while still enforcing direct cell-capture, intra-unit nonlocal mutator, and
     referenced-sibling closure checks.
@@ -266,9 +387,9 @@ def resolve_closure_strictness_mode(
                 _warn_closure_event_once(
                     f"deprecated_strictness_alias:{c_mode}",
                     "closure_strictness alias '%s' is deprecated and now resolves to 'pedantic' "
-                    "(changed from 'strict'; rejects all unproven with-blocks and dunder-invoking "
-                    "builtins in global-reading units); use 'pedantic' for fail-closed analysis "
-                    "or 'strict' to preserve prior behavior",
+                    "(changed from 'strict'; rejects all unproven with-blocks and unproven "
+                    "implicit-dunder operations in global-reading units); use 'pedantic' "
+                    "explicitly or 'strict' for the default heuristic mode",
                     closure_strictness,
                 )
             elif c_mode in ("fast", "skip"):
@@ -278,13 +399,14 @@ def resolve_closure_strictness_mode(
                     closure_strictness,
                     resolved_mode,
                 )
-            if not is_lenient_mode and skip_pre_unit_closures:
-                _warn_closure_event_once(
-                    f"conflict_skip:{closure_strictness}",
-                    "Conflicting configuration: closure_strictness '%s' takes precedence over "
-                    "skip_pre_unit_closures=True (--skip-pre-unit-closures)",
-                    closure_strictness,
-                )
+            _maybe_warn_skip_conflict(
+                is_lenient_mode,
+                skip_pre_unit_closures,
+                "conflict_skip",
+                "Conflicting configuration: closure_strictness '%s' takes precedence over "
+                "skip_pre_unit_closures=True",
+                closure_strictness,
+            )
             expected_strict_with = resolved_mode == "pedantic"
             if (
                 strict_with_suppression is not None
@@ -350,25 +472,17 @@ def resolve_unit_closure_flags(
 ) -> UnitClosureFlags:
     """Resolves (skip_pre_unit_closures, strict_with_suppression) for a unit with optional overrides.
 
-    Precedence Order (highest to lowest):
-        1. Explicit ``closure_strictness`` argument.
-        2. Explicit boolean argument (``skip_pre_unit_closures`` or ``strict_with_suppression``)
-           when ``closure_strictness`` is ``None`` (overrides ``unit["closure_strictness"]``).
-        3. Unit dictionary keys (``unit["closure_strictness"]`` >
-           ``unit["skip_pre_unit_closures"]`` > ``unit["strict_with_suppression"]``).
-        4. Default ``"strict"`` mode: ``UnitClosureFlags(False, False)``.
-
-    Truth Table (effective inputs -> ``(skip_pre_unit_closures, strict_with_suppression)``):
-        ========================  ======  ===========  ==================
-        eff_strictness            skip    strict_with  Result
-        ========================  ======  ===========  ==================
-        "pedantic"/"fail_closed"  any     any          (False, True)
-        "strict"                  any     any          (False, False)
-        "lenient"/"fast"/"skip"   any     any          (True, False)
-        None                      True    any          (True, False)
-        None                      False   True         (False, True)
-        None                      False   False/None   (False, False)
-        ========================  ======  ===========  ==================
+    Precedence Order:
+        1. Explicit ``closure_strictness`` argument from the caller.
+        2. When ``closure_strictness`` is ``None`` and the unit itself explicitly sets a
+           non-lenient closure policy (``unit["closure_strictness"]``,
+           ``unit["strict_with_suppression"] is True``, or
+           ``unit["skip_pre_unit_closures"] is False``), caller boolean flags
+           (``skip_pre_unit_closures``, ``strict_with_suppression``) combine monotonically:
+           they may strengthen the unit's policy (``lenient -> strict -> pedantic``) but
+           never weaken an explicit stricter unit policy.
+        3. Otherwise, caller boolean flags apply over unit dictionary defaults, falling
+           back to ``"strict"`` mode: ``UnitClosureFlags(False, False)``.
     """
     if closure_strictness is not None:
         eff_skip_in = (
@@ -388,6 +502,11 @@ def resolve_unit_closure_flags(
         )
         return UnitClosureFlags(eff_skip, resolved_mode == "pedantic")
 
+    has_explicit_unit_mode = (
+        unit.get("closure_strictness") is not None
+        or unit.get("strict_with_suppression") is True
+        or unit.get("skip_pre_unit_closures") is False
+    )
     unit_mode, unit_skip = resolve_closure_strictness_mode(
         closure_strictness=unit.get("closure_strictness"),
         skip_pre_unit_closures=bool(unit.get("skip_pre_unit_closures", False)),
@@ -407,12 +526,28 @@ def resolve_unit_closure_flags(
         if strict_with_suppression is not None
         else (False if skip_pre_unit_closures else unit_strict_with)
     )
-    resolved_mode, eff_skip = resolve_closure_strictness_mode(
+    resolved_mode, caller_skip = resolve_closure_strictness_mode(
         closure_strictness=None,
         skip_pre_unit_closures=bool(eff_skip_in),
         strict_with_suppression=eff_sw_in,
     )
-    return UnitClosureFlags(eff_skip, resolved_mode == "pedantic")
+    caller_strict_with = resolved_mode == "pedantic"
+    if has_explicit_unit_mode:
+        _maybe_warn_skip_conflict(
+            unit_skip,
+            caller_skip,
+            "conflict_unit_strictness_vs_caller_skip",
+            "Conflicting configuration: unit closure strictness '%s' cannot be "
+            "weakened by skip_pre_unit_closures=True; pass closure_strictness='lenient' "
+            "to override explicitly",
+            unit_mode,
+        )
+        eff_skip = bool(unit_skip and caller_skip)
+        eff_strict_with = bool(
+            not eff_skip and (unit_strict_with or caller_strict_with)
+        )
+        return UnitClosureFlags(eff_skip, eff_strict_with)
+    return UnitClosureFlags(caller_skip, caller_strict_with)
 
 
 def resolve_pair_closure_flags(
@@ -482,12 +617,12 @@ def clear_closure_warning_cache() -> None:
     """Clears the set of warned closure strictness values and resets thread-local heuristic summaries."""
     with _warned_closure_lock:
         _warned_closure_strictness_values.clear()
+        _registered_thread_states.clear()
         _heuristic_reset_epoch[0] += 1
         new_epoch = _heuristic_reset_epoch[0]
-    _heuristic_collector_tls.summary_names = set()
-    _heuristic_collector_tls.overflow_count = [0]
-    _heuristic_collector_tls.defer_depth = [0]
-    _heuristic_collector_tls.epoch = new_epoch
+        fresh_state = _ThreadHeuristicState(epoch=new_epoch)
+        _registered_thread_states.append(fresh_state)
+    _heuristic_collector_tls.state = fresh_state
 
 
 DEFAULT_EXCLUDES: List[str] = [

@@ -483,6 +483,10 @@ def resolve_clone_generator_subroutine_outputs(
                 "unavailable_source_for_closure_mode",
                 "unavailable source for closure mode",
             ),
+            (
+                "unavailable_source_placeholder",
+                "unavailable source placeholder",
+            ),
             ("severed_closure_cell", "severed closure cell"),
             ("stale_source_code", "stale source code"),
             ("pathological_ast", "pathological ast"),
@@ -803,15 +807,26 @@ def resolve_clone_pair_outputs(
 
     outs1 = _extract_effective_unit_outputs(u1, scope1)
     outs2 = _extract_effective_unit_outputs(u2, scope2)
-    for hazard_key, reason_str in (
+    blocking_hazards: List[Tuple[str, str]] = [
         (
             "unavailable_source_for_closure_mode",
             "unavailable source for closure mode",
         ),
+        *(
+            [
+                (
+                    "unavailable_source_placeholder",
+                    "unavailable source placeholder",
+                )
+            ]
+            if (is_sub or require_pairing is not False)
+            else []
+        ),
         ("severed_closure_cell", "severed closure cell"),
         ("stale_source_code", "stale source code"),
         ("pathological_ast", "pathological ast"),
-    ):
+    ]
+    for hazard_key, reason_str in blocking_hazards:
         if (
             hazard_key in scope1.get("control_flow_hazards", ())
             or hazard_key in scope2.get("control_flow_hazards", ())

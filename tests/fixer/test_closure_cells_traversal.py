@@ -2402,20 +2402,6 @@ def test_module_star_import_and_single_node_locals_cached_once(
     from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope
 
     clear_dataflow_cache()
-    star_walk_calls = 0
-    orig_uncached_star = df_closures_mod._node_has_star_import_uncached
-
-    def _counting_star_import(root: ast.AST) -> bool:
-        nonlocal star_walk_calls
-        if isinstance(root, ast.Module) and len(root.body) > 50:
-            star_walk_calls += 1
-        return orig_uncached_star(root)
-
-    monkeypatch.setattr(
-        df_closures_mod,
-        "_node_has_star_import_uncached",
-        _counting_star_import,
-    )
     large_lines = [f"CONST_{i} = {i}\n" for i in range(200)]
     for i in range(30):
         large_lines.append(
@@ -2427,6 +2413,21 @@ def test_module_star_import_and_single_node_locals_cached_once(
         )
     large_src = "".join(large_lines)
     large_tree = ast.parse(large_src)
+
+    star_walk_calls = 0
+    orig_uncached_star = df_closures_mod._node_has_star_import_uncached
+
+    def _counting_star_import(root: ast.AST) -> bool:
+        nonlocal star_walk_calls
+        if root is large_tree:
+            star_walk_calls += 1
+        return orig_uncached_star(root)
+
+    monkeypatch.setattr(
+        df_closures_mod,
+        "_node_has_star_import_uncached",
+        _counting_star_import,
+    )
     for i in range(30):
         base_ln = 200 + i * 5 + 1
         sc_unit = inspect_single_unit_scope(

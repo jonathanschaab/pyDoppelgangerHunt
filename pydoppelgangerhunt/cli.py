@@ -25,11 +25,9 @@ from pydoppelgangerhunt.baseline import (
 from pydoppelgangerhunt.clustering import cluster_clone_families
 from pydoppelgangerhunt.config import (
     DEFAULT_EXCLUDES,
-    defer_heuristic_ctx_manager_summary,
-    format_heuristic_ctx_manager_comment,
+    heuristic_ctx_manager_session,
     init_tool_configuration,
     load_tool_config,
-    log_heuristic_ctx_manager_summary,
     normalize_non_suppressing_ctx_managers,
     normalize_path_string,
     resolve_closure_strictness_mode,
@@ -410,7 +408,7 @@ def _render_pair_diff_and_suggestions(
     use_color: bool,
     indent: str = "    ",
     closure_strictness: Optional[str] = None,
-    skip_pre_unit_closures: bool = False,
+    skip_pre_unit_closures: Optional[bool] = False,
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> List[str]:
     """Renders optional refactoring suggestion and unified diff for a pair of clone units."""
@@ -420,8 +418,8 @@ def _render_pair_diff_and_suggestions(
         sug_kwargs: Dict[str, Any] = {"repo_root": effective_root}
         if closure_strictness is not None:
             sug_kwargs["closure_strictness"] = closure_strictness
-            sug_kwargs["skip_pre_unit_closures"] = skip_pre_unit_closures
-        elif skip_pre_unit_closures:
+            sug_kwargs["skip_pre_unit_closures"] = bool(skip_pre_unit_closures)
+        elif skip_pre_unit_closures is not None:
             sug_kwargs["skip_pre_unit_closures"] = skip_pre_unit_closures
         if non_suppressing_ctx_managers is not None:
             sug_kwargs["non_suppressing_ctx_managers"] = (
@@ -672,7 +670,7 @@ def _render_text_violations(
     repo_root: Optional[str] = None,
     audit_tests_enabled: bool = False,
     closure_strictness: Optional[str] = None,
-    skip_pre_unit_closures: bool = False,
+    skip_pre_unit_closures: Optional[bool] = False,
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> List[str]:
     """Renders human-readable text output for clone violations (either clustered families or pairwise)."""
@@ -1176,6 +1174,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.shared_module_name or tool_cfg.get("shared_module_name", "_common.py")
     )
     cfg_strictness = tool_cfg.get("closure_strictness")
+    has_cfg_skip = (
+        "skip_pre_unit_closures" in tool_cfg
+        and tool_cfg.get("skip_pre_unit_closures") is not None
+    )
     cfg_skip = _safe_bool(tool_cfg.get("skip_pre_unit_closures", False))
 
     cfg_strict_with = (
@@ -1184,40 +1186,70 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         and tool_cfg.get("strict_with_suppression") is not None
         else None
     )
-    if args.closure_strictness is not None:
-        cli_strictness: Optional[str] = args.closure_strictness
-        cli_skip: bool = _safe_bool(args.skip_pre_unit_closures)
-    elif args.skip_pre_unit_closures:
-        cli_strictness = "lenient"
-        cli_skip = True
-        if cfg_strictness is not None and str(cfg_strictness).strip().lower() in (
-            "strict",
-            "fail_closed",
-            "pedantic",
-        ):
-            logger.warning(
-                "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
-                "configured closure_strictness='%s'",
-                cfg_strictness,
-            )
-        elif cfg_strict_with:
-            logger.warning(
-                "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
-                "configured strict_with_suppression=True"
-            )
-    else:
-        cli_strictness = cfg_strictness
-        cli_skip = cfg_skip
-
-    closure_strictness, skip_pre_unit_closures = resolve_closure_strictness_mode(
-        closure_strictness=cli_strictness,
-        skip_pre_unit_closures=cli_skip,
-        strict_with_suppression=(
-            cfg_strict_with
-            if args.closure_strictness is None and not args.skip_pre_unit_closures
-            else None
-        ),
+    has_explicit_closure_cfg = (
+        args.closure_strictness is not None
+        or bool(args.skip_pre_unit_closures)
+        or cfg_strictness is not None
+        or has_cfg_skip
+        or cfg_strict_with is not None
     )
+    closure_strictness: Optional[str]
+    skip_pre_unit_closures: Optional[bool]
+    if not has_explicit_closure_cfg:
+        closure_strictness = None
+        skip_pre_unit_closures = None
+    else:
+        eff_cfg_strict_with: Optional[bool] = None
+        if args.closure_strictness is not None:
+            cli_strictness: Optional[str] = args.closure_strictness
+            cli_skip: bool = _safe_bool(args.skip_pre_unit_closures)
+            if cli_skip and str(cli_strictness).strip().lower() in (
+                "strict",
+                "pedantic",
+                "fail_closed",
+            ):
+                logger.warning(
+                    "Conflicting configuration: closure_strictness '%s' takes precedence over "
+                    "skip_pre_unit_closures=True (--skip-pre-unit-closures)",
+                    cli_strictness,
+                )
+                cli_skip = False
+        elif args.skip_pre_unit_closures:
+            cli_strictness = "lenient"
+            cli_skip = True
+            if cfg_strictness is not None and str(cfg_strictness).strip().lower() in (
+                "strict",
+                "fail_closed",
+                "pedantic",
+            ):
+                logger.warning(
+                    "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
+                    "configured closure_strictness='%s'",
+                    cfg_strictness,
+                )
+            elif cfg_strict_with:
+                logger.warning(
+                    "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
+                    "configured strict_with_suppression=True"
+                )
+        elif (
+            cfg_strict_with is True
+            and cfg_strictness is not None
+            and str(cfg_strictness).strip().lower() == "strict"
+        ):
+            cli_strictness = "pedantic"
+            cli_skip = cfg_skip
+            eff_cfg_strict_with = True
+        else:
+            cli_strictness = cfg_strictness
+            cli_skip = cfg_skip
+            eff_cfg_strict_with = cfg_strict_with
+
+        closure_strictness, skip_pre_unit_closures = resolve_closure_strictness_mode(
+            closure_strictness=cli_strictness,
+            skip_pre_unit_closures=cli_skip,
+            strict_with_suppression=eff_cfg_strict_with,
+        )
     non_suppressing_ctx_managers = normalize_non_suppressing_ctx_managers(
         tool_cfg.get("non_suppressing_ctx_managers"),
         getattr(args, "non_suppressing_ctx_managers", ()),
@@ -1530,105 +1562,148 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.coverage:
         cov_data = read_coverage_data(args.coverage)
 
-    with defer_heuristic_ctx_manager_summary():
-        if args.html:
-            html_report = generate_html_report(
+    return _emit_scan_artifacts_and_report(
+        args=args,
+        clones=clones,
+        target=target,
+        threshold=threshold,
+        sort_by=sort_by,
+        families=families,
+        stats=stats,
+        cov_data=cov_data,
+        use_color=use_color,
+        git_worktree_root=git_worktree_root,
+        audit_tests_enabled=audit_tests_enabled,
+        type_merge_strategy=type_merge_strategy,
+        replace_clones=replace_clones,
+        method_binding=method_binding,
+        cross_file_strategy=cross_file_strategy,
+        shared_module_name=shared_module_name,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+        closure_strictness=closure_strictness,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+    )
+
+
+@heuristic_ctx_manager_session()
+def _emit_scan_artifacts_and_report(
+    *,
+    args: argparse.Namespace,
+    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
+    target: str,
+    threshold: float,
+    sort_by: str,
+    families: Optional[List[Dict[str, Any]]],
+    stats: Optional[Dict[str, Any]],
+    cov_data: Dict[str, Set[int]],
+    use_color: bool,
+    git_worktree_root: str,
+    audit_tests_enabled: bool,
+    type_merge_strategy: str,
+    replace_clones: bool,
+    method_binding: str,
+    cross_file_strategy: str,
+    shared_module_name: str,
+    skip_pre_unit_closures: Optional[bool],
+    closure_strictness: Optional[str],
+    non_suppressing_ctx_managers: Tuple[str, ...],
+) -> int:
+    """Emits HTML/patch/annotation artifacts and structured or text scan reports."""
+    if args.html:
+        html_report = generate_html_report(
+            clones,
+            target,
+            threshold,
+            families=families,
+            stats=stats,
+            repo_root=git_worktree_root,
+        )
+        _write_artifact_file(args.html, html_report, "HTML", args.format == "text")
+
+    if args.patch:
+        patch_text = (
+            generate_refactoring_patch(
                 clones,
-                target,
-                threshold,
-                families=families,
-                stats=stats,
                 repo_root=git_worktree_root,
-            )
-            _write_artifact_file(args.html, html_report, "HTML", args.format == "text")
-
-        try:
-            if args.patch:
-                patch_text = (
-                    generate_refactoring_patch(
-                        clones,
-                        repo_root=git_worktree_root,
-                        type_merge_strategy=type_merge_strategy,
-                        replace_clones=replace_clones,
-                        method_binding=method_binding,
-                        cross_file_strategy=cross_file_strategy,
-                        shared_module_name=shared_module_name,
-                        skip_pre_unit_closures=skip_pre_unit_closures,
-                        closure_strictness=closure_strictness,
-                        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
-                    )
-                    if clones
-                    else ""
-                )
-                _write_artifact_file(args.patch, patch_text, "PATCH", args.format == "text")
-            elif args.replace_clones and args.format == "text":
-                print(
-                    colorize(
-                        "Warning: --replace-clones specified without --patch; no patch will be generated.",
-                        COLOR_BOLD + COLOR_YELLOW,
-                        use_color,
-                    )
-                )
-
-            if args.github_annotations and clones:
-                annotations = format_github_annotations(clones)
-                if annotations:
-                    print("\n".join(annotations))
-
-            if args.format in ("sarif", "json"):
-                report_data = (
-                    format_sarif_report(clones, target, threshold)
-                    if args.format == "sarif"
-                    else format_json_report(clones, target, threshold, families=families, stats=stats)
-                )
-                emit_structured_report(
-                    report_data, "SARIF 2.1.0" if args.format == "sarif" else "JSON", args.output
-                )
-                return 0 if not clones else 1
-
-            # Text format
-            if stats and args.stats:
-                _render_dry_scorecard(stats, use_color)
-
-            if not clones:
-                ok_msg = colorize(f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!", COLOR_BOLD + COLOR_GREEN, use_color)
-                print(ok_msg)
-                if args.output:
-                    out_p = Path(args.output)
-                    out_p.parent.mkdir(parents=True, exist_ok=True)
-                    with open(out_p, "w", encoding="utf-8") as fh:
-                        fh.write(f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!\n")
-                return 0
-
-            report_lines = _render_text_violations(
-                clones,
-                threshold,
-                sort_by,
-                args=args,
-                families=families,
-                cov_data=cov_data,
-                use_color=use_color,
-                target_repo_root=git_worktree_root,
-                audit_tests_enabled=audit_tests_enabled,
-                closure_strictness=closure_strictness,
+                type_merge_strategy=type_merge_strategy,
+                replace_clones=replace_clones,
+                method_binding=method_binding,
+                cross_file_strategy=cross_file_strategy,
+                shared_module_name=shared_module_name,
                 skip_pre_unit_closures=skip_pre_unit_closures,
+                closure_strictness=closure_strictness,
                 non_suppressing_ctx_managers=non_suppressing_ctx_managers,
             )
-            summary_names = log_heuristic_ctx_manager_summary(force=True)
-            if summary_names:
-                summary_comment = format_heuristic_ctx_manager_comment(summary_names)
-                print(summary_comment)
-                report_lines.append(summary_comment)
+            if clones
+            else ""
+        )
+        _write_artifact_file(args.patch, patch_text, "PATCH", args.format == "text")
+    elif args.replace_clones and args.format == "text":
+        print(
+            colorize(
+                "Warning: --replace-clones specified without --patch; no patch will be generated.",
+                COLOR_BOLD + COLOR_YELLOW,
+                use_color,
+            )
+        )
 
-            if args.output:
-                out_p = Path(args.output)
-                out_p.parent.mkdir(parents=True, exist_ok=True)
-                with open(out_p, "w", encoding="utf-8") as fh:
-                    fh.write("\n".join(report_lines) + "\n")
+    if args.github_annotations and clones:
+        annotations = format_github_annotations(clones)
+        if annotations:
+            print("\n".join(annotations))
 
-            return 1
-        finally:
-            log_heuristic_ctx_manager_summary(force=True)
+    if args.format in ("sarif", "json"):
+        report_data = (
+            format_sarif_report(clones, target, threshold)
+            if args.format == "sarif"
+            else format_json_report(clones, target, threshold, families=families, stats=stats)
+        )
+        emit_structured_report(
+            report_data, "SARIF 2.1.0" if args.format == "sarif" else "JSON", args.output
+        )
+        return 0 if not clones else 1
+
+    if stats and args.stats:
+        _render_dry_scorecard(stats, use_color)
+
+    if not clones:
+        ok_msg = colorize(
+            f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!",
+            COLOR_BOLD + COLOR_GREEN,
+            use_color,
+        )
+        print(ok_msg)
+        if args.output:
+            out_p = Path(args.output)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_p, "w", encoding="utf-8") as fh:
+                fh.write(
+                    f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!\n"
+                )
+        return 0
+
+    report_lines = _render_text_violations(
+        clones,
+        threshold,
+        sort_by,
+        args=args,
+        families=families,
+        cov_data=cov_data,
+        use_color=use_color,
+        target_repo_root=git_worktree_root,
+        audit_tests_enabled=audit_tests_enabled,
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+    )
+
+    if args.output:
+        out_p = Path(args.output)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_p, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(report_lines) + "\n")
+
+    return 1
 
 
 if __name__ == "__main__":

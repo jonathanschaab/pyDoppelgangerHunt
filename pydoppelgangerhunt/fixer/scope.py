@@ -42,6 +42,7 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _get_or_compute_scope_cached,
     _get_or_parse_tree,
     _get_scope_parent_map,
+    _is_ephemeral_unit_ast,
     _register_tree_source_lines,
     _scope_cell_info_cache,
     _split_source_lines_stripped,
@@ -106,6 +107,7 @@ from pydoppelgangerhunt.fixer.source import (
     _slice_utf8_line,
     dedent_source_text,
     find_enclosing_function_is_async,
+    is_sliced_unit_source_lines,
     is_subroutine_unit,
     parse_unit_coord,
     resolve_unit_declared_outputs,
@@ -1797,7 +1799,7 @@ def _get_tree_sha256_digest(mod_tree: ast.AST) -> str:
         )
         return hasher.hexdigest()
 
-    if getattr(mod_tree, "_is_ephemeral_unit_mod", False):
+    if _is_ephemeral_unit_ast(mod_tree):
         return _compute()
     cache_key = _ScopeCacheKey(mod_tree, "tree_sha256_digest")
     return cast(
@@ -1832,14 +1834,14 @@ def _unit_source_code_matches_tree(
         "closure",
     )
     span_idx = _get_span_line_index(file_tree)
-    end_entries = [
-        entry
-        for entry in (
-            *span_idx.by_start_line.get(u_end, ()),
-            *span_idx.by_end_line.get(u_end, ()),
-        )
-        if entry.n_end == u_end
-    ]
+    end_nodes: List[Tuple[ast.AST, int]] = []
+    for cand_node in (
+        *span_idx.by_start_line.get(u_end, ()),
+        *span_idx.by_end_line.get(u_end, ()),
+    ):
+        cand_start, cand_end, _c, _ec = span_idx.node_coords(cand_node)
+        if cand_end == u_end:
+            end_nodes.append((cand_node, cand_start))
     src_dumps = _parse_normalized_stmt_dumps(src_code)
     if src_dumps:
         candidate_dump_seqs: List[List[str]] = [src_dumps]
@@ -1877,11 +1879,10 @@ def _unit_source_code_matches_tree(
         parent_map = _get_scope_parent_map(file_tree)
         candidate_parents: List[ast.AST] = []
         seen_parent_ids: Set[int] = set()
-        for entry in end_entries:
-            node = entry.node
+        for node, entry_start in end_nodes:
             if isinstance(node, (ast.stmt, ast.ExceptHandler)):
-                n_s = getattr(node, "lineno", entry.n_start)
-                if u_start in (n_s, entry.n_start):
+                n_s = getattr(node, "lineno", entry_start)
+                if u_start in (n_s, entry_start):
                     single_dump = [span_idx.get_dump(node)]
                     if single_dump in candidate_dump_seqs:
                         return True
@@ -1941,11 +1942,10 @@ def _unit_source_code_matches_tree(
             with _suppress_syntax_warnings():
                 expr_node = ast.parse(dedented, mode="eval").body
             expr_dump = ast.dump(expr_node, include_attributes=False)
-            for entry in end_entries:
-                node = entry.node
+            for node, entry_start in end_nodes:
                 if (
                     isinstance(node, ast.expr)
-                    and entry.n_start == u_start
+                    and entry_start == u_start
                     and span_idx.get_dump(node) == expr_dump
                 ):
                     return True
@@ -2251,27 +2251,31 @@ def _inspect_unit_scope(
         }
     if is_placeholder_source and file_tree is None:
         unit_kind_str = str(unit.get("kind") or "")
-        if (
-            bool(unit.get("is_subroutine"))
-            or unit_kind_str in _SUBROUTINE_KINDS
-            or unit_kind_str
-            in (
-                "subroutine",
-                "basic_block",
-                "linear_block",
-                "stmt_seq",
-                "statement",
-                "closure",
-                "comprehension",
-                "complex_expr",
+        placeholder_hazards = (
+            ["severed_closure_cell", "unavailable_source_placeholder"]
+            if (
+                bool(unit.get("is_subroutine"))
+                or unit_kind_str in _SUBROUTINE_KINDS
+                or unit_kind_str
+                in (
+                    "subroutine",
+                    "basic_block",
+                    "linear_block",
+                    "stmt_seq",
+                    "statement",
+                    "closure",
+                    "comprehension",
+                    "complex_expr",
+                )
             )
-        ):
-            return {
-                **empty_res,
-                "control_flow_hazards": ["severed_closure_cell"],
-                "closure_hazard_reasons": ["unavailable_source_placeholder"],
-                "is_control_flow_safe": False,
-            }
+            else ["unavailable_source_placeholder"]
+        )
+        return {
+            **empty_res,
+            "control_flow_hazards": placeholder_hazards,
+            "closure_hazard_reasons": ["unavailable_source_placeholder"],
+            "is_control_flow_safe": False,
+        }
     if not dedented.strip():
         return empty_res
 
@@ -3049,18 +3053,24 @@ def _inspect_unit_scope(
                         for r in hazard_res.reasons:
                             if r not in closure_hazard_reasons:
                                 closure_hazard_reasons.append(r)
-            elif "severed_closure_cell" not in hazards and (
-                bool(_get_full_source())
-                or (unit.get("kind") == "closure" and bool(free_vars))
-            ):
-                # Fail closed when module source exists but failed AST parsing, or when
-                # a closure unit captures free variables without an enclosing module AST.
-                # Standalone snippet-only subroutine units (source_code/source_lines with
-                # no enclosing module source) are an intentional exception for isolated
-                # snippet scope inspection.
-                hazards.append("severed_closure_cell")
-                if "unresolved_span_bounds" not in closure_hazard_reasons:
-                    closure_hazard_reasons.append("unresolved_span_bounds")
+            elif "severed_closure_cell" not in hazards:
+                if bool(_get_full_source()) or (
+                    unit.get("kind") == "closure" and bool(free_vars)
+                ):
+                    hazards.append("severed_closure_cell")
+                    if "unresolved_span_bounds" not in closure_hazard_reasons:
+                        closure_hazard_reasons.append("unresolved_span_bounds")
+                elif not bool(unit.get("allow_snippet_only")):
+                    # Fail closed when enclosing module context is absent unless the
+                    # caller explicitly opted into isolated snippet-only inspection.
+                    hazards.append("severed_closure_cell")
+                    if (
+                        "snippet_only_missing_enclosing_context"
+                        not in closure_hazard_reasons
+                    ):
+                        closure_hazard_reasons.append(
+                            "snippet_only_missing_enclosing_context"
+                        )
 
         is_control_flow_safe = not any(
             h
@@ -3073,6 +3083,7 @@ def _inspect_unit_scope(
                 "deleted_output",
                 "severed_closure_cell",
                 "unavailable_source_for_closure_mode",
+                "unavailable_source_placeholder",
             )
             for h in hazards
         )
@@ -3328,9 +3339,11 @@ def ensure_unit_scope_closure_mode(
 ) -> Dict[str, Any]:
     """Returns scope if its schema version and closure mode match, else recomputes it.
 
-    Unmarked or legacy scopes (missing ``scope_schema_version == SCOPE_SCHEMA_VERSION``)
-    and scopes whose mode flags differ from the requested configuration are recomputed
-    when unit source or AST is available, and fail closed when source is unavailable.
+    Caller-supplied scopes lacking ``scope_schema_version == SCOPE_SCHEMA_VERSION`` (or
+    whose ``skip_pre_unit_closures`` / ``strict_with_suppression`` /
+    ``non_suppressing_ctx_managers`` flags differ from the requested configuration) are
+    discarded — losing any manual caller overrides in those dicts — and recomputed from
+    the backing module source/AST, or fail closed when backing source is unavailable.
 
     Note:
         Scopes that already record terminal ``"pathological_ast"`` or ``"stale_source_code"``
@@ -3338,13 +3351,13 @@ def ensure_unit_scope_closure_mode(
         the terminal hazard dict, as they are unconditionally rejected downstream regardless
         of closure mode.
     """
-    resolved_flags = resolve_unit_closure_flags(
-        unit,
-        skip_pre_unit_closures=bool(skip_pre_unit_closures),
-        strict_with_suppression=strict_with_suppression,
-    )
-    eff_skip = resolved_flags.skip_pre_unit_closures
-    eff_strict_with = resolved_flags.strict_with_suppression
+    eff_skip = bool(skip_pre_unit_closures)
+    if eff_skip:
+        eff_strict_with = False
+    elif strict_with_suppression is not None:
+        eff_strict_with = bool(strict_with_suppression)
+    else:
+        eff_strict_with = resolve_unit_closure_flags(unit).strict_with_suppression
     eff_non_sup = normalize_non_suppressing_ctx_managers(
         non_suppressing_ctx_managers,
         unit.get("non_suppressing_ctx_managers"),
@@ -3374,20 +3387,48 @@ def ensure_unit_scope_closure_mode(
         u_copy["source_text"] = source_text
     if scope is not None:
         src_text_val = u_copy.get("source_text")
+        file_src_val = u_copy.get("file_source")
         src_code_val = u_copy.get("source_code")
         src_lines_val = u_copy.get("source_lines")
-        has_unit_source = (
+        needs_enclosing_module = bool(u_copy.get("is_subroutine")) or str(
+            u_copy.get("kind") or ""
+        ) in (
+            *_SUBROUTINE_KINDS,
+            "subroutine",
+            "basic_block",
+            "linear_block",
+            "stmt_seq",
+            "statement",
+            "closure",
+            "comprehension",
+            "complex_expr",
+        )
+        has_full_module_source = (
             tree is not None
             or (isinstance(src_text_val, str) and bool(src_text_val.strip()))
-            or (isinstance(src_code_val, str) and bool(src_code_val.strip()))
+            or (isinstance(file_src_val, str) and bool(file_src_val.strip()))
             or (
                 isinstance(src_lines_val, (list, tuple))
+                and not is_sliced_unit_source_lines(u_copy, src_lines_val)
                 and any(
                     isinstance(ln, str) and bool(ln.strip())
                     for ln in src_lines_val
                 )
             )
             or bool(_load_unit_file_text(u_copy, repo_root=repo_root))
+        )
+        has_snippet_source = (
+            isinstance(src_code_val, str) and bool(src_code_val.strip())
+        ) or (
+            isinstance(src_lines_val, (list, tuple))
+            and any(
+                isinstance(ln, str) and bool(ln.strip())
+                for ln in src_lines_val
+            )
+        )
+        has_unit_source = has_full_module_source or (
+            has_snippet_source
+            and (not needs_enclosing_module or bool(u_copy.get("allow_snippet_only")))
         )
         if not has_unit_source:
             logger.debug(
@@ -3437,7 +3478,16 @@ def analyze_unit_variable_scope(
     strict_with_suppression: Optional[bool] = None,
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
+    """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes.
+
+    Note:
+        Precomputed ``scope1`` / ``scope2`` dictionaries (or ``unit["scope"]``) are validated
+        via ``ensure_unit_scope_closure_mode``: any caller-supplied scope missing
+        ``scope_schema_version == SCOPE_SCHEMA_VERSION`` or computed under a different
+        closure strictness / allowlist configuration is discarded (dropping manual caller
+        overrides) and recomputed from backing module source, or fails closed if backing
+        source is unavailable.
+    """
     if u2 is not None:
         pair_flags = resolve_pair_closure_flags(
             u1,

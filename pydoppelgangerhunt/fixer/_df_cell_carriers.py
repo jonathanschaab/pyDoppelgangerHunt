@@ -23,12 +23,14 @@ from typing import (
 
 from pydoppelgangerhunt.fixer._df_cache import (
     _ScopeCacheKey,
+    _ensure_scope_owner_parent_map,
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
     _is_ephemeral_unit_ast,
     _make_trusted_scope_cache_key,
     _mark_ephemeral_unit_ast,
     _scope_cell_info_cache,
+    _tree_contains_scope_node,
     _validate_scope_cache_params,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
@@ -114,10 +116,8 @@ __all__ = [
 
 
 def _is_node_attached_to_tree(node: ast.AST, mod_tree: ast.AST) -> bool:
-    """Returns True if node is mod_tree or belongs to mod_tree's parent map."""
-    if getattr(node, "_is_ephemeral_unit_mod", False):
-        return False
-    return node is mod_tree or node in _get_scope_parent_map(mod_tree)
+    """Returns True if node is mod_tree or belongs to mod_tree without rebuilding oversized maps."""
+    return _tree_contains_scope_node(mod_tree, node)
 
 
 def _compute_scope_ctx_aux_nodes(
@@ -127,29 +127,23 @@ def _compute_scope_ctx_aux_nodes(
     has_parent_map: bool,
 ) -> Tuple[ast.AST, ...]:
     """Computes attached AST owner, module root, and enclosing scope nodes for _FnScopeContext."""
-    mod_pm = (
-        _get_scope_parent_map(mod_tree)
-        if isinstance(mod_tree, ast.AST)
-        else None
-    )
+    has_mod_tree = isinstance(mod_tree, ast.AST)
     aux_nodes: List[ast.AST] = []
-    if isinstance(scope_owner, ast.AST) and not getattr(
-        scope_owner, "_is_ephemeral_unit_mod", False
-    ):
-        if mod_pm is not None:
-            if scope_owner is mod_tree or scope_owner in mod_pm:
+    if isinstance(scope_owner, ast.AST) and not _is_ephemeral_unit_ast(scope_owner):
+        if has_mod_tree and mod_tree is not None:
+            if _tree_contains_scope_node(mod_tree, scope_owner):
                 aux_nodes.append(scope_owner)
         elif not isinstance(scope_owner, ast.Module) or has_parent_map:
             aux_nodes.append(scope_owner)
-    if isinstance(mod_tree, ast.AST) and not getattr(
-        mod_tree, "_is_ephemeral_unit_mod", False
-    ):
+    if has_mod_tree and mod_tree is not None and not _is_ephemeral_unit_ast(mod_tree):
         aux_nodes.append(mod_tree)
     for enc in enclosing_scopes:
-        if isinstance(enc, ast.AST) and not getattr(
-            enc, "_is_ephemeral_unit_mod", False
-        ):
-            if mod_pm is None or enc is mod_tree or enc in mod_pm:
+        if isinstance(enc, ast.AST) and not _is_ephemeral_unit_ast(enc):
+            if (
+                not has_mod_tree
+                or mod_tree is None
+                or _tree_contains_scope_node(mod_tree, enc)
+            ):
                 aux_nodes.append(enc)
     return tuple(aux_nodes)
 
@@ -204,17 +198,18 @@ def _scope_ctx_allows_node_cache(
     """Returns False when owner or scope_ctx.scope_owner is detached from the target AST."""
     if scope_ctx is None:
         return True
+    if _is_ephemeral_unit_ast(owner):
+        return False
     if isinstance(scope_ctx.mod_tree, ast.AST):
-        if not _is_node_attached_to_tree(owner, scope_ctx.mod_tree):
-            return False
-        if isinstance(
-            scope_ctx.scope_owner, ast.AST
-        ) and not _is_node_attached_to_tree(
-            scope_ctx.scope_owner, scope_ctx.mod_tree
-        ):
-            return False
-        return True
+        if isinstance(scope_ctx.scope_owner, ast.AST):
+            if not _is_node_attached_to_tree(scope_ctx.scope_owner, scope_ctx.mod_tree):
+                return False
+            if owner is scope_ctx.scope_owner or owner in scope_ctx.parent_map:
+                return True
+        return _is_node_attached_to_tree(owner, scope_ctx.mod_tree)
     if isinstance(scope_ctx.scope_owner, ast.AST):
+        if _is_ephemeral_unit_ast(scope_ctx.scope_owner):
+            return False
         if (
             scope_ctx.scope_owner is not owner
             and scope_ctx.scope_owner not in scope_ctx.parent_map
@@ -268,7 +263,7 @@ def _get_fn_scope_context_uncached(
             and not _is_ephemeral_unit_ast(mod_tree)
             and scope_node is not mod_tree
         ):
-            _get_scope_parent_map(mod_tree, use_cache=True)
+            _ensure_scope_owner_parent_map(mod_tree)
         raw_parent_map = _get_scope_parent_map(
             scope_node, use_cache=cache_parent_map
         )
@@ -1066,14 +1061,16 @@ def _extract_mutated_target_names(target: ast.AST) -> Set[str]:
 
 
 # Built-in functions used in _is_non_closure_scalar_expr (for closure carrier tracking, not
-# side-effect purity) whose return types are enforced by the CPython C runtime to be
-# non-callable scalars, booleans, strings, byte sequences, ranges, file streams, or None
-# (e.g., TypeError is raised in C if __int__, __index__, __len__, __bool__, __str__,
-# __repr__, __format__, __float__, __complex__, or __hash__ returns an arbitrary callable
-# instead of the required base type). Built-ins that delegate to unconstrained user dunders
-# (abs -> __abs__, round -> __round__, divmod -> __divmod__, pow -> __pow__, sum -> __add__)
-# are intentionally excluded so custom objects whose dunders return closures are never
-# misclassified as non-closure values.
+# side-effect purity) that return primitive scalars, booleans, strings, byte sequences,
+# ranges, file streams, or None under standard Python conventions. CPython enforces that
+# conversion dunders (__int__, __index__, __len__, __bool__, __str__, __repr__, __format__,
+# __float__, __complex__, __hash__) return instances of the corresponding base type rather
+# than arbitrary function/lambda closures. Note that constructor-style built-ins such as
+# int(x), str(x), float(x), complex(x), bytes(x), and bytearray(x) can still return an
+# instance of a user subclass of that base type which could theoretically define __call__;
+# treating them as non-closure scalar values is a deliberate static heuristic, whereas
+# built-ins that delegate to unconstrained user dunders (abs -> __abs__, round -> __round__,
+# divmod -> __divmod__, pow -> __pow__, sum -> __add__) are excluded.
 _NON_CLOSURE_RETURN_BUILTINS: frozenset[str] = frozenset(
     {
         "all",
@@ -1132,11 +1129,12 @@ def _is_non_closure_scalar_expr(
     node: ast.AST,
     scope_ctx: Optional[_FnScopeContext] = None,
 ) -> bool:
-    """Returns True if node is guaranteed to evaluate to a non-closure scalar value.
+    """Returns True if node evaluates to a scalar/primitive non-closure value.
 
     Note:
         Only literals (``ast.Constant``, ``ast.JoinedStr``), boolean negation
-        (``not x``), calls to unshadowed C-enforced ``_NON_CLOSURE_RETURN_BUILTINS``,
+        (``not x``), calls to unshadowed ``_NON_CLOSURE_RETURN_BUILTINS`` (excluding
+        callable subclasses of ``int``/``str``/``float``/``bytes``),
         and unary/binary/comparison operations whose operands are all recursively
         non-closure scalars are classified as scalar. Binary, unary, or comparison
         operations involving arbitrary variables or custom objects are NOT assumed
@@ -1553,7 +1551,7 @@ def _collect_escaped_and_executed_intra_unit_defs(
         (0, name): list(nodes) for name, nodes in root_defs.items()
     }
     unit_mod = ast.Module(body=list(candidate_stmts), type_ignores=[])
-    setattr(unit_mod, "_is_ephemeral_unit_mod", True)
+    _mark_ephemeral_unit_ast(unit_mod)
     top_bound_names = (
         _extract_single_node_local_names(unit_mod)
         - _extract_direct_nonlocals(unit_mod, is_global=False)

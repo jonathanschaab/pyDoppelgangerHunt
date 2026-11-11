@@ -289,32 +289,37 @@ escaping callbacks across lexical scopes.
     references such as `with open:` or `with contextlib.nullcontext:` and `pathlib.Path(...)`
     are never treated as non-suppressing context managers). Unproven context managers use a
     name-and-provenance heuristic:
-    managers are treated as non-suppressing unless their identifier matches one of the 22
-    case-insensitive suppression-idiom substrings (`suppress`, `raises`, `ignore`, `subtest`,
-    `exitstack`, `enter_context`, `cancelscope`, `move_on_after`, `fail_after`, `catch`,
-    `swallow`, `silen`, `quiet`, `tolerat`, `best_effort`, `absorb`, `trap`, `fallback`,
-    `noop`, `shield`, `retry`, `attempt`) or is proven suppressing via local/function/class
-    `__exit__` provenance.
+    managers are treated as non-suppressing unless their terminal identifier/callee attribute
+    matches one of the 34 case-insensitive suppression-idiom substrings (`suppress`, `raises`,
+    `ignor`, `subtest`, `exitstack`, `enter_context`, `enter_async_context`, `cancelscope`,
+    `move_on_after`, `fail_after`, `catch`, `swallow`, `silen`, `quiet`, `toler`, `best_effort`,
+    `absorb`, `trap`, `fallback`, `noop`, `no_op`, `shield`, `retry`, `attempt`, `skip`, `mute`,
+    `muting`, `maybe`, `hush`, `discard`, `forgiv`, `squelch`, `quench`, `mask`) or their root
+    receiver/class is proven suppressing via local/function/class `__exit__` provenance (intermediate
+    attribute names on receiver chains such as `self.retry_budget.acquire()` are not scanned).
     **Note**: because this heuristic is name-based, `strict` mode is **fail-open for neutrally
     named custom exception-suppressing context managers** (such as `Transaction()`, `Guard()`,
     `SpanContext()`, `SessionScope()`, or `BatchContext()`).
     Whenever an unproven context manager is accepted via the name heuristic, `pyDoppelgangerHunt`
-    logs a deduplicated `INFO` diagnostic and an end-of-run summary (and records a per-hunk
-    advisory comment in `--patch` / `--output` artifacts); use `--closure-strictness pedantic` to
-    fail closed on all unproven context managers.
-  - `pedantic` (deprecated alias: `fail_closed`; or `strict_with_suppression = true` in programmatic
-    `UnitSchema` dicts when `closure_strictness` is omitted): **Fail-closed context-manager and call/setter mode**
+    logs a deduplicated `INFO` diagnostic and a session-scoped `WARNING` summary to `stderr`/logging
+    (never polluting `stdout` or `--output` report files, while recording a per-hunk advisory
+    comment in `--patch` unified diffs); use `--closure-strictness pedantic` to reject all
+    unproven context managers.
+  - `pedantic` (deprecated alias: `fail_closed`; or `strict_with_suppression = true` in `pyproject.toml`
+    or `UnitSchema` dicts when `closure_strictness` is omitted): **Stricter static conservative mode**
     that treats all unproven unknown `with` / `async with` context managers as potentially
     exception-suppressing unless explicitly allowlisted via `--non-suppressing-ctx-managers` or
-    `non_suppressing_ctx_managers` (merged across global config and per-unit overrides), and
-    rejects dunder-invoking built-in calls (`len`, `bool`, `chr`, `int`, `bin`, `hex`, `oct`, `isinstance`,
-    `issubclass`, `range`), implicit boolean truth-value evaluations (`if`, `while`, `assert`, `not`,
-    `and`/`or`, conditional expressions, comprehension `ifs`, and `match` guards) on non-primitive
-    operands, and local primitive-initialized accumulator augmented assignments (`total += x`)
-    inside global-reading units, in addition to the attribute, subscript, class-body descriptor
-    (`__set_name__`), and external or `@=` augmented-assignment mutations rejected in `strict` mode
-    (while read-only Python protocol syntax such as synchronous `for` iteration, attribute/property
-    reads, subscript reads, and binary/comparison operators remains permitted by static convention). Allowlist entries support bare names (including locally defined classes), relative
+    `non_suppressing_ctx_managers` (merged across global config and per-unit overrides), and inside
+    global-reading units rejects dunder-invoking built-in calls (`len`, `bool`, `chr`, `int`, `bin`,
+    `hex`, `oct`, `isinstance`, `issubclass`, `range`), all augmented assignments (`total += x`),
+    and unproven implicit-dunder AST operations (binary/unary operators, non-identity comparisons and
+    `in`/`not in` membership checks, attribute/`@property` and subscript reads, `for`/comprehension
+    iteration, sequence/mapping unpacking, f-string formatting, `set`/`dict` key hashing, `match`
+    class/value/mapping/sequence patterns on unproven subjects, `import`, non-builtin `raise`, and
+    boolean truth-value evaluations) unless operands are statically proven built-in primitives or
+    immutable literals. Static analysis remains bounded by Python's dynamic runtime (e.g., runtime
+    frame introspection via `sys._getframe()`, metaclasses, or out-of-module monkeypatching are not
+    modeled). Allowlist entries support bare names (including locally defined classes), relative
     imports (`.Name` matching `from . import Name`), dotted paths (e.g., `pkg.tx.atomic` or
     `unittest.mock.patch.object`), and wildcard attribute suffixes (`*.atomic` or `*.lock` matching
     `<any_receiver>.atomic` / `<any_receiver>.lock(...)`).
@@ -357,19 +362,17 @@ strict fail-closed safety invariants:
   (`counter += 1`, `obj.attr += 1`, `obj[k] += 1`, `total @= x`), and deletions (`del`) are
   rejected in both `strict` and `pedantic` modes as a `global_escape` hazard because they could
   rebind or mutate the module-level global mid-execution. Local arithmetic/bitwise augmented assignments on variables
-  initialized inside the unit to a primitive constant (`total = 0; total += x`) and implicit boolean truth-value tests
-  are permitted in `strict` mode (under the heuristic assumption that the right-hand operand does not implement a
-  global-mutating reflected operator dunder such as `__radd__` and truth-tested objects do not mutate globals in
-  `__bool__`/`__len__`) and rejected in `pedantic` mode. C-level built-ins that do not invoke user-defined Python dunders
-  (`_PROVEN_PURE_GLOBAL_SAFE_BUILTINS`: `callable`, `id`, `ord`) are permitted when
-  unshadowed in both `strict` and `pedantic` modes; dunder-invoking inspection/conversion built-ins
-  (`_HEURISTIC_GLOBAL_SAFE_BUILTINS`: `bin`, `bool`, `chr`, `hex`, `int`, `isinstance`, `issubclass`,
-  `len`, `oct`, `range`) are permitted in `strict` mode under the heuristic assumption that user
+  initialized inside the unit to a primitive constant (`total = 0; total += x`), implicit boolean truth-value tests,
+  and read-only AST protocol operations (binary/unary/comparison operators, subscript reads, attribute/`@property`
+  reads, synchronous `for`/comprehension iteration, unpacking, f-strings, and container literals) are permitted in
+  `strict` mode (under the heuristic assumption that user operands do not mutate module-level globals inside protocol
+  dunders such as `__radd__`, `__bool__`, `__getitem__`, `__getattr__`, `__iter__`, or `__format__`) and rejected in
+  `pedantic` mode unless operands are statically proven built-in primitives or literals. C-level built-ins that do not
+  invoke user-defined Python dunders (`callable`, `id`, `ord`) are permitted when unshadowed in both `strict` and
+  `pedantic` modes; dunder-invoking inspection/conversion built-ins (`bin`, `bool`, `chr`, `hex`, `int`, `isinstance`,
+  `issubclass`, `len`, `oct`, `range`) are permitted in `strict` mode under the heuristic assumption that user
   types do not mutate module-level globals inside `__len__`/`__bool__`/`__int__`/`__index__`/
-  `__instancecheck__`/`__subclasscheck__`, and are rejected in `pedantic` mode. Read-only
-  AST protocol operations (binary/comparison operators, subscript reads, attribute/`@property` reads, and synchronous `for`
-  iteration) are assumed by static convention not to mutate module-level globals in both `strict` and
-  `pedantic` modes.
+  `__instancecheck__`/`__subclasscheck__`, and are rejected in `pedantic` mode.
 - **Dynamic Scope Reflection Limitations**: Downstream variable liveness analysis statically
   identifies dynamic local and global reads via `locals()`, `vars()`, `eval()`, `exec()`, `dir()`,
   and `globals()`. Dynamic reflection via runtime stack frame introspection (such as

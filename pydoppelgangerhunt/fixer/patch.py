@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, TypedDict, U
 
 from pydoppelgangerhunt.config import (
     format_heuristic_ctx_manager_comment,
-    log_heuristic_ctx_manager_summary,
+    heuristic_ctx_manager_session,
     normalize_non_suppressing_ctx_managers,
     normalize_path_string,
     resolve_closure_strictness_mode,
@@ -3172,7 +3172,8 @@ def _unit_start(u: Dict[str, Any]) -> int:
     return max(1, parse_unit_coord(u, "start", default=1))
 
 
-def _generate_refactoring_patch_impl(
+@heuristic_ctx_manager_session()
+def generate_refactoring_patch(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     repo_root: Optional[str] = None,
     type_merge_strategy: str = "fallback_any",
@@ -3617,13 +3618,17 @@ def _generate_refactoring_patch_impl(
                         + list(s2.get("closure_hazard_reasons", ()))
                     )
                 )
+                skip_reasons["severed closure cell"] += 1
                 if sub_reasons and sub_reasons != ["cell_severing"]:
                     reason_detail = "/".join(
                         r.replace("_", " ") for r in sub_reasons
                     )
-                    skip_reasons[f"severed closure cell ({reason_detail})"] += 1
-                else:
-                    skip_reasons["severed closure cell"] += 1
+                    logger.debug(
+                        "Skipping clone pair (%s, %s): severed closure cell (%s)",
+                        u1.get("name"),
+                        u2.get("name"),
+                        reason_detail,
+                    )
                 continue
             if "embedded_return" in hazards1 | hazards2:
                 lines1 = u1_lines
@@ -4458,34 +4463,4 @@ def _generate_refactoring_patch_impl(
                 seen_comments.add(chunk)
             patch_chunks.append(chunk)
 
-    log_heuristic_ctx_manager_summary()
     return "\n".join(patch_chunks)
-
-
-def generate_refactoring_patch(
-    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
-    repo_root: Optional[str] = None,
-    type_merge_strategy: str = "fallback_any",
-    replace_clones: bool = False,
-    method_binding: str = "auto",
-    cross_file_strategy: str = "auto",
-    shared_module_name: str = "_common.py",
-    depgraph: Optional[ModuleDependencyGraph] = None,
-    skip_pre_unit_closures: Optional[bool] = None,
-    closure_strictness: Optional[str] = None,
-    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
-) -> str:
-    """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
-    return _generate_refactoring_patch_impl(
-        clones=clones,
-        repo_root=repo_root,
-        type_merge_strategy=type_merge_strategy,
-        replace_clones=replace_clones,
-        method_binding=method_binding,
-        cross_file_strategy=cross_file_strategy,
-        shared_module_name=shared_module_name,
-        depgraph=depgraph,
-        skip_pre_unit_closures=skip_pre_unit_closures,
-        closure_strictness=closure_strictness,
-        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
-    )

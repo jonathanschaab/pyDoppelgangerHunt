@@ -24,7 +24,9 @@ from typing import (
 
 from pydoppelgangerhunt.fixer._ast_compat import is_trystar_node
 from pydoppelgangerhunt.fixer._df_cache import (
+    _get_cached_tree_source_lines,
     _get_or_parse_tree,
+    _register_tree_source_lines,
     _suppress_syntax_warnings,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
@@ -144,6 +146,10 @@ class UnitSchema(TypedDict, total=False):
             exception suppression treatment (``True`` in pedantic mode, ``False`` in strict/lenient).
         non_suppressing_ctx_managers: Optional iterable of context manager names/paths
             configured to be treated as non-suppressing in ``with`` statements.
+        allow_snippet_only: Explicit boolean opt-in permitting subroutine, closure,
+            comprehension, or complex-expression scope analysis when only isolated
+            snippet ``source_code`` / ``source_lines`` is supplied without a backing
+            module ``tree``, ``source_text``, or ``file``. Defaults to ``False`` (fail-closed).
         token_count: Number of normalized AST tokens in the unit.
         tokens: Legacy alias for ``token_count``.
         lines: Total line span count emitted by the parser.
@@ -200,6 +206,7 @@ class UnitSchema(TypedDict, total=False):
     skip_pre_unit_closures: Optional[bool]
     strict_with_suppression: Optional[bool]
     non_suppressing_ctx_managers: Optional[Sequence[str]]
+    allow_snippet_only: Optional[bool]
     token_count: Optional[int]
     tokens: Optional[Union[int, Sequence[str]]]
     norm_tokens: Optional[Sequence[str]]
@@ -232,6 +239,7 @@ _UNIT_BOOL_KEYS: frozenset[str] = frozenset(
         "has_await",
         "skip_pre_unit_closures",
         "strict_with_suppression",
+        "allow_snippet_only",
     }
 )
 _UNIT_STR_KEYS: frozenset[str] = frozenset(
@@ -1905,11 +1913,13 @@ def _find_innermost_enclosing_node(
         if tree is None:
             return None
 
-    src_lines: Optional[Tuple[str, ...]] = (
-        tuple(ln.rstrip("\r\n") for ln in split_source_lines(source_text))
-        if source_text
-        else None
-    )
+    src_lines: Optional[Tuple[str, ...]] = _get_cached_tree_source_lines(tree)
+    if src_lines is None and source_text:
+        src_lines = _register_tree_source_lines(tree, source_text=source_text)
+        if src_lines is None:
+            src_lines = tuple(
+                ln.rstrip("\r\n") for ln in split_source_lines(source_text)
+            )
 
     candidates: List[Tuple[int, ast.AST, int, int]] = []
     intervals = _get_tree_scope_intervals(tree, source_lines=src_lines)

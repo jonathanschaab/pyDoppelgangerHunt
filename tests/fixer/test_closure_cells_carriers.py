@@ -467,7 +467,6 @@ def test_returned_closure_hazard_and_captured_mutable_differential_execution(
     )
     safe_file = tmp_path / "safe_mut.py"
     safe_file.write_text(safe_mut_src, encoding="utf-8")
-    (tmp_path / ".git").mkdir(exist_ok=True)
     u1_safe = {
         "file": str(safe_file),
         "start": 5,
@@ -492,6 +491,12 @@ def test_returned_closure_hazard_and_captured_mutable_differential_execution(
 
     if shutil.which("git") is None:
         pytest.skip("git executable is required for patch application")
+    subprocess.run(
+        ["git", "init", "-q"],
+        cwd=str(tmp_path),
+        check=True,
+        capture_output=True,
+    )
     subprocess.run(
         ["git", "apply", "--whitespace=nowarn"],
         input=safe_patch,
@@ -2322,7 +2327,22 @@ def test_ensure_unit_scope_closure_mode_all_six_cases() -> None:
         lenient_scope,
         False,
     )
-    assert res_6_no_src_arg["skip_pre_unit_closures"] is False
+    assert res_6_no_src_arg["is_control_flow_safe"] is False
+    assert (
+        "unavailable_source_for_closure_mode"
+        in res_6_no_src_arg["closure_hazard_reasons"]
+    )
+    res_6_snippet_opt_in = ensure_unit_scope_closure_mode(
+        {
+            **unit_with_none_src,
+            "source_code": "for x in items:\n    acc = x + 1\n",
+            "allow_snippet_only": True,
+        },
+        lenient_scope,
+        False,
+    )
+    assert res_6_snippet_opt_in["is_control_flow_safe"] is True
+    assert res_6_snippet_opt_in["skip_pre_unit_closures"] is False
     res_6_empty_lines_fail_closed = ensure_unit_scope_closure_mode(
         unit_with_none_src,
         lenient_scope,
@@ -2586,12 +2606,12 @@ def test_span_line_index_missing_end_positions_and_duplicate_boundary_statements
     early_stmt.end_lineno = None
     assert _has_unresolved_span_bounds(outer_fn, 4, 4, 4, 16, [outer_fn.body[2]]) is True
 
-    # 2. iter_boundary_entries deduplicates by node identity when u_start == u_end
+    # 2. iter_boundary_nodes deduplicates by node identity when u_start == u_end
     clear_dataflow_cache()
     same_line_tree = ast.parse("def f():\n    a = 1; b = a + 2\n")
     idx = _get_span_line_index(same_line_tree)
-    entries = idx.iter_boundary_entries(2, 2)
-    node_ids = [id(e.node) for e in entries]
+    entries = idx.iter_boundary_nodes(2, 2)
+    node_ids = [id(node) for node in entries]
     assert len(node_ids) == len(set(node_ids))
 
     # 3. Multiple identical boundary statements on the same line reject ambiguous column inference

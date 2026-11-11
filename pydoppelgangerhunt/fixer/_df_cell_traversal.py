@@ -33,7 +33,7 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _TrackedCachedDict,
     _downstream_cache_lock,
     _get_or_compute_scope_cached,
-    _get_scope_parent_map,
+    _get_scope_ancestor_map,
     _make_trusted_scope_cache_key,
     _scope_cell_info_cache,
     _stmt_with_summary_cache,
@@ -1800,7 +1800,7 @@ def _find_enclosing_method_class_node(
     enc_child: ast.AST,
 ) -> Optional[ast.ClassDef]:
     """Finds the ClassDef inside fn_node that directly defines method enc_child."""
-    parent_map = _get_scope_parent_map(fn_node)
+    parent_map = _get_scope_ancestor_map(fn_node)
     curr_p = parent_map.get(enc_child)
     while curr_p is not None and curr_p is not fn_node:
         if isinstance(curr_p, (ast.FunctionDef, ast.AsyncFunctionDef)):
