@@ -973,7 +973,7 @@ def _slice_unit_token_lines(
     last_byte_len = len(res[-1].rstrip("\r\n").encode("utf-8"))
     if (
         s_col > first_byte_len
-        or (s_col == first_byte_len and first_byte_len > 0)
+        or 0 < first_byte_len == s_col
         or (e_col is not None and e_col > last_byte_len)
     ):
         return []
