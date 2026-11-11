@@ -6,20 +6,13 @@ import ast
 from collections.abc import Set as AbstractSet
 from pathlib import Path
 import sys
-import threading
-from types import MappingProxyType
-from typing import Any
 
 import pytest
 
 from pydoppelgangerhunt.fixer import (
-    analyze_unit_variable_scope,
     clear_dataflow_cache,
     generate_refactoring_patch,
     inspect_single_unit_scope,
-    resolve_clone_generator_subroutine_outputs,
-    resolve_clone_pair_outputs,
-    synthesize_shared_helper_code,
 )
 
 
@@ -2584,7 +2577,6 @@ def test_pathlib_path_and_uncalled_factories_not_classified_as_non_suppressing(
             n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_b"
         )
         with_a = next(n for n in run_a.body if isinstance(n, ast.With))
-        with_b = next(n for n in run_b.body if isinstance(n, ast.With))
         prov_a = _seed_scope_suppress_aliases(
             run_a, mod_tree=tree, u_start=with_a.lineno
         )
@@ -2753,3 +2745,96 @@ def test_suspicious_suppress_substrings_negative_attribute_chain_and_mutex_contr
         tree=ast.parse(sup_root_src),
     )
     assert "severed_closure_cell" in sc_sup["control_flow_hazards"]
+
+
+def test_comprehension_walrus_bindings_and_provenance_updates() -> None:
+    """Verifies comprehension walrus expressions bind conditionally and update context-manager provenance."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _SuppressProvenance,
+        _analyze_block_assignment,
+        _classify_with_suppression,
+        _seed_scope_suppress_aliases,
+        _update_suppress_provenance_from_expr_walrus,
+    )
+
+    comp_stmts = ast.parse("vals = [y := x + 1 for x in items]\n").body
+    def_assigned, cond_assigned = _analyze_block_assignment(comp_stmts)
+    assert "vals" in def_assigned
+    assert "y" not in def_assigned
+    assert "y" in cond_assigned
+
+    # Walrus inside comprehension assigning a known suppressor marks the alias as suppressing
+    sup_src = (
+        "import contextlib\n"
+        "def f(items):\n"
+        "    _ = [(cm := contextlib.suppress(ValueError)) for _ in items]\n"
+        "    with cm:\n"
+        "        val = 1\n"
+    )
+    sup_tree = ast.parse(sup_src)
+    sup_fn = sup_tree.body[1]
+    assert isinstance(sup_fn, ast.FunctionDef)
+    prov_clean = _SuppressProvenance(
+        stdlib_modules=frozenset({("contextlib", "contextlib")})
+    )
+    assert "cm" not in prov_clean.suppressors
+    comp_expr = sup_fn.body[0].value  # type: ignore[attr-defined]
+    prov_after_sup = _update_suppress_provenance_from_expr_walrus(
+        (comp_expr,), prov_clean
+    )
+    assert "cm" in prov_after_sup.suppressors
+    with_stmt = sup_fn.body[1]
+    assert isinstance(with_stmt, ast.With)
+    assert _classify_with_suppression(with_stmt, prov_after_sup) == "suppressing"
+
+    # Positive control without comprehension walrus keeps nullcontext() non-suppressing proof
+    safe_src = (
+        "import contextlib\n"
+        "def g_safe():\n"
+        "    cm = contextlib.nullcontext()\n"
+        "    with cm:\n"
+        "        val = 1\n"
+    )
+    safe_tree = ast.parse(safe_src)
+    safe_fn = safe_tree.body[1]
+    assert isinstance(safe_fn, ast.FunctionDef)
+    prov_safe = _seed_scope_suppress_aliases(safe_fn, mod_tree=safe_tree, u_start=4)
+    assert "cm" in prov_safe.non_suppressor_instances
+    with_safe = safe_fn.body[1]
+    assert isinstance(with_safe, ast.With)
+    assert _classify_with_suppression(with_safe, prov_safe) == "non_suppressing"
+
+    # Adversarial control: walrus inside comprehension rebinding a previously proven non-suppressor clears proof
+    rebind_src = (
+        "import contextlib\n"
+        "def g(items, CustomUnknown):\n"
+        "    cm = contextlib.nullcontext()\n"
+        "    _ = [(cm := CustomUnknown()) for _ in items]\n"
+        "    with cm:\n"
+        "        val = 1\n"
+    )
+    rebind_tree = ast.parse(rebind_src)
+    rebind_fn = rebind_tree.body[1]
+    assert isinstance(rebind_fn, ast.FunctionDef)
+    prov_rebind = _seed_scope_suppress_aliases(rebind_fn, mod_tree=rebind_tree, u_start=5)
+    assert "cm" not in prov_rebind.non_suppressor_instances
+    with_rebind = rebind_fn.body[2]
+    assert isinstance(with_rebind, ast.With)
+    assert _classify_with_suppression(with_rebind, prov_rebind) == "unknown"
+
+
+def test_lambda_body_walrus_excluded_while_lambda_default_walrus_binds() -> None:
+    """Verifies lambda body walruses do not leak into enclosing assignments while parameter defaults do."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import _analyze_block_assignment
+
+    body_walrus_stmts = ast.parse("fn = lambda: (leaked := 42)\n").body
+    defs_body, conds_body = _analyze_block_assignment(body_walrus_stmts)
+    assert "fn" in defs_body
+    assert "leaked" not in defs_body
+    assert "leaked" not in conds_body
+
+    default_walrus_stmts = ast.parse("fn = lambda a=(eager_default := 42): a\n").body
+    defs_default, conds_default = _analyze_block_assignment(default_walrus_stmts)
+    assert "fn" in defs_default
+    assert "eager_default" in defs_default
+    assert "eager_default" not in conds_default

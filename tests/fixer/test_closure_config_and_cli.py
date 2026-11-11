@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Set as AbstractSet
 from pathlib import Path
 import sys
 import threading
-from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -17,8 +15,6 @@ from pydoppelgangerhunt.fixer import (
     clear_dataflow_cache,
     generate_refactoring_patch,
     inspect_single_unit_scope,
-    resolve_clone_generator_subroutine_outputs,
-    resolve_clone_pair_outputs,
     synthesize_shared_helper_code,
 )
 
@@ -26,9 +22,10 @@ from pydoppelgangerhunt.fixer import (
 def test_closure_strictness_precedence_ctx_managers_and_global_pure_builtins(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Verifies fail_closed->pedantic mapping, strictness precedence, non_suppressing_ctx_managers plumbing, and pure builtin calls with global reads."""
+    """Verifies pedantic strictness precedence, non_suppressing_ctx_managers plumbing, and pure builtin calls with global reads."""
     import logging
     from pydoppelgangerhunt.config import (
+        clear_closure_warning_cache,
         normalize_non_suppressing_ctx_managers,
         resolve_closure_strictness_mode,
         resolve_strict_with_suppression,
@@ -38,19 +35,35 @@ def test_closure_strictness_precedence_ctx_managers_and_global_pure_builtins(
     )
     from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
 
-    # 1. fail_closed maps to pedantic and explicit closure_strictness overrides conflicting strict_with_suppression
-    assert resolve_closure_strictness_mode("fail_closed") == (
+    assert resolve_closure_strictness_mode("pedantic") == (
         "pedantic",
         False,
     )
-    assert resolve_strict_with_suppression(closure_strictness="fail_closed") is True
+    assert resolve_strict_with_suppression(closure_strictness="pedantic") is True
+    clear_closure_warning_cache()
+    caplog.clear()
     with caplog.at_level(logging.WARNING):
         resolved_conflict = resolve_strict_with_suppression(
             closure_strictness="strict",
             strict_with_suppression=True,
         )
+        assert (
+            resolve_strict_with_suppression(
+                closure_strictness="unknown_mode_xyz",
+                strict_with_suppression=True,
+            )
+            is True
+        )
+        mode_bogus, is_lenient_bogus = resolve_closure_strictness_mode(
+            closure_strictness="bogus_mode",
+            skip_pre_unit_closures=True,
+            strict_with_suppression=True,
+        )
     assert resolved_conflict is False
+    assert (mode_bogus, is_lenient_bogus) == ("lenient", True)
     assert "Conflicting configuration: closure_strictness" in caplog.text
+    assert "Unrecognized closure_strictness" in caplog.text
+    assert "strict_with_suppression=True and skip_pre_unit_closures=True" in caplog.text
 
     assert normalize_non_suppressing_ctx_managers("SafeTx, db.tx , ") == (
         "SafeTx",
@@ -823,7 +836,7 @@ def test_synthesize_refactoring_suggestion_contains_helper_synthesis_exception(
     }
 
     def _expected_syntax_failure(*_args: Any, **_kwargs: Any) -> str:
-        raise ValueError("simulated malformed helper syntax")
+        raise SyntaxError("simulated malformed helper syntax")
 
     monkeypatch.setattr(synth_mod, "synthesize_shared_helper_code", _expected_syntax_failure)
     suggestion = reporters_mod.synthesize_refactoring_suggestion(
@@ -832,14 +845,15 @@ def test_synthesize_refactoring_suggestion_contains_helper_synthesis_exception(
     assert "skipped as structurally incompatible" in suggestion
     assert "WARNING: Automatic helper synthesis was skipped" in suggestion
 
-    def _unexpected_bug(*_args: Any, **_kwargs: Any) -> str:
-        raise RuntimeError("unexpected internal defect")
+    for exc_cls in (ValueError, TypeError, RuntimeError):
+        def _unexpected_bug(*_args: Any, _exc: type[Exception] = exc_cls, **_kwargs: Any) -> str:
+            raise _exc("unexpected internal defect")
 
-    monkeypatch.setattr(synth_mod, "synthesize_shared_helper_code", _unexpected_bug)
-    with pytest.raises(RuntimeError, match="unexpected internal defect"):
-        reporters_mod.synthesize_refactoring_suggestion(
-            u1, u2, repo_root=str(tmp_path)
-        )
+        monkeypatch.setattr(synth_mod, "synthesize_shared_helper_code", _unexpected_bug)
+        with pytest.raises(exc_cls, match="unexpected internal defect"):
+            reporters_mod.synthesize_refactoring_suggestion(
+                u1, u2, repo_root=str(tmp_path)
+            )
 
 
 @pytest.mark.parametrize(
@@ -1443,12 +1457,14 @@ def test_public_entrypoints_configuration_consistency_matrix(
 def test_docs_sync_with_suspicious_suppress_substrings_and_local_accumulator_strict_vs_pedantic() -> (
     None
 ):
-    """Verifies README/CHANGELOG match _SUSPICIOUS_SUPPRESS_SUBSTRINGS, local primitive accumulators work in strict mode, and ephemeral AST tracking uses weakrefs."""
+    """Verifies README matches _SUSPICIOUS_SUPPRESS_SUBSTRINGS and _STDLIB_NON_SUPPRESSING_MODULES, CHANGELOG stays clean of private internals, and local primitive accumulators work in strict mode."""
+    import re
     from pydoppelgangerhunt.fixer._df_cache import (
         _is_ephemeral_unit_ast,
         _mark_ephemeral_unit_ast,
     )
     from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _STDLIB_NON_SUPPRESSING_MODULES,
         _SUSPICIOUS_SUPPRESS_SUBSTRINGS,
     )
 
@@ -1458,7 +1474,20 @@ def test_docs_sync_with_suspicious_suppress_substrings_and_local_accumulator_str
     assert len(_SUSPICIOUS_SUPPRESS_SUBSTRINGS) == 34
     for sub in _SUSPICIOUS_SUPPRESS_SUBSTRINGS:
         assert f"`{sub}`" in readme_text, sub
-        assert f"`{sub}`" in changelog_text, sub
+    for mod_name, attrs in _STDLIB_NON_SUPPRESSING_MODULES.items():
+        for attr in attrs:
+            assert f"{mod_name}.{attr}" in readme_text, f"{mod_name}.{attr}"
+    for removed_alias in ("`fail_closed`", "--closure-strictness {strict,pedantic,lenient,fail_closed"):
+        assert removed_alias not in readme_text
+        assert removed_alias not in changelog_text
+    unreleased_section = changelog_text.split("## [1.0.0]", 1)[0]
+    private_tokens = [
+        tok
+        for tok in re.findall(r"`(_[A-Za-z0-9_]+)`", unreleased_section)
+        if not (tok.startswith("__") and tok.endswith("__"))
+        and tok not in ("_common", "_item")
+    ]
+    assert private_tokens == [], f"Unexpected private symbols in CHANGELOG: {private_tokens}"
 
     # Local primitive-initialized accumulator in a global-reading unit is permitted in strict mode and rejected in pedantic mode
     acc_src = (
@@ -1777,3 +1806,307 @@ def test_synthesize_refactoring_suggestion_pair_level_structural_vs_safety_reaso
     )
     assert "rejected as unsafe" in sug_cleanup
     assert "enclosing try or with cleanup hazard" in sug_cleanup
+
+
+def test_html_report_plumbs_closure_strictness_and_reuses_file_parse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies generate_html_report and CLI --html honor closure_strictness/non_suppressing_ctx_managers and cache per-file ASTs."""
+    from pydoppelgangerhunt.cli import main
+    from pydoppelgangerhunt.reporters import generate_html_report
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+
+    src = (
+        "from myguard import Guard\n\n"
+        "def run_a(compute, items):\n"
+        "    with Guard():\n"
+        "        val = compute()\n"
+        "    acc = 0\n"
+        "    for item in items:\n"
+        "        acc += item + val\n"
+        "    cb = lambda: val\n"
+        "    return acc + cb()\n\n"
+        "def run_b(compute, items):\n"
+        "    with Guard():\n"
+        "        val = compute()\n"
+        "    acc = 0\n"
+        "    for item in items:\n"
+        "        acc += item + val\n"
+        "    cb = lambda: val\n"
+        "    return acc + cb()\n"
+    )
+    mod_file = tmp_path / "svc.py"
+    mod_file.write_text(src, encoding="utf-8")
+    u1 = {"name": "run_a:loop", "file": str(mod_file), "start": 6, "end": 9, "kind": "compound_block"}
+    u2 = {"name": "run_b:loop", "file": str(mod_file), "start": 15, "end": 18, "kind": "compound_block"}
+
+    html_pedantic = generate_html_report(
+        [(1.0, u1, u2)],
+        str(tmp_path),
+        0.90,
+        repo_root=str(tmp_path),
+        closure_strictness="pedantic",
+    )
+    assert "rejected as unsafe" in html_pedantic
+
+    html_allowlisted = generate_html_report(
+        [(1.0, u1, u2)],
+        str(tmp_path),
+        0.90,
+        repo_root=str(tmp_path),
+        closure_strictness="pedantic",
+        non_suppressing_ctx_managers=["Guard"],
+    )
+    assert "def _shared_" in html_allowlisted
+
+    # Multi-pair HTML report sharing the same file parses the file at most once
+    clear_dataflow_cache()
+    parse_calls: list[int] = []
+    real_parse = df_cache_mod.ast.parse
+
+    def _counting_parse(source: Any, *args: Any, **kwargs: Any) -> ast.AST:
+        if source == src:
+            parse_calls.append(1)
+        return real_parse(source, *args, **kwargs)  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(df_cache_mod.ast, "parse", _counting_parse)
+    generate_html_report(
+        [(1.0, u1, u2), (0.99, u1, u2)],
+        str(tmp_path),
+        0.90,
+        repo_root=str(tmp_path),
+        closure_strictness="strict",
+    )
+    assert len(parse_calls) == 1
+
+    # End-to-end CLI --html honors --closure-strictness lenient on pre-unit closure generator clones
+    lenient_repo = tmp_path / "html_cli_repo"
+    lenient_repo.mkdir()
+    gen_src = (
+        "def stream_a(items):\n"
+        "    total = 0\n"
+        "    snap = lambda: total\n"
+        "    for item in items:\n"
+        "        if item > 0:\n"
+        "            total += item\n"
+        "            yield total\n"
+        "        else:\n"
+        "            yield 0\n"
+        "    _ = snap\n\n"
+        "def stream_b(items):\n"
+        "    total = 0\n"
+        "    snap = lambda: total\n"
+        "    for item in items:\n"
+        "        if item > 0:\n"
+        "            total += item\n"
+        "            yield total\n"
+        "        else:\n"
+        "            yield 0\n"
+        "    _ = snap\n"
+    )
+    (lenient_repo / "gen.py").write_text(gen_src, encoding="utf-8")
+    html_strict_out = tmp_path / "strict.html"
+    html_lenient_out = tmp_path / "lenient.html"
+    main([str(lenient_repo), "--min-lines", "5", "--sliding-window", "--html", str(html_strict_out), "--closure-strictness", "strict"])
+    main([str(lenient_repo), "--min-lines", "5", "--sliding-window", "--html", str(html_lenient_out), "--closure-strictness", "lenient"])
+    assert "def _shared_" in html_lenient_out.read_text(encoding="utf-8")
+
+
+def test_replace_clones_defaults_to_pedantic_in_api_and_cli(tmp_path: Path) -> None:
+    """Verifies replace_clones=True and CLI --replace-clones default to pedantic unless overridden."""
+    from pydoppelgangerhunt.cli import main
+
+    repo = tmp_path / "pedantic_default_repo"
+    repo.mkdir()
+    src = (
+        "from myguard import Guard\n\n"
+        "def work_a(compute, items):\n"
+        "    with Guard():\n"
+        "        val = compute()\n"
+        "    acc = 0\n"
+        "    for item in items:\n"
+        "        if item > 0:\n"
+        "            acc += item\n"
+        "        else:\n"
+        "            acc -= item\n"
+        "    cb = lambda: val\n"
+        "    return acc + cb()\n\n"
+        "def work_b(other_fn, items, extra):\n"
+        "    if extra:\n"
+        "        with Guard():\n"
+        "            val = other_fn(extra)\n"
+        "    else:\n"
+        "        val = 0\n"
+        "    acc = 0\n"
+        "    for item in items:\n"
+        "        if item > 0:\n"
+        "            acc += item\n"
+        "        else:\n"
+        "            acc -= item\n"
+        "    cb = lambda: val\n"
+        "    return cb() - acc\n"
+    )
+    mod_file = repo / "work.py"
+    mod_file.write_text(src, encoding="utf-8")
+    u1 = {"name": "work_a:blk", "file": str(mod_file), "start": 6, "end": 12, "kind": "compound_block"}
+    u2 = {"name": "work_b:blk", "file": str(mod_file), "start": 21, "end": 27, "kind": "compound_block"}
+
+    # replace_clones=True defaults to pedantic -> rejects unproven Guard()
+    assert generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(repo), replace_clones=True) == ""
+    # replace_clones=False preview defaults to strict -> emits helper preview with advisory # Note:
+    preview_patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(repo), replace_clones=False)
+    assert "def _shared_" in preview_patch
+    assert "# Note: 1 unproven context manager(s) ('myguard.Guard') were treated as non-suppressing via name heuristic in strict mode" in preview_patch
+    # Explicit closure_strictness="strict" or non_suppressing_ctx_managers=["Guard"] allows replace_clones=True
+    assert generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(repo), replace_clones=True, closure_strictness="strict"
+    ) != ""
+    assert generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(repo), replace_clones=True, non_suppressing_ctx_managers=["Guard"]
+    ) != ""
+
+    # CLI --replace-clones rejects by default and accepts with --closure-strictness strict
+    patch_default = tmp_path / "default_rc.patch"
+    patch_strict = tmp_path / "strict_rc.patch"
+    cli_scan_args = [str(repo), "--min-lines", "6", "--sliding-window", "--window-size", "3", "--threshold", "0.90"]
+    main([*cli_scan_args, "--patch", str(patch_default), "--replace-clones"])
+    main([*cli_scan_args, "--patch", str(patch_strict), "--replace-clones", "--closure-strictness", "strict"])
+    assert not patch_default.exists() or "_shared_" not in patch_default.read_text(encoding="utf-8")
+    assert "def _shared_" in patch_strict.read_text(encoding="utf-8")
+
+
+def test_pyproject_skip_pre_unit_closures_false_treated_as_unset(tmp_path: Path) -> None:
+    """Verifies skip_pre_unit_closures = false in pyproject.toml does not override --replace-clones pedantic default."""
+    from unittest import mock
+    from pydoppelgangerhunt.cli import main
+
+    repo = tmp_path / "pyproject_false_repo"
+    repo.mkdir()
+    (repo / "f.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "pyproject.toml").write_text(
+        "[tool.pydoppelgangerhunt]\nskip_pre_unit_closures = false\n",
+        encoding="utf-8",
+    )
+    patch_out = repo / "out.patch"
+    dummy_clone = (
+        0.95,
+        {"name": "u1", "file": "f.py", "start": 1, "end": 1},
+        {"name": "u2", "file": "f.py", "start": 1, "end": 1},
+    )
+    with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[dummy_clone]):
+        with mock.patch(
+            "pydoppelgangerhunt.cli.generate_refactoring_patch", return_value="# patch\n"
+        ) as mock_patch:
+            main([str(repo), "--patch", str(patch_out), "--replace-clones"])
+            _, kwargs_rc = mock_patch.call_args
+            assert kwargs_rc.get("closure_strictness") == "pedantic"
+            assert kwargs_rc.get("skip_pre_unit_closures") is False
+
+            main([str(repo), "--patch", str(patch_out)])
+            _, kwargs_preview = mock_patch.call_args
+            assert kwargs_preview.get("closure_strictness") is None
+            assert kwargs_preview.get("skip_pre_unit_closures") is None
+
+
+def test_heuristic_session_over_1024_live_threads_mid_session_clear_and_intra_unit_with(
+    tmp_path: Path,
+) -> None:
+    """Verifies >1024 live threads retain all heuristic names, mid-session clear preserves session_depth, pre-session worker entries do not leak, and intra-unit with emits # Note:."""
+    import concurrent.futures
+    import pydoppelgangerhunt.config as cfg_mod
+    from pydoppelgangerhunt.config import (
+        clear_closure_warning_cache,
+        heuristic_ctx_manager_session,
+        log_heuristic_ctx_manager_summary,
+        record_heuristic_non_suppressing_ctx_manager,
+    )
+
+    # 1. > 1024 live threads kept alive simultaneously never drop any recorded manager name
+    clear_closure_warning_cache()
+    release_evt = threading.Event()
+    ready_sem = threading.Semaphore(0)
+    thread_count = 1050
+    threads: list[threading.Thread] = []
+
+    def _hold_worker(idx: int) -> None:
+        record_heuristic_non_suppressing_ctx_manager(f"LiveWorkerMgr_{idx:04d}")
+        ready_sem.release()
+        release_evt.wait(timeout=10.0)
+
+    with heuristic_ctx_manager_session():
+        try:
+            for idx in range(thread_count):
+                t = threading.Thread(target=_hold_worker, args=(idx,))
+                t.start()
+                threads.append(t)
+            for _ in range(thread_count):
+                assert ready_sem.acquire(timeout=10.0)
+            harvested_all = log_heuristic_ctx_manager_summary()
+        finally:
+            release_evt.set()
+            for t in threads:
+                t.join(timeout=5.0)
+    assert len(harvested_all) == thread_count
+
+    # 2. Mid-session clear_closure_warning_cache() preserves active state identity and session_depth
+    with heuristic_ctx_manager_session():
+        record_heuristic_non_suppressing_ctx_manager("BeforeMidClearMgr")
+        clear_closure_warning_cache()
+        record_heuristic_non_suppressing_ctx_manager("AfterMidClearMgr")
+        harvested_mid = log_heuristic_ctx_manager_summary()
+    assert harvested_mid == ("AfterMidClearMgr",)
+    assert cfg_mod._get_thread_heuristic_state_obj().session_depth == 0
+
+    # 3. Persistent worker thread records before session are excluded by sequence watermark
+    clear_closure_warning_cache()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(
+            record_heuristic_non_suppressing_ctx_manager, "PreSessionPoolMgr"
+        ).result()
+        with heuristic_ctx_manager_session():
+            pool.submit(
+                record_heuristic_non_suppressing_ctx_manager, "InSessionPoolMgr"
+            ).result()
+            harvested_pool = log_heuristic_ctx_manager_summary()
+    assert harvested_pool == ("InSessionPoolMgr",)
+
+    # 4. Intra-unit `with NeutralIntraMgr():` populates scope["heuristic_ctx_managers"] and patch # Note:
+    intra_src = (
+        "def task_a(NeutralIntraMgr, x):\n"
+        "    with NeutralIntraMgr():\n"
+        "        y = x + 1\n"
+        "    return y\n\n"
+        "def task_b(NeutralIntraMgr, x):\n"
+        "    with NeutralIntraMgr():\n"
+        "        y = x + 1\n"
+        "    return y\n"
+    )
+    intra_file = tmp_path / "intra_with.py"
+    intra_file.write_text(intra_src, encoding="utf-8")
+    u_intra1 = {"name": "task_a:with", "file": str(intra_file), "start": 2, "end": 3, "kind": "compound_block"}
+    u_intra2 = {"name": "task_b:with", "file": str(intra_file), "start": 7, "end": 8, "kind": "compound_block"}
+    sc_intra = inspect_single_unit_scope(u_intra1, repo_root=str(tmp_path))
+    assert "NeutralIntraMgr" in sc_intra["heuristic_ctx_managers"]
+    patch_intra = generate_refactoring_patch(
+        [(1.0, u_intra1, u_intra2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        closure_strictness="strict",
+    )
+    assert "# Note: 1 unproven context manager(s) ('NeutralIntraMgr') were treated as non-suppressing via name heuristic in strict mode" in patch_intra
+
+
+def test_top_level_and_fixer_package_public_exports() -> None:
+    """Verifies SourceLinesOrigin, extract_unit_source_lines_with_state, heuristic_ctx_manager_session, and clear_dataflow_cache are exported at both package levels."""
+    import pydoppelgangerhunt as pdh
+    import pydoppelgangerhunt.fixer as pdh_fixer
+
+    for sym_name in (
+        "SourceLinesOrigin",
+        "extract_unit_source_lines_with_state",
+        "heuristic_ctx_manager_session",
+        "clear_dataflow_cache",
+    ):
+        assert sym_name in pdh.__all__
+        assert sym_name in pdh_fixer.__all__
+        assert getattr(pdh, sym_name) is getattr(pdh_fixer, sym_name)

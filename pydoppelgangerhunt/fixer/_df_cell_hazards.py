@@ -120,7 +120,10 @@ from typing import (
 )
 
 from pydoppelgangerhunt.fixer._ast_compat import is_match_node
-from pydoppelgangerhunt.fixer._df_cache import _mark_ephemeral_unit_ast
+from pydoppelgangerhunt.fixer._df_cache import (
+    _ephemeral_unit_ast_context,
+    _mark_ephemeral_unit_ast,
+)
 from pydoppelgangerhunt.fixer._df_cell_carriers import (
     _EnclosingFnCellInfo,
     _IntraUnitMutator,
@@ -1456,20 +1459,9 @@ def _evaluate_severed_closure_cell_hazard(
         return _ClosureHazardResult(True, tuple(reasons))
     if not enclosing_chain:
         span_idx = _get_span_line_index(ctx.mod_tree)
-        has_missing_end = False
-        has_overlapping_closure = False
-        for node in span_idx.closure_like_nodes:
-            n_start = getattr(node, "lineno", None)
-            if not isinstance(n_start, int) or n_start > ctx.u_end:
-                continue
-            n_end = getattr(node, "end_lineno", None)
-            if not isinstance(n_end, int):
-                has_missing_end = True
-                break
-            if n_end >= ctx.u_start:
-                has_overlapping_closure = True
-        has_unresolved = has_missing_end or (
-            has_overlapping_closure
+        overlap = span_idx.has_closure_overlap(ctx.u_start, ctx.u_end)
+        has_unresolved = overlap.has_missing_end or (
+            overlap.has_overlapping_closure
             and (u_start_col is None or u_end_col is None)
             and _has_unresolved_span_bounds(
                 ctx.mod_tree,
@@ -1511,120 +1503,121 @@ def _evaluate_severed_closure_cell_hazard(
         if ctx.is_subroutine
         else set()
     )
-    immediate_cell_mutations: Set[str] = (
-        (_extract_comprehension_walrus_names(unit_mod) | explicit_nonlocal_mutations)
-        if is_expr_unit
-        else explicit_nonlocal_mutations
-    )
-    escaping_unit_mutations: Set[str] = helper_rebound_vars | immediate_cell_mutations
-    if not unit_stores_affect_enclosing and bool(explicit_nonlocal_mutations):
-        _append_hazard_reason(reasons, "cell_severing")
-        return _ClosureHazardResult(True, tuple(reasons))
+    with _ephemeral_unit_ast_context(unit_mod):
+        immediate_cell_mutations: Set[str] = (
+            (_extract_comprehension_walrus_names(unit_mod) | explicit_nonlocal_mutations)
+            if is_expr_unit
+            else explicit_nonlocal_mutations
+        )
+        escaping_unit_mutations: Set[str] = helper_rebound_vars | immediate_cell_mutations
+        if not unit_stores_affect_enclosing and bool(explicit_nonlocal_mutations):
+            _append_hazard_reason(reasons, "cell_severing")
+            return _ClosureHazardResult(True, tuple(reasons))
 
-    innermost_stmt_fn: ast.AST = next(
-        (
+        innermost_stmt_fn: ast.AST = next(
+            (
+                fn_n
+                for _, _, fn_n in reversed(enclosing_chain)
+                if isinstance(fn_n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ),
+            enclosing_chain[-1][2],
+        )
+        if _has_escaped_intra_unit_global_declarations(
+            innermost_stmt_fn,
+            ctx.u_start,
+            ctx.u_end,
+            u_start_col=u_start_col,
+            u_end_col=u_end_col,
+            is_subroutine=ctx.is_subroutine,
+        ):
+            _append_hazard_reason(reasons, "global_escape")
+            return _ClosureHazardResult(True, tuple(reasons))
+        enc_nonlocals, enc_outer_globals = _extract_scope_nonlocals_and_outer_globals(
+            innermost_stmt_fn,
+            ctx.u_start,
+            ctx.u_end,
+            u_start_col=u_start_col,
+            u_end_col=u_end_col,
+        )
+        fn_scopes_in_chain = [
             fn_n
-            for _, _, fn_n in reversed(enclosing_chain)
+            for _, _, fn_n in enclosing_chain
             if isinstance(fn_n, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ),
-        enclosing_chain[-1][2],
-    )
-    if _has_escaped_intra_unit_global_declarations(
-        innermost_stmt_fn,
-        ctx.u_start,
-        ctx.u_end,
-        u_start_col=u_start_col,
-        u_end_col=u_end_col,
-        is_subroutine=ctx.is_subroutine,
-    ):
-        _append_hazard_reason(reasons, "global_escape")
-        return _ClosureHazardResult(True, tuple(reasons))
-    enc_nonlocals, enc_outer_globals = _extract_scope_nonlocals_and_outer_globals(
-        innermost_stmt_fn,
-        ctx.u_start,
-        ctx.u_end,
-        u_start_col=u_start_col,
-        u_end_col=u_end_col,
-    )
-    fn_scopes_in_chain = [
-        fn_n
-        for _, _, fn_n in enclosing_chain
-        if isinstance(fn_n, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ]
-    if len(fn_scopes_in_chain) > 1:
-        for idx_fn, outer_fn in enumerate(fn_scopes_in_chain[:-1]):
-            _, outer_og = _extract_scope_nonlocals_and_outer_globals(
-                outer_fn,
-                ctx.u_start,
-                ctx.u_end,
-                u_start_col=u_start_col,
-                u_end_col=u_end_col,
-            )
-            if outer_og:
-                inner_locals: Set[str] = set()
-                for inner_fn in fn_scopes_in_chain[idx_fn + 1 :]:
-                    inner_locals.update(
-                        _extract_single_node_local_names(
-                            inner_fn, include_globals=False
+        ]
+        if len(fn_scopes_in_chain) > 1:
+            for idx_fn, outer_fn in enumerate(fn_scopes_in_chain[:-1]):
+                _, outer_og = _extract_scope_nonlocals_and_outer_globals(
+                    outer_fn,
+                    ctx.u_start,
+                    ctx.u_end,
+                    u_start_col=u_start_col,
+                    u_end_col=u_end_col,
+                )
+                if outer_og:
+                    inner_locals: Set[str] = set()
+                    for inner_fn in fn_scopes_in_chain[idx_fn + 1 :]:
+                        inner_locals.update(
+                            _extract_single_node_local_names(
+                                inner_fn, include_globals=False
+                            )
                         )
-                    )
-                enc_outer_globals.update((outer_og - inner_locals) - enc_nonlocals)
-    enc_escaping = enc_nonlocals | enc_outer_globals
-    if unit_stores_affect_enclosing and bool(
-        escaping_unit_mutations
-        & (enc_outer_globals if ctx.is_subroutine else enc_escaping)
-    ):
-        _append_global_or_cell_hazard(
-            reasons, escaping_unit_mutations, enc_outer_globals
+                    enc_outer_globals.update((outer_og - inner_locals) - enc_nonlocals)
+        enc_escaping = enc_nonlocals | enc_outer_globals
+        if unit_stores_affect_enclosing and bool(
+            escaping_unit_mutations
+            & (enc_outer_globals if ctx.is_subroutine else enc_escaping)
+        ):
+            _append_global_or_cell_hazard(
+                reasons, escaping_unit_mutations, enc_outer_globals
+            )
+            return _ClosureHazardResult(True, tuple(reasons))
+        imm_scope = _resolve_immediate_scope_in_fn(
+            innermost_stmt_fn,
+            ctx.u_start,
+            ctx.u_end,
+            u_start_col=u_start_col,
+            u_end_col=u_end_col,
         )
-        return _ClosureHazardResult(True, tuple(reasons))
-    imm_scope = _resolve_immediate_scope_in_fn(
-        innermost_stmt_fn,
-        ctx.u_start,
-        ctx.u_end,
-        u_start_col=u_start_col,
-        u_end_col=u_end_col,
-    )
-    unit_enclosing_scopes: List[ast.AST] = [
-        enc_fn for _, _, enc_fn in enclosing_chain
-    ] + ([imm_scope] if isinstance(imm_scope, ast.ClassDef) else [])
-    intra_nl_mutators = _collect_unit_nonlocal_mutators(
-        ctx.candidate_stmts,
-        mod_tree=ctx.mod_tree,
-        enclosing_scopes=unit_enclosing_scopes,
-    )
-    is_suspended = ctx.is_subroutine and (
-        ctx.has_yield
-        or (
-            ctx.is_async
-            and _node_is_effectively_async(
-                (
-                    ctx.candidate_stmts[0].body
-                    if len(ctx.candidate_stmts) == 1
-                    and isinstance(
-                        ctx.candidate_stmts[0],
-                        (ast.FunctionDef, ast.AsyncFunctionDef),
-                    )
-                    else ctx.candidate_stmts
-                ),
-                True,
+        unit_enclosing_scopes: List[ast.AST] = [
+            enc_fn for _, _, enc_fn in enclosing_chain
+        ] + ([imm_scope] if isinstance(imm_scope, ast.ClassDef) else [])
+        intra_nl_mutators = _collect_unit_nonlocal_mutators(
+            ctx.candidate_stmts,
+            mod_tree=ctx.mod_tree,
+            enclosing_scopes=unit_enclosing_scopes,
+        )
+        is_suspended = ctx.is_subroutine and (
+            ctx.has_yield
+            or (
+                ctx.is_async
+                and _node_is_effectively_async(
+                    (
+                        ctx.candidate_stmts[0].body
+                        if len(ctx.candidate_stmts) == 1
+                        and isinstance(
+                            ctx.candidate_stmts[0],
+                            (ast.FunctionDef, ast.AsyncFunctionDef),
+                        )
+                        else ctx.candidate_stmts
+                    ),
+                    True,
+                )
             )
         )
-    )
-    if is_suspended and bool(unit_mutated_names & (enc_escaping | nonlocal_set)):
-        _append_global_or_cell_hazard(reasons, unit_mutated_names, enc_outer_globals)
-        return _ClosureHazardResult(True, tuple(reasons))
+        if is_suspended and bool(unit_mutated_names & (enc_escaping | nonlocal_set)):
+            _append_global_or_cell_hazard(reasons, unit_mutated_names, enc_outer_globals)
+            return _ClosureHazardResult(True, tuple(reasons))
 
-    if ctx.is_subroutine and _extract_direct_nonlocals(unit_mod):
-        _append_hazard_reason(reasons, "cell_severing")
-        return _ClosureHazardResult(True, tuple(reasons))
-    unit_closures = _collect_scope_closures_uncached(
-        unit_mod,
-        module_tree=ctx.mod_tree,
-        genexp_include_header=False,
-        cache_parent_map=False,
-        enclosing_scopes=unit_enclosing_scopes,
-    )
+        if ctx.is_subroutine and _extract_direct_nonlocals(unit_mod):
+            _append_hazard_reason(reasons, "cell_severing")
+            return _ClosureHazardResult(True, tuple(reasons))
+        unit_closures = _collect_scope_closures_uncached(
+            unit_mod,
+            module_tree=ctx.mod_tree,
+            genexp_include_header=False,
+            cache_parent_map=False,
+            enclosing_scopes=unit_enclosing_scopes,
+        )
     unit_closure_reads: Set[str] = (
         set().union(*(reads for _, reads in unit_closures)) if unit_closures else set()
     )

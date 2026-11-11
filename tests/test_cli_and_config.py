@@ -2845,7 +2845,7 @@ def test_cli_closure_strictness_and_skip_closures_precedence_warning(
             ]
             assert len(precedence_warnings) == 1
 
-            # 3. CLI --closure-strictness fail_closed maps to pedantic and overrides CLI --skip-pre-unit-closures
+            # 3. CLI --closure-strictness pedantic overrides CLI --skip-pre-unit-closures
             caplog.clear()
             mock_patch.reset_mock()
             with caplog.at_level(logging.WARNING):
@@ -2854,7 +2854,7 @@ def test_cli_closure_strictness_and_skip_closures_precedence_warning(
                     "--patch",
                     str(patch_out),
                     "--closure-strictness",
-                    "fail_closed",
+                    "pedantic",
                     "--skip-pre-unit-closures",
                     "--non-suppressing-ctx-managers",
                     "SafeA,SafeB",
@@ -2938,10 +2938,10 @@ def test_resolve_closure_strictness_mode_thread_safety() -> None:
     assert mock_warn.call_count == 3
 
 
-def test_resolve_closure_strictness_legacy_aliases_emit_deprecation_warning(
+def test_resolve_closure_strictness_rejects_unshipped_and_unknown_modes(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Verifies that legacy aliases emit a one-time deprecation warning and unshipped aliases are rejected."""
+    """Verifies that non-canonical and unknown strictness strings warn once per distinct value and fall back to strict."""
     import logging  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
         clear_closure_warning_cache,
@@ -2951,21 +2951,20 @@ def test_resolve_closure_strictness_legacy_aliases_emit_deprecation_warning(
     clear_closure_warning_cache()
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        assert resolve_closure_strictness_mode("fail_closed") == ("pedantic", False)
-        assert resolve_closure_strictness_mode("fail_closed") == ("pedantic", False)
-        assert resolve_closure_strictness_mode("fast") == ("lenient", True)
-        assert resolve_closure_strictness_mode("skip") == ("lenient", True)
+        assert resolve_closure_strictness_mode("fail_closed") == ("strict", False)
+        assert resolve_closure_strictness_mode("fail_closed") == ("strict", False)
+        assert resolve_closure_strictness_mode("fast") == ("strict", False)
+        assert resolve_closure_strictness_mode("skip") == ("strict", False)
         assert resolve_closure_strictness_mode("strict_with") == ("strict", False)
 
-    dep_msgs = [r.message for r in caplog.records if "deprecated" in r.message]
-    assert len(dep_msgs) == 3
-    assert any("closure_strictness alias 'fail_closed' is deprecated" in m for m in dep_msgs)
-    assert any("closure_strictness alias 'fast' is deprecated" in m for m in dep_msgs)
-    assert any("closure_strictness alias 'skip' is deprecated" in m for m in dep_msgs)
-    assert any(
-        "Unrecognized closure_strictness 'strict_with'" in r.message
+    warn_msgs = [
+        r.message
         for r in caplog.records
-    )
+        if "Unrecognized closure_strictness" in r.message
+    ]
+    assert len(warn_msgs) == 4
+    for bad_val in ("fail_closed", "fast", "skip", "strict_with"):
+        assert any(f"Unrecognized closure_strictness '{bad_val}'" in m for m in warn_msgs)
 
 
 def test_resolve_closure_strictness_mode_config_conflict_warning(

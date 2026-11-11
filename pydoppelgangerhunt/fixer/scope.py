@@ -2044,7 +2044,14 @@ def _inspect_unit_scope(
         if isinstance(unit.get("source_code"), str)
         else ""
     )
-    is_placeholder_source = not src_code_str and is_placeholder_origin
+    has_backing_source_spec = any(
+        unit.get(k) is not None
+        for k in ("file", "source_text", "file_source", "source_lines")
+    )
+    is_placeholder_source = not src_code_str and (
+        is_placeholder_origin
+        or (not unit_code_lines and has_backing_source_spec)
+    )
     inferred_s_col, inferred_e_col = _unit_cols(
         unit, None if is_placeholder_origin else unit_code_lines
     )
@@ -2123,8 +2130,8 @@ def _inspect_unit_scope(
     # the module lines at (start, end, start_col, end_col). When no backing module is
     # available (e.g., an in-memory unit carrying only source_code), raw_lines falls
     # back to unit["source_code"].
-    stale_source_code_mismatch = col_bounds_invalid
-    if stale_source_code_mismatch:
+    stale_source_code_mismatch = False
+    if col_bounds_invalid:
         pass
     elif is_placeholder_origin and src_code_str:
         if file_tree is not None and not _unit_source_code_matches_tree(
@@ -2243,13 +2250,19 @@ def _inspect_unit_scope(
         "non_suppressing_ctx_managers": sorted(extra_non_sup),
         "heuristic_ctx_managers": [],
     }
+    if col_bounds_invalid:
+        return {
+            **empty_res,
+            "control_flow_hazards": ["invalid_unit_columns"],
+            "is_control_flow_safe": False,
+        }
     if stale_source_code_mismatch:
         return {
             **empty_res,
             "control_flow_hazards": ["stale_source_code"],
             "is_control_flow_safe": False,
         }
-    if is_placeholder_source and file_tree is None:
+    if is_placeholder_source and (file_tree is None or has_backing_source_spec):
         unit_kind_str = str(unit.get("kind") or "")
         placeholder_hazards = (
             ["severed_closure_cell", "unavailable_source_placeholder"]
@@ -2639,14 +2652,17 @@ def _inspect_unit_scope(
             initial_sup_prov = initial_sup_prov.with_shadowed_builtins(
                 ("open",)
             )
-        def_assigned, cond_assigned = _analyze_block_assignment(
-            candidate_stmts,
-            may_deleted=may_deleted,
-            live_in_deleted=live_in_deleted,
-            suppress_aliases=initial_sup_prov,
-            extra_non_suppressing_ctx_managers=extra_non_sup,
-            strict_with_suppression=strict_with_flag,
-        )
+        unit_heuristic_mgrs: Set[str] = set()
+        with collect_heuristic_ctx_managers() as block_heur_mgrs:
+            def_assigned, cond_assigned = _analyze_block_assignment(
+                candidate_stmts,
+                may_deleted=may_deleted,
+                live_in_deleted=live_in_deleted,
+                suppress_aliases=initial_sup_prov,
+                extra_non_suppressing_ctx_managers=extra_non_sup,
+                strict_with_suppression=strict_with_flag,
+            )
+        unit_heuristic_mgrs.update(block_heur_mgrs)
         for del_name in sorted(live_in_deleted):
             if (
                 del_name not in visitor.params
@@ -2716,18 +2732,20 @@ def _inspect_unit_scope(
                             )
                         )
                         enc_escaping = enc_nonlocals | enc_outer_globals
-                        def_pre_bound = (
-                            _find_enclosing_chain_definite_pre_bound(
-                                enclosing_chain,
-                                u_start,
-                                u_end,
-                                u_start_col=u_start_col,
-                                u_end_col=u_end_col,
-                                mod_tree=mod_tree,
-                                strict_with_suppression=strict_with_flag,
-                                extra_non_suppressing_ctx_managers=extra_non_sup,
+                        with collect_heuristic_ctx_managers() as pre_heur_mgrs:
+                            def_pre_bound = (
+                                _find_enclosing_chain_definite_pre_bound(
+                                    enclosing_chain,
+                                    u_start,
+                                    u_end,
+                                    u_start_col=u_start_col,
+                                    u_end_col=u_end_col,
+                                    mod_tree=mod_tree,
+                                    strict_with_suppression=strict_with_flag,
+                                    extra_non_suppressing_ctx_managers=extra_non_sup,
+                                )
                             )
-                        )
+                        unit_heuristic_mgrs.update(pre_heur_mgrs)
                         write_only_cond_cands = {
                             v
                             for v in cond_escaping_cands
@@ -3011,7 +3029,6 @@ def _inspect_unit_scope(
             if "invalid_lexical_declaration" not in closure_hazard_reasons:
                 closure_hazard_reasons.append("invalid_lexical_declaration")
 
-        unit_heuristic_mgrs: Set[str] = set()
         if is_subroutine or unit.get("kind") in (
             "closure",
             "comprehension",
@@ -3019,7 +3036,7 @@ def _inspect_unit_scope(
         ):
             if u_start > 0 and mod_tree is not None:
                 if "severed_closure_cell" not in hazards:
-                    with collect_heuristic_ctx_managers() as unit_heuristic_mgrs:
+                    with collect_heuristic_ctx_managers() as cell_heur_mgrs:
                         hazard_res = _evaluate_severed_closure_cell_hazard(
                             _UnitClosureHazardContext(
                                 candidate_stmts=candidate_stmts,
@@ -3048,6 +3065,7 @@ def _inspect_unit_scope(
                                 lex_validated=True,
                             )
                         )
+                    unit_heuristic_mgrs.update(cell_heur_mgrs)
                     if hazard_res.has_hazard:
                         hazards.append("severed_closure_cell")
                         for r in hazard_res.reasons:
@@ -3084,6 +3102,7 @@ def _inspect_unit_scope(
                 "severed_closure_cell",
                 "unavailable_source_for_closure_mode",
                 "unavailable_source_placeholder",
+                "invalid_unit_columns",
             )
             for h in hazards
         )
@@ -3371,7 +3390,11 @@ def ensure_unit_scope_closure_mode(
         )
         or any(
             h in scope.get("control_flow_hazards", ())
-            for h in ("pathological_ast", "stale_source_code")
+            for h in (
+                "pathological_ast",
+                "stale_source_code",
+                "invalid_unit_columns",
+            )
         )
     ):
         return scope

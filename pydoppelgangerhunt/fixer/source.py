@@ -9,6 +9,7 @@ import textwrap
 import tokenize
 import warnings
 from typing import (
+    AbstractSet,
     Any,
     Dict,
     List,
@@ -138,8 +139,7 @@ class UnitSchema(TypedDict, total=False):
         has_yield: Whether the unit yields values (generator function or generator subroutine).
         has_await: Whether the unit contains ``await`` expressions.
         closure_strictness: Per-unit closure strictness mode override
-            (``"strict"``, ``"pedantic"``, or ``"lenient"``; deprecated aliases
-            ``"fail_closed"``, ``"fast"``, ``"skip"``).
+            (``"strict"``, ``"pedantic"``, or ``"lenient"``).
         skip_pre_unit_closures: Per-unit boolean fallback when ``closure_strictness`` is omitted
             (``False`` for strict/pedantic mode, ``True`` for lenient mode).
         strict_with_suppression: Per-unit boolean override for conservative ``with``-statement
@@ -205,7 +205,7 @@ class UnitSchema(TypedDict, total=False):
     closure_strictness: Optional[str]
     skip_pre_unit_closures: Optional[bool]
     strict_with_suppression: Optional[bool]
-    non_suppressing_ctx_managers: Optional[Sequence[str]]
+    non_suppressing_ctx_managers: Optional[Union[Sequence[str], AbstractSet[str]]]
     allow_snippet_only: Optional[bool]
     token_count: Optional[int]
     tokens: Optional[Union[int, Sequence[str]]]
@@ -289,14 +289,14 @@ _UNIT_STR_SEQ_KEYS: frozenset[str] = frozenset(
     }
 )
 _VALID_CLOSURE_STRICTNESS_VALUES: frozenset[str] = frozenset(
-    {"strict", "pedantic", "lenient", "fail_closed", "fast", "skip"}
+    {"strict", "pedantic", "lenient"}
 )
 
 
 def _is_valid_str_collection(val: Any) -> bool:
     """Returns True if val is a non-string sequence or set of strings."""
     if isinstance(val, (str, bytes, bytearray, Mapping)) or not isinstance(
-        val, (Sequence, Set)
+        val, (Sequence, AbstractSet)
     ):
         return False
     return all(isinstance(item, str) for item in val)
@@ -358,7 +358,7 @@ def _validate_known_unit_field_value(key: str, val: Any) -> None:
         return
     if key == "shingles":
         if isinstance(val, (str, bytes, bytearray, Mapping)) or not isinstance(
-            val, (Sequence, Set)
+            val, (Sequence, AbstractSet)
         ):
             raise ValueError(f"Expected sequence for 'shingles', got {val!r}")
         return

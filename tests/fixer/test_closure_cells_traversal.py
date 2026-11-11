@@ -219,6 +219,8 @@ def test_2d_coordinate_enclosure_and_decorator_start_pos() -> None:
     assert not _strictly_encloses_span(single_if, _SpanBounds(1, 1, 0, 22))
 
     # 5. _resolve_immediate_scope_in_fn ignores disjoint class ending before or starting after unit on same line
+    from pydoppelgangerhunt.fixer._df_cache import evict_tree_scopes
+
     cls_tree = ast.parse("def outer():\n" "    class Box(\n" "        Base\n" "    ): pass\n")
     outer_fn = cls_tree.body[0]
     box_cls = outer_fn.body[0]  # type: ignore[attr-defined]
@@ -227,6 +229,7 @@ def test_2d_coordinate_enclosure_and_decorator_start_pos() -> None:
     box_cls.lineno = 4
     box_cls.col_offset = 20
     box_cls.end_col_offset = 35
+    evict_tree_scopes(cls_tree)
     assert _resolve_immediate_scope_in_fn(outer_fn, 4, 4, u_start_col=4, u_end_col=15) is outer_fn
 
     # 6. _find_enclosing_pre_bound_names sets in_loop=False when loop is disjoint on boundary line
@@ -240,6 +243,7 @@ def test_2d_coordinate_enclosure_and_decorator_start_pos() -> None:
     for_stmt.lineno = 4
     for_stmt.col_offset = 20
     for_stmt.end_col_offset = 35
+    evict_tree_scopes(loop_tree)
     _, in_loop_right = _find_enclosing_pre_bound_names(loop_tree, 4, 4, u_start_col=4, u_end_col=15)
     assert in_loop_right is False
 

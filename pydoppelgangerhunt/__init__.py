@@ -44,6 +44,7 @@ from pydoppelgangerhunt.config import (
     DEFAULT_EXCLUDES,
     DEFAULT_TOOL_TOML_CONTENT,
     canonical_path_key,
+    heuristic_ctx_manager_session,
     init_tool_configuration,
     load_toml_section,
     load_tool_config,
@@ -63,6 +64,7 @@ from pydoppelgangerhunt.fixer import (
     UnitSpan,
     analyze_unit_variable_scope,
     check_units_overlap,
+    clear_dataflow_cache,
     col_offset_to_char_offset,
     compute_line_offsets,
     compute_unit_byte_offsets,
@@ -141,6 +143,7 @@ from pydoppelgangerhunt.reporters import (
     colorize,
     emit_structured_report,
     extract_unit_source_code,
+    extract_unit_source_lines_with_state,
     format_github_annotations,
     format_json_report,
     format_markdown_summary,
@@ -150,7 +153,7 @@ from pydoppelgangerhunt.reporters import (
     supports_color,
     synthesize_refactoring_suggestion,
 )
-from pydoppelgangerhunt.source_lines import _PHYSICAL_LINE_RE
+from pydoppelgangerhunt.source_lines import SourceLinesOrigin, _PHYSICAL_LINE_RE
 
 __version__ = "1.0.0"
 __all__ = [
@@ -190,6 +193,8 @@ __all__ = [
     "generate_clone_diff",
     "synthesize_refactoring_suggestion",
     "extract_unit_source_code",
+    "extract_unit_source_lines_with_state",
+    "SourceLinesOrigin",
     "supports_color",
     "colorize",
     "parse_git_diff_hunks",
@@ -211,8 +216,10 @@ __all__ = [
     "compute_unit_coverage",
     "check_asymmetric_coverage",
     "analyze_unit_variable_scope",
+    "clear_dataflow_cache",
     "ensure_unit_scope_closure_mode",
     "evict_tree_scopes",
+    "heuristic_ctx_manager_session",
     "inspect_single_unit_scope",
     "scope_matches_closure_mode",
     "SCOPE_SCHEMA_VERSION",

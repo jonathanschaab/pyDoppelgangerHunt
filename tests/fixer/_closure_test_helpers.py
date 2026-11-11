@@ -17,9 +17,24 @@ from pydoppelgangerhunt.fixer import (
 from pydoppelgangerhunt.fixer._df_cache import _suppress_syntax_warnings
 
 __all__ = [
+    "_ensure_shared_git_repo",
     "_extract_symtable_scope_info",
     "_run_differential_refactoring_case",
 ]
+
+
+def _ensure_shared_git_repo(tmp_path: Path) -> Path:
+    """Initializes and returns a reusable git repository root inside tmp_path."""
+    repo_dir = tmp_path / "_shared_git_repo"
+    if not (repo_dir / ".git").exists():
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "init", "-q"],
+            cwd=str(repo_dir),
+            check=True,
+            capture_output=True,
+        )
+    return repo_dir
 
 
 def _extract_symtable_scope_info(
@@ -71,18 +86,11 @@ def _run_differential_refactoring_case(
     if shutil.which("git") is None:
         pytest.skip("git executable is required for differential patch application")
 
-    case_dir = tmp_path / case_name
-    case_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["git", "init", "-q"],
-        cwd=str(case_dir),
-        check=True,
-        capture_output=True,
-    )
+    case_dir = _ensure_shared_git_repo(tmp_path)
     fn_b_src = fn_src.replace("def entry(", "def entry_b(", 1)
     line_offset = len(fn_src.splitlines()) + 1
     combined_src = f"{fn_src}\n{fn_b_src}"
-    mod_file = case_dir / "mod.py"
+    mod_file = case_dir / f"{case_name}_mod.py"
     mod_file.write_text(combined_src, encoding="utf-8")
 
     u1 = {
@@ -117,8 +125,8 @@ def _run_differential_refactoring_case(
         for args in call_args_list:
             ns_orig: dict[str, Any] = {}
             ns_ref: dict[str, Any] = {}
-            exec(compile(combined_src, "<orig>", "exec"), ns_orig)  # pylint: disable=exec-used
-            exec(compile(refactored_src, "<ref>", "exec"), ns_ref)  # pylint: disable=exec-used
+            exec(compile(combined_src, "<orig>", "exec"), ns_orig)  # pylint: disable=exec-used  # nosec B102
+            exec(compile(refactored_src, "<ref>", "exec"), ns_ref)  # pylint: disable=exec-used  # nosec B102
             res_orig = ns_orig["entry"](*args)
             res_ref = ns_ref["entry"](*args)
             res_ref_b = ns_ref["entry_b"](*args)
@@ -141,7 +149,7 @@ def _run_differential_refactoring_case(
                 assert expected_hazard_reason in reasons
         for args in call_args_list:
             ns_orig_only: dict[str, Any] = {}
-            exec(compile(combined_src, "<orig>", "exec"), ns_orig_only)  # pylint: disable=exec-used
+            exec(compile(combined_src, "<orig>", "exec"), ns_orig_only)  # pylint: disable=exec-used  # nosec B102
             res_a = ns_orig_only["entry"](*args)
             res_b = ns_orig_only["entry_b"](*args)
             assert res_a == res_b

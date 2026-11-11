@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import contextlib
 import hashlib
 import logging
@@ -52,21 +52,30 @@ class _MissingCachedAstNodesError(TypeError):
     """Raised when a custom cached value type does not implement cached_ast_nodes()."""
 
 
-def _filters_already_ignore_syntax_warnings() -> bool:
-    """Returns True when active warnings.filters already ignores SyntaxWarning unconditionally."""
-    saw_syntax_ignore = False
+def _category_unconditionally_ignored(target_cat: Type[Warning]) -> bool:
+    """Returns True when active warnings.filters unconditionally ignores target_cat ahead of non-ignore rules."""
     for entry in warnings.filters:
         if len(entry) < 5:
             continue
         action, msg, cat, mod, ln = entry[:5]
-        if not isinstance(cat, type) or not issubclass(SyntaxWarning, cat):
+        if not isinstance(cat, type) or not issubclass(target_cat, cat):
             continue
         if action in ("error", "always", "default", "module", "once"):
             return False
         if action == "ignore" and msg is None and mod is None and ln == 0:
-            saw_syntax_ignore = True
-            break
-    return saw_syntax_ignore
+            return True
+    return False
+
+
+def _filters_already_ignore_syntax_warnings() -> bool:
+    """Returns True when active warnings.filters unconditionally ignores SyntaxWarning (and <3.12 DeprecationWarning)."""
+    if not _category_unconditionally_ignored(SyntaxWarning):
+        return False
+    if sys.version_info < (3, 12) and not _category_unconditionally_ignored(
+        DeprecationWarning
+    ):
+        return False
+    return True
 
 
 @contextlib.contextmanager
@@ -130,7 +139,6 @@ _MAX_SCOPE_CACHE_SIZE: int = 2048
 _MAX_PARENT_MAP_CACHE_ENTRIES: int = 256
 _MAX_PARENT_MAP_TOTAL_NODES: int = 262144
 _MAX_OVERSIZED_PARENT_MAP_ROOTS: int = 16
-_MAX_ACTIVE_OVERSIZED_PARENT_MAPS: int = 2
 _MAX_EPHEMERAL_FALLBACK_ASTS: int = 256
 _MAX_PARSED_TREE_CACHE_SIZE: int = 128
 _MAX_STMT_DELTAS_PER_FN: int = 512
@@ -154,16 +162,16 @@ class _OversizedParentEntry(NamedTuple):
 
     fingerprint: Tuple[Any, ...]
     scope_ancestors: Dict[ast.AST, ast.AST]
-    attached_ids: frozenset[int]
+    scope_children: Dict[ast.AST, Tuple[ast.AST, ...]]
+    attached_nodes: weakref.WeakSet[ast.AST]
+    has_non_weakref: bool
 
 
 _parent_map_total_nodes: List[int] = [0]
 _oversized_scope_parent_maps: OrderedDict[ast.AST, _OversizedParentEntry] = (
     OrderedDict()
 )
-_active_oversized_parent_maps: OrderedDict[ast.AST, Dict[ast.AST, ast.AST]] = (
-    OrderedDict()
-)
+_scope_children_maps: Dict[ast.AST, Dict[ast.AST, Tuple[ast.AST, ...]]] = {}
 _downstream_reads_cache: OrderedDict[Tuple[Any, ...], frozenset[str]] = OrderedDict()
 _parsed_tree_cache: OrderedDict[Tuple[str, int], Optional[ast.AST]] = OrderedDict()
 _cached_scope_fingerprints: OrderedDict[ast.AST, Tuple[Any, ...]] = OrderedDict()
@@ -177,6 +185,7 @@ _stmt_with_summary_cache: OrderedDict[ast.stmt, Tuple[bool, frozenset[str]]] = (
 _tree_raw_source_cache: Dict[ast.AST, Tuple[int, str]] = {}
 _ephemeral_unit_asts: weakref.WeakSet[ast.AST] = weakref.WeakSet()
 _ephemeral_unit_ast_fallback: OrderedDict[int, ast.AST] = OrderedDict()
+_active_ephemeral_unit_asts: Dict[int, Tuple[ast.AST, int]] = {}
 _warned_lenient_closure: List[bool] = [False]
 
 
@@ -194,6 +203,31 @@ def _mark_ephemeral_unit_ast(node: ast.AST) -> ast.AST:
     return node
 
 
+@contextlib.contextmanager
+def _ephemeral_unit_ast_context(node: ast.AST) -> Iterator[ast.AST]:
+    """Pins a non-weakrefable ephemeral synthetic AST in an active refcounted table for the duration of a call."""
+    pinned_id: Optional[int] = None
+    with _downstream_cache_lock:
+        try:
+            _ephemeral_unit_asts.add(node)
+        except TypeError:
+            pinned_id = id(node)
+            prev = _active_ephemeral_unit_asts.get(pinned_id)
+            prev_cnt = prev[1] if prev is not None and prev[0] is node else 0
+            _active_ephemeral_unit_asts[pinned_id] = (node, prev_cnt + 1)
+    try:
+        yield node
+    finally:
+        if pinned_id is not None:
+            with _downstream_cache_lock:
+                cur = _active_ephemeral_unit_asts.get(pinned_id)
+                if cur is not None and cur[0] is node:
+                    if cur[1] <= 1:
+                        _active_ephemeral_unit_asts.pop(pinned_id, None)
+                    else:
+                        _active_ephemeral_unit_asts[pinned_id] = (node, cur[1] - 1)
+
+
 def _is_ephemeral_unit_ast(node: Optional[ast.AST]) -> bool:
     """Returns True when node was registered as an ephemeral synthetic unit AST wrapper."""
     if node is None or not isinstance(node, ast.AST):
@@ -204,7 +238,11 @@ def _is_ephemeral_unit_ast(node: Optional[ast.AST]) -> bool:
                 return True
         except TypeError:
             pass
-        return _ephemeral_unit_ast_fallback.get(id(node)) is node
+        node_id = id(node)
+        active_entry = _active_ephemeral_unit_asts.get(node_id)
+        if active_entry is not None and active_entry[0] is node:
+            return True
+        return _ephemeral_unit_ast_fallback.get(node_id) is node
 
 
 _SCOPE_ROOT_TYPES: Tuple[Type[ast.AST], ...] = (
@@ -621,35 +659,85 @@ def _build_oversized_scope_parent_map(
     return scope_map
 
 
+def _build_children_adjacency(
+    parent_map: Mapping[ast.AST, ast.AST],
+) -> Dict[ast.AST, Tuple[ast.AST, ...]]:
+    """Inverts a child->parent map into a compact parent->children tuple adjacency map."""
+    adj_lists: Dict[ast.AST, List[ast.AST]] = {}
+    for child, parent in parent_map.items():
+        adj_lists.setdefault(parent, []).append(child)
+    return {parent: tuple(children) for parent, children in adj_lists.items()}
+
+
+def _build_attached_node_weakset(
+    nodes: Iterable[ast.AST],
+) -> Tuple[weakref.WeakSet[ast.AST], bool]:
+    """Builds a WeakSet of AST nodes, reporting whether any node lacked weakref support."""
+    ws: weakref.WeakSet[ast.AST] = weakref.WeakSet()
+    has_non_weakref = False
+    for n in nodes:
+        try:
+            ws.add(n)
+        except TypeError:
+            has_non_weakref = True
+    return ws, has_non_weakref
+
+
+def _oversized_entry_contains_node(
+    root_node: ast.AST, entry: _OversizedParentEntry, node: ast.AST
+) -> bool:
+    """Checks whether node belongs to oversized root_node without id() reuse false positives."""
+    if node is root_node:
+        return True
+    if isinstance(node, _INDEXED_PARENT_MAP_TYPES):
+        return node in entry.scope_ancestors
+    try:
+        if node in entry.attached_nodes:
+            return True
+    except TypeError:
+        if entry.has_non_weakref:
+            return any(n is node for n in ast.walk(root_node))
+    return False
+
+
+def _is_oversized_scope_root(node: Optional[ast.AST]) -> bool:
+    """Returns True if node is currently tracked as an oversized parent-map root."""
+    if node is None or not isinstance(node, ast.AST):
+        return False
+    with _downstream_cache_lock:
+        return node in _oversized_scope_parent_maps
+
+
 def _store_parent_map_locked(
     root_node: ast.AST, parent_map: Dict[ast.AST, ast.AST]
 ) -> Dict[ast.AST, ast.AST]:
     """Stores parent_map in _scope_parent_maps with LRU cap, total-node budget, and scope reverse indexing."""
     if root_node in _scope_parent_maps:
-        _scope_parent_maps.move_to_end(root_node)
+        if next(reversed(_scope_parent_maps)) != root_node:
+            _scope_parent_maps.move_to_end(root_node)
         return _scope_parent_maps[root_node]
     new_map_size = len(parent_map)
     if new_map_size > _MAX_PARENT_MAP_TOTAL_NODES:
+        scope_anc = _build_oversized_scope_parent_map(root_node, parent_map)
+        attached_ws, has_non_weakref = _build_attached_node_weakset(parent_map)
         _oversized_scope_parent_maps[root_node] = _OversizedParentEntry(
             fingerprint=_compute_scope_fingerprint(root_node),
-            scope_ancestors=_build_oversized_scope_parent_map(root_node, parent_map),
-            attached_ids=frozenset(id(n) for n in parent_map),
+            scope_ancestors=scope_anc,
+            scope_children=_build_children_adjacency(scope_anc),
+            attached_nodes=attached_ws,
+            has_non_weakref=has_non_weakref,
         )
         _oversized_scope_parent_maps.move_to_end(root_node)
         while len(_oversized_scope_parent_maps) > _MAX_OVERSIZED_PARENT_MAP_ROOTS:
             _oversized_scope_parent_maps.popitem(last=False)
-        _active_oversized_parent_maps[root_node] = parent_map
-        _active_oversized_parent_maps.move_to_end(root_node)
-        while len(_active_oversized_parent_maps) > _MAX_ACTIVE_OVERSIZED_PARENT_MAPS:
-            _active_oversized_parent_maps.popitem(last=False)
         return parent_map
     _oversized_scope_parent_maps.pop(root_node, None)
-    _active_oversized_parent_maps.pop(root_node, None)
     while _scope_parent_maps and (
         len(_scope_parent_maps) >= _MAX_PARENT_MAP_CACHE_ENTRIES
         or _parent_map_total_nodes[0] + new_map_size > _MAX_PARENT_MAP_TOTAL_NODES
     ):
         evicted_root, evicted_map = _scope_parent_maps.popitem(last=False)
+        _scope_children_maps.pop(evicted_root, None)
         _parent_map_total_nodes[0] = max(
             0, _parent_map_total_nodes[0] - len(evicted_map)
         )
@@ -658,6 +746,7 @@ def _store_parent_map_locked(
         )
     _scope_parent_maps[root_node] = parent_map
     _scope_parent_maps.move_to_end(root_node)
+    _scope_children_maps[root_node] = _build_children_adjacency(parent_map)
     _parent_map_total_nodes[0] += new_map_size
     indexed_nodes: Set[ast.AST] = {
         n
@@ -678,12 +767,12 @@ def _store_parent_map_locked(
 def _pop_parent_map_locked(root_node: ast.AST) -> None:
     """Removes root_node from _scope_parent_maps and prunes its reverse node-to-root index entries."""
     removed_map = _scope_parent_maps.pop(root_node, None)
+    _scope_children_maps.pop(root_node, None)
     if removed_map is not None:
         _parent_map_total_nodes[0] = max(
             0, _parent_map_total_nodes[0] - len(removed_map)
         )
     _oversized_scope_parent_maps.pop(root_node, None)
-    _active_oversized_parent_maps.pop(root_node, None)
     _prune_reverse_index_buckets(
         root_node, _parent_map_root_nodes, _node_to_parent_map_roots
     )
@@ -725,14 +814,14 @@ def _tree_contains_scope_node(tree: ast.AST, node: ast.AST) -> bool:
         return node in _build_parent_map_unlocked(tree)
     with _downstream_cache_lock:
         if tree in _scope_parent_maps:
-            _scope_parent_maps.move_to_end(tree)
+            if next(reversed(_scope_parent_maps)) != tree:
+                _scope_parent_maps.move_to_end(tree)
             return node in _scope_parent_maps[tree]
         entry = _oversized_scope_parent_maps.get(tree)
         if entry is not None and _check_oversized_fingerprint_locked(tree, entry):
-            _oversized_scope_parent_maps.move_to_end(tree)
-            if isinstance(node, _INDEXED_PARENT_MAP_TYPES):
-                return node in entry.scope_ancestors
-            return id(node) in entry.attached_ids
+            if next(reversed(_oversized_scope_parent_maps)) != tree:
+                _oversized_scope_parent_maps.move_to_end(tree)
+            return _oversized_entry_contains_node(tree, entry, node)
     built_map = _build_parent_map_unlocked(tree)
     with _downstream_cache_lock:
         stored_map = _store_parent_map_locked(tree, built_map)
@@ -942,6 +1031,8 @@ class _TrackedCachedDict(Dict[Any, Any]):
     def touch_lru(self, k: Any) -> Any:
         """Promotes an existing key to the MRU end in O(1) without re-indexing AST nodes."""
         with _downstream_cache_lock:
+            if self and next(reversed(self)) == k:
+                return dict.__getitem__(self, k)
             val = super().pop(k)
             super().__setitem__(k, val)
             return val
@@ -1080,11 +1171,13 @@ class _TrackedScopeCache(OrderedDict[Any, _CacheValT]):
 
     def move_to_end(self, key: Any, last: bool = True) -> None:
         with _downstream_cache_lock:
-            super().move_to_end(key, last=last)
+            if not last or not self or next(reversed(self)) != key:
+                super().move_to_end(key, last=last)
             if isinstance(key, _ScopeCacheKey):
                 kind_ring = self.ensure_kind_keys().get(key.kind)
                 if kind_ring is not None and key in kind_ring:
-                    kind_ring.move_to_end(key, last=last)
+                    if not last or next(reversed(kind_ring)) != key:
+                        kind_ring.move_to_end(key, last=last)
 
     def __delitem__(self, key: Any) -> None:
         with _downstream_cache_lock:
@@ -1180,40 +1273,138 @@ def _key_references_scope_nodes(
     return False
 
 
+_MAX_PROD_FINGERPRINT_NODES: int = 512
+_MAX_DEBUG_FINGERPRINT_NODES: int = 65536
+
+
+def _node_fingerprint_scalar(curr: ast.AST) -> Any:
+    """Extracts hashable scalar AST attributes that can be mutated in place without replacing node identity."""
+    if isinstance(curr, ast.Name):
+        return (curr.id, type(curr.ctx))
+    if isinstance(curr, ast.Constant):
+        val = curr.value
+        try:
+            hash(val)
+            return (type(val), val)
+        except TypeError:
+            return (type(val), repr(val))
+    if isinstance(curr, ast.Attribute):
+        return (curr.attr, type(curr.ctx))
+    if isinstance(curr, ast.arg):
+        return curr.arg
+    if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return curr.name
+    if isinstance(curr, (ast.Nonlocal, ast.Global)):
+        return tuple(curr.names)
+    if isinstance(curr, ast.alias):
+        return (curr.name, curr.asname)
+    if isinstance(curr, ast.ImportFrom):
+        return (curr.module, curr.level)
+    if isinstance(curr, (ast.BinOp, ast.UnaryOp, ast.AugAssign, ast.BoolOp)):
+        return type(curr.op)
+    if isinstance(curr, ast.Compare):
+        return tuple(type(op) for op in curr.ops)
+    return None
+
+
 def _compute_scope_fingerprint(node: ast.AST) -> Tuple[Any, ...]:
-    """Computes an O(1) diagnostic header and endpoint fingerprint of a scope root.
+    """Computes a structural AST fingerprint of a scope root outside lock.
 
     Note:
-        This is a fast O(1) diagnostic heuristic over the scope header, decorator count,
-        body length, and first/last body statements (not a comprehensive structural proof
-        of recursive AST immutability). Mutations to middle statements or interior
-        sub-expressions do not alter this fingerprint; callers that mutate a cached AST
-        in place must call ``evict_tree_scopes(tree)`` explicitly.
+        Walks up to ``_MAX_PROD_FINGERPRINT_NODES`` AST nodes in BFS order in production
+        mode (covering full subtrees of typical functions and small modules in bounded O(1)
+        time, plus strided top-level statement sampling on large modules) and up to
+        ``_MAX_DEBUG_FINGERPRINT_NODES`` nodes when ``_debug_ast_immutability[0]`` is True.
+        Callers that mutate a cached AST in place must still call ``evict_tree_scopes(tree)``
+        explicitly.
     """
+    max_nodes = (
+        _MAX_DEBUG_FINGERPRINT_NODES
+        if _debug_ast_immutability[0]
+        else _MAX_PROD_FINGERPRINT_NODES
+    )
+    queue: deque[ast.AST] = deque([node])
+    visited = 0
+    acc = 0x9E3779B97F4A7C15
+    mask = 0xFFFFFFFFFFFFFFFF
+    while queue and visited < max_nodes:
+        curr = queue.popleft()
+        visited += 1
+        children = [
+            ch
+            for ch in ast.iter_child_nodes(curr)
+            if not isinstance(ch, _SINGLETON_AST_TYPES)
+        ]
+        if visited + len(queue) < max_nodes:
+            rem = max_nodes - (visited + len(queue))
+            queue.extend(children[:rem])
+        item_hash = hash(
+            (
+                type(curr),
+                id(curr),
+                getattr(curr, "lineno", None),
+                getattr(curr, "end_lineno", None),
+                getattr(curr, "col_offset", None),
+                getattr(curr, "end_col_offset", None),
+                len(children),
+                _node_fingerprint_scalar(curr),
+            )
+        )
+        acc = ((acc ^ (item_hash & mask)) * 0xBF58476D1CE4E5B9) & mask
+
     body = getattr(node, "body", None)
     if isinstance(body, list):
         n_body = len(body)
-        first_stmt = body[0] if n_body else None
+        step = max(1, n_body // 32)
+        sampled = tuple(
+            (
+                id(s),
+                type(s),
+                getattr(s, "lineno", None),
+                getattr(s, "end_lineno", None),
+            )
+            for s in body[::step]
+        )
         last_stmt = body[-1] if n_body else None
         body_sig: Any = (
             n_body,
-            id(first_stmt),
-            getattr(first_stmt, "lineno", None) if first_stmt is not None else None,
+            sampled,
             id(last_stmt),
+            getattr(last_stmt, "lineno", None) if last_stmt is not None else None,
             getattr(last_stmt, "end_lineno", None) if last_stmt is not None else None,
         )
     else:
         body_sig = id(body)
-    decs = getattr(node, "decorator_list", None)
-    dec_sig: Any = len(decs) if isinstance(decs, list) else 0
     return (
         type(node),
         getattr(node, "name", None),
         getattr(node, "lineno", None),
         getattr(node, "end_lineno", None),
+        visited,
+        acc,
         body_sig,
-        dec_sig,
     )
+
+
+def _collect_historical_descendants(
+    seeds: Iterable[ast.AST],
+    children_map: Mapping[ast.AST, Tuple[ast.AST, ...]],
+    tree_nodes: Set[ast.AST],
+    scope_nodes: Set[ast.AST],
+) -> None:
+    """Adds historical descendants from children_map (including already-detached subtrees) in O(|T_old|)."""
+    stack: List[ast.AST] = [s for s in seeds if s in children_map]
+    seen_stack: Set[ast.AST] = set(stack)
+    while stack:
+        curr = stack.pop()
+        for child in children_map.get(curr, ()):
+            if child not in tree_nodes:
+                tree_nodes.add(child)
+                if isinstance(child, _SCOPE_ROOT_TYPES):
+                    scope_nodes.add(child)
+            if child in children_map and child not in seen_stack:
+                seen_stack.add(child)
+                stack.append(child)
 
 
 def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
@@ -1221,12 +1412,11 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
 
     Note:
         Runs in O(|T| + k) time under ``_downstream_cache_lock`` where |T| is the number
-        of AST nodes in ``tree`` (plus its ancestor chain in ``_scope_parent_maps``) and
-        k is the number of dependent cache entries indexed for those nodes in
-        ``_node_to_parent_map_roots`` and ``_scope_owner_keys_index``, without scanning
-        global cache tables or flushing unrelated sibling scopes. Callers must not mutate
-        an AST concurrently while another thread is traversing or analyzing that same AST
-        without external synchronization.
+        of AST nodes in ``tree`` (including previously cached children detached prior to
+        eviction via ``_scope_children_maps``, plus its ancestor chain in
+        ``_scope_parent_maps``) and k is the number of dependent cache entries indexed
+        for those nodes in ``_node_to_parent_map_roots`` and ``_scope_owner_keys_index``,
+        without scanning global cache tables or flushing unrelated sibling scopes.
     """
     if tree is None or not isinstance(tree, ast.AST):
         return
@@ -1261,26 +1451,40 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
             roots = _node_to_parent_map_roots.get(n)
             if roots:
                 candidate_roots.update(roots)
-        for r_node, pmap in _scope_parent_maps.items():
-            if r_node not in candidate_roots and (r_node is tree or tree in pmap):
-                candidate_roots.add(r_node)
+        if not isinstance(tree, _INDEXED_PARENT_MAP_TYPES):
+            for r_node, pmap in _scope_parent_maps.items():
+                if r_node not in candidate_roots and (r_node is tree or tree in pmap):
+                    candidate_roots.add(r_node)
         for o_root in list(_oversized_scope_parent_maps.keys()):
             o_entry = _oversized_scope_parent_maps.get(o_root)
-            o_map = o_entry.scope_ancestors if o_entry is not None else {}
-            o_ids = o_entry.attached_ids if o_entry is not None else frozenset()
+            if o_entry is None:
+                continue
+            o_map = o_entry.scope_ancestors
             if (
                 o_root in tree_nodes
-                or tree is o_root
-                or tree in o_map
-                or id(tree) in o_ids
+                or _oversized_entry_contains_node(o_root, o_entry, tree)
                 or any(sn in o_map for sn in scope_nodes)
             ):
+                _collect_historical_descendants(
+                    initial_tree_nodes,
+                    o_entry.scope_children,
+                    tree_nodes,
+                    scope_nodes,
+                )
                 _oversized_scope_parent_maps.pop(o_root, None)
-                _active_oversized_parent_maps.pop(o_root, None)
                 scope_nodes.add(o_root)
+                candidate_roots.add(o_root)
         keys_to_remove: Set[Any] = set()
         for root_node in candidate_roots:
             keys_to_remove.update(_scope_owner_keys_index.get(root_node, ()))
+            children_map = _scope_children_maps.get(root_node)
+            if children_map is not None:
+                _collect_historical_descendants(
+                    initial_tree_nodes,
+                    children_map,
+                    tree_nodes,
+                    scope_nodes,
+                )
             pmap_opt = _scope_parent_maps.get(root_node)
             if pmap_opt is None:
                 continue
@@ -1290,41 +1494,12 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
             elif root_node in tree_nodes:
                 matched_child = root_node
             else:
-                for n in tree_nodes:
+                for n in initial_tree_nodes:
                     if n in pmap_opt:
                         matched_child = n
                         break
             if matched_child is None:
                 continue
-            if isinstance(tree, _SCOPE_ROOT_TYPES) and tree in pmap_opt:
-                descends_cache: Dict[ast.AST, bool] = {}
-                cached_candidates = [
-                    cn
-                    for cn in (
-                        *_scope_owner_keys_index.keys(),
-                        *_stmt_with_summary_cache.keys(),
-                    )
-                    if cn not in tree_nodes and cn in pmap_opt
-                ]
-                for pnode in cached_candidates:
-                    chain: List[ast.AST] = []
-                    curr_p: Optional[ast.AST] = pnode
-                    hit = False
-                    while curr_p is not None:
-                        if curr_p in descends_cache:
-                            hit = descends_cache[curr_p]
-                            break
-                        if curr_p in initial_tree_nodes:
-                            hit = True
-                            break
-                        chain.append(curr_p)
-                        curr_p = pmap_opt.get(curr_p)
-                    for cn in chain:
-                        descends_cache[cn] = hit
-                    if hit:
-                        tree_nodes.add(pnode)
-                        if isinstance(pnode, _SCOPE_ROOT_TYPES):
-                            scope_nodes.add(pnode)
             scope_nodes.add(root_node)
             has_inner_scope_anc = isinstance(
                 matched_child,
@@ -1458,6 +1633,14 @@ def _store_lru_cache_entry(
     return stored_value
 
 
+def _move_to_end_if_needed(cache: OrderedDict[Any, Any], key: Any) -> None:
+    """Moves key to MRU tail unless it is already the most recently used entry."""
+    if isinstance(cache, _TrackedScopeCache):
+        cache.move_to_end(key)
+    elif cache and next(reversed(cache)) != key:
+        cache.move_to_end(key)
+
+
 def _get_or_compute_scope_cached(
     cache: OrderedDict[Any, _CacheValT],
     scope_node: Any,
@@ -1473,9 +1656,13 @@ def _get_or_compute_scope_cached(
         if isinstance(scope_node, _ScopeCacheKey)
         else (scope_node if isinstance(scope_node, ast.AST) else None)
     )
+    curr_fp: Optional[Tuple[Any, ...]] = (
+        _compute_scope_fingerprint(owner_ast)
+        if isinstance(owner_ast, ast.AST)
+        else None
+    )
     with _downstream_cache_lock:
-        if isinstance(owner_ast, ast.AST):
-            curr_fp = _compute_scope_fingerprint(owner_ast)
+        if isinstance(owner_ast, ast.AST) and curr_fp is not None:
             prev_fp = _cached_scope_fingerprints.get(owner_ast)
             if prev_fp is not None and prev_fp != curr_fp:
                 if _debug_ast_immutability[0]:
@@ -1487,11 +1674,11 @@ def _get_or_compute_scope_cached(
                 prev_fp = None
             if prev_fp is None:
                 _cached_scope_fingerprints[owner_ast] = curr_fp
-                _cached_scope_fingerprints.move_to_end(owner_ast)
+                _move_to_end_if_needed(_cached_scope_fingerprints, owner_ast)
                 while len(_cached_scope_fingerprints) > _MAX_SCOPE_CACHE_SIZE:
                     _cached_scope_fingerprints.popitem(last=False)
         if scope_node in cache:
-            cache.move_to_end(scope_node)
+            _move_to_end_if_needed(cache, scope_node)
             return cache[scope_node]
 
     # Concurrency Design Note: compute_fn() executes outside _downstream_cache_lock to
@@ -1579,6 +1766,8 @@ def _get_cached_tree_source_lines(node: Optional[ast.AST]) -> Optional[Tuple[str
         if direct_ck in _scope_cell_info_cache:
             _scope_cell_info_cache.move_to_end(direct_ck)
             return cast(Tuple[str, ...], _scope_cell_info_cache[direct_ck])
+        if isinstance(node, ast.Module):
+            return None
         for root in _node_to_parent_map_roots.get(node, ()):
             root_ck = _make_trusted_scope_cache_key(
                 owner=root, kind="tree_source_lines"
@@ -1587,21 +1776,29 @@ def _get_cached_tree_source_lines(node: Optional[ast.AST]) -> Optional[Tuple[str
                 _scope_cell_info_cache.move_to_end(root_ck)
                 return cast(Tuple[str, ...], _scope_cell_info_cache[root_ck])
         src_ring = _scope_cell_info_cache.ensure_kind_keys().get("tree_source_lines")
-        if src_ring:
-            for root_ck in reversed(list(src_ring.keys())):
-                if not isinstance(root_ck, _ScopeCacheKey) or root_ck not in _scope_cell_info_cache:
-                    continue
-                root_owner = root_ck.owner
-                pmap = _scope_parent_maps.get(root_owner)
-                if pmap is not None and node in pmap:
-                    _scope_cell_info_cache.move_to_end(root_ck)
-                    return cast(Tuple[str, ...], _scope_cell_info_cache[root_ck])
-                o_map = _oversized_scope_parent_maps.get(root_owner)
-                if o_map is not None and (
-                    node in o_map.scope_ancestors or id(node) in o_map.attached_ids
-                ):
-                    _scope_cell_info_cache.move_to_end(root_ck)
-                    return cast(Tuple[str, ...], _scope_cell_info_cache[root_ck])
+        if not src_ring:
+            return None
+        matched_ck: Optional[_ScopeCacheKey] = None
+        for root_ck in reversed(src_ring):
+            if (
+                not isinstance(root_ck, _ScopeCacheKey)
+                or root_ck not in _scope_cell_info_cache
+            ):
+                continue
+            root_owner = root_ck.owner
+            pmap = _scope_parent_maps.get(root_owner)
+            if pmap is not None and node in pmap:
+                matched_ck = root_ck
+                break
+            o_entry = _oversized_scope_parent_maps.get(root_owner)
+            if o_entry is not None and _oversized_entry_contains_node(
+                root_owner, o_entry, node
+            ):
+                matched_ck = root_ck
+                break
+        if matched_ck is not None:
+            _scope_cell_info_cache.move_to_end(matched_ck)
+            return cast(Tuple[str, ...], _scope_cell_info_cache[matched_ck])
     return None
 
 
@@ -1711,13 +1908,6 @@ def _get_scope_parent_map(
     if not use_cache:
         return _build_parent_map_unlocked(scope_node)
     with _downstream_cache_lock:
-        if scope_node in _active_oversized_parent_maps:
-            o_entry = _oversized_scope_parent_maps.get(scope_node)
-            if o_entry is None or _check_oversized_fingerprint_locked(
-                scope_node, o_entry
-            ):
-                _active_oversized_parent_maps.move_to_end(scope_node)
-                return _active_oversized_parent_maps[scope_node]
         if scope_node not in _scope_parent_maps:
             roots = _node_to_parent_map_roots.get(scope_node)
             if roots:
@@ -1907,8 +2097,8 @@ def clear_dataflow_cache() -> None:
         _parsed_tree_cache.clear()
         _cached_scope_fingerprints.clear()
         _scope_parent_maps.clear()
+        _scope_children_maps.clear()
         _oversized_scope_parent_maps.clear()
-        _active_oversized_parent_maps.clear()
         _parent_map_total_nodes[0] = 0
         _node_to_parent_map_roots.clear()
         _parent_map_root_nodes.clear()
@@ -1924,6 +2114,7 @@ def clear_dataflow_cache() -> None:
         _tree_raw_source_cache.clear()
         _ephemeral_unit_asts.clear()
         _ephemeral_unit_ast_fallback.clear()
+        _active_ephemeral_unit_asts.clear()
         _warned_lenient_closure[0] = False
     clear_closure_warning_cache()
 

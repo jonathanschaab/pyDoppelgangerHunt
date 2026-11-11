@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+from collections import OrderedDict
 import difflib
 import html
 import json
@@ -118,10 +120,11 @@ def extract_unit_source_lines_with_state(
             )
         start = max(1, s_d)
         end = min(len(source_lines), e_d)
+        sliced_buf = source_lines[start - 1 : end]
         return (
             [
                 ln if ln.endswith("\n") else ln + "\n"
-                for ln in source_lines[start - 1 : end]
+                for ln in sliced_buf
             ],
             SourceLinesOrigin.FULL_BUFFER,
         )
@@ -239,6 +242,7 @@ _PAIR_SAFETY_HAZARD_REASONS = frozenset(
         "generator cleanup hazard",
         "severed closure cell",
         "stale source code",
+        "invalid unit columns",
         "pathological ast",
         "unavailable source for closure mode",
         "unavailable source placeholder",
@@ -322,6 +326,102 @@ def _collect_suggestion_rejection_reasons(
     )
 
 
+_MAX_REPORT_FILE_CACHE_ENTRIES = 256
+
+
+def resolve_cached_unit_source_and_tree(
+    unit: Dict[str, Any],
+    repo_root: Optional[str] = None,
+    file_cache: Optional[
+        OrderedDict[str, Tuple[Optional[str], Optional[ast.AST]]]
+    ] = None,
+) -> Tuple[Optional[str], Optional[ast.AST]]:
+    """Loads and caches (source_text, parsed_ast) for a unit across multi-pair reporting passes."""
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
+        _get_or_parse_tree,
+    )
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        _load_unit_file_text,
+    )
+
+    inline_src = unit.get("source_text")
+    if not isinstance(inline_src, str) or not inline_src:
+        inline_src = unit.get("file_source")
+    if isinstance(inline_src, str) and inline_src:
+        try:
+            return inline_src, _get_or_parse_tree(inline_src)
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            return inline_src, None
+
+    if "source_lines" in unit and unit.get("source_lines") is not None:
+        return None, None
+
+    raw_file = str(unit.get("file") or "")
+    if not raw_file:
+        return None, None
+
+    cache_key: Optional[str] = None
+    if file_cache is not None:
+        resolved_p = resolve_safe_unit_file_path(unit, repo_root=repo_root)
+        if resolved_p is not None:
+            anchor = raw_file.split("#", 1)[1] if "#" in raw_file else ""
+            cache_key = f"{resolved_p}#{anchor}" if anchor else str(resolved_p)
+            if cache_key in file_cache:
+                file_cache.move_to_end(cache_key)
+                return file_cache[cache_key]
+
+    src_text = _load_unit_file_text(unit, repo_root=repo_root)
+    parsed_tree: Optional[ast.AST] = None
+    if isinstance(src_text, str) and src_text:
+        try:
+            parsed_tree = _get_or_parse_tree(src_text)
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            parsed_tree = None
+    entry = (src_text, parsed_tree)
+    if file_cache is not None and cache_key is not None:
+        file_cache[cache_key] = entry
+        if len(file_cache) > _MAX_REPORT_FILE_CACHE_ENTRIES:
+            file_cache.popitem(last=False)
+    return entry
+
+
+class _PreparedSuggestionUnit(NamedTuple):
+    """Resolved unit dictionary, backing module source/AST, and sliced lines for suggestion synthesis."""
+
+    unit: Dict[str, Any]
+    source_text: Optional[str]
+    tree: Optional[ast.AST]
+    lines: List[str]
+
+
+def _prepare_effective_suggestion_unit(
+    unit: Dict[str, Any],
+    *,
+    repo_root: Optional[str],
+    source_text: Optional[str],
+    tree: Optional[ast.AST],
+) -> _PreparedSuggestionUnit:
+    """Copies unit, attaches resolved full-module source_text when not inline, and slices unit lines."""
+    u_eff = dict(unit)
+    eff_src, eff_tree = (
+        (source_text, tree)
+        if source_text is not None or tree is not None
+        else resolve_cached_unit_source_and_tree(u_eff, repo_root=repo_root)
+    )
+    if (
+        eff_src is not None
+        and "source_text" not in u_eff
+        and "source_lines" not in u_eff
+    ):
+        u_eff["source_text"] = eff_src
+    return _PreparedSuggestionUnit(
+        unit=u_eff,
+        source_text=eff_src,
+        tree=eff_tree,
+        lines=extract_unit_source_code(u_eff, repo_root),
+    )
+
+
 def synthesize_refactoring_suggestion(
     u1: Dict[str, Any],
     u2: Dict[str, Any],
@@ -330,10 +430,12 @@ def synthesize_refactoring_suggestion(
     closure_strictness: Optional[str] = None,
     skip_pre_unit_closures: Optional[bool] = None,
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    source_text1: Optional[str] = None,
+    source_text2: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
 ) -> str:
     """Synthesizes actionable refactoring recommendation and shared helper template."""
-    lines1 = extract_unit_source_code(u1, repo_root)
-    lines2 = extract_unit_source_code(u2, repo_root)
     n1 = str(u1.get("name") or "unit1").rsplit(":", maxsplit=1)[-1]
     n2 = str(u2.get("name") or "unit2").rsplit(":", maxsplit=1)[-1]
 
@@ -348,6 +450,16 @@ def synthesize_refactoring_suggestion(
             f"        ..."
         )
 
+    p1, p2 = (
+        _prepare_effective_suggestion_unit(
+            u_item, repo_root=repo_root, source_text=s_item, tree=t_item
+        )
+        for u_item, s_item, t_item in (
+            (u1, source_text1, tree1),
+            (u2, source_text2, tree2),
+        )
+    )
+
     shared_prefix = ""
     for c1, c2 in zip(n1, n2):
         if c1 == c2:
@@ -358,7 +470,7 @@ def synthesize_refactoring_suggestion(
     helper_name = f"_shared_{clean_prefix}" if clean_prefix else "_shared_helper"
 
     diff_lines = [
-        line for line in difflib.ndiff(lines1, lines2)
+        line for line in difflib.ndiff(p1.lines, p2.lines)
         if line.startswith("- ") or line.startswith("+ ")
     ]
     diff_summary = f"{len(diff_lines)} varying line(s) detected between clone blocks."
@@ -375,39 +487,41 @@ def synthesize_refactoring_suggestion(
         synthesize_shared_helper_code,
     )
 
-    u1_eff = dict(u1)
-    u2_eff = dict(u2)
-    k1_expr = u1_eff.get("kind") in ("comprehension", "complex_expr")
-    k2_expr = u2_eff.get("kind") in ("comprehension", "complex_expr")
-    if k1_expr != k2_expr and not (u1_eff.get("kind") and u2_eff.get("kind")):
-        eff_expr_kind = u1_eff.get("kind") if k1_expr else u2_eff.get("kind")
-        u1_eff.setdefault("kind", eff_expr_kind)
-        u2_eff.setdefault("kind", eff_expr_kind)
-    is_expr_unit = u1_eff.get("kind") in ("comprehension", "complex_expr")
+    k1_expr = p1.unit.get("kind") in ("comprehension", "complex_expr")
+    k2_expr = p2.unit.get("kind") in ("comprehension", "complex_expr")
+    if k1_expr != k2_expr and not (p1.unit.get("kind") and p2.unit.get("kind")):
+        eff_expr_kind = p1.unit.get("kind") if k1_expr else p2.unit.get("kind")
+        p1.unit.setdefault("kind", eff_expr_kind)
+        p2.unit.setdefault("kind", eff_expr_kind)
+    is_expr_unit = p1.unit.get("kind") in ("comprehension", "complex_expr")
 
     pair_flags = resolve_pair_closure_flags(
-        u1_eff,
-        u2_eff,
+        p1.unit,
+        p2.unit,
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
         non_suppressing_ctx_managers=non_suppressing_ctx_managers,
     )
-    pre_sc1 = u1_eff.get("scope") if isinstance(u1_eff.get("scope"), dict) else None
-    pre_sc2 = u2_eff.get("scope") if isinstance(u2_eff.get("scope"), dict) else None
+    pre_sc1 = p1.unit.get("scope") if isinstance(p1.unit.get("scope"), dict) else None
+    pre_sc2 = p2.unit.get("scope") if isinstance(p2.unit.get("scope"), dict) else None
     sc1 = ensure_unit_scope_closure_mode(
-        u1_eff,
+        p1.unit,
         pre_sc1,
         pair_flags.effective_skip_pre_unit_closures,
         strict_with_suppression=pair_flags.effective_strict_with_suppression,
         non_suppressing_ctx_managers=pair_flags.unit1.non_suppressing_ctx_managers,
+        source_text=p1.source_text,
+        tree=p1.tree,
         repo_root=repo_root,
     )
     sc2 = ensure_unit_scope_closure_mode(
-        u2_eff,
+        p2.unit,
         pre_sc2,
         pair_flags.effective_skip_pre_unit_closures,
         strict_with_suppression=pair_flags.effective_strict_with_suppression,
         non_suppressing_ctx_managers=pair_flags.unit2.non_suppressing_ctx_managers,
+        source_text=p2.source_text,
+        tree=p2.tree,
         repo_root=repo_root,
     )
     has_naked_loop_jump = any(
@@ -415,10 +529,14 @@ def synthesize_refactoring_suggestion(
         for h in (*sc1.get("control_flow_hazards", ()), *sc2.get("control_flow_hazards", ()))
     )
     pair_out_raw = resolve_clone_pair_outputs(
-        u1=u1_eff,
-        u2=u2_eff,
+        u1=p1.unit,
+        u2=p2.unit,
         scope1=sc1,
         scope2=sc2,
+        source_text1=p1.source_text,
+        source_text2=p2.source_text,
+        tree1=p1.tree,
+        tree2=p2.tree,
         repo_root=repo_root,
         skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
         closure_strictness=closure_strictness,
@@ -441,10 +559,14 @@ def synthesize_refactoring_suggestion(
     if not has_naked_loop_jump and (pair_outputs is not None or is_expr_unit):
         try:
             helper_code = synthesize_shared_helper_code(
-                u1_eff,
-                u2_eff,
+                p1.unit,
+                p2.unit,
                 helper_name=helper_name,
                 repo_root=repo_root,
+                source_text1=p1.source_text,
+                source_text2=p2.source_text,
+                tree1=p1.tree,
+                tree2=p2.tree,
                 closure_strictness=closure_strictness,
                 skip_pre_unit_closures=skip_pre_unit_closures,
                 non_suppressing_ctx_managers=non_suppressing_ctx_managers,
@@ -455,8 +577,6 @@ def synthesize_refactoring_suggestion(
             )
         except (
             SyntaxError,
-            ValueError,
-            TypeError,
             OSError,
             UnicodeDecodeError,
             RecursionError,
@@ -488,8 +608,8 @@ def synthesize_refactoring_suggestion(
         has_outputs=bool(pair_outputs and (pair_outputs[0] or pair_outputs[1])),
     )
     rejection = _collect_suggestion_rejection_reasons(
-        u1_eff,
-        u2_eff,
+        p1.unit,
+        p2.unit,
         sc1,
         sc2,
         pair_skip_reason=pair_skip_reason,
@@ -799,6 +919,10 @@ def generate_html_report(
     families: Optional[List[Dict[str, Any]]] = None,
     stats: Optional[Dict[str, Any]] = None,
     repo_root: Optional[str] = None,
+    *,
+    closure_strictness: Optional[str] = None,
+    skip_pre_unit_closures: Optional[bool] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> str:
     """Generates a standalone, self-contained interactive HTML audit report."""
     effective_repo_root = (
@@ -817,10 +941,38 @@ def generate_html_report(
     dashoffset = circumference * (1.0 - (dry_score / 100.0))
 
     cards_html: List[str] = []
+    file_cache: OrderedDict[str, Tuple[Optional[str], Optional[ast.AST]]] = OrderedDict()
     with heuristic_ctx_manager_session():
         for idx, (sim, u1, u2) in enumerate(clones, 1):
-            diff_txt = generate_clone_diff(u1, u2, repo_root=effective_repo_root)
-            sug_txt = synthesize_refactoring_suggestion(u1, u2, repo_root=effective_repo_root)
+            src1, tree1 = resolve_cached_unit_source_and_tree(
+                u1, repo_root=effective_repo_root, file_cache=file_cache
+            )
+            src2, tree2 = resolve_cached_unit_source_and_tree(
+                u2, repo_root=effective_repo_root, file_cache=file_cache
+            )
+            u1_diff = (
+                {**u1, "source_text": src1}
+                if src1 is not None and "source_text" not in u1 and "source_lines" not in u1
+                else u1
+            )
+            u2_diff = (
+                {**u2, "source_text": src2}
+                if src2 is not None and "source_text" not in u2 and "source_lines" not in u2
+                else u2
+            )
+            diff_txt = generate_clone_diff(u1_diff, u2_diff, repo_root=effective_repo_root)
+            sug_txt = synthesize_refactoring_suggestion(
+                u1,
+                u2,
+                repo_root=effective_repo_root,
+                closure_strictness=closure_strictness,
+                skip_pre_unit_closures=skip_pre_unit_closures,
+                non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+                source_text1=src1,
+                source_text2=src2,
+                tree1=tree1,
+                tree2=tree2,
+            )
             diff_block = (
                 f"<pre class='diff'><code>{html.escape(diff_txt)}</code></pre>" if diff_txt else "<em>No textual diff</em>"
             )

@@ -22,11 +22,14 @@ from typing import (
 )
 
 from pydoppelgangerhunt.fixer._df_cache import (
+    _MAX_PARENT_MAP_TOTAL_NODES,
     _ScopeCacheKey,
     _ensure_scope_owner_parent_map,
+    _ephemeral_unit_ast_context,
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
     _is_ephemeral_unit_ast,
+    _is_oversized_scope_root,
     _make_trusted_scope_cache_key,
     _mark_ephemeral_unit_ast,
     _scope_cell_info_cache,
@@ -148,23 +151,85 @@ def _compute_scope_ctx_aux_nodes(
     return tuple(aux_nodes)
 
 
-class _FnScopeContext(NamedTuple):
+class _FnScopeContext:
     """Cached per-function lexical scope metadata for eager generator expression checks.
 
     Note:
-        ``parent_map`` is a read-only ``MappingProxyType`` view over a dictionary
-        that is also shared across nested scope contexts; the underlying dictionary
-        must never be mutated after construction.
+        ``parent_map`` is a read-only ``MappingProxyType`` view. When a cached
+        scope exceeds ``_MAX_PARENT_MAP_TOTAL_NODES``, ``_stored_parent_map`` is
+        left ``None`` so ``_scope_cell_info_cache`` never pins an oversized AST
+        parent dictionary in memory; ``parent_map`` resolves transiently on demand.
     """
 
+    __slots__ = (
+        "fn_locals",
+        "_stored_parent_map",
+        "has_nonempty_parent_map",
+        "shadowed_names",
+        "has_star_import",
+        "scope_owner",
+        "mod_tree",
+        "enclosing_scopes",
+        "precomputed_aux_nodes",
+    )
+
     fn_locals: frozenset[str]
-    parent_map: Mapping[ast.AST, ast.AST]
+    _stored_parent_map: Optional[Mapping[ast.AST, ast.AST]]
+    has_nonempty_parent_map: bool
     shadowed_names: frozenset[str]
     has_star_import: bool
-    scope_owner: Optional[ast.AST] = None
-    mod_tree: Optional[ast.AST] = None
-    enclosing_scopes: Tuple[ast.AST, ...] = ()
-    precomputed_aux_nodes: Optional[Tuple[ast.AST, ...]] = None
+    scope_owner: Optional[ast.AST]
+    mod_tree: Optional[ast.AST]
+    enclosing_scopes: Tuple[ast.AST, ...]
+    precomputed_aux_nodes: Optional[Tuple[ast.AST, ...]]
+
+    def __init__(
+        self,
+        fn_locals: frozenset[str],
+        parent_map: Optional[Mapping[ast.AST, ast.AST]],
+        shadowed_names: frozenset[str],
+        has_star_import: bool,
+        scope_owner: Optional[ast.AST] = None,
+        mod_tree: Optional[ast.AST] = None,
+        enclosing_scopes: Tuple[ast.AST, ...] = (),
+        precomputed_aux_nodes: Optional[Tuple[ast.AST, ...]] = None,
+        *,
+        has_nonempty_parent_map: Optional[bool] = None,
+    ) -> None:
+        object.__setattr__(self, "fn_locals", fn_locals)
+        object.__setattr__(self, "_stored_parent_map", parent_map)
+        object.__setattr__(
+            self,
+            "has_nonempty_parent_map",
+            bool(parent_map)
+            if has_nonempty_parent_map is None
+            else bool(has_nonempty_parent_map),
+        )
+        object.__setattr__(self, "shadowed_names", shadowed_names)
+        object.__setattr__(self, "has_star_import", has_star_import)
+        object.__setattr__(self, "scope_owner", scope_owner)
+        object.__setattr__(self, "mod_tree", mod_tree)
+        object.__setattr__(self, "enclosing_scopes", enclosing_scopes)
+        object.__setattr__(
+            self, "precomputed_aux_nodes", precomputed_aux_nodes
+        )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("_FnScopeContext is immutable")
+
+    @property
+    def parent_map(self) -> Mapping[ast.AST, ast.AST]:
+        """Returns the read-only AST child-to-parent mapping, resolving oversized scopes lazily."""
+        if self._stored_parent_map is not None:
+            return self._stored_parent_map
+        target = (
+            self.scope_owner
+            if isinstance(self.scope_owner, ast.AST)
+            else self.mod_tree
+        )
+        if isinstance(target, ast.AST):
+            return MappingProxyType(_get_scope_parent_map(target, use_cache=True))
+        return MappingProxyType({})
 
     def cache_fingerprint(self) -> Tuple[Any, ...]:
         """Returns the non-AST semantic fingerprint of this scope context."""
@@ -172,7 +237,7 @@ class _FnScopeContext(NamedTuple):
             self.fn_locals,
             self.shadowed_names,
             self.has_star_import,
-            bool(self.parent_map),
+            self.has_nonempty_parent_map,
         )
 
     def cache_aux_nodes(self) -> Tuple[ast.AST, ...]:
@@ -183,7 +248,7 @@ class _FnScopeContext(NamedTuple):
             self.scope_owner,
             self.mod_tree,
             self.enclosing_scopes,
-            bool(self.parent_map),
+            self.has_nonempty_parent_map,
         )
 
     def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
@@ -200,20 +265,26 @@ def _scope_ctx_allows_node_cache(
         return True
     if _is_ephemeral_unit_ast(owner):
         return False
+    stored_pmap = scope_ctx._stored_parent_map  # pylint: disable=protected-access
     if isinstance(scope_ctx.mod_tree, ast.AST):
         if isinstance(scope_ctx.scope_owner, ast.AST):
             if not _is_node_attached_to_tree(scope_ctx.scope_owner, scope_ctx.mod_tree):
                 return False
-            if owner is scope_ctx.scope_owner or owner in scope_ctx.parent_map:
+            if owner is scope_ctx.scope_owner or (
+                stored_pmap is not None and owner in stored_pmap
+            ):
                 return True
         return _is_node_attached_to_tree(owner, scope_ctx.mod_tree)
     if isinstance(scope_ctx.scope_owner, ast.AST):
         if _is_ephemeral_unit_ast(scope_ctx.scope_owner):
             return False
+        if scope_ctx.scope_owner is owner:
+            return True
+        if stored_pmap is None:
+            return _is_node_attached_to_tree(owner, scope_ctx.scope_owner)
         if (
-            scope_ctx.scope_owner is not owner
-            and scope_ctx.scope_owner not in scope_ctx.parent_map
-            and owner not in scope_ctx.parent_map
+            scope_ctx.scope_owner not in stored_pmap
+            and owner not in stored_pmap
         ):
             return False
     return True
@@ -250,12 +321,14 @@ def _get_fn_scope_context_uncached(
     parent_map_override: Optional[Mapping[ast.AST, ast.AST]] = None,
 ) -> _FnScopeContext:
     """Computes lexical scope metadata for a function or ephemeral unit module without caching."""
+    has_nonempty_pmap: bool
     if parent_map_override is not None:
-        eff_parent_map: Mapping[ast.AST, ast.AST] = (
+        eff_parent_map: Optional[Mapping[ast.AST, ast.AST]] = (
             parent_map_override
             if isinstance(parent_map_override, MappingProxyType)
             else MappingProxyType(dict(parent_map_override))
         )
+        has_nonempty_pmap = bool(eff_parent_map)
     else:
         if (
             cache_parent_map
@@ -264,10 +337,21 @@ def _get_fn_scope_context_uncached(
             and scope_node is not mod_tree
         ):
             _ensure_scope_owner_parent_map(mod_tree)
-        raw_parent_map = _get_scope_parent_map(
-            scope_node, use_cache=cache_parent_map
-        )
-        eff_parent_map = MappingProxyType(raw_parent_map)
+        if cache_parent_map and _is_oversized_scope_root(scope_node):
+            eff_parent_map = None
+            has_nonempty_pmap = True
+        else:
+            raw_parent_map = _get_scope_parent_map(
+                scope_node, use_cache=cache_parent_map
+            )
+            has_nonempty_pmap = bool(raw_parent_map)
+            if cache_parent_map and (
+                len(raw_parent_map) > _MAX_PARENT_MAP_TOTAL_NODES
+                or _is_oversized_scope_root(scope_node)
+            ):
+                eff_parent_map = None
+            else:
+                eff_parent_map = MappingProxyType(raw_parent_map)
     if scope_owner is None and (
         cache_parent_map or not isinstance(scope_node, ast.Module)
     ):
@@ -302,8 +386,9 @@ def _get_fn_scope_context_uncached(
         mod_tree=mod_tree,
         enclosing_scopes=enc_tuple,
         precomputed_aux_nodes=_compute_scope_ctx_aux_nodes(
-            eff_owner, mod_tree, enc_tuple, bool(eff_parent_map)
+            eff_owner, mod_tree, enc_tuple, has_nonempty_pmap
         ),
+        has_nonempty_parent_map=has_nonempty_pmap,
     )
 
 
@@ -554,14 +639,14 @@ def _ensure_subtree_scope_ctx(
     if scope_ctx is not None or isinstance(node, ast.GeneratorExp):
         return scope_ctx
     if isinstance(node, ast.Module):
-        wrap: ast.AST = node
-    else:
-        wrap = ast.Module(
-            body=[node if isinstance(node, ast.stmt) else ast.Expr(value=cast(ast.expr, node))],
-            type_ignores=[],
-        )
-        _mark_ephemeral_unit_ast(wrap)
-    return _get_fn_scope_context_uncached(wrap, cache_parent_map=False)
+        return _get_fn_scope_context_uncached(node, cache_parent_map=False)
+    wrap = ast.Module(
+        body=[node if isinstance(node, ast.stmt) else ast.Expr(value=cast(ast.expr, node))],
+        type_ignores=[],
+    )
+    _mark_ephemeral_unit_ast(wrap)
+    with _ephemeral_unit_ast_context(wrap):
+        return _get_fn_scope_context_uncached(wrap, cache_parent_map=False)
 
 
 def _extract_lazy_genexp_walrus_names(
@@ -746,37 +831,44 @@ def _collect_unit_nonlocal_mutators(
         type_ignores=[],
     )
     _mark_ephemeral_unit_ast(unit_mod)
-    mod_parent_map = (
-        _get_scope_parent_map(mod_tree) if mod_tree is not None else None
-    )
+    if mod_tree is not None and not _is_ephemeral_unit_ast(mod_tree):
+        _ensure_scope_owner_parent_map(mod_tree)
     use_node_cache = bool(
-        mod_parent_map is not None
+        mod_tree is not None
         and candidate_stmts
-        and candidate_stmts[0] in mod_parent_map
+        and _is_node_attached_to_tree(candidate_stmts[0], mod_tree)
+    )
+    mod_parent_map = (
+        _get_scope_parent_map(mod_tree)
+        if use_node_cache
+        and mod_tree is not None
+        and not _is_oversized_scope_root(mod_tree)
+        else None
     )
     fn_enclosing = [
         s for s in enclosing_scopes if not isinstance(s, ast.ClassDef)
     ]
-    base_fn_ctx = _get_fn_scope_context_uncached(
-        unit_mod,
-        mod_tree=mod_tree,
-        cache_parent_map=False,
-        enclosing_scopes=fn_enclosing,
-        scope_owner=None,
-        parent_map_override=mod_parent_map if use_node_cache else None,
-    )
-    top_ctx = (
-        _get_fn_scope_context_uncached(
+    with _ephemeral_unit_ast_context(unit_mod):
+        base_fn_ctx = _get_fn_scope_context_uncached(
             unit_mod,
             mod_tree=mod_tree,
             cache_parent_map=False,
-            enclosing_scopes=enclosing_scopes,
+            enclosing_scopes=fn_enclosing,
             scope_owner=None,
-            parent_map_override=mod_parent_map if use_node_cache else None,
+            parent_map_override=mod_parent_map,
         )
-        if len(fn_enclosing) != len(enclosing_scopes)
-        else base_fn_ctx
-    )
+        top_ctx = (
+            _get_fn_scope_context_uncached(
+                unit_mod,
+                mod_tree=mod_tree,
+                cache_parent_map=False,
+                enclosing_scopes=enclosing_scopes,
+                scope_owner=None,
+                parent_map_override=mod_parent_map,
+            )
+            if len(fn_enclosing) != len(enclosing_scopes)
+            else base_fn_ctx
+        )
     _esc_names, escaped_def_ids, _exec_ids = (
         _collect_escaped_and_executed_intra_unit_defs(
             candidate_stmts, frozenset(), use_cache=use_node_cache
@@ -1552,11 +1644,12 @@ def _collect_escaped_and_executed_intra_unit_defs(
     }
     unit_mod = ast.Module(body=list(candidate_stmts), type_ignores=[])
     _mark_ephemeral_unit_ast(unit_mod)
-    top_bound_names = (
-        _extract_single_node_local_names(unit_mod)
-        - _extract_direct_nonlocals(unit_mod, is_global=False)
-        - _extract_direct_nonlocals(unit_mod, is_global=True)
-    ) | set(root_defs.keys())
+    with _ephemeral_unit_ast_context(unit_mod):
+        top_bound_names = (
+            _extract_single_node_local_names(unit_mod)
+            - _extract_direct_nonlocals(unit_mod, is_global=False)
+            - _extract_direct_nonlocals(unit_mod, is_global=True)
+        ) | set(root_defs.keys())
     root_origins: Dict[str, int] = {name: 0 for name in top_bound_names}
     all_def_nodes: List[_NamedScopeNode] = []
     defs_by_name: Dict[str, List[_NamedScopeNode]] = {}
@@ -1853,19 +1946,39 @@ def _make_nested_fn_scope_context(
     use_cache: bool = True,
 ) -> _FnScopeContext:
     """Builds a _FnScopeContext for analyzing expressions inside a nested function."""
-    if scope_ctx is None:
-        parent_map: Mapping[ast.AST, ast.AST] = MappingProxyType(
-            _get_scope_parent_map(fn_node, use_cache=use_cache)
-        )
-    elif fn_node.body and fn_node.body[0] not in scope_ctx.parent_map:
-        parent_map = MappingProxyType(
-            ChainMap(
-                _get_scope_parent_map(fn_node, use_cache=use_cache),
-                cast(Dict[ast.AST, ast.AST], scope_ctx.parent_map),
-            )
-        )
+    prev_stored = (
+        scope_ctx._stored_parent_map  # pylint: disable=protected-access
+        if scope_ctx is not None
+        else None
+    )
+    parent_map: Optional[Mapping[ast.AST, ast.AST]]
+    has_nonempty_pmap: bool
+    if prev_stored is not None and (
+        not fn_node.body or fn_node.body[0] in prev_stored
+    ):
+        parent_map = prev_stored
+        has_nonempty_pmap = bool(prev_stored)
+    elif use_cache and _is_oversized_scope_root(fn_node):
+        parent_map = None
+        has_nonempty_pmap = True
     else:
-        parent_map = scope_ctx.parent_map
+        raw_fn_map = _get_scope_parent_map(fn_node, use_cache=use_cache)
+        has_nonempty_pmap = bool(raw_fn_map)
+        if use_cache and (
+            len(raw_fn_map) > _MAX_PARENT_MAP_TOTAL_NODES
+            or _is_oversized_scope_root(fn_node)
+        ):
+            parent_map = None
+        elif prev_stored is not None:
+            parent_map = MappingProxyType(
+                ChainMap(
+                    raw_fn_map,
+                    cast(Dict[ast.AST, ast.AST], prev_stored),
+                )
+            )
+            has_nonempty_pmap = bool(parent_map)
+        else:
+            parent_map = MappingProxyType(raw_fn_map)
     include_prev_owner = (
         scope_ctx is not None
         and isinstance(scope_ctx.scope_owner, ast.AST)
@@ -1899,8 +2012,9 @@ def _make_nested_fn_scope_context(
         mod_tree=eff_mod_tree,
         enclosing_scopes=enc_scopes,
         precomputed_aux_nodes=_compute_scope_ctx_aux_nodes(
-            fn_node, eff_mod_tree, enc_scopes, bool(parent_map)
+            fn_node, eff_mod_tree, enc_scopes, has_nonempty_pmap
         ),
+        has_nonempty_parent_map=has_nonempty_pmap,
     )
 
 

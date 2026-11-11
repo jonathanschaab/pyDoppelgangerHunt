@@ -154,21 +154,28 @@ If any proposed cross-module extraction would introduce a circular import or unr
 ```python
 from pydoppelgangerhunt import (
     ReplacementItem,
+    SourceLinesOrigin,
     UnitCollisionError,
     UnitDict,
+    UnitSchema,
     UnitSpan,
+    clear_dataflow_cache,
     compute_unit_byte_offsets,
     compute_unit_char_offsets,
     compute_unit_replacement_span,
     compute_unit_spans,
     count_physical_newlines,
     detect_line_ending,
+    evict_tree_scopes,
+    extract_unit_source_lines_with_state,
     generate_refactoring_patch,
+    heuristic_ctx_manager_session,
     intervals_overlap,
     is_subroutine_unit,
     refactor_module_units,
     split_source_lines,
     validate_module_unit_replacements,
+    validate_unit_schema,
 )
 ```
 
@@ -258,8 +265,9 @@ escaping callbacks across lexical scopes.
   and avoid cache thrashing across multi-pair sessions, `clear_dataflow_cache()` and
   `evict_tree_scopes(tree)` are exposed as public APIs (exported from `pydoppelgangerhunt` and
   `pydoppelgangerhunt.fixer`). AST trees passed via `tree=` are assumed immutable while cached
-  (internal scope fingerprinting is an `O(1)` diagnostic heuristic over the scope header and
-  first/last body statements, not a recursive structural proof of subtree immutability);
+  (internal scope fingerprinting is a bounded `O(1)` diagnostic check over a 512-node BFS prefix
+  and strided body statements in production—with full subtree traversal in test debug mode—rather
+  than an unbounded structural proof in production);
   callers that mutate an `ast.AST` in place (including interior statements or expressions) must
   call `evict_tree_scopes(tree)` (or `clear_dataflow_cache()`) after mutation to invalidate cached
   scope intervals and parent maps, and must not mutate an AST concurrently while another thread is
@@ -269,26 +277,32 @@ escaping callbacks across lexical scopes.
   periodically between scan runs or batch boundaries to release memoized AST trees and parent node maps.
 - **Precision vs. Soundness Trade-off**: Pre-unit closure and context-manager exception-suppression
   analysis can be configured via `--closure-strictness {strict,pedantic,lenient}`
-  (deprecated aliases: `fail_closed` -> `pedantic`, `fast`/`skip` -> `lenient`; or `--skip-pre-unit-closures`,
+  (or `--skip-pre-unit-closures`,
   or setting `closure_strictness = "strict"|"pedantic"|"lenient"`, `strict_with_suppression = true|false`,
-  and `non_suppressing_ctx_managers = [...]` in `pyproject.toml` or per-unit `UnitSchema` dicts):
-  - `strict` (default): **Heuristic context-manager safety mode** with conservative closure-cell
+  and `non_suppressing_ctx_managers = [...]` in `pyproject.toml` or per-unit `UnitSchema` dicts;
+  applicable across text/`--suggest` reports, `--html` reports, and `--patch`):
+  - `strict` (default for reporting, `--suggest`, `--html`, and preview patch generation with
+    `replace_clones=False`): **Heuristic context-manager safety mode** with conservative closure-cell
     analysis. Treats pre-unit closures capturing candidate outputs as live escaping callbacks and
     enforces all closure-cell hazard checks. For `with` / `async with` blocks, calls to standard
-    library non-suppressing context-manager factories (`open(...)`, `io.open(...)`, `io.StringIO`,
-    `io.BytesIO`, `io.TextIOWrapper`, `io.BufferedReader`, `io.BufferedWriter`,
-    `io.BufferedRandom`, `io.BufferedRWPair`, `io.FileIO`, `tempfile.*`,
+    library non-suppressing context-manager factories (`open(...)`, `builtins.open(...)`,
+    `__builtins__.open(...)`, `io.open`, `io.StringIO`, `io.BytesIO`, `io.TextIOWrapper`,
+    `io.BufferedReader`, `io.BufferedWriter`, `io.BufferedRandom`, `io.BufferedRWPair`,
+    `io.FileIO`, `tempfile.TemporaryDirectory`, `tempfile.NamedTemporaryFile`,
+    `tempfile.SpooledTemporaryFile`, `tempfile.TemporaryFile`,
     `contextlib.nullcontext`, `contextlib.closing`, `contextlib.aclosing`, `contextlib.chdir`,
     `contextlib.redirect_stdout`, `contextlib.redirect_stderr`, `warnings.catch_warnings`,
-    `threading.Lock`/`RLock`/`Condition`/`Semaphore`/`BoundedSemaphore`, `asyncio.Lock`,
-    `decimal.localcontext`, `unittest.mock.patch`, `os.scandir`, `sqlite3.connect`,
-    `zipfile.ZipFile`, `tarfile.open`, `gzip.open`, `bz2.open`, `lzma.open`, `mmap.mmap`,
-    `socket.socket`, `socket.create_connection`), local variables bound to instances returned by
-    those calls, and local classes with a strictly static class body whose `__exit__`/`__aexit__`
-    returns only `False`/`None` are proven non-suppressing (whereas bare uncalled factory
-    references such as `with open:` or `with contextlib.nullcontext:` and `pathlib.Path(...)`
-    are never treated as non-suppressing context managers). Unproven context managers use a
-    name-and-provenance heuristic:
+    `threading.Lock`, `threading.RLock`, `threading.Condition`, `threading.Semaphore`,
+    `threading.BoundedSemaphore`, `asyncio.Lock`, `asyncio.Condition`, `asyncio.Semaphore`,
+    `asyncio.BoundedSemaphore`, `decimal.localcontext`, `unittest.mock.patch`, `mock.patch`,
+    `os.scandir`, `sqlite3.connect`, `zipfile.ZipFile`, `tarfile.TarFile`, `tarfile.open`,
+    `gzip.open`, `gzip.GzipFile`, `bz2.open`, `bz2.BZ2File`, `lzma.open`, `lzma.LZMAFile`,
+    `mmap.mmap`, `socket.socket`, `socket.create_connection`), local variables bound to instances
+    returned by those calls, and local classes with a strictly static class body whose
+    `__exit__`/`__aexit__` returns only `False`/`None` are proven non-suppressing (whereas bare
+    uncalled factory references such as `with open:` or `with contextlib.nullcontext:` and
+    `pathlib.Path(...)` are never treated as non-suppressing context managers). Unproven context
+    managers use a name-and-provenance heuristic:
     managers are treated as non-suppressing unless their terminal identifier/callee attribute
     matches one of the 34 case-insensitive suppression-idiom substrings (`suppress`, `raises`,
     `ignor`, `subtest`, `exitstack`, `enter_context`, `enter_async_context`, `cancelscope`,
@@ -303,10 +317,11 @@ escaping callbacks across lexical scopes.
     Whenever an unproven context manager is accepted via the name heuristic, `pyDoppelgangerHunt`
     logs a deduplicated `INFO` diagnostic and a session-scoped `WARNING` summary to `stderr`/logging
     (never polluting `stdout` or `--output` report files, while recording a per-hunk advisory
-    comment in `--patch` unified diffs); use `--closure-strictness pedantic` to reject all
-    unproven context managers.
-  - `pedantic` (deprecated alias: `fail_closed`; or `strict_with_suppression = true` in `pyproject.toml`
-    or `UnitSchema` dicts when `closure_strictness` is omitted): **Stricter static conservative mode**
+    comment in `--patch` unified diffs); automated call-site delegation (`--replace-clones` /
+    `replace_clones=True`) defaults to `pedantic` unless `closure_strictness` is explicitly set.
+  - `pedantic` (default when `--replace-clones` / `replace_clones=True` is enabled without an
+    explicit `closure_strictness`, or when `strict_with_suppression = true` is set in `pyproject.toml`
+    or `UnitSchema` dicts): **Stricter static conservative mode**
     that treats all unproven unknown `with` / `async with` context managers as potentially
     exception-suppressing unless explicitly allowlisted via `--non-suppressing-ctx-managers` or
     `non_suppressing_ctx_managers` (merged across global config and per-unit overrides), and inside
@@ -323,7 +338,7 @@ escaping callbacks across lexical scopes.
     imports (`.Name` matching `from . import Name`), dotted paths (e.g., `pkg.tx.atomic` or
     `unittest.mock.patch.object`), and wildcard attribute suffixes (`*.atomic` or `*.lock` matching
     `<any_receiver>.atomic` / `<any_receiver>.lock(...)`).
-  - `lenient` (deprecated aliases: `fast`, `skip`): Precision-oriented mode that skips pre-unit
+  - `lenient`: Precision-oriented mode that skips pre-unit
     closure liveness scanning for generator subroutines and relaxes speculative unreferenced-sibling
     closure checks, while still enforcing checks for unbound captured cells at the extraction point,
     externally mutated captured cells, intra-unit `nonlocal`/walrus mutator escapes, and sibling
@@ -440,13 +455,13 @@ pydoppelgangerhunt --init
 | `--output`, `-o` | `PATH` | Output file path to save report |
 | `--html` | `PATH` | Write standalone interactive HTML dashboard report |
 | `--patch` | `PATH` | Write git-apply compatible unified patch file |
-| `--replace-clones` | Flag | Replace duplicate clone bodies with calls delegating to extracted helpers |
+| `--replace-clones` | Flag | Replace duplicate clone bodies with calls delegating to extracted helpers (defaults `--closure-strictness` to `pedantic` when unset) |
 | `--type-merge-strategy` | `fallback_any\|union` | Parameter typing strategy for helper synthesis (`fallback_any` or `union`) |
 | `--method-binding` | `auto\|method\|module` | Target helper binding strategy (`auto`, `method`, or `module`) |
 | `--cross-file-strategy` | `auto\|shared_module\|host_module\|skip` | Cross-module deduplication strategy (`auto`, `shared_module`, `host_module`, or `skip`; default: `auto`) |
 | `--shared-module-name` | `FILENAME` | Target filename for shared utility extractions (default: `_common.py`) |
 | `--skip-pre-unit-closures` | Flag | Relax speculative unreferenced pre-unit closure checks (`lenient` mode) |
-| `--closure-strictness` | `strict\|pedantic\|lenient\|fail_closed\|fast\|skip` | Closure strictness mode (`strict` [heuristic `with`-suppression, default], `pedantic` [all unproven `with`-managers treated as potentially suppressing], or `lenient` [relaxes speculative unreferenced-sibling closure checks while keeping unbound/mutated captured-cell, intra-unit `nonlocal`/walrus mutator, and referenced-sibling closure checks]; deprecated aliases: `fail_closed`, `fast`, `skip`) |
+| `--closure-strictness` | `strict\|pedantic\|lenient` | Closure strictness mode (`strict` [heuristic `with`-suppression, default for reports/`--suggest`/preview patches], `pedantic` [all unproven `with`-managers treated as potentially suppressing, default for `--replace-clones`], or `lenient` [relaxes speculative unreferenced-sibling closure checks while keeping unbound/mutated captured-cell, intra-unit `nonlocal`/walrus mutator, and referenced-sibling closure checks]) |
 | `--non-suppressing-ctx-managers` | `NAMES` | Context manager names, `.Name` relative imports, dotted paths, or `*.attr` wildcard suffixes proven not to suppress exceptions (comma-separated or repeatable) |
 | `--sort-by` | `similarity\|priority\|sloc` | Sort clone hits (default: `similarity`) |
 | `--priority` | Flag | Sort clones by Priority score: $\text{Sim} \times \text{SLOC} \times \text{Complexity}$ |

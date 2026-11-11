@@ -3493,10 +3493,37 @@ def generate_refactoring_patch(
 
             # Apply monotone strict-wins pair resolution (pedantic > strict > lenient)
             # across both units so u1_eff and u2_eff are inspected under a single
-            # consistent closure and context-manager suppression policy.
+            # consistent closure and context-manager suppression policy. When
+            # replace_clones=True and no explicit policy is set on the call or unit,
+            # default to pedantic so automated call-site rewrites fail closed on
+            # unproven context managers.
+            u1_policy = (
+                {**u1, "closure_strictness": "pedantic"}
+                if (
+                    replace_clones
+                    and closure_strictness is None
+                    and skip_pre_unit_closures is None
+                    and u1.get("closure_strictness") is None
+                    and u1.get("skip_pre_unit_closures") is None
+                    and u1.get("strict_with_suppression") is None
+                )
+                else u1
+            )
+            u2_policy = (
+                {**u2, "closure_strictness": "pedantic"}
+                if (
+                    replace_clones
+                    and closure_strictness is None
+                    and skip_pre_unit_closures is None
+                    and u2.get("closure_strictness") is None
+                    and u2.get("skip_pre_unit_closures") is None
+                    and u2.get("strict_with_suppression") is None
+                )
+                else u2
+            )
             pair_flags = resolve_pair_closure_flags(
-                u1,
-                u2,
+                u1_policy,
+                u2_policy,
                 closure_strictness=closure_strictness,
                 skip_pre_unit_closures=skip_pre_unit_closures,
             )
@@ -3596,22 +3623,38 @@ def generate_refactoring_patch(
 
             hazards1 = set(s1.get("control_flow_hazards", []))
             hazards2 = set(s2.get("control_flow_hazards", []))
-            if "stale_source_code" in hazards1 | hazards2:
+            combined_pair_hazards = hazards1 | hazards2
+            if "unavailable_source_placeholder" in hazards1 or (
+                (replace_clones or is_sub1 or is_sub2 or u2_lines is not None)
+                and "unavailable_source_placeholder" in hazards2
+            ):
+                skip_reasons["unavailable source placeholder"] += 1
+                continue
+            if "unavailable_source_for_closure_mode" in combined_pair_hazards:
+                skip_reasons["unavailable source for closure mode"] += 1
+                continue
+            if "invalid_unit_columns" in combined_pair_hazards:
+                skip_reasons["invalid unit columns"] += 1
+                continue
+            if "stale_source_code" in combined_pair_hazards:
                 skip_reasons["stale source code"] += 1
                 continue
-            if "pathological_ast" in hazards1 | hazards2:
+            if "pathological_ast" in combined_pair_hazards:
                 skip_reasons["pathological ast"] += 1
                 continue
-            if "type_param_closure_capture" in hazards1 | hazards2:
+            if "type_param_closure_capture" in combined_pair_hazards:
                 skip_reasons["type_param closure capture"] += 1
                 continue
-            if any(h in ("naked_break", "naked_continue") for h in hazards1 | hazards2):
+            if any(
+                h in ("naked_break", "naked_continue")
+                for h in combined_pair_hazards
+            ):
                 skip_reasons["naked break or continue"] += 1
                 continue
-            if "deleted_output" in hazards1 | hazards2:
+            if "deleted_output" in combined_pair_hazards:
                 skip_reasons["deleted output hazard"] += 1
                 continue
-            if "severed_closure_cell" in hazards1 | hazards2:
+            if "severed_closure_cell" in combined_pair_hazards:
                 sub_reasons = list(
                     dict.fromkeys(
                         list(s1.get("closure_hazard_reasons", ()))

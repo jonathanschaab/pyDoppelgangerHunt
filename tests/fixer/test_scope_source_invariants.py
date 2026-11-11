@@ -5,9 +5,6 @@ from __future__ import annotations
 import ast
 from collections.abc import Set as AbstractSet
 from pathlib import Path
-import sys
-import threading
-from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -17,7 +14,6 @@ from pydoppelgangerhunt.fixer import (
     clear_dataflow_cache,
     generate_refactoring_patch,
     inspect_single_unit_scope,
-    resolve_clone_generator_subroutine_outputs,
     resolve_clone_pair_outputs,
     synthesize_shared_helper_code,
 )
@@ -1455,14 +1451,15 @@ def test_out_of_range_unit_columns_fail_closed_in_scope_and_slicing() -> None:
         },
         tree=ast.parse(src),
     )
-    assert "stale_source_code" in sc_oob["control_flow_hazards"]
+    assert "invalid_unit_columns" in sc_oob["control_flow_hazards"]
+    assert "stale_source_code" not in sc_oob["control_flow_hazards"]
     assert sc_oob["is_control_flow_safe"] is False
 
 
-def test_col_sliced_flag_separation_and_fail_closed_remap_warning(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+def test_col_sliced_flag_separation_and_unrecognized_strictness_rejection(
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Verifies source_lines_is_sliced vs source_lines_is_col_sliced and fail_closed warning message."""
+    """Verifies source_lines_is_sliced vs source_lines_is_col_sliced and rejection of non-canonical strictness modes."""
     import logging
     from pydoppelgangerhunt.config import (
         clear_closure_warning_cache,
@@ -1502,19 +1499,23 @@ def test_col_sliced_flag_separation_and_fail_closed_remap_warning(
     sc_col_sliced = inspect_single_unit_scope(unit_col_sliced)
     assert set(sc_col_sliced["inputs"]) == {"items", "offset"}
 
-    clear_closure_warning_cache()
-    caplog.clear()
-    with caplog.at_level(logging.WARNING):
-        res_mode, res_skip = resolve_closure_strictness_mode(
-            closure_strictness="fail_closed"
+    for removed_mode in ("fail_closed", "fast", "skip"):
+        clear_closure_warning_cache()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            res_mode, res_skip = resolve_closure_strictness_mode(
+                closure_strictness=removed_mode
+            )
+        assert (res_mode, res_skip) == ("strict", False)
+        assert any(
+            "Unrecognized closure_strictness" in rec.message
+            for rec in caplog.records
         )
-    assert res_mode == "pedantic"
-    assert res_skip is False
-    assert any(
-        "now resolves to 'pedantic' (changed from 'strict'" in rec.message
-        and "or 'strict' for the default heuristic mode" in rec.message
-        for rec in caplog.records
-    )
+        with pytest.raises(ValueError, match="closure_strictness"):
+            validate_unit_schema(
+                {"start": 1, "end": 2, "closure_strictness": removed_mode},
+                strict=True,
+            )
 
 
 @pytest.mark.parametrize(
@@ -1636,3 +1637,114 @@ def test_placeholder_source_non_subroutine_units_fail_closed(unit_kind: str) -> 
     res = resolve_clone_pair_outputs(u1, u2, sc, sc2, return_details=True)
     assert res.outputs is None
     assert res.skip_reason == "unavailable source placeholder"
+
+    # Also blocked when require_pairing=False (replace_clones=False) and in synthesize_shared_helper_code
+    res_preview = resolve_clone_pair_outputs(
+        u1, u2, sc, sc2, require_pairing=False, return_details=True
+    )
+    assert res_preview.outputs is None
+    assert res_preview.skip_reason == "unavailable source placeholder"
+    assert synthesize_shared_helper_code(u1, u2) == ""
+
+
+def test_placeholder_non_subroutine_pair_blocked_in_patch_preview(tmp_path: Path) -> None:
+    """Verifies non-subroutine pairs with placeholder source are blocked in generate_refactoring_patch(..., replace_clones=False)."""
+    real_file = tmp_path / "tiny.py"
+    real_file.write_text("x = 1\n", encoding="utf-8")
+    # Lines 50..60 exceed file length so extract_unit_source_lines_with_state yields placeholder lines on readable file
+    u1 = {"file": str(real_file), "start": 50, "end": 60, "name": "fn_a", "kind": "function"}
+    u2 = {"file": str(real_file), "start": 70, "end": 80, "name": "fn_b", "kind": "function"}
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=False,
+    )
+    assert patch == ""
+
+
+def test_invalid_unit_columns_propagates_across_pairing_synthesis_patch_and_suggest(
+    tmp_path: Path,
+) -> None:
+    """Verifies out-of-bounds unit columns surface as 'invalid_unit_columns' across all refactoring stages."""
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    src = (
+        "def f1(items):\n"
+        "    return [x + 1 for x in items]\n\n"
+        "def f2(items):\n"
+        "    return [x + 1 for x in items]\n"
+    )
+    mod_file = tmp_path / "cols.py"
+    mod_file.write_text(src, encoding="utf-8")
+    u1 = {
+        "name": "f1:comp",
+        "file": str(mod_file),
+        "start": 2,
+        "end": 2,
+        "start_col": 500,
+        "end_col": 600,
+        "kind": "comprehension",
+    }
+    u2 = {
+        "name": "f2:comp",
+        "file": str(mod_file),
+        "start": 5,
+        "end": 5,
+        "start_col": 500,
+        "end_col": 600,
+        "kind": "comprehension",
+    }
+    sc1 = inspect_single_unit_scope(u1, repo_root=str(tmp_path))
+    sc2 = inspect_single_unit_scope(u2, repo_root=str(tmp_path))
+    assert "invalid_unit_columns" in sc1["control_flow_hazards"]
+
+    res = resolve_clone_pair_outputs(
+        u1, u2, sc1, sc2, repo_root=str(tmp_path), return_details=True
+    )
+    assert res.outputs is None
+    assert res.skip_reason == "invalid unit columns"
+    assert synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path)) == ""
+    assert (
+        generate_refactoring_patch(
+            [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+        )
+        == ""
+    )
+    sug = synthesize_refactoring_suggestion(u1, u2, repo_root=str(tmp_path))
+    assert "rejected as unsafe" in sug
+    assert "invalid unit columns" in sug
+
+
+def test_validate_unit_schema_accepts_frozenset_and_custom_abstract_set() -> None:
+    """Verifies validate_unit_schema accepts frozenset and custom collections.abc.Set instances while rejecting non-string members."""
+    from pydoppelgangerhunt.fixer.source import validate_unit_schema
+
+    class _CustomStringSet(AbstractSet[str]):
+        def __init__(self, items: tuple[str, ...]) -> None:
+            self._items = items
+
+        def __contains__(self, x: object) -> bool:
+            return x in self._items
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            return iter(self._items)
+
+        def __len__(self) -> int:
+            return len(self._items)
+
+    unit_with_sets = {
+        "start": 1,
+        "end": 3,
+        "inputs": frozenset({"x", "y"}),
+        "outputs": _CustomStringSet(("z",)),
+        "precomputed_outputs": frozenset({"z"}),
+        "shingles": frozenset({"tok_a", "tok_b"}),
+        "non_suppressing_ctx_managers": _CustomStringSet(("SafeTx", "db.atomic")),
+    }
+    assert validate_unit_schema(unit_with_sets, strict=True) == set()
+
+    with pytest.raises(ValueError, match="non_suppressing_ctx_managers"):
+        validate_unit_schema(
+            {"start": 1, "end": 2, "non_suppressing_ctx_managers": frozenset({123})},  # type: ignore[arg-type]
+            strict=True,
+        )

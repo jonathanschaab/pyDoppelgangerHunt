@@ -715,6 +715,7 @@ def test_scope_intervals_col_offset_sig_and_lru_shrink_and_decorated_pragma() ->
     """Verifies col_offset signature invalidation, dynamic LRU shrinkage, and decorated pragma leading scan."""
     from collections import OrderedDict  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=protected-access,import-outside-toplevel
+        _debug_ast_immutability,
         _evict_tree_scopes,
         _store_lru_cache_entry,
     )
@@ -733,7 +734,14 @@ def test_scope_intervals_col_offset_sig_and_lru_shrink_and_decorated_pragma() ->
     intervals1 = _get_tree_scope_intervals(tree)
     assert intervals1[0][3] is tree.body[1]
     tree.body[0].col_offset = 30
-    assert _get_tree_scope_intervals(tree)[0][3] is tree.body[1]
+    with pytest.raises(RuntimeError, match="Cached AST node was mutated in-place"):
+        _get_tree_scope_intervals(tree)
+    prev_dbg = _debug_ast_immutability[0]
+    _debug_ast_immutability[0] = False
+    try:
+        assert _get_tree_scope_intervals(tree)[0][3] is tree.body[0]
+    finally:
+        _debug_ast_immutability[0] = prev_dbg
     _evict_tree_scopes(tree)
     intervals2 = _get_tree_scope_intervals(tree)
     assert intervals2[0][3] is tree.body[0]

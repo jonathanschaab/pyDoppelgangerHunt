@@ -1320,10 +1320,6 @@ def _update_suppress_provenance_from_expr_walrus(
                     else prov.merge_branch_conservative(bound_prov)
                 )
             continue
-        if isinstance(w_curr, _INNER_SCOPE_TYPES):
-            for hdr in reversed(tuple(iter_nested_scope_header_nodes(w_curr))):
-                w_stack.append((hdr, cur_allow_pos, False))
-            continue
         if isinstance(w_curr, _COMPREHENSION_TYPES):
             if isinstance(w_curr, ast.DictComp):
                 w_stack.append((w_curr.value, False, False))
@@ -1337,6 +1333,10 @@ def _update_suppress_provenance_from_expr_walrus(
                 for gen in reversed(w_curr.generators[1:]):
                     w_stack.append((gen.iter, False, False))
                 w_stack.append((w_curr.generators[0].iter, cur_allow_pos, False))
+            continue
+        if isinstance(w_curr, _INNER_SCOPE_TYPES):
+            for hdr in reversed(tuple(iter_nested_scope_header_nodes(w_curr))):
+                w_stack.append((hdr, cur_allow_pos, False))
             continue
         if isinstance(w_curr, ast.NamedExpr):
             if isinstance(w_curr.target, ast.Name):
@@ -4067,14 +4067,36 @@ def _walrus_assignment_in_expr(
     if expr is None:
         return definite, conditional
 
+    if isinstance(expr, _COMPREHENSION_TYPES):
+        d_seq, c_seq = _walrus_in_sequence(
+            [g.iter for g in expr.generators], is_conditional
+        )
+        definite.update(d_seq)
+        conditional.update(c_seq)
+        for child in ast.iter_child_nodes(expr):
+            if (
+                isinstance(expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp))
+                and child is expr.elt
+            ):
+                d_c, c_c = _walrus_assignment_in_expr(child, True)
+                conditional.update(d_c | c_c)
+            elif isinstance(expr, ast.DictComp) and child in (
+                expr.key,
+                expr.value,
+            ):
+                d_c, c_c = _walrus_assignment_in_expr(child, True)
+                conditional.update(d_c | c_c)
+            elif isinstance(child, ast.comprehension):
+                for if_expr in child.ifs:
+                    d_c, c_c = _walrus_assignment_in_expr(if_expr, True)
+                    conditional.update(d_c | c_c)
+        return definite, conditional - definite
+
     if isinstance(expr, _INNER_SCOPE_TYPES):
         for hdr in iter_nested_scope_header_nodes(expr):
             d_h, c_h = _walrus_assignment_in_expr(hdr, is_conditional)
             definite.update(d_h)
             conditional.update(c_h)
-        if isinstance(expr, ast.Lambda):
-            d_l, c_l = _walrus_assignment_in_expr(expr.body, True)
-            conditional.update(d_l | c_l)
         return definite, conditional - definite
 
     if isinstance(expr, ast.NamedExpr) and isinstance(expr.target, ast.Name):
@@ -4106,31 +4128,6 @@ def _walrus_assignment_in_expr(
         d_seq, c_seq = _walrus_in_sequence(expr.comparators, is_conditional)
         definite.update(d_seq)
         conditional.update(c_seq)
-        return definite, conditional - definite
-
-    if isinstance(expr, _COMPREHENSION_TYPES):
-        d_seq, c_seq = _walrus_in_sequence(
-            [g.iter for g in expr.generators], is_conditional
-        )
-        definite.update(d_seq)
-        conditional.update(c_seq)
-        for child in ast.iter_child_nodes(expr):
-            if (
-                isinstance(expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp))
-                and child is expr.elt
-            ):
-                d_c, c_c = _walrus_assignment_in_expr(child, True)
-                conditional.update(d_c | c_c)
-            elif isinstance(expr, ast.DictComp) and child in (
-                expr.key,
-                expr.value,
-            ):
-                d_c, c_c = _walrus_assignment_in_expr(child, True)
-                conditional.update(d_c | c_c)
-            elif isinstance(child, ast.comprehension):
-                for if_expr in child.ifs:
-                    d_c, c_c = _walrus_assignment_in_expr(if_expr, True)
-                    conditional.update(d_c | c_c)
         return definite, conditional - definite
 
     for child in ast.iter_child_nodes(expr):

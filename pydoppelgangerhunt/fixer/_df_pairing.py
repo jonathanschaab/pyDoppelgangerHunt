@@ -807,30 +807,44 @@ def resolve_clone_pair_outputs(
 
     outs1 = _extract_effective_unit_outputs(u1, scope1)
     outs2 = _extract_effective_unit_outputs(u2, scope2)
+    hazards1 = scope1.get("control_flow_hazards", ())
+    hazards2 = scope2.get("control_flow_hazards", ())
+    has_blocking_placeholder = (
+        "unavailable_source_placeholder" in hazards1
+        or (
+            (is_sub or require_pairing is not False or source_text2 is not None)
+            and "unavailable_source_placeholder" in hazards2
+        )
+    )
+    if (
+        "unavailable_source_for_closure_mode" in hazards1
+        or "unavailable_source_for_closure_mode" in hazards2
+    ):
+        logger.debug(
+            "Rejecting clone pair output resolution: unavailable source for closure mode"
+        )
+        return (
+            CloneOutputResolution(None, "unavailable source for closure mode")
+            if return_details
+            else None
+        )
+    if has_blocking_placeholder:
+        logger.debug(
+            "Rejecting clone pair output resolution: unavailable source placeholder"
+        )
+        return (
+            CloneOutputResolution(None, "unavailable source placeholder")
+            if return_details
+            else None
+        )
     blocking_hazards: List[Tuple[str, str]] = [
-        (
-            "unavailable_source_for_closure_mode",
-            "unavailable source for closure mode",
-        ),
-        *(
-            [
-                (
-                    "unavailable_source_placeholder",
-                    "unavailable source placeholder",
-                )
-            ]
-            if (is_sub or require_pairing is not False)
-            else []
-        ),
+        ("invalid_unit_columns", "invalid unit columns"),
         ("severed_closure_cell", "severed closure cell"),
         ("stale_source_code", "stale source code"),
         ("pathological_ast", "pathological ast"),
     ]
     for hazard_key, reason_str in blocking_hazards:
-        if (
-            hazard_key in scope1.get("control_flow_hazards", ())
-            or hazard_key in scope2.get("control_flow_hazards", ())
-        ):
+        if hazard_key in hazards1 or hazard_key in hazards2:
             logger.debug(
                 "Rejecting clone pair output resolution: %s", reason_str
             )

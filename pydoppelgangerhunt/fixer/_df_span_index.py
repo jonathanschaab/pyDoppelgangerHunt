@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import ast
+import bisect
 import symtable
 from typing import (
     AbstractSet,
     Dict,
     List,
+    NamedTuple,
     Optional,
     Sequence,
     Set,
@@ -97,7 +99,7 @@ class _TreeEnclosingScopeIndex:
     def query_enclosing(
         self, u_start: int, u_end: int
     ) -> List[Tuple[int, int, bool, ast.AST]]:
-        """Returns all indexed scope intervals with start <= u_start and end >= u_end in O((1 + k) log S)."""
+        """Returns indexed scope intervals with start <= u_start and end >= u_end (O((1 + k) log S) typical on nested scopes; O(S) worst-case when non-matching intervals interleave)."""
         size = self._size
         if size == 0:
             return []
@@ -273,6 +275,13 @@ def _stmt_dump_set(stmts: Sequence[ast.AST], idx: int) -> Set[str]:
     return dumps
 
 
+class _ClosureOverlapCheck(NamedTuple):
+    """Typed result of O(log C) closure-interval overlap query on _SpanLineIndex."""
+
+    has_missing_end: bool
+    has_overlapping_closure: bool
+
+
 class _SpanLineIndex:
     """Cached per-tree compact line index and lazy AST dump cache for O(1) boundary lookups."""
 
@@ -285,6 +294,9 @@ class _SpanLineIndex:
         "missing_end_lineno_starts",
         "missing_col_spans",
         "closure_like_nodes",
+        "missing_closure_end_starts",
+        "closure_starts",
+        "closure_prefix_max_ends",
         "_decorated_starts",
         "_dump_cache",
     )
@@ -308,7 +320,7 @@ class _SpanLineIndex:
         stack: List[ast.AST] = [root_node]
         while stack:
             node = stack.pop()
-            if isinstance(
+            if node is not root_node and isinstance(
                 node,
                 (
                     ast.FunctionDef,
@@ -406,6 +418,45 @@ class _SpanLineIndex:
             missing_cols
         )
         self.closure_like_nodes: Tuple[ast.AST, ...] = tuple(closure_nodes)
+        missing_cls_starts: List[int] = []
+        cls_intervals: List[Tuple[int, int]] = []
+        for c_node in closure_nodes:
+            c_start = getattr(c_node, "lineno", None)
+            if not isinstance(c_start, int):
+                continue
+            c_end = getattr(c_node, "end_lineno", None)
+            if not isinstance(c_end, int):
+                missing_cls_starts.append(c_start)
+            else:
+                cls_intervals.append((c_start, c_end))
+        missing_cls_starts.sort()
+        cls_intervals.sort()
+        self.missing_closure_end_starts: Tuple[int, ...] = tuple(
+            missing_cls_starts
+        )
+        self.closure_starts: Tuple[int, ...] = tuple(
+            s for s, _ in cls_intervals
+        )
+        prefix_max: List[int] = []
+        running_max = -1
+        for _, e in cls_intervals:
+            running_max = max(running_max, e)
+            prefix_max.append(running_max)
+        self.closure_prefix_max_ends: Tuple[int, ...] = tuple(prefix_max)
+
+    def has_closure_overlap(
+        self, u_start: int, u_end: int
+    ) -> _ClosureOverlapCheck:
+        """Returns _ClosureOverlapCheck(has_missing_end, has_overlapping_closure) for [u_start, u_end] in O(log C)."""
+        has_missing_end = bool(
+            self.missing_closure_end_starts
+            and self.missing_closure_end_starts[0] <= u_end
+        )
+        idx = bisect.bisect_right(self.closure_starts, u_end)
+        has_overlap = bool(
+            idx > 0 and self.closure_prefix_max_ends[idx - 1] >= u_start
+        )
+        return _ClosureOverlapCheck(has_missing_end, has_overlap)
 
     def node_coords(
         self, node: ast.AST

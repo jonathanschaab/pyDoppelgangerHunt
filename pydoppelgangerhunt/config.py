@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Set as AbstractSet
 import contextlib
 import itertools
 import logging
@@ -23,6 +24,7 @@ from typing import (
     Tuple,
     Union,
 )
+import weakref
 
 from pydoppelgangerhunt.canonical_path import (
     normalize_lexical_posix,
@@ -34,11 +36,38 @@ logger = logging.getLogger(__name__)
 _warned_closure_lock: threading.Lock = threading.Lock()
 _MAX_WARNED_CLOSURE_EVENTS: int = 4096
 _MAX_HEURISTIC_CTX_MANAGERS: int = 16384
+_MAX_OVERFLOW_SEQ_EVENTS: int = 1024
 _MAX_REGISTERED_THREAD_STATES: int = 1024
 _warned_closure_strictness_values: OrderedDict[str, None] = OrderedDict()
 _heuristic_reset_epoch: List[int] = [0]
 _heuristic_record_seq = itertools.count(1)
 _heuristic_collector_tls: threading.local = threading.local()
+_next_thread_state_prune_threshold: List[int] = [_MAX_REGISTERED_THREAD_STATES]
+_retired_worker_name_seqs: Dict[str, int] = {}
+_retired_worker_overflow_events: List[List[int]] = []
+
+
+def _record_into_name_seqs(
+    name_seqs: Dict[str, int],
+    overflow_events: List[List[int]],
+    mgr_name: str,
+    seq: int,
+    count: int = 1,
+) -> None:
+    """Inserts or updates mgr_name's latest sequence number, recording bounded overflow events past cap."""
+    prev_seq = name_seqs.get(mgr_name)
+    if prev_seq is not None:
+        if seq > prev_seq:
+            name_seqs[mgr_name] = seq
+        return
+    if len(name_seqs) < _MAX_HEURISTIC_CTX_MANAGERS:
+        name_seqs[mgr_name] = seq
+        return
+    if len(overflow_events) >= _MAX_OVERFLOW_SEQ_EVENTS:
+        overflow_events[-1][0] = max(overflow_events[-1][0], seq)
+        overflow_events[-1][1] += count
+    else:
+        overflow_events.append([seq, count])
 
 
 class _ThreadHeuristicState:
@@ -47,26 +76,69 @@ class _ThreadHeuristicState:
     __slots__ = (
         "defer_depth",
         "epoch",
-        "last_record_seq",
         "lock",
-        "names",
-        "overflow",
+        "name_seqs",
+        "overflow_events",
         "session_depth",
         "session_start_seq",
+        "thread_ref",
     )
 
     def __init__(self, epoch: int, defer_depth: int = 0, session_depth: int = 0) -> None:
-        self.names: Set[str] = set()
-        self.overflow: List[int] = [0]
+        self.name_seqs: Dict[str, int] = {}
+        self.overflow_events: List[List[int]] = []
         self.defer_depth: List[int] = [defer_depth]
         self.session_depth: int = session_depth
         self.session_start_seq: int = 0
         self.epoch: int = epoch
-        self.last_record_seq: int = 0
+        self.thread_ref: weakref.ReferenceType[threading.Thread] = weakref.ref(
+            threading.current_thread()
+        )
         self.lock: threading.Lock = threading.Lock()
+
+    def is_thread_alive(self) -> bool:
+        """Returns True if the owning thread object is still alive."""
+        owner = self.thread_ref()
+        return owner is not None and owner.is_alive()
 
 
 _registered_thread_states: List[_ThreadHeuristicState] = []
+
+
+def _prune_dead_thread_states_locked(current_epoch: int) -> None:
+    """Prunes exited thread states under _warned_closure_lock while folding unharvested records."""
+    kept: List[_ThreadHeuristicState] = []
+    for s in _registered_thread_states:
+        if s.epoch != current_epoch:
+            continue
+        if s.is_thread_alive() or s.session_depth > 0 or s.defer_depth[0] > 0:
+            kept.append(s)
+            continue
+        with s.lock:
+            if s.session_depth > 0 or s.defer_depth[0] > 0:
+                kept.append(s)
+                continue
+            for mgr_name, seq in s.name_seqs.items():
+                _record_into_name_seqs(
+                    _retired_worker_name_seqs,
+                    _retired_worker_overflow_events,
+                    mgr_name,
+                    seq,
+                )
+            for ov_seq, ov_cnt in s.overflow_events:
+                if len(_retired_worker_overflow_events) >= _MAX_OVERFLOW_SEQ_EVENTS:
+                    _retired_worker_overflow_events[-1][0] = max(
+                        _retired_worker_overflow_events[-1][0], ov_seq
+                    )
+                    _retired_worker_overflow_events[-1][1] += ov_cnt
+                else:
+                    _retired_worker_overflow_events.append([ov_seq, ov_cnt])
+            s.name_seqs.clear()
+            s.overflow_events.clear()
+    _registered_thread_states[:] = kept
+    _next_thread_state_prune_threshold[0] = max(
+        _MAX_REGISTERED_THREAD_STATES, len(kept) * 2
+    )
 
 
 def _get_thread_heuristic_state_obj() -> _ThreadHeuristicState:
@@ -79,27 +151,10 @@ def _get_thread_heuristic_state_obj() -> _ThreadHeuristicState:
         state = _ThreadHeuristicState(epoch=current_epoch)
         _heuristic_collector_tls.state = state
         with _warned_closure_lock:
-            if len(_registered_thread_states) >= _MAX_REGISTERED_THREAD_STATES:
-                _registered_thread_states[:] = [
-                    s
-                    for s in _registered_thread_states
-                    if s.epoch == current_epoch
-                    and (s.names or s.session_depth > 0 or s.defer_depth[0] > 0)
-                ]
-                if len(_registered_thread_states) >= _MAX_REGISTERED_THREAD_STATES:
-                    del _registered_thread_states[
-                        : len(_registered_thread_states)
-                        - _MAX_REGISTERED_THREAD_STATES
-                        + 1
-                    ]
+            if len(_registered_thread_states) >= _next_thread_state_prune_threshold[0]:
+                _prune_dead_thread_states_locked(current_epoch)
             _registered_thread_states.append(state)
     return state
-
-
-def _get_thread_heuristic_summary_state() -> Tuple[Set[str], List[int], List[int]]:
-    """Returns the current thread's (summary_names, overflow_count_box, defer_depth_box), resetting on epoch advance."""
-    state = _get_thread_heuristic_state_obj()
-    return state.names, state.overflow, state.defer_depth
 
 
 _CONFIG_KEY_NAMES: Tuple[str, ...] = (
@@ -187,13 +242,7 @@ def record_heuristic_non_suppressing_ctx_manager(mgr_name: str) -> None:
     state = _get_thread_heuristic_state_obj()
     seq = next(_heuristic_record_seq)
     with state.lock:
-        state.last_record_seq = seq
-        if mgr_name in state.names:
-            return
-        if len(state.names) >= _MAX_HEURISTIC_CTX_MANAGERS:
-            state.overflow[0] += 1
-            return
-        state.names.add(mgr_name)
+        _record_into_name_seqs(state.name_seqs, state.overflow_events, mgr_name, seq)
 
 
 def peek_heuristic_non_suppressing_ctx_managers() -> Tuple[str, ...]:
@@ -202,9 +251,9 @@ def peek_heuristic_non_suppressing_ctx_managers() -> Tuple[str, ...]:
     if state.session_depth > 0:
         _harvest_worker_heuristic_states(state, state.session_start_seq)
     with state.lock:
-        if not state.names:
+        if not state.name_seqs:
             return ()
-        return tuple(sorted(state.names))
+        return tuple(sorted(state.name_seqs))
 
 
 def format_heuristic_ctx_manager_comment(names: Sequence[str]) -> str:
@@ -237,12 +286,26 @@ def _harvest_worker_heuristic_states(
     owner_state: _ThreadHeuristicState,
     session_start_seq: int,
 ) -> None:
-    """Drains unowned worker-thread heuristic accumulators touched during an active session."""
+    """Drains unowned worker-thread heuristic records whose sequence exceeds session_start_seq."""
     current_epoch = _heuristic_reset_epoch[0]
+    harvested_items: List[Tuple[str, int]] = []
+    harvested_overflows: List[Tuple[int, int]] = []
     with _warned_closure_lock:
         candidates = list(_registered_thread_states)
-    harvested_names: List[str] = []
-    harvested_overflow = 0
+        retired_keys = [
+            k for k, seq in _retired_worker_name_seqs.items() if seq > session_start_seq
+        ]
+        for k in retired_keys:
+            harvested_items.append((k, _retired_worker_name_seqs.pop(k)))
+        if _retired_worker_overflow_events:
+            kept_retired_ov: List[List[int]] = []
+            for ov_pair in _retired_worker_overflow_events:
+                if ov_pair[0] > session_start_seq:
+                    harvested_overflows.append((ov_pair[0], ov_pair[1]))
+                else:
+                    kept_retired_ov.append(ov_pair)
+            _retired_worker_overflow_events[:] = kept_retired_ov
+
     for worker_state in candidates:
         if worker_state is owner_state or worker_state.epoch != current_epoch:
             continue
@@ -250,26 +313,42 @@ def _harvest_worker_heuristic_states(
             continue
         with worker_state.lock:
             if (
-                worker_state.last_record_seq <= session_start_seq
+                worker_state.epoch != current_epoch
                 or worker_state.session_depth > 0
                 or worker_state.defer_depth[0] > 0
-                or not worker_state.names
+                or (not worker_state.name_seqs and not worker_state.overflow_events)
             ):
                 continue
-            harvested_names.extend(worker_state.names)
-            harvested_overflow += worker_state.overflow[0]
-            worker_state.names.clear()
-            worker_state.overflow[0] = 0
-    if harvested_names or harvested_overflow:
+            eligible_keys = [
+                k
+                for k, seq in worker_state.name_seqs.items()
+                if seq > session_start_seq
+            ]
+            for k in eligible_keys:
+                harvested_items.append((k, worker_state.name_seqs.pop(k)))
+            if worker_state.overflow_events:
+                kept_ov: List[List[int]] = []
+                for ov_pair in worker_state.overflow_events:
+                    if ov_pair[0] > session_start_seq:
+                        harvested_overflows.append((ov_pair[0], ov_pair[1]))
+                    else:
+                        kept_ov.append(ov_pair)
+                worker_state.overflow_events[:] = kept_ov
+
+    if harvested_items or harvested_overflows:
         with owner_state.lock:
-            owner_state.overflow[0] += harvested_overflow
-            for mgr_name in harvested_names:
-                if mgr_name in owner_state.names:
-                    continue
-                if len(owner_state.names) >= _MAX_HEURISTIC_CTX_MANAGERS:
-                    owner_state.overflow[0] += 1
+            for mgr_name, seq in harvested_items:
+                _record_into_name_seqs(
+                    owner_state.name_seqs, owner_state.overflow_events, mgr_name, seq
+                )
+            for ov_seq, ov_cnt in harvested_overflows:
+                if len(owner_state.overflow_events) >= _MAX_OVERFLOW_SEQ_EVENTS:
+                    owner_state.overflow_events[-1][0] = max(
+                        owner_state.overflow_events[-1][0], ov_seq
+                    )
+                    owner_state.overflow_events[-1][1] += ov_cnt
                 else:
-                    owner_state.names.add(mgr_name)
+                    owner_state.overflow_events.append([ov_seq, ov_cnt])
 
 
 @contextlib.contextmanager
@@ -280,11 +359,9 @@ def heuristic_ctx_manager_session() -> Iterator[None]:
     if is_outermost:
         session_start_seq = next(_heuristic_record_seq)
         with state.lock:
-            state.names.clear()
-            state.overflow[0] = 0
+            state.name_seqs.clear()
+            state.overflow_events.clear()
             state.session_start_seq = session_start_seq
-    else:
-        session_start_seq = state.session_start_seq
     state.session_depth += 1
     state.defer_depth[0] += 1
     try:
@@ -294,7 +371,7 @@ def heuristic_ctx_manager_session() -> Iterator[None]:
         after_state.defer_depth[0] = max(0, after_state.defer_depth[0] - 1)
         after_state.session_depth = max(0, after_state.session_depth - 1)
         if is_outermost and after_state is state:
-            _harvest_worker_heuristic_states(state, session_start_seq)
+            _harvest_worker_heuristic_states(state, state.session_start_seq)
             log_heuristic_ctx_manager_summary(force=True)
 
 
@@ -304,14 +381,14 @@ def log_heuristic_ctx_manager_summary(*, force: bool = False) -> Tuple[str, ...]
     if state.session_depth > 0:
         _harvest_worker_heuristic_states(state, state.session_start_seq)
     with state.lock:
-        if not state.names:
+        if not state.name_seqs:
             return ()
         if state.defer_depth[0] > 0 and not force:
-            return tuple(sorted(state.names))
-        names = tuple(sorted(state.names))
-        overflow = state.overflow[0]
-        state.names.clear()
-        state.overflow[0] = 0
+            return tuple(sorted(state.name_seqs))
+        names = tuple(sorted(state.name_seqs))
+        overflow = sum(cnt for _, cnt in state.overflow_events)
+        state.name_seqs.clear()
+        state.overflow_events.clear()
     distinct_count = len(names)
     preview = ", ".join(repr(n) for n in names[:10])
     if distinct_count > 10:
@@ -348,57 +425,34 @@ def resolve_closure_strictness_mode(
     """Resolves canonical closure strictness mode ('strict', 'pedantic', or 'lenient') and boolean skip flag.
 
     Precision vs Soundness Trade-off:
-    'strict' (default) is a heuristic safety mode for context managers and global-reading
-    operations: it enforces all escaping closure and callback hazard checks while using a
-    name-and-provenance heuristic for unproven unknown context managers (treating them as
-    non-suppressing unless their terminal manager/callee name matches a suppression idiom in
-    _SUSPICIOUS_SUPPRESS_SUBSTRINGS or is proven suppressing via local/function/class __exit__
-    provenance), and in global-reading units rejects attribute/subscript mutations, deletions,
-    non-static class-body attributes (__set_name__ descriptors), and external or @= augmented
-    assignments while permitting dunder-invoking inspection/conversion built-ins, implicit
-    operator/truthiness/iteration protocols, and local primitive-initialized arithmetic/bitwise
-    accumulator augmented assignments.
-    'pedantic' (deprecated alias 'fail_closed') is a stricter conservative mode for
-    context-manager suppression and global-reading dunder operations: it treats all unproven
-    unknown context managers as potentially exception-suppressing unless explicitly listed in
-    non_suppressing_ctx_managers, and in global-reading units rejects calls, attribute/subscript
-    loads and mutations, for-iteration over non-primitive iterables, f-string formatting,
-    starred unpacking of non-primitives, and binary/unary/comparison/truth-testing operations
-    unless operands are proven primitive values (excluding exotic import-hook or
-    metaclass/frame side effects).
-    'lenient' (deprecated aliases 'fast', 'skip') relaxes speculative unreferenced-sibling closure
-    checks while still enforcing direct cell-capture, intra-unit nonlocal mutator, and
-    referenced-sibling closure checks.
+    'strict' (default for reporting and stub patches) is a heuristic safety mode for context
+    managers and global-reading operations: it enforces all escaping closure and callback hazard
+    checks while using a name-and-provenance heuristic for unproven unknown context managers
+    (treating them as non-suppressing unless their terminal manager/callee name matches a
+    suppression idiom in _SUSPICIOUS_SUPPRESS_SUBSTRINGS or is proven suppressing via
+    local/function/class __exit__ provenance), and in global-reading units rejects
+    attribute/subscript mutations, deletions, non-static class-body attributes (__set_name__
+    descriptors), and external or @= augmented assignments while permitting dunder-invoking
+    inspection/conversion built-ins, implicit operator/truthiness/iteration protocols, and local
+    primitive-initialized arithmetic/bitwise accumulator augmented assignments.
+    'pedantic' (default for replace_clones=True / --replace-clones when unset) is a stricter
+    static conservative mode: it treats all unproven unknown context managers as potentially
+    exception-suppressing unless explicitly listed in non_suppressing_ctx_managers, and in
+    global-reading units rejects dunder-invoking built-in calls, all augmented assignments, and
+    unproven implicit-dunder AST operations (binary/unary operators, non-identity comparisons and
+    in/not in membership checks, attribute/@property and subscript reads, for/comprehension
+    iteration, sequence/mapping unpacking, f-string formatting, set/dict key hashing, match
+    class/value/mapping/sequence patterns on unproven subjects, import, non-builtin raise, and
+    boolean truth-value evaluations) unless operands are statically proven built-in primitives or
+    immutable literals (subject to Python's dynamic runtime boundaries such as frame
+    introspection, metaclasses, and out-of-module monkeypatching).
+    'lenient' relaxes speculative unreferenced-sibling closure checks while still enforcing
+    direct cell-capture, intra-unit nonlocal mutator, and referenced-sibling closure checks.
     """
     if closure_strictness is not None:
         c_mode = str(closure_strictness).strip().lower()
-        is_lenient_mode = c_mode in ("lenient", "fast", "skip")
-        if is_lenient_mode or c_mode in (
-            "pedantic",
-            "strict",
-            "fail_closed",
-        ):
-            resolved_mode = (
-                "lenient"
-                if is_lenient_mode
-                else ("pedantic" if c_mode in ("pedantic", "fail_closed") else "strict")
-            )
-            if c_mode == "fail_closed":
-                _warn_closure_event_once(
-                    f"deprecated_strictness_alias:{c_mode}",
-                    "closure_strictness alias '%s' is deprecated and now resolves to 'pedantic' "
-                    "(changed from 'strict'; rejects all unproven with-blocks and unproven "
-                    "implicit-dunder operations in global-reading units); use 'pedantic' "
-                    "explicitly or 'strict' for the default heuristic mode",
-                    closure_strictness,
-                )
-            elif c_mode in ("fast", "skip"):
-                _warn_closure_event_once(
-                    f"deprecated_strictness_alias:{c_mode}",
-                    "closure_strictness alias '%s' is deprecated; use '%s' instead",
-                    closure_strictness,
-                    resolved_mode,
-                )
+        if c_mode in ("strict", "pedantic", "lenient"):
+            is_lenient_mode = c_mode == "lenient"
             _maybe_warn_skip_conflict(
                 is_lenient_mode,
                 skip_pre_unit_closures,
@@ -407,7 +461,7 @@ def resolve_closure_strictness_mode(
                 "skip_pre_unit_closures=True",
                 closure_strictness,
             )
-            expected_strict_with = resolved_mode == "pedantic"
+            expected_strict_with = c_mode == "pedantic"
             if (
                 strict_with_suppression is not None
                 and bool(strict_with_suppression) != expected_strict_with
@@ -420,7 +474,7 @@ def resolve_closure_strictness_mode(
                     closure_strictness,
                     bool(strict_with_suppression),
                 )
-            return resolved_mode, is_lenient_mode
+            return c_mode, is_lenient_mode
         fallback = (
             "lenient"
             if skip_pre_unit_closures
@@ -600,7 +654,9 @@ def normalize_non_suppressing_ctx_managers(*sources: Any) -> Tuple[str, ...]:
                 cleaned = part.strip()
                 if cleaned:
                     collected.add(cleaned)
-        elif isinstance(item, (list, tuple, set, frozenset)):
+        elif not isinstance(item, (bytes, bytearray, Mapping)) and isinstance(
+            item, (Sequence, AbstractSet)
+        ):
             stack.extend(item)
         else:
             invalid_key = f"invalid_non_sup_type:{type(item).__name__}"
@@ -615,14 +671,45 @@ def normalize_non_suppressing_ctx_managers(*sources: Any) -> Tuple[str, ...]:
 
 def clear_closure_warning_cache() -> None:
     """Clears the set of warned closure strictness values and resets thread-local heuristic summaries."""
+    curr_tls_state: Optional[_ThreadHeuristicState] = getattr(
+        _heuristic_collector_tls, "state", None
+    )
     with _warned_closure_lock:
         _warned_closure_strictness_values.clear()
-        _registered_thread_states.clear()
+        _retired_worker_name_seqs.clear()
+        _retired_worker_overflow_events.clear()
         _heuristic_reset_epoch[0] += 1
         new_epoch = _heuristic_reset_epoch[0]
-        fresh_state = _ThreadHeuristicState(epoch=new_epoch)
-        _registered_thread_states.append(fresh_state)
-    _heuristic_collector_tls.state = fresh_state
+        active_states: List[_ThreadHeuristicState] = []
+        seen_ids: Set[int] = set()
+        candidates = list(_registered_thread_states)
+        if curr_tls_state is not None:
+            candidates.append(curr_tls_state)
+        for st in candidates:
+            st_id = id(st)
+            if st_id in seen_ids:
+                continue
+            seen_ids.add(st_id)
+            if st.session_depth > 0 or st.defer_depth[0] > 0:
+                with st.lock:
+                    st.name_seqs.clear()
+                    st.overflow_events.clear()
+                    st.epoch = new_epoch
+                    if st.session_depth > 0:
+                        st.session_start_seq = next(_heuristic_record_seq)
+                active_states.append(st)
+        _registered_thread_states[:] = active_states
+        if curr_tls_state is not None and id(curr_tls_state) in {
+            id(s) for s in active_states
+        }:
+            next_tls_state = curr_tls_state
+        else:
+            next_tls_state = _ThreadHeuristicState(epoch=new_epoch)
+            _registered_thread_states.append(next_tls_state)
+        _next_thread_state_prune_threshold[0] = max(
+            _MAX_REGISTERED_THREAD_STATES, len(_registered_thread_states) * 2
+        )
+    _heuristic_collector_tls.state = next_tls_state
 
 
 DEFAULT_EXCLUDES: List[str] = [
@@ -703,23 +790,34 @@ def find_matching_path_value(
     direct = path_map.get(target_path)
     if direct is not None:
         return direct
-    candidates = [normalize_path_string(target_path, strip_anchor=False)]
+    # 1. Match exact normalized path (preserving anchors)
+    norm_exact = normalize_path_string(target_path, strip_anchor=False)
+    if norm_exact in path_map:
+        return path_map[norm_exact]
+    key_exact = canonical_path_key(norm_exact, strip_anchor=False)
+    for k, val in path_map.items():
+        k_clean = normalize_path_string(k, strip_anchor=False)
+        if norm_exact == k_clean or key_exact == canonical_path_key(k_clean, strip_anchor=False):
+            return val
+    for k, val in path_map.items():
+        if paths_match_boundary(norm_exact, k, strip_anchor=False):
+            return val
+
+    # 2. If target_path contains a notebook cell anchor, fallback to stripped anchor matching
     target_raw = str(target_path)
     if parse_notebook_cell_anchor(target_raw) is not None:
         target_stripped = normalize_path_string(target_raw, strip_anchor=True)
-        if target_stripped and target_stripped not in candidates:
-            candidates.append(target_stripped)
-    for cand in candidates:
-        if cand in path_map:
-            return path_map[cand]
-        cand_key = canonical_path_key(cand, strip_anchor=False)
-        for k, val in path_map.items():
-            k_clean = normalize_path_string(k, strip_anchor=False)
-            if cand == k_clean or cand_key == canonical_path_key(k_clean, strip_anchor=False):
-                return val
-        for k, val in path_map.items():
-            if paths_match_boundary(cand, k, strip_anchor=False):
-                return val
+        if target_stripped:
+            if target_stripped in path_map:
+                return path_map[target_stripped]
+            key_stripped = canonical_path_key(target_stripped, strip_anchor=False)
+            for k, val in path_map.items():
+                k_clean = normalize_path_string(k, strip_anchor=False)
+                if target_stripped == k_clean or key_stripped == canonical_path_key(k_clean, strip_anchor=False):
+                    return val
+            for k, val in path_map.items():
+                if paths_match_boundary(target_stripped, k, strip_anchor=False):
+                    return val
     return None
 
 

@@ -6,7 +6,10 @@ shared helper synthesis, and unified diff patch generation.
 
 from __future__ import annotations
 
-from pydoppelgangerhunt.config import resolve_closure_strictness_mode
+from pydoppelgangerhunt.config import (
+    heuristic_ctx_manager_session,
+    resolve_closure_strictness_mode,
+)
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
     _extract_child_indentation,
@@ -130,11 +133,14 @@ from pydoppelgangerhunt.fixer.synthesis import (
     _merge_types,
     synthesize_shared_helper_code,
 )
+from pydoppelgangerhunt.reporters import extract_unit_source_lines_with_state
+from pydoppelgangerhunt.source_lines import SourceLinesOrigin
 
 __all__ = [
     "ModuleDependencyGraph",
     "ReplacementItem",
     "SCOPE_SCHEMA_VERSION",
+    "SourceLinesOrigin",
     "UnitCollisionError",
     "UnitDict",
     "UnitSchema",
@@ -157,6 +163,7 @@ __all__ = [
     "ensure_unit_scope_closure_mode",
     "evict_tree_scopes",
     "extract_unit_comments_and_pragmas",
+    "extract_unit_source_lines_with_state",
     "filter_overlapping_clone_units",
     "find_enclosing_class",
     "find_enclosing_function",
@@ -164,6 +171,7 @@ __all__ = [
     "generate_refactoring_patch",
     "GeneratorCloneSideData",
     "has_async_generator_delegation_hazard",
+    "heuristic_ctx_manager_session",
     "inspect_single_unit_scope",
     "intervals_overlap",
     "is_async_generator_with_return_value",

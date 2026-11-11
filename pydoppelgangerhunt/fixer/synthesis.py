@@ -1334,8 +1334,8 @@ def synthesize_shared_helper_code(
         repo_root: Optional root directory of the repository for relative path resolution.
         helper_name: Optional custom helper name override.
         skip_pre_unit_closures: Whether to bypass scanning pre-unit AST closures.
-        closure_strictness: Closure isolation strictness ("strict", "pedantic" / "fail_closed",
-            or "lenient" / "fast" / "skip").
+        closure_strictness: Closure isolation strictness ("strict", "pedantic",
+            or "lenient").
         outputs: Optional pre-resolved output variable names for u1.
         outputs2: Optional pre-resolved output variable names for u2.
     """
@@ -1617,17 +1617,30 @@ def synthesize_shared_helper_code(
         return ""
     if scope1.get("nonlocals") or scope2.get("nonlocals") or scope.get("nonlocals"):
         return ""
+    hazards1 = scope1.get("control_flow_hazards", ())
+    hazards2 = scope2.get("control_flow_hazards", ())
     combined_hazards = (
-        list(scope1.get("control_flow_hazards", ()))
-        + list(scope2.get("control_flow_hazards", ()))
+        list(hazards1)
+        + list(hazards2)
         + list(scope.get("control_flow_hazards", ()))
     )
+    if "unavailable_source_placeholder" in hazards1 or (
+        (
+            is_expr_unit
+            or is_subroutine_unit(u1, source_text=source_text1, tree=tree1)
+            or is_subroutine_unit(u2, source_text=source_text2, tree=tree2)
+            or source_text2 is not None
+        )
+        and "unavailable_source_placeholder" in hazards2
+    ):
+        return ""
     if any(
         h in combined_hazards
         for h in (
             "type_param_closure_capture",
             "pathological_ast",
             "stale_source_code",
+            "invalid_unit_columns",
             "deleted_output",
             "severed_closure_cell",
             "unavailable_source_for_closure_mode",

@@ -333,6 +333,18 @@ def test_helper_inserted_before_decorators(tmp_path: Path) -> None:
 
 def test_static_methods_propagation_in_synthesis_and_patch(tmp_path: Path) -> None:
     """Verifies is_static propagates into synthesize_shared_helper_code and method_binding='method'."""
+    f = tmp_path / "calc.py"
+    calc_code = (
+        "class Calculator:\n"
+        "    @staticmethod\n"
+        "    def add_a(x: int, y: int) -> int:\n"
+        "        return x + y\n"
+        "\n"
+        "    @staticmethod\n"
+        "    def add_b(x: int, y: int) -> int:\n"
+        "        return x + y\n"
+    )
+    f.write_text(calc_code, encoding="utf-8")
     u1: Dict[str, Any] = {
         "file": "calc.py",
         "start": 3,
@@ -354,24 +366,13 @@ def test_static_methods_propagation_in_synthesis_and_patch(tmp_path: Path) -> No
         u2,
         method_binding="method",
         is_static=True,
+        repo_root=str(tmp_path),
     )
     assert "@staticmethod" in code
     assert "(self" not in code
     assert "(cls" not in code
     assert "__class__._shared_calc_a_calc_b" in code
 
-    f = tmp_path / "calc.py"
-    calc_code = (
-        "class Calculator:\n"
-        "    @staticmethod\n"
-        "    def add_a(x: int, y: int) -> int:\n"
-        "        return x + y\n"
-        "\n"
-        "    @staticmethod\n"
-        "    def add_b(x: int, y: int) -> int:\n"
-        "        return x + y\n"
-    )
-    f.write_text(calc_code, encoding="utf-8")
     u1["file"] = str(f)
     u2["file"] = str(f)
     patch = generate_refactoring_patch(
@@ -3956,6 +3957,7 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     )
 
     from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
+        _debug_ast_immutability,
         _evict_tree_scopes,
     )
 
@@ -3964,7 +3966,14 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     assert intervals_initial[0][:2] == (1, 2)
     mut_tree.body[0].lineno = 5  # type: ignore[attr-defined]
     mut_tree.body[0].end_lineno = 8  # type: ignore[attr-defined]
-    assert _get_tree_scope_intervals(mut_tree)[0][:2] == (5, 8)
+    with pytest.raises(RuntimeError, match="Cached AST node was mutated in-place"):
+        _get_tree_scope_intervals(mut_tree)
+    prev_dbg = _debug_ast_immutability[0]
+    _debug_ast_immutability[0] = False
+    try:
+        assert _get_tree_scope_intervals(mut_tree)[0][:2] == (5, 8)
+    finally:
+        _debug_ast_immutability[0] = prev_dbg
     _evict_tree_scopes(mut_tree)
     intervals_updated = _get_tree_scope_intervals(mut_tree)
     assert intervals_updated[0][:2] == (5, 8)

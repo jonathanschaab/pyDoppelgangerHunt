@@ -245,8 +245,9 @@ def test_fixer_and_patch_synthesis(tmp_path: Path) -> None:
     u1 = {"file": str(file_a), "name": "op_one", "start": 1, "end": 3}
     u2 = {"file": str(file_b), "name": "op_two", "start": 1, "end": 3}
 
-    helper = synthesize_shared_helper_code(u1, u2)
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert "def _shared_op_one" in helper
+    assert "res = x + y" in helper
 
     patch = generate_refactoring_patch([(0.85, u1, u2)], repo_root=str(tmp_path))
     assert "--- a/" in patch

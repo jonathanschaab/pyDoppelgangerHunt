@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Set as AbstractSet
-from pathlib import Path
-import sys
 import threading
 from types import MappingProxyType
 from typing import Any
@@ -15,7 +12,6 @@ import pytest
 from pydoppelgangerhunt.fixer import (
     analyze_unit_variable_scope,
     clear_dataflow_cache,
-    generate_refactoring_patch,
     inspect_single_unit_scope,
     resolve_clone_generator_subroutine_outputs,
     resolve_clone_pair_outputs,
@@ -597,17 +593,21 @@ def test_extract_value_ast_nodes_mandatory_protocol_and_tracked_dict_copy() -> N
     with pytest.raises(TypeError, match="must implement cached_ast_nodes"):
         _extract_value_ast_nodes(bad_val)
     # Default production mode safely bypasses caching without crashing end users
-    _scope_cell_info_cache[_ScopeCacheKey(mod, "bad_val")] = bad_val
-    assert _ScopeCacheKey(mod, "bad_val") not in _scope_cell_info_cache
-    bypassed = _get_or_compute_scope_cached(
-        _scope_cell_info_cache,
-        _ScopeCacheKey(mod, "bad_val_graceful"),
-        lambda: bad_val,
-    )
-    assert bypassed is bad_val
-    assert _ScopeCacheKey(mod, "bad_val_graceful") not in _scope_cell_info_cache
-    # Debug mode strictly raises TypeError on unregistered cached value types
     prev_dbg = _debug_ast_immutability[0]
+    _debug_ast_immutability[0] = False
+    try:
+        _scope_cell_info_cache[_ScopeCacheKey(mod, "bad_val")] = bad_val
+        assert _ScopeCacheKey(mod, "bad_val") not in _scope_cell_info_cache
+        bypassed = _get_or_compute_scope_cached(
+            _scope_cell_info_cache,
+            _ScopeCacheKey(mod, "bad_val_graceful"),
+            lambda: bad_val,
+        )
+        assert bypassed is bad_val
+        assert _ScopeCacheKey(mod, "bad_val_graceful") not in _scope_cell_info_cache
+    finally:
+        _debug_ast_immutability[0] = prev_dbg
+    # Debug mode strictly raises TypeError on unregistered cached value types
     _debug_ast_immutability[0] = True
     try:
         with pytest.raises(TypeError, match="must implement cached_ast_nodes"):
@@ -1298,14 +1298,18 @@ def test_tracked_cached_dict_prunes_reverse_index_and_missing_cached_ast_nodes_r
     class _UnindexedCustomBox:
         pass
 
-    unindexed_res = _get_or_compute_scope_cached(
-        _scope_cell_info_cache,
-        _ScopeCacheKey(fn, "unit_test_bad_box_cache"),
-        _UnindexedCustomBox,
-    )
-    assert isinstance(unindexed_res, _UnindexedCustomBox)
-    assert _ScopeCacheKey(fn, "unit_test_bad_box_cache") not in _scope_cell_info_cache
     prev_dbg_box = _debug_ast_immutability[0]
+    _debug_ast_immutability[0] = False
+    try:
+        unindexed_res = _get_or_compute_scope_cached(
+            _scope_cell_info_cache,
+            _ScopeCacheKey(fn, "unit_test_bad_box_cache"),
+            _UnindexedCustomBox,
+        )
+        assert isinstance(unindexed_res, _UnindexedCustomBox)
+        assert _ScopeCacheKey(fn, "unit_test_bad_box_cache") not in _scope_cell_info_cache
+    finally:
+        _debug_ast_immutability[0] = prev_dbg_box
     _debug_ast_immutability[0] = True
     try:
         with pytest.raises(TypeError, match="cached_ast_nodes"):
@@ -1542,16 +1546,8 @@ def test_suppress_syntax_warnings_exception_and_nested_thread_restoration() -> N
         assert list(warnings.filters) == baseline_filters
 
 
-def test_make_scope_ctx_cache_key_validates_extra_params_and_strict_with_warnings(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Verifies _make_scope_ctx_cache_key rejects mutable extra_params and config helpers emit all expected warnings."""
-    import logging
-    from pydoppelgangerhunt.config import (
-        clear_closure_warning_cache,
-        resolve_closure_strictness_mode,
-        resolve_strict_with_suppression,
-    )
+def test_make_scope_ctx_cache_key_rejects_mutable_extra_params() -> None:
+    """Verifies _make_scope_ctx_cache_key rejects mutable extra_params."""
     from pydoppelgangerhunt.fixer._df_cell_carriers import (
         _make_scope_ctx_cache_key,
     )
@@ -1561,39 +1557,6 @@ def test_make_scope_ctx_cache_key_validates_extra_params_and_strict_with_warning
         _make_scope_ctx_cache_key(mod, "test_kind", None, extra_params=([1, 2],))
     with pytest.raises(TypeError, match="immutable"):
         _make_scope_ctx_cache_key(mod, "test_kind", None, extra_params=({"a": 1},))
-
-    clear_closure_warning_cache()
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt.config"):
-        assert resolve_strict_with_suppression(closure_strictness="fail_closed") is True
-        assert (
-            resolve_strict_with_suppression(
-                closure_strictness="unknown_mode_xyz",
-                strict_with_suppression=True,
-            )
-            is True
-        )
-    assert any("deprecated" in r.message.lower() for r in caplog.records)
-    assert any(
-        "unrecognized closure_strictness" in r.message.lower() for r in caplog.records
-    )
-
-    clear_closure_warning_cache()
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt.config"):
-        mode, is_lenient = resolve_closure_strictness_mode(
-            closure_strictness="bogus_mode",
-            skip_pre_unit_closures=True,
-            strict_with_suppression=True,
-        )
-    assert (mode, is_lenient) == ("lenient", True)
-    assert any(
-        "unrecognized closure_strictness" in r.message.lower() for r in caplog.records
-    )
-    assert any(
-        "strict_with_suppression=True and skip_pre_unit_closures=True" in r.message
-        for r in caplog.records
-    )
 
 
 def test_lazy_parent_map_eviction_and_total_node_budget() -> None:
@@ -2217,3 +2180,224 @@ def test_suppress_syntax_warnings_fast_path_respects_preceding_error_filters() -
         with _suppress_syntax_warnings():
             parsed = ast.parse(r"s = '\d+'")
             assert isinstance(parsed, ast.Module)
+
+
+def test_interior_ast_mutation_detected_without_header_change() -> None:
+    """Verifies mutating an interior expression inside a cached AST raises RuntimeError without evict_tree_scopes."""
+    from pydoppelgangerhunt.fixer._df_cache import evict_tree_scopes
+
+    src = (
+        "def compute(x):\n"
+        "    a = x + 1\n"
+        "    b = a * 2\n"
+        "    return b\n"
+    )
+    tree = ast.parse(src)
+    unit = {
+        "start": 2,
+        "end": 3,
+        "kind": "compound_block",
+        "source_text": src,
+        "source_code": "    a = x + 1\n    b = a * 2\n",
+    }
+    sc1 = inspect_single_unit_scope(unit, tree=tree)
+    assert sc1["is_control_flow_safe"] is True
+
+    # Mutate deep interior constant in middle statement without altering header or first/last stmt identity
+    fn = tree.body[0]
+    assert isinstance(fn, ast.FunctionDef)
+    mid_assign = fn.body[1]
+    assert isinstance(mid_assign, ast.Assign) and isinstance(mid_assign.value, ast.BinOp)
+    assert isinstance(mid_assign.value.right, ast.Constant)
+    mid_assign.value.right.value = 99
+
+    with pytest.raises(RuntimeError, match="Cached AST node was mutated in-place"):
+        inspect_single_unit_scope(unit, tree=tree)
+
+    evict_tree_scopes(tree)
+    unit_updated = {
+        **unit,
+        "source_text": "def compute(x):\n    a = x + 1\n    b = a * 99\n    return b\n",
+        "source_code": "    a = x + 1\n    b = a * 99\n",
+    }
+    sc2 = inspect_single_unit_scope(unit_updated, tree=tree)
+    assert sc2["is_control_flow_safe"] is True
+
+
+def test_evict_tree_scopes_detached_child_and_unrelated_preservation() -> None:
+    """Verifies evict_tree_scopes evicts detached child scopes and with-summaries while preserving unrelated trees."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _ScopeCacheKey,
+        _get_scope_parent_map,
+        _scope_cell_info_cache,
+        _stmt_with_summary_cache,
+        evict_tree_scopes,
+    )
+
+    clear_dataflow_cache()
+    target_tree = ast.parse(
+        "def outer():\n"
+        "    with mgr():\n"
+        "        def inner():\n"
+        "            return 1\n"
+        "    return inner\n"
+    )
+    other_tree = ast.parse(
+        "def unrelated():\n"
+        "    with other_mgr():\n"
+        "        x = 2\n"
+        "    return x\n"
+    )
+    _get_scope_parent_map(target_tree)
+    _get_scope_parent_map(other_tree)
+    outer_fn = target_tree.body[0]
+    assert isinstance(outer_fn, ast.FunctionDef)
+    with_target = outer_fn.body[0]
+    assert isinstance(with_target, ast.With)
+    inner_fn = with_target.body[0]
+    assert isinstance(inner_fn, ast.FunctionDef)
+
+    other_fn = other_tree.body[0]
+    assert isinstance(other_fn, ast.FunctionDef)
+    with_other = other_fn.body[0]
+    assert isinstance(with_other, ast.With)
+
+    target_ck = _ScopeCacheKey(inner_fn, "detached_child_test")
+    other_ck = _ScopeCacheKey(other_fn, "unrelated_tree_test")
+    _scope_cell_info_cache[target_ck] = ("child_val",)
+    _scope_cell_info_cache[other_ck] = ("other_val",)
+    _stmt_with_summary_cache[with_target] = (False, frozenset())
+    _stmt_with_summary_cache[with_other] = (False, frozenset())
+
+    # Detach inner_fn and with_target from outer_fn before calling evict_tree_scopes
+    outer_fn.body = [ast.Return(value=ast.Constant(value=0), lineno=2, col_offset=4)]
+    evict_tree_scopes(target_tree)
+
+    assert target_ck not in _scope_cell_info_cache
+    assert with_target not in _stmt_with_summary_cache
+    assert other_ck in _scope_cell_info_cache
+    assert with_other in _stmt_with_summary_cache
+
+
+def test_oversized_scope_context_unpins_parent_map_and_weakref_attachment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies oversized _FnScopeContext leaves _stored_parent_map None and _OversizedParentEntry uses weakrefs."""
+    import gc
+    import weakref
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+    from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context
+
+    clear_dataflow_cache()
+    monkeypatch.setattr(df_cache_mod, "_MAX_PARENT_MAP_TOTAL_NODES", 4)
+    mod = ast.parse(
+        "def big_fn(x):\n"
+        "    a = x + 1\n"
+        "    b = a + 2\n"
+        "    return b\n"
+    )
+    fn = mod.body[0]
+    assert isinstance(fn, ast.FunctionDef)
+    ctx = _get_fn_scope_context(fn, mod_tree=mod)
+    assert ctx._stored_parent_map is None
+    assert ctx.parent_map.get(fn.body[0]) is fn
+
+    entry = df_cache_mod._oversized_scope_parent_maps[mod]
+    assert isinstance(entry.attached_nodes, weakref.WeakSet)
+    detached_stmt = fn.body.pop(1)
+    stmt_ref = weakref.ref(detached_stmt)
+    del detached_stmt
+    gc.collect()
+    assert stmt_ref() is None
+
+
+def test_syntax_warning_fast_path_requires_deprecation_warning_before_py312(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies Python <3.12 requires both SyntaxWarning and DeprecationWarning ignored for fast path."""
+    import warnings
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+
+    monkeypatch.setattr(df_cache_mod.sys, "version_info", (3, 11, 9))
+    with warnings.catch_warnings():
+        warnings.simplefilter("default", DeprecationWarning)
+        warnings.simplefilter("ignore", SyntaxWarning)
+        assert df_cache_mod._filters_already_ignore_syntax_warnings() is False
+        warnings.simplefilter("ignore", DeprecationWarning)
+        assert df_cache_mod._filters_already_ignore_syntax_warnings() is True
+
+
+def test_ephemeral_unit_ast_context_handles_non_weakrefable_custom_ast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies _ephemeral_unit_ast_context refcounts non-weakrefable ASTs and unregisters on exit."""
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+
+    class _NoWeakRefSet:
+        def add(self, _item: Any) -> None:
+            raise TypeError("cannot create weak reference")
+
+        def __contains__(self, _item: object) -> bool:
+            raise TypeError("cannot create weak reference")
+
+        def clear(self) -> None:
+            pass
+
+    monkeypatch.setattr(df_cache_mod, "_ephemeral_unit_asts", _NoWeakRefSet())
+    ephem_mod = ast.Module(body=[], type_ignores=[])
+    assert df_cache_mod._is_ephemeral_unit_ast(ephem_mod) is False
+    with df_cache_mod._ephemeral_unit_ast_context(ephem_mod):
+        assert df_cache_mod._is_ephemeral_unit_ast(ephem_mod) is True
+        with df_cache_mod._ephemeral_unit_ast_context(ephem_mod):
+            assert df_cache_mod._is_ephemeral_unit_ast(ephem_mod) is True
+        assert df_cache_mod._is_ephemeral_unit_ast(ephem_mod) is True
+    assert df_cache_mod._is_ephemeral_unit_ast(ephem_mod) is False
+
+
+def test_span_line_index_has_closure_overlap_bisect_and_missing_end_fallback() -> None:
+    """Verifies _SpanLineIndex.has_closure_overlap interval bisect and missing end_lineno fallback."""
+    from pydoppelgangerhunt.fixer._df_span_index import _get_span_line_index
+
+    src = (
+        "def outer():\n"
+        "    a = 1\n"
+        "    f1 = lambda: a\n"
+        "    b = 2\n"
+        "    def f2():\n"
+        "        return b\n"
+        "    c = 3\n"
+    )
+    tree = ast.parse(src)
+    outer_fn = tree.body[0]
+    span_idx = _get_span_line_index(outer_fn)
+    assert span_idx.has_closure_overlap(2, 2) == (False, False)
+    assert span_idx.has_closure_overlap(3, 3) == (False, True)
+    assert span_idx.has_closure_overlap(4, 4) == (False, False)
+    assert span_idx.has_closure_overlap(5, 6) == (False, True)
+    assert span_idx.has_closure_overlap(7, 7) == (False, False)
+
+    # Synthetic closure missing end_lineno falls back conservatively when c_start <= u_end
+    synth_fn = ast.FunctionDef(
+        name="outer_synth",
+        args=ast.arguments(
+            posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]
+        ),
+        body=[
+            ast.Lambda(
+                args=ast.arguments(
+                    posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]
+                ),
+                body=ast.Constant(value=1),
+                lineno=5,
+                end_lineno=None,
+                col_offset=4,
+            )  # type: ignore[list-item]
+        ],
+        decorator_list=[],
+        lineno=1,
+        end_lineno=10,
+        col_offset=0,
+    )
+    synth_idx = _get_span_line_index(synth_fn)
+    assert synth_idx.has_closure_overlap(2, 4).has_missing_end is False
+    assert synth_idx.has_closure_overlap(5, 8).has_missing_end is True

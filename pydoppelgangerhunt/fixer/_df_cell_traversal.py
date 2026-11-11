@@ -1144,28 +1144,14 @@ def _evict_stmt_delta_if_full(
     stmt_deltas: Dict[Tuple[Any, ...], Optional[_StmtCellDelta]],
     incoming_key: Tuple[Any, ...],
 ) -> None:
-    """Evicts one entry when stmt_deltas reaches _MAX_STMT_DELTAS_PER_FN without sequential-scan thrashing."""
+    """Evicts the least-recently-used entry when stmt_deltas reaches _MAX_STMT_DELTAS_PER_FN."""
     if (
         incoming_key in stmt_deltas
         or len(stmt_deltas) < _MAX_STMT_DELTAS_PER_FN
         or not stmt_deltas
     ):
         return
-    oldest_key = next(iter(stmt_deltas))
-    newest_key = next(reversed(stmt_deltas))
-    inc_ln = getattr(incoming_key[0], "lineno", 0) or 0
-    old_ln = getattr(oldest_key[0], "lineno", 0) or 0
-    new_ln = getattr(newest_key[0], "lineno", 0) or 0
-    victim_key = (
-        newest_key
-        if (
-            old_ln < new_ln < inc_ln
-            and oldest_key[1:] == incoming_key[1:]
-            and newest_key[1:] == incoming_key[1:]
-        )
-        else oldest_key
-    )
-    stmt_deltas.pop(victim_key, None)
+    stmt_deltas.pop(next(iter(stmt_deltas)), None)
 
 
 def _try_apply_cached_stmt_delta(

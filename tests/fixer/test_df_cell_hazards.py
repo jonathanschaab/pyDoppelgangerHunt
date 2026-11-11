@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Set as AbstractSet
 from pathlib import Path
 import sys
-import threading
 from types import MappingProxyType
 from typing import Any
 
@@ -19,7 +17,6 @@ from pydoppelgangerhunt.fixer import (
     inspect_single_unit_scope,
     resolve_clone_generator_subroutine_outputs,
     resolve_clone_pair_outputs,
-    synthesize_shared_helper_code,
 )
 
 

@@ -14,6 +14,7 @@ from pydoppelgangerhunt.fixer import (
     synthesize_shared_helper_code,
 )
 from tests.fixer._closure_test_helpers import (
+    _ensure_shared_git_repo,
     _run_differential_refactoring_case,
 )
 
@@ -1381,15 +1382,8 @@ def test_seeded_generated_closure_program_differential_fuzzer(tmp_path: Path) ->
             if idx >= len(selected_combinations):
                 continue
 
-            case_dir = tmp_path / f"fuzz_{idx}_{mode}"
-            case_dir.mkdir(parents=True, exist_ok=True)
-            subprocess.run(
-                ["git", "init", "-q"],
-                cwd=str(case_dir),
-                check=True,
-                capture_output=True,
-            )
-            mod_file = case_dir / "mod.py"
+            case_dir = _ensure_shared_git_repo(tmp_path)
+            mod_file = case_dir / f"fuzz_{idx}_{mode}_mod.py"
             mod_file.write_text(combined_src, encoding="utf-8")
 
             u1 = {
@@ -1428,8 +1422,8 @@ def test_seeded_generated_closure_program_differential_fuzzer(tmp_path: Path) ->
                 for test_items, test_cond in [([1, 2, 3], True), ([5], False)]:
                     ns_orig: dict[str, Any] = {}
                     ns_ref: dict[str, Any] = {}
-                    exec(compile(combined_src, "<orig>", "exec"), ns_orig)  # pylint: disable=exec-used
-                    exec(compile(refactored_src, "<ref>", "exec"), ns_ref)  # pylint: disable=exec-used
+                    exec(compile(combined_src, "<orig>", "exec"), ns_orig)  # pylint: disable=exec-used  # nosec B102
+                    exec(compile(refactored_src, "<ref>", "exec"), ns_ref)  # pylint: disable=exec-used  # nosec B102
                     assert ns_orig["entry"](test_items, test_cond) == ns_ref["entry"](
                         test_items, test_cond
                     )
@@ -1441,6 +1435,8 @@ def test_seeded_generated_closure_program_differential_fuzzer(tmp_path: Path) ->
 
     assert len(selected_combinations) == min(seed_limit, len(all_combinations))
     assert len(selected_combinations) >= 1
+    assert patched_count > 0
+    assert blocked_count > 0
     assert git_apply_count == patched_count
     assert patched_count + blocked_count == len(selected_combinations) * 2
 
@@ -1468,8 +1464,8 @@ def test_seeded_generated_closure_program_differential_fuzzer(tmp_path: Path) ->
     )
     ns_neg_orig: dict[str, Any] = {}
     ns_neg_forced: dict[str, Any] = {}
-    exec(compile(neg_orig_src, "<neg_orig>", "exec"), ns_neg_orig)  # pylint: disable=exec-used
-    exec(compile(neg_forced_src, "<neg_forced>", "exec"), ns_neg_forced)  # pylint: disable=exec-used
+    exec(compile(neg_orig_src, "<neg_orig>", "exec"), ns_neg_orig)  # pylint: disable=exec-used  # nosec B102
+    exec(compile(neg_forced_src, "<neg_forced>", "exec"), ns_neg_forced)  # pylint: disable=exec-used  # nosec B102
     assert ns_neg_orig["entry"]([1, 2]) != ns_neg_forced["entry"]([1, 2])
 
 

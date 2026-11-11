@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import ast
+from collections import OrderedDict
 from dataclasses import dataclass
 import logging
 import os
@@ -61,6 +63,7 @@ from pydoppelgangerhunt.reporters import (
     format_sarif_report,
     generate_clone_diff,
     generate_html_report,
+    resolve_cached_unit_source_and_tree,
     supports_color,
     synthesize_refactoring_suggestion,
 )
@@ -205,15 +208,11 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
             "strict",
             "lenient",
             "pedantic",
-            "fail_closed",
-            "fast",
-            "skip",
         ],
         help=(
-            "Closure strictness ('strict' [heuristic with-suppression, default], "
-            "'pedantic' [all unproven with-managers treated as potentially suppressing], "
-            "or 'lenient' [relax unreferenced sibling closure checks]; "
-            "deprecated aliases: 'fail_closed' -> 'pedantic', 'fast'/'skip' -> 'lenient'; "
+            "Closure strictness ('strict' [heuristic with-suppression, default; '--replace-clones' "
+            "defaults to 'pedantic' when unset], 'pedantic' [all unproven with-managers treated "
+            "as potentially suppressing], or 'lenient' [relax unreferenced sibling closure checks]; "
             "takes precedence over --skip-pre-unit-closures)"
         ),
     )
@@ -408,14 +407,34 @@ def _render_pair_diff_and_suggestions(
     use_color: bool,
     indent: str = "    ",
     closure_strictness: Optional[str] = None,
-    skip_pre_unit_closures: Optional[bool] = False,
+    skip_pre_unit_closures: Optional[bool] = None,
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    file_cache: Optional[
+        OrderedDict[str, Tuple[Optional[str], Optional[ast.AST]]]
+    ] = None,
 ) -> List[str]:
     """Renders optional refactoring suggestion and unified diff for a pair of clone units."""
     effective_root = repo_root or target_repo_root
     lines: List[str] = []
+    src1: Optional[str] = None
+    src2: Optional[str] = None
+    tree1: Optional[ast.AST] = None
+    tree2: Optional[ast.AST] = None
+    if (args.suggest or args.diff) and file_cache is not None:
+        src1, tree1 = resolve_cached_unit_source_and_tree(
+            u1, repo_root=effective_root, file_cache=file_cache
+        )
+        src2, tree2 = resolve_cached_unit_source_and_tree(
+            u2, repo_root=effective_root, file_cache=file_cache
+        )
     if args.suggest:
         sug_kwargs: Dict[str, Any] = {"repo_root": effective_root}
+        if src1 is not None or tree1 is not None:
+            sug_kwargs["source_text1"] = src1
+            sug_kwargs["tree1"] = tree1
+        if src2 is not None or tree2 is not None:
+            sug_kwargs["source_text2"] = src2
+            sug_kwargs["tree2"] = tree2
         if closure_strictness is not None:
             sug_kwargs["closure_strictness"] = closure_strictness
             sug_kwargs["skip_pre_unit_closures"] = bool(skip_pre_unit_closures)
@@ -430,8 +449,18 @@ def _render_pair_diff_and_suggestions(
         print(indent + sug_colored.replace("\n", "\n" + indent))
         lines.append(indent + sug.replace("\n", "\n" + indent))
     if args.diff:
+        u1_diff = (
+            {**u1, "source_text": src1}
+            if src1 is not None and "source_text" not in u1 and "source_lines" not in u1
+            else u1
+        )
+        u2_diff = (
+            {**u2, "source_text": src2}
+            if src2 is not None and "source_text" not in u2 and "source_lines" not in u2
+            else u2
+        )
         diff_out = generate_clone_diff(
-            u1, u2, repo_root=effective_root, color=use_color
+            u1_diff, u2_diff, repo_root=effective_root, color=use_color
         )
         if diff_out:
             print(f"{indent}--- Diff ---")
@@ -670,13 +699,16 @@ def _render_text_violations(
     repo_root: Optional[str] = None,
     audit_tests_enabled: bool = False,
     closure_strictness: Optional[str] = None,
-    skip_pre_unit_closures: Optional[bool] = False,
+    skip_pre_unit_closures: Optional[bool] = None,
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> List[str]:
     """Renders human-readable text output for clone violations (either clustered families or pairwise)."""
     effective_root = repo_root or target_repo_root
     report_lines: List[str] = []
     active_cov = cov_data or {}
+    file_cache: Optional[
+        OrderedDict[str, Tuple[Optional[str], Optional[ast.AST]]]
+    ] = OrderedDict() if (args.suggest or args.diff) else None
     if args.cluster and families is not None:
         title = f"\n[VIOLATION] Clustered into {len(families)} Clone Family/Families (from {len(clones)} pairwise hits) >= {threshold:.0%}:\n"
         print(colorize(title, COLOR_BOLD + COLOR_RED, use_color))
@@ -727,6 +759,7 @@ def _render_text_violations(
                         closure_strictness=closure_strictness,
                         skip_pre_unit_closures=skip_pre_unit_closures,
                         non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+                        file_cache=file_cache,
                     )
                 )
     else:
@@ -775,6 +808,7 @@ def _render_text_violations(
                     closure_strictness=closure_strictness,
                     skip_pre_unit_closures=skip_pre_unit_closures,
                     non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+                    file_cache=file_cache,
                 )
             )
 
@@ -1174,11 +1208,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.shared_module_name or tool_cfg.get("shared_module_name", "_common.py")
     )
     cfg_strictness = tool_cfg.get("closure_strictness")
-    has_cfg_skip = (
-        "skip_pre_unit_closures" in tool_cfg
-        and tool_cfg.get("skip_pre_unit_closures") is not None
-    )
     cfg_skip = _safe_bool(tool_cfg.get("skip_pre_unit_closures", False))
+    has_cfg_skip = cfg_skip
 
     cfg_strict_with = (
         _safe_bool(tool_cfg.get("strict_with_suppression"))
@@ -1196,8 +1227,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     closure_strictness: Optional[str]
     skip_pre_unit_closures: Optional[bool]
     if not has_explicit_closure_cfg:
-        closure_strictness = None
-        skip_pre_unit_closures = None
+        if replace_clones:
+            closure_strictness = "pedantic"
+            skip_pre_unit_closures = False
+        else:
+            closure_strictness = None
+            skip_pre_unit_closures = None
     else:
         eff_cfg_strict_with: Optional[bool] = None
         if args.closure_strictness is not None:
@@ -1206,7 +1241,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if cli_skip and str(cli_strictness).strip().lower() in (
                 "strict",
                 "pedantic",
-                "fail_closed",
             ):
                 logger.warning(
                     "Conflicting configuration: closure_strictness '%s' takes precedence over "
@@ -1219,7 +1253,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cli_skip = True
             if cfg_strictness is not None and str(cfg_strictness).strip().lower() in (
                 "strict",
-                "fail_closed",
                 "pedantic",
             ):
                 logger.warning(
@@ -1617,6 +1650,9 @@ def _emit_scan_artifacts_and_report(
             families=families,
             stats=stats,
             repo_root=git_worktree_root,
+            closure_strictness=closure_strictness,
+            skip_pre_unit_closures=skip_pre_unit_closures,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
         )
         _write_artifact_file(args.html, html_report, "HTML", args.format == "text")
 
