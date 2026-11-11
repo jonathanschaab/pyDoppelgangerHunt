@@ -1287,6 +1287,7 @@ def _extract_probe_active_idents(probe_src: str, return_type: str) -> Set[str]:
     } | set(re.findall(r"\b[A-Za-z_]\w*\b", f"{return_type}\n{str_ann_text}"))
 
 
+@_suppress_syntax_warnings()
 def synthesize_shared_helper_code(
     u1: Dict[str, Any],
     u2: Dict[str, Any],
@@ -1360,14 +1361,14 @@ def synthesize_shared_helper_code(
         _extract_unit_body_lines(
             u1, [ln.rstrip("\r\n") for ln in raw_lines1]
         ),
-        is_pre_sliced=origin1.is_pre_sliced or origin1.is_placeholder,
+        is_pre_sliced=origin1.is_pre_sliced,
     )
     lines2 = _slice_unit_token_lines(
         u2,
         _extract_unit_body_lines(
             u2, [ln.rstrip("\r\n") for ln in raw_lines2]
         ),
-        is_pre_sliced=origin2.is_pre_sliced or origin2.is_placeholder,
+        is_pre_sliced=origin2.is_pre_sliced,
     )
 
     base_name1 = _base_unit_name(u1)
@@ -1617,23 +1618,27 @@ def synthesize_shared_helper_code(
         return ""
     if scope1.get("nonlocals") or scope2.get("nonlocals") or scope.get("nonlocals"):
         return ""
+    is_sub1 = is_subroutine_unit(u1, source_text=source_text1, tree=tree1)
+    is_sub2 = is_subroutine_unit(u2, source_text=source_text2, tree=tree2)
+    if is_sub1 != is_sub2:
+        return ""
+    is_sub = is_sub1
     hazards1 = scope1.get("control_flow_hazards", ())
     hazards2 = scope2.get("control_flow_hazards", ())
+    # Intentional host-caller asymmetry: synthesize_shared_helper_code always builds
+    # the helper body from u1, so unavailable_source_placeholder on u1 always blocks.
+    # For u2, non-subroutine preview-only extraction (not is_sub and source_text2 is None)
+    # permits emitting the u1-backed host helper when u2's caller file is missing on disk.
+    if "unavailable_source_placeholder" in hazards1 or (
+        "unavailable_source_placeholder" in hazards2
+        and (is_sub or source_text2 is not None)
+    ):
+        return ""
     combined_hazards = (
         list(hazards1)
         + list(hazards2)
         + list(scope.get("control_flow_hazards", ()))
     )
-    if "unavailable_source_placeholder" in hazards1 or (
-        (
-            is_expr_unit
-            or is_subroutine_unit(u1, source_text=source_text1, tree=tree1)
-            or is_subroutine_unit(u2, source_text=source_text2, tree=tree2)
-            or source_text2 is not None
-        )
-        and "unavailable_source_placeholder" in hazards2
-    ):
-        return ""
     if any(
         h in combined_hazards
         for h in (
@@ -1733,11 +1738,6 @@ def synthesize_shared_helper_code(
     r1 = scope1.get("return_type")
     r2 = scope2.get("return_type")
     resolved_ret = _merge_types(r1, r2, type_merge_strategy)
-    is_sub1 = is_subroutine_unit(u1, source_text=source_text1, tree=tree1)
-    is_sub2 = is_subroutine_unit(u2, source_text=source_text2, tree=tree2)
-    if is_sub1 != is_sub2:
-        return ""
-    is_sub = is_sub1
 
     eff_outputs: List[str]
     if outputs is not None and outputs2 is not None:

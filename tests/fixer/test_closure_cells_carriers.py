@@ -983,21 +983,25 @@ def test_unmarked_and_mismatched_scope_recomputation_across_modes(
 
 
 def test_slice_unit_token_lines_multiline_end_col_truncation() -> None:
-    """Verifies _slice_unit_token_lines truncates end_col across pre-sliced, empty-first-line, and UTF-8 lines."""
+    """Verifies _slice_unit_token_lines truncates end_col across valid multiline bounds, fails closed without explicit_col_sliced, and handles UTF-8."""
     from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
 
     assert _slice_unit_token_lines(
         {"kind": "comprehension", "start_col": 24, "end_col": 5},
         ["[\n", "        x * 2 for x in items\n", "    ] + [99]\n"],
-    ) == ["[\n", "        x * 2 for x in items\n", "    ]"]
+    ) == []
     assert _slice_unit_token_lines(
         {"kind": "comprehension", "start_col": 12, "end_col": 5},
+        ["    result = [\n", "        x * 2 for x in items\n", "    ] + [99]\n"],
+    ) == [" [\n", "        x * 2 for x in items\n", "    ]"]
+    assert _slice_unit_token_lines(
+        {"kind": "comprehension", "start_col": 0, "end_col": 5},
         ["\n", "        x * 2 for x in items\n", "    ] + [99]\n"],
     ) == ["\n", "        x * 2 for x in items\n", "    ]"]
     utf8_last = '    ] + "é界🚀"\n'
     assert _slice_unit_token_lines(
-        {"kind": "comprehension", "start_col": 30, "end_col": 5},
-        ["[\n", "    x for x in items\n", utf8_last],
+        {"kind": "comprehension", "start_col": 4, "end_col": 5},
+        ["    [\n", "    x for x in items\n", utf8_last],
     ) == ["[\n", "    x for x in items\n", "    ]"]
     utf8_empty_slice = "é = "
     utf8_len = len(utf8_empty_slice.encode("utf-8"))
@@ -2389,7 +2393,8 @@ def test_utf8_source_slicing_multibyte_and_idempotence() -> None:
     unit1 = {"kind": "complex_expr", "start_col": s1, "end_col": e1}
     sliced1 = _slice_unit_token_lines(unit1, [line1])
     assert sliced1 == [expr1]
-    assert _slice_unit_token_lines(unit1, sliced1, is_pre_sliced=True) == [expr1]
+    assert _slice_unit_token_lines(unit1, sliced1, is_pre_sliced=True) == []
+    assert _slice_unit_token_lines(unit1, sliced1, explicit_col_sliced=True) == [expr1]
 
     # 2. result = "é"; another = "世界"; final = 42
     line2 = 'result = "é"; another = "世界"; final = 42\n'
@@ -2401,17 +2406,18 @@ def test_utf8_source_slicing_multibyte_and_idempotence() -> None:
         u_t = {"kind": "complex_expr", "start_col": s_b, "end_col": e_b}
         out_t = _slice_unit_token_lines(u_t, [line2])
         assert out_t == [target]
-        assert _slice_unit_token_lines(u_t, out_t, is_pre_sliced=True) == [target]
+        assert _slice_unit_token_lines(u_t, out_t, explicit_col_sliced=True) == [target]
 
-    # 3. Pre-sliced single-line expression where s_col < len(sliced) and source_code is omitted
+    # 3. Pre-sliced single-line expression requires explicit_col_sliced=True to bypass column clipping
     line3 = "x = [i + 1 for i in items]\n"
     expr3 = "[i + 1 for i in items]"
     u3 = {"kind": "comprehension", "start_col": 4, "end_col": 4 + len(expr3)}
     sliced3 = _slice_unit_token_lines(u3, [line3])
     assert sliced3 == [expr3]
-    assert _slice_unit_token_lines(u3, sliced3, is_pre_sliced=True) == [expr3]
+    assert _slice_unit_token_lines(u3, sliced3, is_pre_sliced=True) == []
+    assert _slice_unit_token_lines(u3, sliced3, explicit_col_sliced=True) == [expr3]
 
-    # 4. Multiline UTF-8 expression slicing and pre-sliced idempotence
+    # 4. Multiline UTF-8 expression slicing and explicit_col_sliced idempotence
     ml_utf8 = [
         "    résultat = (\n",
         '        café + "世界"\n',
@@ -2422,7 +2428,8 @@ def test_utf8_source_slicing_multibyte_and_idempotence() -> None:
     u_ml = {"kind": "complex_expr", "start_col": s_ml, "end_col": e_ml}
     sliced_ml = _slice_unit_token_lines(u_ml, ml_utf8)
     assert sliced_ml == ["(\n", '        café + "世界"\n', "    )"]
-    assert _slice_unit_token_lines(u_ml, sliced_ml, is_pre_sliced=True) == sliced_ml
+    assert _slice_unit_token_lines(u_ml, sliced_ml, is_pre_sliced=True) == []
+    assert _slice_unit_token_lines(u_ml, sliced_ml, explicit_col_sliced=True) == sliced_ml
 
 
 def test_sibling_closure_ordinary_store_followed_by_call_or_mutation() -> None:

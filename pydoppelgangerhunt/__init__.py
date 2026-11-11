@@ -155,7 +155,7 @@ from pydoppelgangerhunt.reporters import (
 )
 from pydoppelgangerhunt.source_lines import SourceLinesOrigin, _PHYSICAL_LINE_RE
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 __all__ = [
     "__version__",
     "main",

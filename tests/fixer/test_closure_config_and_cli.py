@@ -579,11 +579,12 @@ def test_neutral_named_suppressor_strict_vs_pedantic_and_summary_log(
     )
 
     caplog.clear()
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.INFO):
         recorded = log_heuristic_ctx_manager_summary()
     assert set(recorded) == {"Guard", "SpanContext", "Transaction"}
     assert any(
-        "3 unproven context manager(s)" in rec.message
+        rec.levelno == logging.INFO
+        and "3 unproven context manager(s)" in rec.message
         and "were treated as non-suppressing" in rec.message
         for rec in caplog.records
     )
@@ -1068,7 +1069,7 @@ def test_heuristic_ctx_manager_summary_logged_once_at_batch_boundary(
 
     clear_closure_warning_cache()
     caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt.config"):
+    with caplog.at_level(logging.INFO, logger="pydoppelgangerhunt.config"):
         synthesize_refactoring_suggestion(ua1, ua2, repo_root=str(tmp_path))
         synthesize_refactoring_suggestion(ub1, ub2, repo_root=str(tmp_path))
         assert not [r for r in caplog.records if "Summary:" in r.message]
@@ -1076,11 +1077,12 @@ def test_heuristic_ctx_manager_summary_logged_once_at_batch_boundary(
     assert set(flushed) == {"CustomMgrAlpha", "CustomMgrBeta"}
     summary_records = [r for r in caplog.records if "Summary:" in r.message]
     assert len(summary_records) == 1
+    assert summary_records[0].levelno == logging.INFO
     assert "2 unproven context manager(s)" in summary_records[0].message
 
     clear_closure_warning_cache()
     caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt.config"):
+    with caplog.at_level(logging.INFO, logger="pydoppelgangerhunt.config"):
         patch = generate_refactoring_patch(
             [(1.0, dict(ua1), dict(ua2)), (1.0, dict(ub1), dict(ub2))],
             repo_root=str(tmp_path),
@@ -1088,6 +1090,7 @@ def test_heuristic_ctx_manager_summary_logged_once_at_batch_boundary(
     assert "def _shared_" in patch
     patch_summaries = [r for r in caplog.records if "Summary:" in r.message]
     assert len(patch_summaries) == 1
+    assert patch_summaries[0].levelno == logging.INFO
     assert "2 unproven context manager(s)" in patch_summaries[0].message
 
 
@@ -1477,13 +1480,13 @@ def test_docs_sync_with_suspicious_suppress_substrings_and_local_accumulator_str
     for mod_name, attrs in _STDLIB_NON_SUPPRESSING_MODULES.items():
         for attr in attrs:
             assert f"{mod_name}.{attr}" in readme_text, f"{mod_name}.{attr}"
-    for removed_alias in ("`fail_closed`", "--closure-strictness {strict,pedantic,lenient,fail_closed"):
-        assert removed_alias not in readme_text
-        assert removed_alias not in changelog_text
-    unreleased_section = changelog_text.split("## [1.0.0]", 1)[0]
+    assert "--closure-strictness {strict,pedantic,lenient,fail_closed" not in readme_text
+    assert "--closure-strictness {strict,pedantic,lenient,fail_closed" not in changelog_text
+    assert "## [2.0.0]" in changelog_text
+    latest_section = changelog_text.split("## [1.0.0]", 1)[0]
     private_tokens = [
         tok
-        for tok in re.findall(r"`(_[A-Za-z0-9_]+)`", unreleased_section)
+        for tok in re.findall(r"`(_[A-Za-z0-9_]+)`", latest_section)
         if not (tok.startswith("__") and tok.endswith("__"))
         and tok not in ("_common", "_item")
     ]
@@ -2013,11 +2016,11 @@ def test_heuristic_session_over_1024_live_threads_mid_session_clear_and_intra_un
 ) -> None:
     """Verifies >1024 live threads retain all heuristic names, mid-session clear preserves session_depth, pre-session worker entries do not leak, and intra-unit with emits # Note:."""
     import concurrent.futures
-    import pydoppelgangerhunt.config as cfg_mod
     from pydoppelgangerhunt.config import (
         clear_closure_warning_cache,
         heuristic_ctx_manager_session,
         log_heuristic_ctx_manager_summary,
+        peek_heuristic_non_suppressing_ctx_managers,
         record_heuristic_non_suppressing_ctx_manager,
     )
 
@@ -2048,14 +2051,14 @@ def test_heuristic_session_over_1024_live_threads_mid_session_clear_and_intra_un
                 t.join(timeout=5.0)
     assert len(harvested_all) == thread_count
 
-    # 2. Mid-session clear_closure_warning_cache() preserves active state identity and session_depth
+    # 2. Mid-session clear_closure_warning_cache() preserves active session tracking and cleans up on exit
     with heuristic_ctx_manager_session():
         record_heuristic_non_suppressing_ctx_manager("BeforeMidClearMgr")
         clear_closure_warning_cache()
         record_heuristic_non_suppressing_ctx_manager("AfterMidClearMgr")
         harvested_mid = log_heuristic_ctx_manager_summary()
     assert harvested_mid == ("AfterMidClearMgr",)
-    assert cfg_mod._get_thread_heuristic_state_obj().session_depth == 0
+    assert peek_heuristic_non_suppressing_ctx_managers() == ()
 
     # 3. Persistent worker thread records before session are excluded by sequence watermark
     clear_closure_warning_cache()
@@ -2110,3 +2113,419 @@ def test_top_level_and_fixer_package_public_exports() -> None:
         assert sym_name in pdh.__all__
         assert sym_name in pdh_fixer.__all__
         assert getattr(pdh, sym_name) is getattr(pdh_fixer, sym_name)
+
+
+def test_strict_with_suppression_precedence_identical_across_cli_and_api(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies closure_strictness takes identical precedence over strict_with_suppression across CLI and Python API."""
+    import logging
+    from unittest import mock
+    from pydoppelgangerhunt.cli import main
+    from pydoppelgangerhunt.config import (
+        clear_closure_warning_cache,
+        load_tool_config,
+        resolve_closure_strictness_mode,
+    )
+
+    repo = tmp_path / "precedence_repo"
+    repo.mkdir()
+    (repo / "mod.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "pyproject.toml").write_text(
+        '[tool.pydoppelgangerhunt]\nclosure_strictness = "strict"\nstrict_with_suppression = true\n',
+        encoding="utf-8",
+    )
+    cfg = load_tool_config(repo_root=str(repo))
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        api_mode, api_skip = resolve_closure_strictness_mode(
+            closure_strictness=cfg.get("closure_strictness"),
+            skip_pre_unit_closures=bool(cfg.get("skip_pre_unit_closures", False)),
+            strict_with_suppression=cfg.get("strict_with_suppression"),
+        )
+    assert (api_mode, api_skip) == ("strict", False)
+    assert "Conflicting configuration: closure_strictness 'strict' takes precedence" in caplog.text
+
+    dummy_clone = (
+        0.95,
+        {"name": "u1", "file": "mod.py", "start": 1, "end": 1},
+        {"name": "u2", "file": "mod.py", "start": 1, "end": 1},
+    )
+    patch_out = repo / "out.patch"
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[dummy_clone]):
+            with mock.patch(
+                "pydoppelgangerhunt.cli.generate_refactoring_patch", return_value="# patch\n"
+            ) as mock_patch:
+                rc = main([str(repo), "--patch", str(patch_out)])
+                assert rc == 1
+                _, cli_kwargs = mock_patch.call_args
+    assert (cli_kwargs.get("closure_strictness"), cli_kwargs.get("skip_pre_unit_closures")) == (
+        api_mode,
+        api_skip,
+    )
+    assert "Conflicting configuration: closure_strictness 'strict' takes precedence" in caplog.text
+
+    # Commented-out closure_strictness in README sample preserves --replace-clones pedantic default
+    readme_text = (Path(__file__).resolve().parents[2] / "README.md").read_text(encoding="utf-8")
+    assert '# closure_strictness = "strict"' in readme_text
+    (repo / "pyproject.toml").write_text(
+        '[tool.pydoppelgangerhunt]\n# closure_strictness = "strict"\n',
+        encoding="utf-8",
+    )
+    with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[dummy_clone]):
+        with mock.patch(
+            "pydoppelgangerhunt.cli.generate_refactoring_patch", return_value="# patch\n"
+        ) as mock_patch_rc:
+            main([str(repo), "--patch", str(patch_out), "--replace-clones"])
+            _, rc_kwargs = mock_patch_rc.call_args
+            assert rc_kwargs.get("closure_strictness") == "pedantic"
+
+
+def test_report_boundary_isolates_malformed_clone_pair_without_aborting_run(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies CLI --suggest/--diff and generate_html_report degrade gracefully on a bad pair while direct API raises."""
+    import logging
+    from unittest import mock
+    from pydoppelgangerhunt.cli import main
+    from pydoppelgangerhunt.reporters import (
+        generate_html_report,
+        synthesize_refactoring_suggestion,
+    )
+
+    valid_src = (
+        "def calc_alpha(a: int, b: int) -> int:\n"
+        "    step = a + b\n"
+        "    return step * 2\n\n"
+        "def calc_beta(a: int, b: int) -> int:\n"
+        "    step = a + b\n"
+        "    return step * 2\n"
+    )
+    mod_file = tmp_path / "valid_mod.py"
+    mod_file.write_text(valid_src, encoding="utf-8")
+    valid_u1 = {"name": "calc_alpha", "file": "valid_mod.py", "start": 1, "end": 3, "kind": "function"}
+    valid_u2 = {"name": "calc_beta", "file": "valid_mod.py", "start": 5, "end": 7, "kind": "function"}
+    bad_u1: Any = None
+    bad_u2: Any = {"name": "corrupt_unit", "file": "valid_mod.py", "start": 1, "end": 3}
+
+    # Direct API call still surfaces programmer/data defects
+    with pytest.raises((TypeError, AttributeError)):
+        synthesize_refactoring_suggestion(bad_u1, bad_u2, repo_root=str(tmp_path))
+
+    # HTML report logs traceback at WARNING, emits inline diagnostic, and still renders valid pair
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        html_text = generate_html_report(
+            [(0.99, bad_u1, bad_u2), (0.99, valid_u1, valid_u2)],
+            str(tmp_path),
+            0.85,
+            repo_root=str(tmp_path),
+        )
+    assert "Diagnostic: pair rendering failed" in html_text
+    assert "def _shared_calc" in html_text
+    assert any(rec.exc_info is not None for rec in caplog.records)
+
+    # CLI --suggest --diff logs traceback at WARNING, emits inline diagnostic, and still renders valid pair
+    bad_dict_u1 = {"name": "boom_unit", "file": "valid_mod.py", "start": 1, "end": 3, "kind": "function"}
+
+    def _boom_on_first(u1_arg: Any, u2_arg: Any, **kwargs: Any) -> str:
+        if u1_arg.get("name") == "boom_unit":
+            raise TypeError("synthetic AST defect")
+        return synthesize_refactoring_suggestion(u1_arg, u2_arg, **kwargs)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        with mock.patch(
+            "pydoppelgangerhunt.cli.scan_target",
+            return_value=[(0.99, bad_dict_u1, valid_u2), (0.99, valid_u1, valid_u2)],
+        ):
+            with mock.patch(
+                "pydoppelgangerhunt.cli.synthesize_refactoring_suggestion",
+                side_effect=_boom_on_first,
+            ):
+                exit_code = main([str(tmp_path), "--suggest", "--diff", "--no-color"])
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert (
+        "[REFACTOR SUGGESTION] Diagnostic: suggestion skipped due to TypeError: synthetic AST defect"
+        in captured.out
+    )
+    assert "def _shared_calc" in captured.out
+    assert any(rec.exc_info is not None for rec in caplog.records)
+
+
+def test_patch_replace_clones_pedantic_default_blocks_conditional_outputs(
+    tmp_path: Path,
+) -> None:
+    """Verifies pedantic default under replace_clones=True survives into resolve_clone_pair_outputs for conditional_outputs."""
+    src = (
+        "def run_one(CustomUnknownCtx, compute, scale):\n"
+        "    with CustomUnknownCtx():\n"
+        "        val = compute(scale)\n"
+        "        yield val\n"
+        "        extra = val + 1\n"
+        "    yield extra * 2\n\n"
+        "def run_two(CustomUnknownCtx, compute, scale):\n"
+        "    with CustomUnknownCtx():\n"
+        "        val = compute(scale)\n"
+        "        yield val\n"
+        "        extra = val + 1\n"
+        "    yield extra * 2\n"
+    )
+    mod_p = tmp_path / "cond_out.py"
+    mod_p.write_text(src, encoding="utf-8")
+    u1 = {"name": "run_one:with", "file": "cond_out.py", "start": 2, "end": 5, "kind": "compound_block"}
+    u2 = {"name": "run_two:with", "file": "cond_out.py", "start": 9, "end": 12, "kind": "compound_block"}
+
+    # No closure hazards exist in either mode; the difference is purely definite_stores vs conditional_outputs
+    sc_ped = inspect_single_unit_scope(
+        {**u1, "closure_strictness": "pedantic"}, repo_root=str(tmp_path)
+    )
+    assert sc_ped["control_flow_hazards"] == ["generator_yield"]
+    assert sc_ped["closure_hazard_reasons"] == []
+    assert "extra" in sc_ped["conditional_outputs"]
+    assert "extra" not in sc_ped["definite_stores"]
+
+    preview_patch = generate_refactoring_patch(
+        [(1.0, dict(u1), dict(u2))], repo_root=str(tmp_path), replace_clones=False
+    )
+    assert "def _shared_" in preview_patch
+
+    rewrite_patch = generate_refactoring_patch(
+        [(1.0, dict(u1), dict(u2))], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert rewrite_patch == ""
+
+
+def test_notebook_cell_anchor_coordinates_across_diff_suggest_and_html(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies #cell_N notebook units resolve cell-relative coordinates across CLI --diff, --suggest, and --html."""
+    import json
+    from pydoppelgangerhunt.cli import main
+    from pydoppelgangerhunt.parser import harvest_notebook_units
+    from pydoppelgangerhunt.reporters import generate_html_report
+
+    nb_payload = {
+        "cells": [
+            {
+                "cell_type": "code",
+                "source": [f"FILLER_{idx} = {idx}\n" for idx in range(12)],
+            },
+            {
+                "cell_type": "code",
+                "source": [
+                    "def score_items_a(items, weight):\n",
+                    "    total = 0\n",
+                    "    for item in items:\n",
+                    "        total += item * weight\n",
+                    "    return total\n",
+                ],
+            },
+            {
+                "cell_type": "code",
+                "source": [
+                    "def score_items_b(items, factor):\n",
+                    "    total = 0\n",
+                    "    for item in items:\n",
+                    "        total += item * factor\n",
+                    "    return total\n",
+                ],
+            },
+        ],
+        "metadata": {},
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
+    nb_path = tmp_path / "analysis.ipynb"
+    nb_path.write_text(json.dumps(nb_payload), encoding="utf-8")
+
+    units = harvest_notebook_units(str(nb_path), str(tmp_path), min_lines=4, min_tokens=8)
+    fn_units = [u for u in units if u.get("kind") == "function"]
+    assert len(fn_units) == 2
+    assert str(fn_units[0]["file"]).endswith("#cell_2")
+    assert str(fn_units[1]["file"]).endswith("#cell_3")
+    assert fn_units[0]["start"] == 1
+    assert fn_units[1]["start"] == 1
+
+    html_path = tmp_path / "nb_report.html"
+    exit_code = main(
+        [
+            str(tmp_path),
+            "--notebooks",
+            "--min-lines",
+            "4",
+            "--min-tokens",
+            "8",
+            "--suggest",
+            "--diff",
+            "--html",
+            str(html_path),
+            "--no-color",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "def _shared_score_items" in captured.out
+    assert "score_items_a" in captured.out
+    assert "FILLER_0" not in captured.out
+
+    html_content = html_path.read_text(encoding="utf-8")
+    assert "def _shared_score_items" in html_content
+    assert "stale source code" not in html_content.lower()
+
+    html_direct = generate_html_report(
+        [(1.0, fn_units[0], fn_units[1])],
+        str(tmp_path),
+        0.85,
+        repo_root=str(tmp_path),
+    )
+    assert "def _shared_score_items" in html_direct
+
+
+def test_heuristic_summary_log_level_info_by_default_and_warning_under_replace_clones(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies heuristic summary logs at INFO by default and escalates to WARNING under replace_clones."""
+    import logging
+    from pydoppelgangerhunt.config import (
+        clear_closure_warning_cache,
+        heuristic_ctx_manager_session,
+        record_heuristic_non_suppressing_ctx_manager,
+    )
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="pydoppelgangerhunt.config"):
+        with heuristic_ctx_manager_session(warn=False):
+            record_heuristic_non_suppressing_ctx_manager("DefaultInfoMgr")
+    info_summaries = [r for r in caplog.records if "Summary:" in r.message]
+    assert len(info_summaries) == 1
+    assert info_summaries[0].levelno == logging.INFO
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="pydoppelgangerhunt.config"):
+        with heuristic_ctx_manager_session(warn=True):
+            record_heuristic_non_suppressing_ctx_manager("ReplaceWarnMgr")
+    warn_summaries = [r for r in caplog.records if "Summary:" in r.message]
+    assert len(warn_summaries) == 1
+    assert warn_summaries[0].levelno == logging.WARNING
+
+    src = (
+        "def f1(NeutralSessionMgr, x):\n"
+        "    with NeutralSessionMgr():\n"
+        "        y = x + 1\n"
+        "    return y\n\n"
+        "def f2(NeutralSessionMgr, x):\n"
+        "    with NeutralSessionMgr():\n"
+        "        y = x + 1\n"
+        "    return y\n"
+    )
+    mod_p = tmp_path / "warn_lvl.py"
+    mod_p.write_text(src, encoding="utf-8")
+    u1 = {"name": "f1:w", "file": str(mod_p), "start": 2, "end": 3, "kind": "compound_block"}
+    u2 = {"name": "f2:w", "file": str(mod_p), "start": 7, "end": 8, "kind": "compound_block"}
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="pydoppelgangerhunt.config"):
+        generate_refactoring_patch(
+            [(1.0, dict(u1), dict(u2))],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+            closure_strictness="strict",
+        )
+    rc_summaries = [r for r in caplog.records if "Summary:" in r.message]
+    assert len(rc_summaries) == 1
+    assert rc_summaries[0].levelno == logging.WARNING
+
+
+def test_multi_pair_reporting_shared_cache_reuse_benchmark(tmp_path: Path) -> None:
+    """Verifies 60 clone pairs across --suggest, --diff, and generate_html_report reuse file/AST caches cleanly."""
+    import builtins
+    import time
+    from unittest import mock
+    from pydoppelgangerhunt.cli import main
+    from pydoppelgangerhunt.reporters import generate_html_report
+
+    clear_dataflow_cache()
+    clones: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
+    num_files = 6
+    pairs_per_file = 10
+    target_files: set[Path] = set()
+    for f_idx in range(num_files):
+        chunks: list[str] = []
+        line_cursor = 1
+        for p_idx in range(pairs_per_file):
+            fn_a = (
+                f"def worker_{f_idx}_{p_idx}_a(items, bias):\n"
+                "    acc = 0\n"
+                "    for val in items:\n"
+                "        acc += (val + bias) * 2\n"
+                "    return acc\n\n"
+            )
+            fn_b = (
+                f"def worker_{f_idx}_{p_idx}_b(items, offset):\n"
+                "    acc = 0\n"
+                "    for val in items:\n"
+                "        acc += (val + offset) * 2\n"
+                "    return acc\n\n"
+            )
+            chunks.append(fn_a)
+            chunks.append(fn_b)
+            u1 = {
+                "name": f"worker_{f_idx}_{p_idx}_a",
+                "file": f"mod_{f_idx}.py",
+                "start": line_cursor + 1,
+                "end": line_cursor + 4,
+                "kind": "compound_block",
+            }
+            u2 = {
+                "name": f"worker_{f_idx}_{p_idx}_b",
+                "file": f"mod_{f_idx}.py",
+                "start": line_cursor + 7,
+                "end": line_cursor + 10,
+                "kind": "compound_block",
+            }
+            clones.append((0.98, u1, u2))
+            line_cursor += 12
+        mod_file = (tmp_path / f"mod_{f_idx}.py").resolve()
+        mod_file.write_text("".join(chunks), encoding="utf-8")
+        target_files.add(mod_file)
+
+    assert len(clones) == 60
+    orig_open = builtins.open
+    disk_opens: list[Path] = []
+
+    def _counting_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            resolved = Path(file).resolve()
+            if resolved in target_files:
+                disk_opens.append(resolved)
+        except (TypeError, ValueError, OSError):
+            pass
+        return orig_open(file, *args, **kwargs)
+
+    t0 = time.perf_counter()
+    with mock.patch("builtins.open", _counting_open):
+        html_out = generate_html_report(clones, str(tmp_path), 0.85, repo_root=str(tmp_path))
+    elapsed_html = time.perf_counter() - t0
+    assert len(disk_opens) == num_files
+    assert elapsed_html < 15.0
+    assert "def _shared_worker" in html_out
+
+    disk_opens.clear()
+    t1 = time.perf_counter()
+    with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=clones):
+        with mock.patch("builtins.open", _counting_open):
+            rc = main([str(tmp_path), "--suggest", "--diff", "--no-color"])
+    elapsed_cli = time.perf_counter() - t1
+    assert rc == 1
+    assert len(disk_opens) == num_files
+    assert elapsed_cli < 15.0

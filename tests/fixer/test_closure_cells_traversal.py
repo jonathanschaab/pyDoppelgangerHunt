@@ -921,6 +921,16 @@ def test_utf8_semicolon_and_multiline_column_slicing() -> None:
             "source_code": comp_snip,
         },
         [comp_snip],
+    ) == []
+    assert _slice_unit_token_lines(
+        {
+            "kind": "comprehension",
+            "start_col": s_b,
+            "end_col": e_b,
+            "source_code": comp_snip,
+            "source_lines_is_col_sliced": True,
+        },
+        [comp_snip],
     ) == [comp_snip]
 
     stmt_snip = "res = a + b"
@@ -2493,6 +2503,11 @@ def test_slice_utf8_line_and_augassign_post_read_and_trystar_bindings() -> None:
     assert _slice_unit_token_lines(
         {"kind": "comprehension", "start_col": 50, "end_col": 70},
         ["[x for x in y]"],
+    ) == []
+    assert _slice_unit_token_lines(
+        {"kind": "comprehension", "start_col": 50, "end_col": 70},
+        ["[x for x in y]"],
+        explicit_col_sliced=True,
     ) == ["[x for x in y]"]
 
     src_aug = (

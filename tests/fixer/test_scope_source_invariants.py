@@ -278,6 +278,18 @@ def test_slice_unit_token_lines_multiline_and_utf8_boundaries() -> None:
             presliced_ml,
             is_pre_sliced=True,
         )
+        == []
+    )
+    assert (
+        _slice_unit_token_lines(
+            {
+                "kind": "complex_expr",
+                "start_col": 8,
+                "end_col": last_bytes_len,
+            },
+            presliced_ml,
+            explicit_col_sliced=True,
+        )
         == presliced_ml
     )
 
@@ -512,12 +524,12 @@ def test_extract_unit_source_code_empty_and_whitespace_source_text_fallback(
         "def example():\n",
         "    return 42\n",
     ]
-    lines_with_state, is_pre_sliced = extract_unit_source_lines_with_state(
+    lines_with_state, origin = extract_unit_source_lines_with_state(
         unit_empty_src
     )
     assert lines_with_state == ["def example():\n", "    return 42\n"]
-    assert is_pre_sliced.is_pre_sliced is False
-    assert is_pre_sliced.is_placeholder is False
+    assert origin.is_pre_sliced is False
+    assert origin.is_placeholder is False
 
     unit_ws_src = {
         "name": "example",
@@ -1180,7 +1192,10 @@ def test_source_lines_origin_enum_properties_and_hash_contract() -> None:
     from pydoppelgangerhunt.source_lines import SourceLinesOrigin
 
     assert issubclass(SourceLinesOrigin, enum.Enum)
-    assert "__bool__" not in SourceLinesOrigin.__dict__
+    assert "__bool__" in SourceLinesOrigin.__dict__
+    for member in SourceLinesOrigin:
+        with pytest.raises(TypeError, match="no implicit truth value"):
+            bool(member)
     assert SourceLinesOrigin.PRE_SLICED.is_pre_sliced is True
     assert SourceLinesOrigin.PRE_SLICED.is_placeholder is False
     assert SourceLinesOrigin.PRE_SLICED.has_real_source is True
@@ -1756,3 +1771,134 @@ def test_validate_unit_schema_accepts_frozenset_and_custom_abstract_set() -> Non
             {"start": 1, "end": 2, "non_suppressing_ctx_managers": frozenset({123})},  # type: ignore[arg-type]
             strict=True,
         )
+
+
+def test_tree_only_placeholder_unit_fails_closed_and_host_caller_placeholder_contract(
+    tmp_path: Path,
+) -> None:
+    """Verifies tree-only units without source emit unavailable_source_placeholder and placeholder u1 never leaks into helpers."""
+    mod_tree = ast.parse("def real_fn(x: int) -> int:\n    return x * 4\n")
+    sc_tree_only = inspect_single_unit_scope(
+        {"name": "ghost_fn", "start": 1, "end": 2, "kind": "function"},
+        tree=mod_tree,
+    )
+    assert "unavailable_source_placeholder" in sc_tree_only["control_flow_hazards"]
+    assert sc_tree_only["is_control_flow_safe"] is False
+
+    pkg = tmp_path / "ph_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    real_file = pkg / "real_mod.py"
+    real_file.write_text(
+        "def compute_item(x: int) -> int:\n    y = x + 2\n    return y * 3\n",
+        encoding="utf-8",
+    )
+    u_real_fn = {"name": "compute_item", "file": "ph_pkg/real_mod.py", "start": 1, "end": 3, "kind": "function"}
+    u_missing_fn = {"name": "compute_item", "file": "ph_pkg/missing_mod.py", "start": 1, "end": 3, "kind": "function"}
+    u_real_sub = {"name": "compute_item:blk", "file": "ph_pkg/real_mod.py", "start": 2, "end": 2, "kind": "compound_block"}
+    u_missing_sub = {"name": "compute_item:blk", "file": "ph_pkg/missing_mod.py", "start": 2, "end": 2, "kind": "compound_block"}
+
+    # Placeholder on u1 is unconditionally rejected in both preview and rewrite modes
+    sc_missing = inspect_single_unit_scope(u_missing_fn, repo_root=str(tmp_path))
+    sc_real = inspect_single_unit_scope(u_real_fn, repo_root=str(tmp_path))
+    assert (
+        resolve_clone_pair_outputs(
+            u_missing_fn, u_real_fn, sc_missing, sc_real, repo_root=str(tmp_path), require_pairing=False
+        )
+        is None
+    )
+    assert synthesize_shared_helper_code(u_missing_fn, u_real_fn, repo_root=str(tmp_path)) == ""
+    assert (
+        generate_refactoring_patch(
+            [(1.0, u_missing_fn, u_real_fn)], repo_root=str(tmp_path), replace_clones=False
+        )
+        == ""
+    )
+
+    # Placeholder on u2 is rejected for subroutines and for replace_clones=True
+    assert synthesize_shared_helper_code(u_real_sub, u_missing_sub, repo_root=str(tmp_path)) == ""
+    assert (
+        generate_refactoring_patch(
+            [(1.0, u_real_fn, u_missing_fn)], repo_root=str(tmp_path), replace_clones=True
+        )
+        == ""
+    )
+
+    # Whole-function preview mode synthesizes helper strictly from u1's real AST without placeholder comments
+    helper_preview = synthesize_shared_helper_code(u_real_fn, u_missing_fn, repo_root=str(tmp_path))
+    assert "return y * 3" in helper_preview
+    assert "# Source for" not in helper_preview
+
+
+def test_discarded_precomputed_scope_emits_once_per_run_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies legacy/mock precomputed scopes lacking scope_schema_version==2 emit a once-per-run WARNING."""
+    import logging
+    from pydoppelgangerhunt.config import clear_closure_warning_cache
+
+    src = "def f(x):\n    y = x + 1\n    return y\n"
+    u1 = {"name": "f:blk", "start": 2, "end": 2, "kind": "basic_block", "source_text": src}
+    u2 = {"name": "f:blk2", "start": 2, "end": 2, "kind": "basic_block", "source_text": src}
+    legacy_scope = {"inputs": ["bogus_override"], "outputs": [], "is_control_flow_safe": True}
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        combined_first = analyze_unit_variable_scope(u1, u2, scope1=legacy_scope, scope2=legacy_scope)
+        combined_second = analyze_unit_variable_scope(u1, u2, scope1=legacy_scope, scope2=legacy_scope)
+    assert combined_first["inputs"] == ["x"]
+    assert combined_second["inputs"] == ["x"]
+    discard_warnings = [
+        r for r in caplog.records if "Discarding caller-supplied precomputed scope" in r.message
+    ]
+    assert len(discard_warnings) == 1
+
+
+def test_validate_unit_schema_strict_accepts_post_fixer_mutated_unit_dicts(
+    tmp_path: Path,
+) -> None:
+    """Verifies strict UnitSchema validation succeeds on unit dicts after fixer/reporter mutations."""
+    from pydoppelgangerhunt.fixer.source import validate_unit_schema
+    from pydoppelgangerhunt.parser import harvest_file_units
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    src = (
+        "class Processor:\n"
+        "    def run_a(self, items: list[int], scale: int) -> list[int]:\n"
+        "        filtered = [v * scale for v in items if v > 0]\n"
+        "        total = sum(filtered)\n"
+        "        return [total]\n\n"
+        "    def run_b(self, items: list[int], scale: int) -> list[int]:\n"
+        "        filtered = [v * scale for v in items if v > 0]\n"
+        "        total = sum(filtered)\n"
+        "        return [total]\n"
+    )
+    mod_file = tmp_path / "proc.py"
+    mod_file.write_text(src, encoding="utf-8")
+    harvested = harvest_file_units(
+        str(mod_file),
+        str(tmp_path),
+        min_lines=1,
+        min_tokens=3,
+        comprehensions=True,
+        complex_expressions=True,
+        harvest_closures=True,
+    )
+    assert len(harvested) >= 4
+    methods = [
+        u
+        for u in harvested
+        if u.get("kind") == "function" and u.get("enclosing_class") == "Processor"
+    ]
+    assert len(methods) == 2
+    u1, u2 = methods[0], methods[1]
+
+    inspect_single_unit_scope(u1, repo_root=str(tmp_path))
+    synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    synthesize_refactoring_suggestion(u1, u2, repo_root=str(tmp_path))
+    generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+
+    for u_item in harvested:
+        inspect_single_unit_scope(u_item, repo_root=str(tmp_path))
+        assert validate_unit_schema(u_item, strict=True) == set()

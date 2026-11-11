@@ -930,7 +930,14 @@ def _slice_unit_token_lines(
     is_pre_sliced: Optional[Union[bool, SourceLinesOrigin]] = None,
     explicit_col_sliced: Optional[bool] = None,
 ) -> List[str]:
-    """Slices source lines to the exact start_col and end_col offsets of the unit."""
+    """Slices source lines to the exact start_col and end_col offsets of the unit.
+
+    Line-sliced excerpts still undergo first/last-line column clipping unless
+    ``source_lines_is_col_sliced=True`` (or ``explicit_col_sliced=True``) explicitly
+    declares that column offsets were already stripped. Out-of-bounds column
+    coordinates fail closed by returning ``[]``.
+    """
+    del is_pre_sliced
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
         return lines
     raw_col_flag = unit.get("source_lines_is_col_sliced")
@@ -941,17 +948,6 @@ def _slice_unit_token_lines(
     )
     if eff_col_sliced is True:
         return list(lines)
-    raw_line_flag = unit.get("source_lines_is_sliced")
-    if isinstance(is_pre_sliced, SourceLinesOrigin):
-        effective_pre_sliced = (
-            is_pre_sliced.is_pre_sliced or is_pre_sliced.is_placeholder
-        )
-    elif is_pre_sliced is not None:
-        effective_pre_sliced = bool(is_pre_sliced)
-    elif isinstance(raw_line_flag, bool):
-        effective_pre_sliced = raw_line_flag
-    else:
-        effective_pre_sliced = is_sliced_unit_source_lines(unit)
     s_col_opt = _extract_slice_col_offset(
         unit, ("start_col", "start_col_offset"), default=0
     )
@@ -960,26 +956,11 @@ def _slice_unit_token_lines(
     )
     if s_col_opt is None or s_col_opt < 0:
         return lines
+    if e_col is not None and e_col < 0:
+        return []
     s_col = s_col_opt
     res = list(lines)
-    first_stripped = res[0].rstrip("\r\n")
-    first_byte_len = len(first_stripped.encode("utf-8"))
-    if len(res) == 1 and not first_stripped[:1].isspace():
-        if (
-            s_col > 0
-            and e_col is not None
-            and first_byte_len == e_col - s_col
-        ) or (
-            s_col >= first_byte_len
-            and (e_col is None or e_col > first_byte_len)
-            and _is_valid_eval_expr(res[0])
-        ) or (
-            effective_pre_sliced
-            and "source_lines" not in unit
-            and e_col is None
-            and _is_valid_eval_expr(res[0])
-        ):
-            return res
+    first_byte_len = len(res[0].rstrip("\r\n").encode("utf-8"))
     if len(res) == 1:
         if (
             s_col > first_byte_len
@@ -988,38 +969,20 @@ def _slice_unit_token_lines(
         ):
             return []
         res[0] = _slice_utf8_line(res[0], s_col, e_col)
-    else:
-        last_byte_len = len(res[-1].rstrip("\r\n").encode("utf-8"))
-        res_stripped = [ln.rstrip("\r\n") for ln in res]
-        if (
-            effective_pre_sliced
-            and (s_col == 0 or not first_stripped[:1].isspace())
-            and (e_col is None or last_byte_len == e_col)
-            and _is_valid_eval_expr("\n".join(res_stripped))
-        ):
-            clipped_probe = list(res)
-            if 0 < s_col < first_byte_len:
-                clipped_probe[0] = _slice_utf8_line(clipped_probe[0], s_col, None)
-            if e_col is not None and 0 < e_col <= last_byte_len:
-                clipped_probe[-1] = _slice_utf8_line(
-                    clipped_probe[-1].rstrip("\r\n"), 0, e_col
-                )
-            clipped_stripped = [ln.rstrip("\r\n") for ln in clipped_probe]
-            if clipped_stripped == res_stripped or not _is_valid_eval_expr(
-                "\n".join(clipped_stripped)
-            ):
-                return res
-        if (s_col >= first_byte_len and first_stripped[:1].isspace()) or (
-            e_col is not None and e_col > last_byte_len
-        ):
-            return []
-        clipped = list(res)
-        if 0 < s_col < first_byte_len:
-            clipped[0] = _slice_utf8_line(clipped[0], s_col, None)
-        if e_col is not None and 0 <= e_col <= last_byte_len:
-            clipped[-1] = _slice_utf8_line(clipped[-1].rstrip("\r\n"), 0, e_col)
-        res = clipped
-    return res
+        return res
+    last_byte_len = len(res[-1].rstrip("\r\n").encode("utf-8"))
+    if (
+        s_col > first_byte_len
+        or (s_col == first_byte_len and first_byte_len > 0)
+        or (e_col is not None and e_col > last_byte_len)
+    ):
+        return []
+    clipped = list(res)
+    if 0 < s_col < first_byte_len:
+        clipped[0] = _slice_utf8_line(clipped[0], s_col, None)
+    if e_col is not None and 0 <= e_col <= last_byte_len:
+        clipped[-1] = _slice_utf8_line(clipped[-1].rstrip("\r\n"), 0, e_col)
+    return clipped
 
 
 def _get_module_imported_names(

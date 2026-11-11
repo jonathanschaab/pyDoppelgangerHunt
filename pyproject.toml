@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pydoppelgangerhunt"
-version = "1.0.0"
+version = "2.0.0"
 description = "AST structural code clone detector, redundancy gate, and refactoring patch synthesizer for Python."
 readme = "README.md"
 license = { text = "MIT" }

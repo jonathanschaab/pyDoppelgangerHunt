@@ -73,6 +73,27 @@ def _unit_line_bounds(unit: Dict[str, Any]) -> Tuple[int, int]:
     return resolve_unit_line_bounds(unit)
 
 
+def _read_notebook_cell_lines(resolved_file: Path, cell_idx: int) -> List[str]:
+    """Reads newline-terminated source lines for a 0-indexed Jupyter notebook cell."""
+    try:
+        nb_data = json.loads(resolved_file.read_text(encoding="utf-8", errors="replace"))
+        cells = nb_data.get("cells", [])
+        if isinstance(cells, list) and 0 <= cell_idx < len(cells):
+            cell = cells[cell_idx]
+            if isinstance(cell, dict):
+                src = cell.get("source", [])
+                raw_lines = (
+                    src if isinstance(src, list) else split_source_lines(str(src))
+                )
+                return [
+                    str(ln) if str(ln).endswith("\n") else str(ln) + "\n"
+                    for ln in raw_lines
+                ]
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return []
+    return []
+
+
 def extract_unit_source_lines_with_state(
     unit: Dict[str, Any], repo_root: Optional[str] = None
 ) -> Tuple[List[str], SourceLinesOrigin]:
@@ -144,22 +165,7 @@ def extract_unit_source_lines_with_state(
                 is_cell_anchor = True
 
         if is_cell_anchor:
-            try:
-                nb_data = json.loads(resolved_file.read_text(encoding="utf-8", errors="replace"))
-                cells = nb_data.get("cells", [])
-                if 0 <= cell_idx < len(cells):
-                    cell = cells[cell_idx]
-                    src = cell.get("source", [])
-                    raw_lines = (
-                        src
-                        if isinstance(src, list)
-                        else split_source_lines(str(src))
-                    )
-                    all_lines = [l if l.endswith("\n") else l + "\n" for l in raw_lines]
-                else:
-                    all_lines = []
-            except (json.JSONDecodeError, ValueError):
-                all_lines = []
+            all_lines = _read_notebook_cell_lines(resolved_file, cell_idx)
         else:
             with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
                 all_lines = fh.readlines()
@@ -361,16 +367,24 @@ def resolve_cached_unit_source_and_tree(
         return None, None
 
     cache_key: Optional[str] = None
-    if file_cache is not None:
-        resolved_p = resolve_safe_unit_file_path(unit, repo_root=repo_root)
-        if resolved_p is not None:
-            anchor = raw_file.split("#", 1)[1] if "#" in raw_file else ""
-            cache_key = f"{resolved_p}#{anchor}" if anchor else str(resolved_p)
-            if cache_key in file_cache:
-                file_cache.move_to_end(cache_key)
-                return file_cache[cache_key]
+    resolved_p = resolve_safe_unit_file_path(unit, repo_root=repo_root)
+    if file_cache is not None and resolved_p is not None:
+        anchor = raw_file.split("#", 1)[1] if "#" in raw_file else ""
+        cache_key = f"{resolved_p}#{anchor}" if anchor else str(resolved_p)
+        if cache_key in file_cache:
+            file_cache.move_to_end(cache_key)
+            return file_cache[cache_key]
 
-    src_text = _load_unit_file_text(unit, repo_root=repo_root)
+    src_text: Optional[str]
+    if resolved_p is not None and resolved_p.suffix.lower() == ".ipynb" and "#" in raw_file:
+        parsed_nb = parse_notebook_cell_anchor(raw_file)
+        if parsed_nb is not None:
+            cell_lines = _read_notebook_cell_lines(resolved_p, parsed_nb[1])
+            src_text = "".join(cell_lines) if cell_lines else None
+        else:
+            src_text = None
+    else:
+        src_text = _load_unit_file_text(unit, repo_root=repo_root)
     parsed_tree: Optional[ast.AST] = None
     if isinstance(src_text, str) and src_text:
         try:
@@ -721,7 +735,7 @@ def format_sarif_report(
                 "tool": {
                     "driver": {
                         "name": "pyDoppelgangerHunt",
-                        "version": "1.0.0",
+                        "version": "2.0.0",
                         "informationUri": "https://github.com/jonathanschaab/pyDoppelgangerHunt",
                         "rules": [
                             {
@@ -777,7 +791,7 @@ def format_json_report(
     """Generates structured JSON representation of clone matches."""
     data: Dict[str, Any] = {
         "tool": "pyDoppelgangerHunt",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "target": target,
         "threshold": threshold,
         "clone_count": len(clones),
@@ -940,54 +954,104 @@ def generate_html_report(
     circumference = 282.74  # 2 * pi * 45
     dashoffset = circumference * (1.0 - (dry_score / 100.0))
 
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
+        _suppress_syntax_warnings,
+    )
+
     cards_html: List[str] = []
     file_cache: OrderedDict[str, Tuple[Optional[str], Optional[ast.AST]]] = OrderedDict()
-    with heuristic_ctx_manager_session():
+    with heuristic_ctx_manager_session(), _suppress_syntax_warnings():
         for idx, (sim, u1, u2) in enumerate(clones, 1):
-            src1, tree1 = resolve_cached_unit_source_and_tree(
-                u1, repo_root=effective_repo_root, file_cache=file_cache
-            )
-            src2, tree2 = resolve_cached_unit_source_and_tree(
-                u2, repo_root=effective_repo_root, file_cache=file_cache
-            )
-            u1_diff = (
-                {**u1, "source_text": src1}
-                if src1 is not None and "source_text" not in u1 and "source_lines" not in u1
-                else u1
-            )
-            u2_diff = (
-                {**u2, "source_text": src2}
-                if src2 is not None and "source_text" not in u2 and "source_lines" not in u2
-                else u2
-            )
-            diff_txt = generate_clone_diff(u1_diff, u2_diff, repo_root=effective_repo_root)
-            sug_txt = synthesize_refactoring_suggestion(
-                u1,
-                u2,
-                repo_root=effective_repo_root,
-                closure_strictness=closure_strictness,
-                skip_pre_unit_closures=skip_pre_unit_closures,
-                non_suppressing_ctx_managers=non_suppressing_ctx_managers,
-                source_text1=src1,
-                source_text2=src2,
-                tree1=tree1,
-                tree2=tree2,
-            )
+            try:
+                src1, tree1 = resolve_cached_unit_source_and_tree(
+                    u1, repo_root=effective_repo_root, file_cache=file_cache
+                )
+                src2, tree2 = resolve_cached_unit_source_and_tree(
+                    u2, repo_root=effective_repo_root, file_cache=file_cache
+                )
+                u1_diff = (
+                    {**u1, "source_text": src1}
+                    if src1 is not None
+                    and "source_text" not in u1
+                    and "source_lines" not in u1
+                    else u1
+                )
+                u2_diff = (
+                    {**u2, "source_text": src2}
+                    if src2 is not None
+                    and "source_text" not in u2
+                    and "source_lines" not in u2
+                    else u2
+                )
+                diff_txt = generate_clone_diff(
+                    u1_diff, u2_diff, repo_root=effective_repo_root
+                )
+                sug_txt = synthesize_refactoring_suggestion(
+                    u1,
+                    u2,
+                    repo_root=effective_repo_root,
+                    closure_strictness=closure_strictness,
+                    skip_pre_unit_closures=skip_pre_unit_closures,
+                    non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+                    source_text1=src1,
+                    source_text2=src2,
+                    tree1=tree1,
+                    tree2=tree2,
+                )
+                f1_norm = normalize_path_string(
+                    str(u1.get("file") or ""), strip_anchor=False
+                )
+                f2_norm = normalize_path_string(
+                    str(u2.get("file") or ""), strip_anchor=False
+                )
+                s1, e1 = _unit_line_bounds(u1)
+                s2, e2 = _unit_line_bounds(u2)
+                n1 = str(u1.get("name") or "unit1")
+                n2 = str(u2.get("name") or "unit2")
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                logger.warning(
+                    "Failed to render HTML card for clone pair #%d",
+                    idx,
+                    exc_info=True,
+                )
+                n1 = (
+                    str(u1.get("name") or "unit1")
+                    if isinstance(u1, dict)
+                    else "unit1"
+                )
+                n2 = (
+                    str(u2.get("name") or "unit2")
+                    if isinstance(u2, dict)
+                    else "unit2"
+                )
+                f1_norm = (
+                    normalize_path_string(
+                        str(u1.get("file") or ""), strip_anchor=False
+                    )
+                    if isinstance(u1, dict)
+                    else ""
+                )
+                f2_norm = (
+                    normalize_path_string(
+                        str(u2.get("file") or ""), strip_anchor=False
+                    )
+                    if isinstance(u2, dict)
+                    else ""
+                )
+                s1, e1, s2, e2 = 1, 1, 1, 1
+                diag = f"Diagnostic: pair rendering failed ({type(exc).__name__}: {exc})"
+                diff_txt = f"# {diag}"
+                sug_txt = f"[REFACTOR SUGGESTION] {diag}"
             diff_block = (
-                f"<pre class='diff'><code>{html.escape(diff_txt)}</code></pre>" if diff_txt else "<em>No textual diff</em>"
+                f"<pre class='diff'><code>{html.escape(diff_txt)}</code></pre>"
+                if diff_txt
+                else "<em>No textual diff</em>"
             )
             sug_block = (
                 f"<div class='sug'><strong>Refactoring Suggestion:</strong><pre><code>{html.escape(sug_txt)}</code></pre></div>"
                 if sug_txt
                 else ""
             )
-
-            f1_norm = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
-            f2_norm = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
-            s1, e1 = _unit_line_bounds(u1)
-            s2, e2 = _unit_line_bounds(u2)
-            n1 = str(u1.get("name") or "unit1")
-            n2 = str(u2.get("name") or "unit2")
 
             f1_esc = html.escape(f1_norm)
             f2_esc = html.escape(f2_norm)
@@ -1184,7 +1248,7 @@ def generate_html_report(
     <div class="container">
         <header>
             <h1>pyDoppelgangerHunt Audit Report</h1>
-            <div class="meta">Target: <code>{target_esc}</code> | Similarity Threshold: {threshold:.0%} | Generated by pyDoppelgangerHunt v1.0.0</div>
+            <div class="meta">Target: <code>{target_esc}</code> | Similarity Threshold: {threshold:.0%} | Generated by pyDoppelgangerHunt v2.0.0</div>
         </header>
 
         <div class="grid-stats">

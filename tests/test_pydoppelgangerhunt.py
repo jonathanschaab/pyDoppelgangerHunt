@@ -74,7 +74,7 @@ from pydoppelgangerhunt.reporters import (
 
 def test_package_metadata_and_exports() -> None:
     """Verify package exports and metadata."""
-    assert pydoppelgangerhunt.__version__ == "1.0.0"
+    assert pydoppelgangerhunt.__version__ == "2.0.0"
     assert callable(pydoppelgangerhunt.main)
     assert callable(pydoppelgangerhunt.scan_target)
     assert callable(pydoppelgangerhunt.cluster_clone_families)

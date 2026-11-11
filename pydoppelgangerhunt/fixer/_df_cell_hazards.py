@@ -1258,12 +1258,12 @@ def _unit_has_global_mutating_call(
     protocol hook (``__setattr__``, ``__setitem__``, ``__iadd__``, etc.),
     class-body descriptor hook (``__set_name__`` invoked by ``type.__new__``),
     context-manager protocol hook (``with`` / ``async with``), coroutine/generator
-    suspension point (``await``, ``yield``, ``yield from``, ``async for``), or
-    deletion (``del``) executed during the unit could mutate the module-level
-    global mid-execution, causing subsequent reads inside the helper to observe
-    the stale parameter rather than the updated global. Deferred bodies of nested
-    functions and lambdas are not traversed here (their headers are traversed, and
-    any direct calls or closure escapes are handled separately).
+    suspension point (``await``, ``yield``, ``yield from``, ``async for``, or async
+    comprehensions), or deletion (``del``) executed during the unit could mutate the
+    module-level global mid-execution, causing subsequent reads inside the helper to
+    observe the stale parameter rather than the updated global. Deferred bodies of
+    nested functions and lambdas are not traversed here (their headers are traversed,
+    and any direct calls or closure escapes are handled separately).
 
     In ``strict`` mode (``allow_heuristic_builtins=True``), both
     ``_PROVEN_PURE_GLOBAL_SAFE_BUILTINS`` and ``_HEURISTIC_GLOBAL_SAFE_BUILTINS``
@@ -1343,6 +1343,8 @@ def _unit_has_global_mutating_call(
     )
     for node in immediate_nodes:
         if isinstance(node, _IMMEDIATE_GLOBAL_HAZARD_NODES):
+            return True
+        if isinstance(node, ast.comprehension) and bool(node.is_async):
             return True
         if isinstance(node, ast.AugAssign):
             if not (

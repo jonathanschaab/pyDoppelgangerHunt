@@ -2504,11 +2504,12 @@ def test_multi_item_with_heuristic_telemetry_and_overflow_summary(
     for idx in range(_MAX_HEURISTIC_CTX_MANAGERS + 5):
         record_heuristic_non_suppressing_ctx_manager(f"CustomMgr_{idx:04d}")
     caplog.clear()
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.INFO):
         retained = log_heuristic_ctx_manager_summary()
     assert len(retained) == _MAX_HEURISTIC_CTX_MANAGERS
     assert any(
-        f"Summary: {_MAX_HEURISTIC_CTX_MANAGERS} unproven context manager(s)"
+        rec.levelno == logging.INFO
+        and f"Summary: {_MAX_HEURISTIC_CTX_MANAGERS} unproven context manager(s)"
         in rec.message
         and "5 additional occurrence(s) omitted beyond cap" in rec.message
         for rec in caplog.records
@@ -2659,7 +2660,7 @@ def test_pathlib_path_and_uncalled_factories_not_classified_as_non_suppressing(
         "forgiving()",
         "squelch()",
         "quench()",
-        "masked()",
+        "mask_errors()",
         "no_op()",
         "stack.enter_async_context(cm)",
     ],
@@ -2838,3 +2839,87 @@ def test_lambda_body_walrus_excluded_while_lambda_default_walrus_binds() -> None
     assert "fn" in defs_default
     assert "eager_default" in defs_default
     assert "eager_default" not in conds_default
+
+
+@pytest.mark.parametrize(
+    "benign_mgr",
+    [
+        "masked_array()",
+        "MaskedArray()",
+        "commute()",
+        "CommuteSession()",
+        "Mutex()",
+        "AsyncMutex()",
+        "bootstrap()",
+        "BootstrapContext()",
+        "tolerance_ctx()",
+        "FloatTolerance()",
+        "batch_ctx()",
+        "dispatch_scope()",
+    ],
+)
+def test_suspicious_suppress_token_boundary_avoids_substring_false_positives(
+    benign_mgr: str,
+) -> None:
+    """Verifies snake_case and CamelCase token boundaries prevent substring false positives on unrelated identifiers."""
+    src = (
+        "def work(compute):\n"
+        f"    with {benign_mgr}:\n"
+        "        result = compute()\n"
+        "    cb = lambda: result\n"
+        "    return cb()\n"
+    )
+    sc = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 4,
+            "kind": "basic_block",
+            "source_text": src,
+            "source_code": "    cb = lambda: result\n",
+            "closure_strictness": "strict",
+        },
+        tree=ast.parse(src),
+    )
+    assert sc["is_control_flow_safe"] is True, benign_mgr
+    assert "severed_closure_cell" not in sc["control_flow_hazards"], benign_mgr
+
+
+@pytest.mark.parametrize(
+    "suspicious_mgr",
+    [
+        "mask_errors()",
+        "ErrorMute()",
+        "CancelScope()",
+        "tolerate_errors()",
+        "ErrorTolerant()",
+        "MoveOnAfter()",
+        "SUPPRESS_ERRORS()",
+        "HTTPFallbackGuard()",
+        "TrapExceptions()",
+        "SkipOnError()",
+    ],
+)
+def test_suspicious_suppress_token_boundary_matches_snake_and_camel_case_suppressors(
+    suspicious_mgr: str,
+) -> None:
+    """Verifies snake_case, CamelCase, UPPER_SNAKE, and compound suppressor tokens are flagged in strict mode."""
+    src = (
+        "def work(compute):\n"
+        f"    with {suspicious_mgr}:\n"
+        "        result = compute()\n"
+        "    cb = lambda: result\n"
+        "    return cb()\n"
+    )
+    sc = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 4,
+            "kind": "basic_block",
+            "source_text": src,
+            "source_code": "    cb = lambda: result\n",
+            "closure_strictness": "strict",
+        },
+        tree=ast.parse(src),
+    )
+    assert sc["is_control_flow_safe"] is False, suspicious_mgr
+    assert "severed_closure_cell" in sc["control_flow_hazards"], suspicious_mgr

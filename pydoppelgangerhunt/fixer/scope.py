@@ -27,6 +27,7 @@ from pydoppelgangerhunt.config import (
     normalize_non_suppressing_ctx_managers,
     resolve_pair_closure_flags,
     resolve_unit_closure_flags,
+    should_warn_closure_event,
 )
 from pydoppelgangerhunt.fixer._ast_compat import (
     is_match_as_node,
@@ -1990,25 +1991,7 @@ def _has_out_of_bounds_unit_cols(
     )
     if s_in_bounds and e_in_bounds and order_ok:
         return False
-    if is_pre_sliced and not unit_code_lines[0][:1].isspace():
-        if len(unit_code_lines) == 1:
-            if (
-                raw_s_col is not None
-                and raw_e_col is not None
-                and 0 < raw_s_col < raw_e_col
-                and first_b == raw_e_col - raw_s_col
-            ) or (
-                "source_lines" not in unit
-                and raw_e_col is None
-                and _is_valid_eval_expr(unit_code_lines[0])
-            ):
-                return False
-        elif (
-            raw_e_col is not None
-            and last_b == raw_e_col
-            and _is_valid_eval_expr("".join(unit_code_lines))
-        ):
-            return False
+    del is_pre_sliced
     return True
 
 
@@ -2029,7 +2012,7 @@ def _inspect_unit_scope(
     unit_code_lines, line_origin = extract_unit_source_lines_with_state(
         unit, repo_root=repo_root
     )
-    is_pre_sliced = line_origin.is_pre_sliced or line_origin.is_placeholder
+    is_pre_sliced = line_origin.is_pre_sliced
     is_placeholder_origin = line_origin.is_placeholder
     explicit_col_sliced = bool(unit.get("source_lines_is_col_sliced"))
     col_bounds_invalid = _has_out_of_bounds_unit_cols(
@@ -2044,13 +2027,8 @@ def _inspect_unit_scope(
         if isinstance(unit.get("source_code"), str)
         else ""
     )
-    has_backing_source_spec = any(
-        unit.get(k) is not None
-        for k in ("file", "source_text", "file_source", "source_lines")
-    )
     is_placeholder_source = not src_code_str and (
-        is_placeholder_origin
-        or (not unit_code_lines and has_backing_source_spec)
+        is_placeholder_origin or not unit_code_lines
     )
     inferred_s_col, inferred_e_col = _unit_cols(
         unit, None if is_placeholder_origin else unit_code_lines
@@ -2262,7 +2240,7 @@ def _inspect_unit_scope(
             "control_flow_hazards": ["stale_source_code"],
             "is_control_flow_safe": False,
         }
-    if is_placeholder_source and (file_tree is None or has_backing_source_spec):
+    if is_placeholder_source:
         unit_kind_str = str(unit.get("kind") or "")
         placeholder_hazards = (
             ["severed_closure_cell", "unavailable_source_placeholder"]
@@ -3212,6 +3190,7 @@ def _inspect_unit_scope(
         }
 
 
+@_suppress_syntax_warnings()
 def inspect_single_unit_scope(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
@@ -3365,10 +3344,13 @@ def ensure_unit_scope_closure_mode(
     the backing module source/AST, or fail closed when backing source is unavailable.
 
     Note:
-        Scopes that already record terminal ``"pathological_ast"`` or ``"stale_source_code"``
-        in ``control_flow_hazards`` are returned directly without re-parsing or mutating
-        the terminal hazard dict, as they are unconditionally rejected downstream regardless
-        of closure mode.
+        Scopes that already record terminal ``"pathological_ast"``,
+        ``"stale_source_code"``, or ``"invalid_unit_columns"`` in
+        ``control_flow_hazards`` are returned directly without re-parsing or mutating
+        the terminal hazard dict, as they are unconditionally rejected downstream
+        regardless of closure mode. When a caller-supplied ``scope`` (or
+        ``unit["scope"]``) is discarded due to a missing schema stamp or mode mismatch,
+        a once-per-run ``WARNING`` is emitted.
     """
     eff_skip = bool(skip_pre_unit_closures)
     if eff_skip:
@@ -3381,15 +3363,20 @@ def ensure_unit_scope_closure_mode(
         non_suppressing_ctx_managers,
         unit.get("non_suppressing_ctx_managers"),
     )
-    if scope is not None and (
+    eff_scope: Optional[Dict[str, Any]] = (
+        scope
+        if scope is not None
+        else (unit.get("scope") if isinstance(unit.get("scope"), dict) else None)
+    )
+    if eff_scope is not None and (
         scope_matches_closure_mode(
-            scope,
+            eff_scope,
             eff_skip,
             strict_with_suppression=eff_strict_with,
             non_suppressing_ctx_managers=eff_non_sup,
         )
         or any(
-            h in scope.get("control_flow_hazards", ())
+            h in eff_scope.get("control_flow_hazards", ())
             for h in (
                 "pathological_ast",
                 "stale_source_code",
@@ -3397,18 +3384,30 @@ def ensure_unit_scope_closure_mode(
             )
         )
     ):
-        return scope
+        return eff_scope
     u_copy = {
         **unit,
         "skip_pre_unit_closures": eff_skip,
         "strict_with_suppression": eff_strict_with,
     }
     u_copy.pop("closure_strictness", None)
+    u_copy.pop("scope", None)
     if eff_non_sup or "non_suppressing_ctx_managers" in u_copy:
         u_copy["non_suppressing_ctx_managers"] = list(eff_non_sup)
     if source_text is not None and not str(u_copy.get("source_text") or "").strip():
         u_copy["source_text"] = source_text
-    if scope is not None:
+    if eff_scope is not None:
+        if should_warn_closure_event("precomputed_scope_discarded"):
+            discard_reason = (
+                f"missing scope_schema_version={SCOPE_SCHEMA_VERSION}"
+                if eff_scope.get("scope_schema_version") != SCOPE_SCHEMA_VERSION
+                else "closure mode or allowlist mismatch"
+            )
+            logger.warning(
+                "Discarding caller-supplied precomputed scope (%s) and recomputing "
+                "from source (further occurrences suppressed for this run)",
+                discard_reason,
+            )
         src_text_val = u_copy.get("source_text")
         file_src_val = u_copy.get("file_source")
         src_code_val = u_copy.get("source_code")
@@ -3459,16 +3458,16 @@ def ensure_unit_scope_closure_mode(
                 "and backing source is unavailable; failing closed",
                 unit.get("name"),
             )
-            hazards = list(scope.get("control_flow_hazards", ()))
+            hazards = list(eff_scope.get("control_flow_hazards", ()))
             if "unavailable_source_for_closure_mode" not in hazards:
                 hazards.append("unavailable_source_for_closure_mode")
             if "severed_closure_cell" not in hazards:
                 hazards.append("severed_closure_cell")
-            reasons = list(scope.get("closure_hazard_reasons", ()))
+            reasons = list(eff_scope.get("closure_hazard_reasons", ()))
             if "unavailable_source_for_closure_mode" not in reasons:
                 reasons.append("unavailable_source_for_closure_mode")
             return {
-                **scope,
+                **eff_scope,
                 "control_flow_hazards": hazards,
                 "closure_hazard_reasons": reasons,
                 "is_control_flow_safe": False,
@@ -3477,7 +3476,7 @@ def ensure_unit_scope_closure_mode(
                 "strict_with_suppression": eff_strict_with,
                 "non_suppressing_ctx_managers": list(eff_non_sup),
                 "heuristic_ctx_managers": list(
-                    scope.get("heuristic_ctx_managers", ())
+                    eff_scope.get("heuristic_ctx_managers", ())
                 ),
             }
         logger.debug(

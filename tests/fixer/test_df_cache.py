@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from pathlib import Path
 import threading
 from types import MappingProxyType
 from typing import Any
@@ -2417,3 +2418,233 @@ def test_span_line_index_has_closure_overlap_bisect_and_missing_end_fallback() -
     synth_idx = _get_span_line_index(synth_fn)
     assert synth_idx.has_closure_overlap(2, 4).has_missing_end is False
     assert synth_idx.has_closure_overlap(5, 8).has_missing_end is True
+
+
+def test_oversized_ast_get_scope_parent_map_single_build_and_detached_gc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies oversized module parent map builds once across all _get_scope_parent_map callers and allows GC."""
+    import gc
+    import weakref
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+    from pydoppelgangerhunt.fixer._df_closures import (
+        _collect_scope_closures_uncached,
+        _resolve_enclosing_scopes_by_coords,
+    )
+    from pydoppelgangerhunt.fixer.scope import (
+        _unit_source_code_matches_tree,
+        inspect_single_unit_scope,
+    )
+
+    clear_dataflow_cache()
+    monkeypatch.setattr(df_cache_mod, "_MAX_PARENT_MAP_TOTAL_NODES", 6)
+    orig_build = df_cache_mod._build_parent_map_unlocked
+    root_builds: list[ast.AST] = []
+
+    def _counting_build(node: ast.AST) -> dict[ast.AST, ast.AST]:
+        root_builds.append(node)
+        return orig_build(node)
+
+    monkeypatch.setattr(df_cache_mod, "_build_parent_map_unlocked", _counting_build)
+    src = (
+        "def big_outer(items):\n"
+        "    scale = 2\n"
+        "    cb = lambda v: v * scale\n"
+        "    out = [cb(x) for x in items]\n"
+        "    extra = len(out) + 1\n"
+        "    return out, extra\n"
+    )
+    mod = ast.parse(src)
+    fn_node = mod.body[0]
+    assert isinstance(fn_node, ast.FunctionDef)
+
+    for _ in range(3):
+        pmap_mod = df_cache_mod._get_scope_parent_map(mod)
+        pmap_fn = df_cache_mod._get_scope_parent_map(fn_node)
+        assert pmap_mod.get(fn_node) is mod
+        assert pmap_fn.get(fn_node.body[0]) is fn_node
+        _collect_scope_closures_uncached(mod)
+        _resolve_enclosing_scopes_by_coords(fn_node, mod)
+        assert _unit_source_code_matches_tree(
+            {"start": 4, "end": 4, "kind": "basic_block"},
+            "    out = [cb(x) for x in items]\n",
+            mod,
+        )
+        sc = inspect_single_unit_scope(
+            {
+                "start": 4,
+                "end": 4,
+                "kind": "basic_block",
+                "source_text": src,
+                "source_code": "    out = [cb(x) for x in items]\n",
+            },
+            tree=mod,
+        )
+        assert sc["is_control_flow_safe"] is True
+
+    assert root_builds.count(mod) == 1
+
+    # Verify _WeakParentMap does not retain detached AST child nodes while the oversized root stays cached
+    mod_detach = ast.parse(src)
+    fn_detach = mod_detach.body[0]
+    assert isinstance(fn_detach, ast.FunctionDef)
+    ephem_stmt = ast.parse("temp_detached = 1\n").body[0]
+    fn_detach.body.insert(0, ephem_stmt)
+    pmap_detach = df_cache_mod._get_scope_parent_map(mod_detach)
+    assert pmap_detach.get(ephem_stmt) is fn_detach
+    detached = fn_detach.body.pop(0)
+    detached_ref = weakref.ref(detached)
+    del ephem_stmt, detached
+    gc.collect()
+    assert detached_ref() is None
+
+
+class TestProductionAstImmutabilityMode:
+    """Exercises production AST immutability fingerprinting with _debug_ast_immutability disabled."""
+
+    def test_production_mode_detects_statement_interval_mutation_past_bfs_prefix(self) -> None:
+        """Verifies production fingerprinting hashes all body statement intervals past the 512-node BFS cap."""
+        import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+        from pydoppelgangerhunt.fixer._df_span_index import _get_span_line_index
+
+        clear_dataflow_cache()
+        # Each statement has ~15 AST nodes; 50 statements exceed the 512-node production BFS prefix,
+        # and statement index 43 is also non-aligned with 32-stride sampling.
+        lines = [f"v_{idx} = (a + {idx}) * (b + {idx}) + (c - {idx})\n" for idx in range(50)]
+        mod = ast.parse("".join(lines))
+        assert sum(1 for _ in ast.walk(mod)) > df_cache_mod._MAX_PROD_FINGERPRINT_NODES
+
+        prev_debug = df_cache_mod._debug_ast_immutability[0]
+        df_cache_mod._debug_ast_immutability[0] = False
+        try:
+            idx_before = _get_span_line_index(mod)
+            assert 44 in idx_before.stmts_by_start_line
+
+            target_stmt = mod.body[43]
+            target_stmt.lineno = 950
+            target_stmt.end_lineno = 950
+
+            # In production mode, mutation of immediate statement intervals silently evicts and rebuilds
+            idx_after = _get_span_line_index(mod)
+            assert idx_after is not idx_before
+            assert 950 in idx_after.stmts_by_start_line
+        finally:
+            df_cache_mod._debug_ast_immutability[0] = prev_debug
+
+    def test_production_mode_deep_expr_mutation_requires_evict_tree_scopes(self) -> None:
+        """Verifies evict_tree_scopes refreshes caches when a deep constant beyond the 512-node prefix is mutated."""
+        import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+        from pydoppelgangerhunt.fixer._df_span_index import _get_span_line_index
+        from pydoppelgangerhunt.fixer import evict_tree_scopes
+
+        clear_dataflow_cache()
+        lines = [f"v_{idx} = (a + {idx}) * (b + {idx}) + (c - {idx})\n" for idx in range(50)]
+        mod = ast.parse("".join(lines))
+
+        prev_debug = df_cache_mod._debug_ast_immutability[0]
+        df_cache_mod._debug_ast_immutability[0] = False
+        try:
+            idx_cached = _get_span_line_index(mod)
+            tail_assign = mod.body[48]
+            assert isinstance(tail_assign, ast.Assign)
+            assert isinstance(tail_assign.value, ast.BinOp)
+            assert isinstance(tail_assign.value.right, ast.BinOp)
+            tail_assign.value.right.right = ast.Constant(value=999999, lineno=49, col_offset=30)
+
+            evict_tree_scopes(mod)
+            idx_refreshed = _get_span_line_index(mod)
+            assert idx_refreshed is not idx_cached
+        finally:
+            df_cache_mod._debug_ast_immutability[0] = prev_debug
+
+
+def test_tree_raw_source_cache_weakref_and_lru_eviction_releases_trees() -> None:
+    """Verifies caller-supplied AST trees and raw source strings are not pinned by _tree_raw_source_cache."""
+    import gc
+    import weakref
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+    from pydoppelgangerhunt.fixer import evict_tree_scopes
+    from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope
+
+    class _TrackableSourceStr(str):
+        """Weakly-referenceable str subclass to verify raw source text is not retained."""
+
+    clear_dataflow_cache()
+
+    # 1. Raw source string is never retained by _tree_raw_source_cache even while tree remains cached
+    tracked_src = _TrackableSourceStr("def tracked_fn(x):\n    y = x + 99\n    return y\n")
+    src_ref = weakref.ref(tracked_src)
+    pinned_tree = ast.parse(tracked_src)
+    pinned_tree_ref = weakref.ref(pinned_tree)
+    inspect_single_unit_scope(
+        {"start": 2, "end": 2, "kind": "basic_block", "source_text": tracked_src},
+        tree=pinned_tree,
+    )
+    del tracked_src
+    gc.collect()
+    assert src_ref() is None
+    assert pinned_tree in df_cache_mod._tree_raw_source_cache
+
+    evict_tree_scopes(pinned_tree)
+    assert pinned_tree not in df_cache_mod._tree_raw_source_cache
+    del pinned_tree
+    gc.collect()
+    assert pinned_tree_ref() is None
+
+    # 2. LRU eviction of tree_source_lines pops _tree_raw_source_cache and releases unreferenced trees
+    clear_dataflow_cache()
+    cap = df_cache_mod._SCOPE_CACHE_KIND_CAPS["tree_source_lines"]
+    reg_refs: list[weakref.ReferenceType[ast.Module]] = []
+    for idx in range(cap + 16):
+        src = f"def fn_{idx}(x):\n    y = x + {idx}\n    return y\n"
+        caller_tree = ast.parse(src)
+        reg_refs.append(weakref.ref(caller_tree))
+        df_cache_mod._register_tree_source_lines(caller_tree, src)
+        del caller_tree
+
+    gc.collect()
+    assert reg_refs[0]() is None
+    assert len(df_cache_mod._tree_raw_source_cache) <= cap
+
+
+def test_batch_entrypoints_outer_syntax_warning_guard_preserves_warning_registry(
+    tmp_path: Path,
+) -> None:
+    """Verifies batch scope/synthesis/patch entrypoints preserve warnings.filters and unrelated __warningregistry__."""
+    import warnings
+    from pydoppelgangerhunt.fixer import (
+        generate_refactoring_patch,
+        inspect_single_unit_scope,
+        synthesize_shared_helper_code,
+    )
+
+    src = (
+        "def alpha(x):\n"
+        "    val = x + 1\n"
+        "    return val * 2\n\n"
+        "def beta(x):\n"
+        "    val = x + 1\n"
+        "    return val * 2\n"
+    )
+    mod_file = tmp_path / "batch_warn.py"
+    mod_file.write_text(src, encoding="utf-8")
+    u1 = {"name": "alpha", "file": str(mod_file), "start": 1, "end": 3, "kind": "function"}
+    u2 = {"name": "beta", "file": str(mod_file), "start": 5, "end": 7, "kind": "function"}
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("default")
+        pre_filters = list(warnings.filters)
+        sentinel_reg: dict[Any, int] = {("external warning", UserWarning, 10): 1}
+        globals()["__warningregistry__"] = sentinel_reg
+        try:
+            inspect_single_unit_scope(u1, repo_root=str(tmp_path))
+            helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+            patch = generate_refactoring_patch(
+                [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+            )
+            assert "def _shared_" in helper
+            assert "def _shared_" in patch
+            assert list(warnings.filters) == pre_filters
+            assert sentinel_reg == {("external warning", UserWarning, 10): 1}
+        finally:
+            globals().pop("__warningregistry__", None)

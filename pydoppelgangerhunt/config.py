@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Set as AbstractSet
 import contextlib
+from dataclasses import dataclass, field
 import itertools
 import logging
 import os
@@ -24,7 +25,6 @@ from typing import (
     Tuple,
     Union,
 )
-import weakref
 
 from pydoppelgangerhunt.canonical_path import (
     normalize_lexical_posix,
@@ -36,125 +36,62 @@ logger = logging.getLogger(__name__)
 _warned_closure_lock: threading.Lock = threading.Lock()
 _MAX_WARNED_CLOSURE_EVENTS: int = 4096
 _MAX_HEURISTIC_CTX_MANAGERS: int = 16384
-_MAX_OVERFLOW_SEQ_EVENTS: int = 1024
-_MAX_REGISTERED_THREAD_STATES: int = 1024
+_MAX_DEFAULT_THREAD_BUCKETS: int = 256
 _warned_closure_strictness_values: OrderedDict[str, None] = OrderedDict()
-_heuristic_reset_epoch: List[int] = [0]
-_heuristic_record_seq = itertools.count(1)
+_next_heuristic_session_id = itertools.count(1)
 _heuristic_collector_tls: threading.local = threading.local()
-_next_thread_state_prune_threshold: List[int] = [_MAX_REGISTERED_THREAD_STATES]
-_retired_worker_name_seqs: Dict[str, int] = {}
-_retired_worker_overflow_events: List[List[int]] = []
 
 
-def _record_into_name_seqs(
-    name_seqs: Dict[str, int],
-    overflow_events: List[List[int]],
-    mgr_name: str,
-    seq: int,
-    count: int = 1,
-) -> None:
-    """Inserts or updates mgr_name's latest sequence number, recording bounded overflow events past cap."""
-    prev_seq = name_seqs.get(mgr_name)
-    if prev_seq is not None:
-        if seq > prev_seq:
-            name_seqs[mgr_name] = seq
-        return
-    if len(name_seqs) < _MAX_HEURISTIC_CTX_MANAGERS:
-        name_seqs[mgr_name] = seq
-        return
-    if len(overflow_events) >= _MAX_OVERFLOW_SEQ_EVENTS:
-        overflow_events[-1][0] = max(overflow_events[-1][0], seq)
-        overflow_events[-1][1] += count
-    else:
-        overflow_events.append([seq, count])
+@dataclass
+class _HeuristicSessionBucket:
+    """Bounded accumulator for unproven context managers recorded in a session or thread."""
+
+    names: Set[str] = field(default_factory=set)
+    overflow_count: int = 0
+    defer_depth: int = 0
+    warn_on_summary: bool = False
+
+    def add(self, mgr_name: str) -> None:
+        """Records mgr_name up to _MAX_HEURISTIC_CTX_MANAGERS, counting overflow occurrences beyond cap."""
+        if mgr_name in self.names:
+            return
+        if len(self.names) < _MAX_HEURISTIC_CTX_MANAGERS:
+            self.names.add(mgr_name)
+        else:
+            self.overflow_count += 1
 
 
-class _ThreadHeuristicState:
-    """Per-thread lock-isolated heuristic context-manager accumulator."""
-
-    __slots__ = (
-        "defer_depth",
-        "epoch",
-        "lock",
-        "name_seqs",
-        "overflow_events",
-        "session_depth",
-        "session_start_seq",
-        "thread_ref",
-    )
-
-    def __init__(self, epoch: int, defer_depth: int = 0, session_depth: int = 0) -> None:
-        self.name_seqs: Dict[str, int] = {}
-        self.overflow_events: List[List[int]] = []
-        self.defer_depth: List[int] = [defer_depth]
-        self.session_depth: int = session_depth
-        self.session_start_seq: int = 0
-        self.epoch: int = epoch
-        self.thread_ref: weakref.ReferenceType[threading.Thread] = weakref.ref(
-            threading.current_thread()
-        )
-        self.lock: threading.Lock = threading.Lock()
-
-    def is_thread_alive(self) -> bool:
-        """Returns True if the owning thread object is still alive."""
-        owner = self.thread_ref()
-        return owner is not None and owner.is_alive()
+_active_heuristic_sessions: Dict[int, _HeuristicSessionBucket] = {}
+_default_thread_buckets: OrderedDict[int, _HeuristicSessionBucket] = OrderedDict()
 
 
-_registered_thread_states: List[_ThreadHeuristicState] = []
+def _get_current_session_stack() -> List[int]:
+    """Returns the thread-local stack of active heuristic session IDs."""
+    stack: Optional[List[int]] = getattr(_heuristic_collector_tls, "session_stack", None)
+    if stack is None:
+        stack = []
+        _heuristic_collector_tls.session_stack = stack
+    return stack
 
 
-def _prune_dead_thread_states_locked(current_epoch: int) -> None:
-    """Prunes exited thread states under _warned_closure_lock while folding unharvested records."""
-    kept: List[_ThreadHeuristicState] = []
-    for s in _registered_thread_states:
-        if s.epoch != current_epoch:
-            continue
-        if s.is_thread_alive() or s.session_depth > 0 or s.defer_depth[0] > 0:
-            kept.append(s)
-            continue
-        with s.lock:
-            if s.session_depth > 0 or s.defer_depth[0] > 0:
-                kept.append(s)
-                continue
-            for mgr_name, seq in s.name_seqs.items():
-                _record_into_name_seqs(
-                    _retired_worker_name_seqs,
-                    _retired_worker_overflow_events,
-                    mgr_name,
-                    seq,
-                )
-            for ov_seq, ov_cnt in s.overflow_events:
-                if len(_retired_worker_overflow_events) >= _MAX_OVERFLOW_SEQ_EVENTS:
-                    _retired_worker_overflow_events[-1][0] = max(
-                        _retired_worker_overflow_events[-1][0], ov_seq
-                    )
-                    _retired_worker_overflow_events[-1][1] += ov_cnt
-                else:
-                    _retired_worker_overflow_events.append([ov_seq, ov_cnt])
-            s.name_seqs.clear()
-            s.overflow_events.clear()
-    _registered_thread_states[:] = kept
-    _next_thread_state_prune_threshold[0] = max(
-        _MAX_REGISTERED_THREAD_STATES, len(kept) * 2
-    )
-
-
-def _get_thread_heuristic_state_obj() -> _ThreadHeuristicState:
-    """Returns the current thread's _ThreadHeuristicState without taking the global lock on hits."""
-    current_epoch = _heuristic_reset_epoch[0]
-    state: Optional[_ThreadHeuristicState] = getattr(
-        _heuristic_collector_tls, "state", None
-    )
-    if state is None or state.epoch != current_epoch:
-        state = _ThreadHeuristicState(epoch=current_epoch)
-        _heuristic_collector_tls.state = state
-        with _warned_closure_lock:
-            if len(_registered_thread_states) >= _next_thread_state_prune_threshold[0]:
-                _prune_dead_thread_states_locked(current_epoch)
-            _registered_thread_states.append(state)
-    return state
+def _get_or_create_thread_bucket_locked() -> _HeuristicSessionBucket:
+    """Returns the active session bucket for the current thread or a bounded per-thread fallback bucket."""
+    sess_stack = _get_current_session_stack()
+    if sess_stack:
+        sid = sess_stack[-1]
+        active = _active_heuristic_sessions.get(sid)
+        if active is not None:
+            return active
+    tid = threading.get_ident()
+    bucket = _default_thread_buckets.get(tid)
+    if bucket is not None:
+        _default_thread_buckets.move_to_end(tid)
+        return bucket
+    bucket = _HeuristicSessionBucket()
+    _default_thread_buckets[tid] = bucket
+    while len(_default_thread_buckets) > _MAX_DEFAULT_THREAD_BUCKETS:
+        _default_thread_buckets.popitem(last=False)
+    return bucket
 
 
 _CONFIG_KEY_NAMES: Tuple[str, ...] = (
@@ -234,26 +171,33 @@ def collect_heuristic_ctx_managers() -> Iterator[Set[str]]:
 
 
 def record_heuristic_non_suppressing_ctx_manager(mgr_name: str) -> None:
-    """Records an unproven context manager accepted by the strict-mode name heuristic without global locking."""
+    """Records an unproven context manager accepted by the strict-mode name heuristic."""
     stack: Optional[List[Set[str]]] = getattr(_heuristic_collector_tls, "stack", None)
     if stack:
         for bucket in stack:
             bucket.add(mgr_name)
-    state = _get_thread_heuristic_state_obj()
-    seq = next(_heuristic_record_seq)
-    with state.lock:
-        _record_into_name_seqs(state.name_seqs, state.overflow_events, mgr_name, seq)
+    with _warned_closure_lock:
+        sess_stack = _get_current_session_stack()
+        if sess_stack:
+            sid = sess_stack[-1]
+            sess_bucket = _active_heuristic_sessions.get(sid)
+            if sess_bucket is not None:
+                sess_bucket.add(mgr_name)
+                return
+        if _active_heuristic_sessions:
+            for active_bucket in _active_heuristic_sessions.values():
+                active_bucket.add(mgr_name)
+            return
+        _get_or_create_thread_bucket_locked().add(mgr_name)
 
 
 def peek_heuristic_non_suppressing_ctx_managers() -> Tuple[str, ...]:
-    """Returns sorted unproven context managers recorded on the current thread since last reset without clearing."""
-    state = _get_thread_heuristic_state_obj()
-    if state.session_depth > 0:
-        _harvest_worker_heuristic_states(state, state.session_start_seq)
-    with state.lock:
-        if not state.name_seqs:
+    """Returns sorted unproven context managers recorded in the active session or current thread without clearing."""
+    with _warned_closure_lock:
+        bucket = _get_or_create_thread_bucket_locked()
+        if not bucket.names:
             return ()
-        return tuple(sorted(state.name_seqs))
+        return tuple(sorted(bucket.names))
 
 
 def format_heuristic_ctx_manager_comment(names: Sequence[str]) -> str:
@@ -272,130 +216,89 @@ def format_heuristic_ctx_manager_comment(names: Sequence[str]) -> str:
 
 @contextlib.contextmanager
 def defer_heuristic_ctx_manager_summary() -> Iterator[None]:
-    """Defers mid-run log_heuristic_ctx_manager_summary() draining on the current thread until an outer boundary."""
-    state = _get_thread_heuristic_state_obj()
-    state.defer_depth[0] += 1
+    """Defers mid-run log_heuristic_ctx_manager_summary() draining until an outer boundary."""
+    with _warned_closure_lock:
+        bucket = _get_or_create_thread_bucket_locked()
+        bucket.defer_depth += 1
     try:
         yield
     finally:
-        after_state = _get_thread_heuristic_state_obj()
-        after_state.defer_depth[0] = max(0, after_state.defer_depth[0] - 1)
-
-
-def _harvest_worker_heuristic_states(
-    owner_state: _ThreadHeuristicState,
-    session_start_seq: int,
-) -> None:
-    """Drains unowned worker-thread heuristic records whose sequence exceeds session_start_seq."""
-    current_epoch = _heuristic_reset_epoch[0]
-    harvested_items: List[Tuple[str, int]] = []
-    harvested_overflows: List[Tuple[int, int]] = []
-    with _warned_closure_lock:
-        candidates = list(_registered_thread_states)
-        retired_keys = [
-            k for k, seq in _retired_worker_name_seqs.items() if seq > session_start_seq
-        ]
-        for k in retired_keys:
-            harvested_items.append((k, _retired_worker_name_seqs.pop(k)))
-        if _retired_worker_overflow_events:
-            kept_retired_ov: List[List[int]] = []
-            for ov_pair in _retired_worker_overflow_events:
-                if ov_pair[0] > session_start_seq:
-                    harvested_overflows.append((ov_pair[0], ov_pair[1]))
-                else:
-                    kept_retired_ov.append(ov_pair)
-            _retired_worker_overflow_events[:] = kept_retired_ov
-
-    for worker_state in candidates:
-        if worker_state is owner_state or worker_state.epoch != current_epoch:
-            continue
-        if worker_state.session_depth > 0 or worker_state.defer_depth[0] > 0:
-            continue
-        with worker_state.lock:
-            if (
-                worker_state.epoch != current_epoch
-                or worker_state.session_depth > 0
-                or worker_state.defer_depth[0] > 0
-                or (not worker_state.name_seqs and not worker_state.overflow_events)
-            ):
-                continue
-            eligible_keys = [
-                k
-                for k, seq in worker_state.name_seqs.items()
-                if seq > session_start_seq
-            ]
-            for k in eligible_keys:
-                harvested_items.append((k, worker_state.name_seqs.pop(k)))
-            if worker_state.overflow_events:
-                kept_ov: List[List[int]] = []
-                for ov_pair in worker_state.overflow_events:
-                    if ov_pair[0] > session_start_seq:
-                        harvested_overflows.append((ov_pair[0], ov_pair[1]))
-                    else:
-                        kept_ov.append(ov_pair)
-                worker_state.overflow_events[:] = kept_ov
-
-    if harvested_items or harvested_overflows:
-        with owner_state.lock:
-            for mgr_name, seq in harvested_items:
-                _record_into_name_seqs(
-                    owner_state.name_seqs, owner_state.overflow_events, mgr_name, seq
-                )
-            for ov_seq, ov_cnt in harvested_overflows:
-                if len(owner_state.overflow_events) >= _MAX_OVERFLOW_SEQ_EVENTS:
-                    owner_state.overflow_events[-1][0] = max(
-                        owner_state.overflow_events[-1][0], ov_seq
-                    )
-                    owner_state.overflow_events[-1][1] += ov_cnt
-                else:
-                    owner_state.overflow_events.append([ov_seq, ov_cnt])
+        with _warned_closure_lock:
+            bucket.defer_depth = max(0, bucket.defer_depth - 1)
 
 
 @contextlib.contextmanager
-def heuristic_ctx_manager_session() -> Iterator[None]:
-    """Scopes a batch CLI or patch-generation run, discarding prior leftovers and harvesting worker threads."""
-    state = _get_thread_heuristic_state_obj()
-    is_outermost = state.session_depth == 0 and state.defer_depth[0] == 0
-    if is_outermost:
-        session_start_seq = next(_heuristic_record_seq)
-        with state.lock:
-            state.name_seqs.clear()
-            state.overflow_events.clear()
-            state.session_start_seq = session_start_seq
-    state.session_depth += 1
-    state.defer_depth[0] += 1
+def heuristic_ctx_manager_session(*, warn: bool = False) -> Iterator[None]:
+    """Scopes a batch CLI or patch-generation run in an isolated session keyed by session ID."""
+    sess_stack = _get_current_session_stack()
+    with _warned_closure_lock:
+        existing_sid = sess_stack[-1] if sess_stack else None
+        existing_bucket = (
+            _active_heuristic_sessions.get(existing_sid)
+            if existing_sid is not None
+            else None
+        )
+        if existing_bucket is None or existing_sid is None:
+            is_outermost = True
+            sid = next(_next_heuristic_session_id)
+            bucket = _HeuristicSessionBucket(defer_depth=1, warn_on_summary=warn)
+            _active_heuristic_sessions[sid] = bucket
+        else:
+            is_outermost = False
+            sid = existing_sid
+            bucket = existing_bucket
+            bucket.defer_depth += 1
+            if warn:
+                bucket.warn_on_summary = True
+        sess_stack.append(sid)
     try:
         yield
     finally:
-        after_state = _get_thread_heuristic_state_obj()
-        after_state.defer_depth[0] = max(0, after_state.defer_depth[0] - 1)
-        after_state.session_depth = max(0, after_state.session_depth - 1)
-        if is_outermost and after_state is state:
-            _harvest_worker_heuristic_states(state, state.session_start_seq)
-            log_heuristic_ctx_manager_summary(force=True)
+        emit_warn = False
+        should_flush = False
+        with _warned_closure_lock:
+            bucket.defer_depth = max(0, bucket.defer_depth - 1)
+            if is_outermost:
+                should_flush = True
+                emit_warn = bucket.warn_on_summary
+        try:
+            if should_flush:
+                log_heuristic_ctx_manager_summary(force=True, warn=emit_warn)
+        finally:
+            with _warned_closure_lock:
+                if sess_stack and sess_stack[-1] == sid:
+                    sess_stack.pop()
+                if is_outermost:
+                    _active_heuristic_sessions.pop(sid, None)
 
 
-def log_heuristic_ctx_manager_summary(*, force: bool = False) -> Tuple[str, ...]:
-    """Logs a consolidated summary of unproven context managers accepted via name heuristic on the current thread."""
-    state = _get_thread_heuristic_state_obj()
-    if state.session_depth > 0:
-        _harvest_worker_heuristic_states(state, state.session_start_seq)
-    with state.lock:
-        if not state.name_seqs:
+def log_heuristic_ctx_manager_summary(
+    *, force: bool = False, warn: Optional[bool] = None
+) -> Tuple[str, ...]:
+    """Logs a consolidated summary of unproven context managers recorded in the active session or thread.
+
+    Logs at ``INFO`` by default so read-only scans and previews remain quiet in CI,
+    and escalates to ``WARNING`` when ``warn=True`` (e.g. ``--replace-clones``).
+    """
+    with _warned_closure_lock:
+        bucket = _get_or_create_thread_bucket_locked()
+        if not bucket.names:
             return ()
-        if state.defer_depth[0] > 0 and not force:
-            return tuple(sorted(state.name_seqs))
-        names = tuple(sorted(state.name_seqs))
-        overflow = sum(cnt for _, cnt in state.overflow_events)
-        state.name_seqs.clear()
-        state.overflow_events.clear()
+        if bucket.defer_depth > 0 and not force:
+            return tuple(sorted(bucket.names))
+        names = tuple(sorted(bucket.names))
+        overflow = bucket.overflow_count
+        use_warn = bucket.warn_on_summary if warn is None else bool(warn)
+        bucket.names.clear()
+        bucket.overflow_count = 0
     distinct_count = len(names)
     preview = ", ".join(repr(n) for n in names[:10])
     if distinct_count > 10:
         preview += f", ... ({distinct_count} retained)"
     if overflow > 0:
         preview += f"; {overflow} additional occurrence(s) omitted beyond cap"
-    logger.warning(
+    log_fn = logger.warning if use_warn else logger.info
+    log_fn(
         "Summary: %d unproven context manager(s) (%s) were treated as non-suppressing via "
         "name heuristic in strict mode; use --closure-strictness pedantic to fail closed or "
         "list known-safe managers in --non-suppressing-ctx-managers.",
@@ -670,46 +573,13 @@ def normalize_non_suppressing_ctx_managers(*sources: Any) -> Tuple[str, ...]:
 
 
 def clear_closure_warning_cache() -> None:
-    """Clears the set of warned closure strictness values and resets thread-local heuristic summaries."""
-    curr_tls_state: Optional[_ThreadHeuristicState] = getattr(
-        _heuristic_collector_tls, "state", None
-    )
+    """Clears warned closure strictness events and resets heuristic context-manager accumulators."""
     with _warned_closure_lock:
         _warned_closure_strictness_values.clear()
-        _retired_worker_name_seqs.clear()
-        _retired_worker_overflow_events.clear()
-        _heuristic_reset_epoch[0] += 1
-        new_epoch = _heuristic_reset_epoch[0]
-        active_states: List[_ThreadHeuristicState] = []
-        seen_ids: Set[int] = set()
-        candidates = list(_registered_thread_states)
-        if curr_tls_state is not None:
-            candidates.append(curr_tls_state)
-        for st in candidates:
-            st_id = id(st)
-            if st_id in seen_ids:
-                continue
-            seen_ids.add(st_id)
-            if st.session_depth > 0 or st.defer_depth[0] > 0:
-                with st.lock:
-                    st.name_seqs.clear()
-                    st.overflow_events.clear()
-                    st.epoch = new_epoch
-                    if st.session_depth > 0:
-                        st.session_start_seq = next(_heuristic_record_seq)
-                active_states.append(st)
-        _registered_thread_states[:] = active_states
-        if curr_tls_state is not None and id(curr_tls_state) in {
-            id(s) for s in active_states
-        }:
-            next_tls_state = curr_tls_state
-        else:
-            next_tls_state = _ThreadHeuristicState(epoch=new_epoch)
-            _registered_thread_states.append(next_tls_state)
-        _next_thread_state_prune_threshold[0] = max(
-            _MAX_REGISTERED_THREAD_STATES, len(_registered_thread_states) * 2
-        )
-    _heuristic_collector_tls.state = next_tls_state
+        _default_thread_buckets.clear()
+        for bucket in _active_heuristic_sessions.values():
+            bucket.names.clear()
+            bucket.overflow_count = 0
 
 
 DEFAULT_EXCLUDES: List[str] = [

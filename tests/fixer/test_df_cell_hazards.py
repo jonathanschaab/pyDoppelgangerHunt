@@ -1963,7 +1963,6 @@ def test_pedantic_global_escape_rejects_implicit_truth_value_evaluation(
     )
     assert sc_pedantic["is_control_flow_safe"] is False
     assert "global_escape" in sc_pedantic["closure_hazard_reasons"]
-
     patch_pedantic = generate_refactoring_patch(
         [(1.0, dict(u1), dict(u2))],
         repo_root=str(tmp_path),
@@ -2219,3 +2218,169 @@ def test_pedantic_global_escape_permits_proven_primitive_operations(
     )
     assert sc_pedantic["is_control_flow_safe"] is True, safe_stmt
     assert "global_escape" not in sc_pedantic["closure_hazard_reasons"], safe_stmt
+
+
+@pytest.mark.parametrize(
+    "async_comp_expr",
+    [
+        "[item async for item in stream()]",
+        "{item async for item in stream()}",
+        "{item: 1 async for item in stream()}",
+        "[val async for group in stream() async for val in group]",
+    ],
+)
+@pytest.mark.parametrize("strictness", ["strict", "pedantic"])
+def test_async_comprehension_in_global_reading_unit_rejected_in_strict_and_pedantic(
+    async_comp_expr: str,
+    strictness: str,
+) -> None:
+    """Verifies async comprehensions inside global-reading units trigger global_escape in both strict and pedantic modes."""
+    src = (
+        "STATE = 10\n"
+        "async def run_async(stream):\n"
+        "    global STATE\n"
+        "    first = STATE\n"
+        f"    collected = {async_comp_expr}\n"
+        "    second = STATE\n"
+        "    return first, second, collected\n"
+    )
+    tree = ast.parse(src)
+    sc = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 6,
+            "kind": "compound_block",
+            "source_text": src,
+            "closure_strictness": strictness,
+        },
+        tree=tree,
+    )
+    assert sc["is_control_flow_safe"] is False
+    assert "severed_closure_cell" in sc["control_flow_hazards"]
+    assert "global_escape" in sc["closure_hazard_reasons"]
+
+
+def test_async_comprehension_anext_mutating_global_runtime_divergence() -> None:
+    """Demonstrates runtime divergence when an async comprehension suspends at __anext__ and mutates an enclosing global."""
+    import asyncio
+
+    ns: dict[str, Any] = {}
+    exec(
+        "STATE = 10\n"
+        "class MutatingAsyncStream:\n"
+        "    def __init__(self):\n"
+        "        self._done = False\n"
+        "    def __aiter__(self):\n"
+        "        return self\n"
+        "    async def __anext__(self):\n"
+        "        global STATE\n"
+        "        if self._done:\n"
+        "            raise StopAsyncIteration\n"
+        "        self._done = True\n"
+        "        STATE = 77\n"
+        "        return 1\n"
+        "async def run_inplace():\n"
+        "    global STATE\n"
+        "    STATE = 10\n"
+        "    first = STATE\n"
+        "    items = [x async for x in MutatingAsyncStream()]\n"
+        "    second = STATE\n"
+        "    return first, second, items\n"
+        "async def _extracted_snapshot(state_snapshot):\n"
+        "    first = state_snapshot\n"
+        "    items = [x async for x in MutatingAsyncStream()]\n"
+        "    second = state_snapshot\n"
+        "    return first, second, items\n"
+        "async def run_extracted():\n"
+        "    global STATE\n"
+        "    STATE = 10\n"
+        "    return await _extracted_snapshot(STATE)\n",
+        ns,
+    )
+    inplace_res = asyncio.run(ns["run_inplace"]())
+    extracted_res = asyncio.run(ns["run_extracted"]())
+    assert inplace_res == (10, 77, [1])
+    assert extracted_res == (10, 10, [1])
+    assert inplace_res != extracted_res
+
+
+@pytest.mark.parametrize(
+    "call_expr,dunder_def",
+    [
+        (
+            "len(probe)",
+            "    def __len__(self):\n        global STATE\n        STATE = 99\n        return 3\n",
+        ),
+        (
+            "chr(probe)",
+            "    def __index__(self):\n        global STATE\n        STATE = 99\n        return 65\n",
+        ),
+    ],
+)
+def test_strict_builtin_allowlist_dunder_len_and_index_runtime_divergence_controls(
+    call_expr: str,
+    dunder_def: str,
+) -> None:
+    """Pins the documented strict-mode allowlist behavior vs pedantic rejection for __len__ and __index__ global mutators."""
+    ns: dict[str, Any] = {}
+    runtime_src = (
+        "STATE = 10\n"
+        "class DunderMutator:\n"
+        f"{dunder_def}"
+        "def run_inplace(probe):\n"
+        "    global STATE\n"
+        "    STATE = 10\n"
+        "    first = STATE\n"
+        f"    _ = {call_expr}\n"
+        "    second = STATE\n"
+        "    return first, second\n"
+        "def _helper_snapshot(probe, state_snap):\n"
+        "    first = state_snap\n"
+        f"    _ = {call_expr}\n"
+        "    second = state_snap\n"
+        "    return first, second\n"
+        "def run_snapshot(probe):\n"
+        "    global STATE\n"
+        "    STATE = 10\n"
+        "    return _helper_snapshot(probe, STATE)\n"
+    )
+    exec(runtime_src, ns)
+    probe_obj = ns["DunderMutator"]()
+    assert ns["run_inplace"](probe_obj) == (10, 99)
+    assert ns["run_snapshot"](probe_obj) == (10, 10)
+
+    analysis_src = (
+        "STATE = 10\n"
+        "def inspect_target(probe):\n"
+        "    global STATE\n"
+        "    first = STATE\n"
+        f"    _ = {call_expr}\n"
+        "    second = STATE\n"
+        "    return first, second\n"
+    )
+    analysis_tree = ast.parse(analysis_src)
+    sc_strict = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 6,
+            "kind": "compound_block",
+            "source_text": analysis_src,
+            "closure_strictness": "strict",
+        },
+        tree=analysis_tree,
+    )
+    assert sc_strict["is_control_flow_safe"] is True
+    assert "global_escape" not in sc_strict["closure_hazard_reasons"]
+
+    sc_pedantic = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 6,
+            "kind": "compound_block",
+            "source_text": analysis_src,
+            "closure_strictness": "pedantic",
+        },
+        tree=analysis_tree,
+    )
+    assert sc_pedantic["is_control_flow_safe"] is False
+    assert "global_escape" in sc_pedantic["closure_hazard_reasons"]

@@ -24,6 +24,7 @@ from typing import (
 from pydoppelgangerhunt.fixer._df_cache import (
     _MAX_PARENT_MAP_TOTAL_NODES,
     _ScopeCacheKey,
+    _WeakParentMap,
     _ensure_scope_owner_parent_map,
     _ephemeral_unit_ast_context,
     _get_or_compute_scope_cached,
@@ -337,7 +338,10 @@ def _get_fn_scope_context_uncached(
             and scope_node is not mod_tree
         ):
             _ensure_scope_owner_parent_map(mod_tree)
-        if cache_parent_map and _is_oversized_scope_root(scope_node):
+        if cache_parent_map and (
+            _is_oversized_scope_root(scope_node)
+            or _is_oversized_scope_root(mod_tree)
+        ):
             eff_parent_map = None
             has_nonempty_pmap = True
         else:
@@ -346,8 +350,10 @@ def _get_fn_scope_context_uncached(
             )
             has_nonempty_pmap = bool(raw_parent_map)
             if cache_parent_map and (
-                len(raw_parent_map) > _MAX_PARENT_MAP_TOTAL_NODES
+                isinstance(raw_parent_map, _WeakParentMap)
+                or len(raw_parent_map) > _MAX_PARENT_MAP_TOTAL_NODES
                 or _is_oversized_scope_root(scope_node)
+                or _is_oversized_scope_root(mod_tree)
             ):
                 eff_parent_map = None
             else:
@@ -1972,7 +1978,7 @@ def _make_nested_fn_scope_context(
         elif prev_stored is not None:
             parent_map = MappingProxyType(
                 ChainMap(
-                    raw_fn_map,
+                    cast(Dict[ast.AST, ast.AST], raw_fn_map),
                     cast(Dict[ast.AST, ast.AST], prev_stored),
                 )
             )

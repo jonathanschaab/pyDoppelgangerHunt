@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, field
 import logging
+import re
 from types import MappingProxyType
 from typing import (
     AbstractSet,
@@ -269,6 +270,101 @@ _SUSPICIOUS_SUPPRESS_SUBSTRINGS: Tuple[str, ...] = (
     "quench",
     "mask",
 )
+
+_IDENT_WORD_TOKEN_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[^A-Za-z]|$)|[A-Z]?[a-z]+")
+
+_SUSPICIOUS_PREFIX_STEMS: Tuple[str, ...] = (
+    "suppress",
+    "ignor",
+    "swallow",
+    "silen",
+    "quiet",
+    "absorb",
+    "forgiv",
+    "squelch",
+    "quench",
+)
+
+_SUSPICIOUS_COMPOUND_TOKEN_SPLITS: Mapping[str, Tuple[str, ...]] = MappingProxyType(
+    {
+        "subtest": ("sub", "test"),
+        "exitstack": ("exit", "stack"),
+        "cancelscope": ("cancel", "scope"),
+        "fallback": ("fall", "back"),
+        "noop": ("no", "op"),
+    }
+)
+
+_SUSPICIOUS_EXACT_INFLECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType(
+    {
+        "toler": ("tolerate", "tolerates", "tolerated", "tolerating", "tolerant"),
+        "catch": ("catches", "catching", "catcher"),
+        "trap": ("traps", "trapped", "trapping", "trapper"),
+        "shield": ("shields", "shielded", "shielding"),
+        "retry": ("retries", "retrying", "retried", "retrier"),
+        "attempt": ("attempts", "attempted", "attempting"),
+        "skip": ("skips", "skipped", "skipping", "skipper"),
+        "mute": ("mutes", "muted"),
+        "hush": ("hushes", "hushed", "hushing"),
+        "discard": ("discards", "discarded", "discarding"),
+        "mask": ("masks", "masking"),
+        "fallback": ("fallbacks",),
+        "noop": ("noops",),
+        "subtest": ("subtests",),
+        "exitstack": ("exitstacks",),
+        "cancelscope": ("cancelscopes",),
+    }
+)
+
+
+def _build_suspicious_token_tables() -> Tuple[frozenset[str], Tuple[Tuple[str, ...], ...]]:
+    """Derives exact single-token and multi-token match tables from _SUSPICIOUS_SUPPRESS_SUBSTRINGS."""
+    prefix_set = frozenset(_SUSPICIOUS_PREFIX_STEMS)
+    exact_tokens: Set[str] = set()
+    token_seqs: List[Tuple[str, ...]] = []
+    seen_seqs: Set[Tuple[str, ...]] = set()
+    for entry in _SUSPICIOUS_SUPPRESS_SUBSTRINGS:
+        if "_" in entry:
+            seq = tuple(entry.split("_"))
+            if seq not in seen_seqs:
+                seen_seqs.add(seq)
+                token_seqs.append(seq)
+            continue
+        if entry not in prefix_set:
+            exact_tokens.add(entry)
+            exact_tokens.update(_SUSPICIOUS_EXACT_INFLECTIONS.get(entry, ()))
+        comp_seq = _SUSPICIOUS_COMPOUND_TOKEN_SPLITS.get(entry)
+        if comp_seq is not None and comp_seq not in seen_seqs:
+            seen_seqs.add(comp_seq)
+            token_seqs.append(comp_seq)
+    return frozenset(exact_tokens), tuple(token_seqs)
+
+
+_SUSPICIOUS_EXACT_TOKENS, _SUSPICIOUS_TOKEN_SEQUENCES = _build_suspicious_token_tables()
+
+
+def _ident_has_suspicious_suppress_token(ident: str) -> bool:
+    """Returns True when snake_case/CamelCase tokens of ident match a suspicious suppressor stem."""
+    words = tuple(tok.lower() for tok in _IDENT_WORD_TOKEN_RE.findall(ident))
+    if not words:
+        return False
+    for word in words:
+        if word in _SUSPICIOUS_EXACT_TOKENS or word.startswith(_SUSPICIOUS_PREFIX_STEMS):
+            return True
+    n_words = len(words)
+    for seq in _SUSPICIOUS_TOKEN_SEQUENCES:
+        seq_len = len(seq)
+        if n_words < seq_len:
+            continue
+        seq_prefix = seq[:-1]
+        seq_last = seq[-1]
+        seq_last_plural = f"{seq_last}s"
+        for idx in range(n_words - seq_len + 1):
+            if words[idx : idx + seq_len - 1] == seq_prefix and words[
+                idx + seq_len - 1
+            ] in (seq_last, seq_last_plural):
+                return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -2961,8 +3057,7 @@ def _looks_like_suppressing_ctx_manager(
         elif isinstance(sub, (ast.List, ast.Tuple, ast.Set)):
             stack.extend(sub.elts)
         if ident is not None and ident != "catch_warnings":
-            low_sanitized = ident.lower().replace("mutex", "")
-            if any(tok in low_sanitized for tok in _SUSPICIOUS_SUPPRESS_SUBSTRINGS):
+            if _ident_has_suspicious_suppress_token(ident):
                 return True
     return False
 

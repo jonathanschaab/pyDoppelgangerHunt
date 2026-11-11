@@ -124,7 +124,7 @@ min_lines = 8
 min_tokens = 15
 cross_file_strategy = "auto"
 shared_module_name = "_common.py"
-closure_strictness = "strict"  # "strict" (default), "pedantic", or "lenient"
+# closure_strictness = "strict"  # "strict" (default), "pedantic", or "lenient"
 non_suppressing_ctx_managers = []
 exclude = [
     "tests",
@@ -135,6 +135,8 @@ exemptions = [
     ["module_a.py:func_1", "module_b.py:func_2"],
 ]
 ```
+
+Leaving `closure_strictness` unset (commented out) allows `--replace-clones` (`replace_clones=True`) to default automatically to `"pedantic"` for automated call-site rewrites while keeping reporting (`--suggest`, `--html`) and preview patches (`replace_clones=False`) on `"strict"`. Setting `closure_strictness` explicitly in `pyproject.toml` or `.pydoppelgangerhunt.toml` opts `--replace-clones` out of that automatic `"pedantic"` upgrade.
 
 ### Cross-Module Deduplication Strategies
 
@@ -250,6 +252,8 @@ Refactoring executes in linear-logarithmic time with incremental validation:
 
 ##### Precision & Soundness Trade-off: Closure Scanning
 
+> **Important (`strict` default caveat)**: Default `strict` mode uses a name-and-provenance heuristic for custom context managers and is **fail-open for neutrally named custom exception-suppressing context managers** (such as `Transaction()`, `Guard()`, or `SpanContext()`). To enforce sound fail-closed verification on every unproven context manager, run with `--closure-strictness pedantic` (or set `closure_strictness = "pedantic"` and list verified managers in `non_suppressing_ctx_managers = ["pkg.tx.atomic"]`).
+
 When extracting generator subroutine clones that assign variables, `pyDoppelgangerHunt` conducts
 a pre-unit AST walk within the enclosing scope to detect closures, lambdas, or nested classes
 that capture candidate outputs prior to unit execution. Because such closures may escape into
@@ -265,9 +269,10 @@ escaping callbacks across lexical scopes.
   and avoid cache thrashing across multi-pair sessions, `clear_dataflow_cache()` and
   `evict_tree_scopes(tree)` are exposed as public APIs (exported from `pydoppelgangerhunt` and
   `pydoppelgangerhunt.fixer`). AST trees passed via `tree=` are assumed immutable while cached
-  (internal scope fingerprinting is a bounded `O(1)` diagnostic check over a 512-node BFS prefix
-  and strided body statements in production—with full subtree traversal in test debug mode—rather
-  than an unbounded structural proof in production);
+  (internal scope fingerprinting is a bounded `O(min(|T|, 512) + |body|)` diagnostic check over a
+  512-node BFS prefix plus all immediate body/clause statement intervals in production—with a
+  65,536-node subtree walk in test debug mode—rather than a full-tree walk on arbitrary deep
+  expressions);
   callers that mutate an `ast.AST` in place (including interior statements or expressions) must
   call `evict_tree_scopes(tree)` (or `clear_dataflow_cache()`) after mutation to invalidate cached
   scope intervals and parent maps, and must not mutate an AST concurrently while another thread is
@@ -280,7 +285,11 @@ escaping callbacks across lexical scopes.
   (or `--skip-pre-unit-closures`,
   or setting `closure_strictness = "strict"|"pedantic"|"lenient"`, `strict_with_suppression = true|false`,
   and `non_suppressing_ctx_managers = [...]` in `pyproject.toml` or per-unit `UnitSchema` dicts;
-  applicable across text/`--suggest` reports, `--html` reports, and `--patch`):
+  applicable across text/`--suggest` reports, `--html` reports, and `--patch`). Precedence is uniform
+  across CLI and programmatic APIs: explicit `closure_strictness` takes precedence over
+  `strict_with_suppression` and `skip_pre_unit_closures` (logging a once-per-run conflict warning when
+  both are supplied and disagree), while `strict_with_suppression = true` selects `pedantic` when
+  `closure_strictness` is unset:
   - `strict` (default for reporting, `--suggest`, `--html`, and preview patch generation with
     `replace_clones=False`): **Heuristic context-manager safety mode** with conservative closure-cell
     analysis. Treats pre-unit closures capturing candidate outputs as live escaping callbacks and
@@ -304,24 +313,35 @@ escaping callbacks across lexical scopes.
     `pathlib.Path(...)` are never treated as non-suppressing context managers). Unproven context
     managers use a name-and-provenance heuristic:
     managers are treated as non-suppressing unless their terminal identifier/callee attribute
-    matches one of the 34 case-insensitive suppression-idiom substrings (`suppress`, `raises`,
-    `ignor`, `subtest`, `exitstack`, `enter_context`, `enter_async_context`, `cancelscope`,
-    `move_on_after`, `fail_after`, `catch`, `swallow`, `silen`, `quiet`, `toler`, `best_effort`,
-    `absorb`, `trap`, `fallback`, `noop`, `no_op`, `shield`, `retry`, `attempt`, `skip`, `mute`,
-    `muting`, `maybe`, `hush`, `discard`, `forgiv`, `squelch`, `quench`, `mask`) or their root
+    matches—at `snake_case` or `CamelCase` token boundaries—one of the 34 case-insensitive
+    suppression-idiom stems (`suppress`, `raises`, `ignor`, `subtest`, `exitstack`,
+    `enter_context`, `enter_async_context`, `cancelscope`, `move_on_after`, `fail_after`, `catch`,
+    `swallow`, `silen`, `quiet`, `toler`, `best_effort`, `absorb`, `trap`, `fallback`, `noop`,
+    `no_op`, `shield`, `retry`, `attempt`, `skip`, `mute`, `muting`, `maybe`, `hush`, `discard`,
+    `forgiv`, `squelch`, `quench`, `mask`, avoiding unrelated names such as `masked_array`,
+    `commute`, `Mutex`, `bootstrap`, or `tolerance_ctx`) or their root
     receiver/class is proven suppressing via local/function/class `__exit__` provenance (intermediate
     attribute names on receiver chains such as `self.retry_budget.acquire()` are not scanned).
     **Note**: because this heuristic is name-based, `strict` mode is **fail-open for neutrally
     named custom exception-suppressing context managers** (such as `Transaction()`, `Guard()`,
-    `SpanContext()`, `SessionScope()`, or `BatchContext()`).
+    `SpanContext()`, `SessionScope()`, or `BatchContext()`). In units that read an enclosing
+    `global` variable, `strict` mode rejects arbitrary calls, `with`/`async with` blocks,
+    suspension points (`await`, `yield`, `yield from`, `async for`, and async comprehensions),
+    attribute/subscript/descriptor mutations, deletions, and external or `@=` augmented assignments,
+    while permitting C-level built-ins (`callable`, `id`, `ord`), dunder-invoking inspection/conversion
+    built-ins (`bin`, `bool`, `chr`, `hex`, `int`, `isinstance`, `issubclass`, `len`, `oct`, `range`),
+    implicit boolean truthiness, synchronous read-only AST expressions, and local primitive-initialized
+    accumulator augmented assignments (`total = 0; total += x`) under the heuristic that user dunders
+    (`__len__`, `__index__`, `__bool__`, `__radd__`, etc.) do not mutate module-level globals.
     Whenever an unproven context manager is accepted via the name heuristic, `pyDoppelgangerHunt`
-    logs a deduplicated `INFO` diagnostic and a session-scoped `WARNING` summary to `stderr`/logging
+    logs a deduplicated `INFO` diagnostic and a session-scoped `INFO` summary (escalated to
+    `WARNING` when `--replace-clones` / `replace_clones=True` is active) to `stderr`/logging
     (never polluting `stdout` or `--output` report files, while recording a per-hunk advisory
     comment in `--patch` unified diffs); automated call-site delegation (`--replace-clones` /
     `replace_clones=True`) defaults to `pedantic` unless `closure_strictness` is explicitly set.
   - `pedantic` (default when `--replace-clones` / `replace_clones=True` is enabled without an
-    explicit `closure_strictness`, or when `strict_with_suppression = true` is set in `pyproject.toml`
-    or `UnitSchema` dicts): **Stricter static conservative mode**
+    explicit `closure_strictness`, or when `strict_with_suppression = true` is set while
+    `closure_strictness` is unset in `pyproject.toml` or `UnitSchema` dicts): **Stricter static conservative mode**
     that treats all unproven unknown `with` / `async with` context managers as potentially
     exception-suppressing unless explicitly allowlisted via `--non-suppressing-ctx-managers` or
     `non_suppressing_ctx_managers` (merged across global config and per-unit overrides), and inside
@@ -348,6 +368,15 @@ escaping callbacks across lexical scopes.
 
 When synthesizing refactoring patches and shared helpers, `pyDoppelgangerHunt` enforces
 strict fail-closed safety invariants:
+- **Unavailable Source Placeholders & Host-Caller Preview Semantics**: Units lacking backing source
+  (including tree-only units without inline/file source) emit `"unavailable_source_placeholder"` and
+  `is_control_flow_safe = False`. Because `u1` always supplies the extracted helper AST, a
+  placeholder `u1` is unconditionally rejected across pair resolution, helper synthesis, and patch
+  generation (preventing placeholder comment lines from ever entering a helper); for `u2`,
+  subroutine extraction, `replace_clones=True`, and explicit `source_text2` inputs reject
+  placeholders, while whole-unit preview-only extraction (`replace_clones=False`, missing caller
+  file) intentionally synthesizes the helper from `u1`'s verified AST and records a manual-import
+  advisory comment.
 - **Lexical Scope Containment & Pre-Unit Closure Isolation (Generator Subroutines)**: For generator
   subroutines, any closures, lambdas, generator expressions, or nested class definitions preceding a
   candidate unit within the enclosing lexical scope that capture potential output variables are

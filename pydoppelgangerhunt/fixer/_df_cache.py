@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from collections import OrderedDict, deque
+from collections.abc import Mapping as _AbcMapping
 import contextlib
 import hashlib
 import logging
@@ -158,6 +159,41 @@ _SCOPE_CACHE_KIND_CAPS: Dict[str, int] = {
 }
 
 
+class _WeakParentMap(_AbcMapping[ast.AST, ast.AST]):
+    """Read-only child->parent mapping holding weak references to both child keys and parent values."""
+
+    __slots__ = ("_refs",)
+
+    def __init__(self, parent_map: Mapping[ast.AST, ast.AST]) -> None:
+        refs: weakref.WeakKeyDictionary[
+            ast.AST, weakref.ReferenceType[ast.AST]
+        ] = weakref.WeakKeyDictionary()
+        for child, parent in parent_map.items():
+            try:
+                refs[child] = weakref.ref(parent)
+            except TypeError:
+                continue
+        self._refs = refs
+
+    def __getitem__(self, key: ast.AST) -> ast.AST:
+        try:
+            ref = self._refs[key]
+        except TypeError as exc:
+            raise KeyError(key) from exc
+        parent = ref()
+        if parent is None:
+            raise KeyError(key)
+        return parent
+
+    def __iter__(self) -> Iterator[ast.AST]:
+        for child, ref in list(self._refs.items()):
+            if ref() is not None:
+                yield child
+
+    def __len__(self) -> int:
+        return len(self._refs)
+
+
 class _OversizedParentEntry(NamedTuple):
     """Compact metadata retained for AST roots exceeding _MAX_PARENT_MAP_TOTAL_NODES."""
 
@@ -166,6 +202,7 @@ class _OversizedParentEntry(NamedTuple):
     scope_children: Dict[ast.AST, Tuple[ast.AST, ...]]
     attached_nodes: weakref.WeakSet[ast.AST]
     has_non_weakref: bool
+    weak_parent_map: Mapping[ast.AST, ast.AST]
 
 
 _parent_map_total_nodes: List[int] = [0]
@@ -183,7 +220,9 @@ _scope_try_with_cache: OrderedDict[ast.AST, List[ast.AST]] = OrderedDict()
 _stmt_with_summary_cache: OrderedDict[ast.stmt, Tuple[bool, frozenset[str]]] = (
     OrderedDict()
 )
-_tree_raw_source_cache: Dict[ast.AST, Tuple[int, str]] = {}
+_tree_raw_source_cache: weakref.WeakKeyDictionary[
+    ast.AST, Tuple[int, int, str]
+] = weakref.WeakKeyDictionary()
 _ephemeral_unit_asts: weakref.WeakSet[ast.AST] = weakref.WeakSet()
 _ephemeral_unit_ast_fallback: OrderedDict[int, ast.AST] = OrderedDict()
 _active_ephemeral_unit_asts: Dict[int, Tuple[ast.AST, int]] = {}
@@ -419,12 +458,14 @@ class _ScopeCacheKey:
         ``evict_tree_scopes(tree)`` call. Synthesized ephemeral unit modules must always
         be registered via ``_mark_ephemeral_unit_ast(unit_mod)`` and bypass node-keyed
         caches so detached AST nodes never enter ``_scope_owner_keys_index``.
-        ``_compute_scope_fingerprint`` is an O(1) diagnostic heuristic over the scope
-        header and first/last body statements (not a full recursive proof of AST
-        immutability); any code path that mutates a cached AST in place (including
-        interior statements or expressions) must call ``evict_tree_scopes(tree)`` to
-        invalidate cached entries and must not mutate an AST concurrently while another
-        thread is analyzing that same AST without synchronization.
+        ``_compute_scope_fingerprint`` is a bounded ``O(min(|T|, 512) + |body|)``
+        diagnostic check in production mode covering all direct ``body``/``orelse``/
+        ``finalbody`` statement intervals plus up to 512 BFS nodes (not a full recursive
+        proof of deep interior expression immutability); any code path that mutates a
+        cached AST in place (including deep interior expressions beyond the 512-node
+        prefix) must call ``evict_tree_scopes(tree)`` to invalidate cached entries and
+        must not mutate an AST concurrently while another thread is analyzing that same
+        AST without synchronization.
     """
 
     __slots__ = ("owner", "kind", "params", "aux_ast_nodes", "cached_hash")
@@ -710,7 +751,9 @@ def _is_oversized_scope_root(node: Optional[ast.AST]) -> bool:
 
 
 def _store_parent_map_locked(
-    root_node: ast.AST, parent_map: Dict[ast.AST, ast.AST]
+    root_node: ast.AST,
+    parent_map: Dict[ast.AST, ast.AST],
+    precomputed_fp: Optional[Tuple[Any, ...]] = None,
 ) -> Dict[ast.AST, ast.AST]:
     """Stores parent_map in _scope_parent_maps with LRU cap, total-node budget, and scope reverse indexing."""
     if root_node in _scope_parent_maps:
@@ -721,12 +764,20 @@ def _store_parent_map_locked(
     if new_map_size > _MAX_PARENT_MAP_TOTAL_NODES:
         scope_anc = _build_oversized_scope_parent_map(root_node, parent_map)
         attached_ws, has_non_weakref = _build_attached_node_weakset(parent_map)
+        weak_pmap: Mapping[ast.AST, ast.AST] = (
+            parent_map if has_non_weakref else _WeakParentMap(parent_map)
+        )
         _oversized_scope_parent_maps[root_node] = _OversizedParentEntry(
-            fingerprint=_compute_scope_fingerprint(root_node),
+            fingerprint=(
+                precomputed_fp
+                if precomputed_fp is not None
+                else _compute_scope_fingerprint(root_node)
+            ),
             scope_ancestors=scope_anc,
             scope_children=_build_children_adjacency(scope_anc),
             attached_nodes=attached_ws,
             has_non_weakref=has_non_weakref,
+            weak_parent_map=weak_pmap,
         )
         _oversized_scope_parent_maps.move_to_end(root_node)
         while len(_oversized_scope_parent_maps) > _MAX_OVERSIZED_PARENT_MAP_ROOTS:
@@ -790,11 +841,13 @@ def _needs_scope_owner_parent_map_locked(owner: ast.AST) -> bool:
     )
 
 
-def _check_oversized_fingerprint_locked(
-    tree: ast.AST, entry: _OversizedParentEntry
+def _verify_oversized_fingerprint_locked(
+    tree: ast.AST,
+    entry: _OversizedParentEntry,
+    curr_fp: Tuple[Any, ...],
 ) -> bool:
-    """Verifies tree matches entry.fingerprint under lock, evicting or raising if mutated."""
-    if _compute_scope_fingerprint(tree) == entry.fingerprint:
+    """Verifies precomputed curr_fp matches entry.fingerprint under lock, evicting or raising if mutated."""
+    if curr_fp == entry.fingerprint:
         return True
     if _debug_ast_immutability[0]:
         raise RuntimeError(
@@ -805,6 +858,22 @@ def _check_oversized_fingerprint_locked(
     return False
 
 
+def _lookup_valid_oversized_entry(
+    root_node: ast.AST,
+) -> Optional[_OversizedParentEntry]:
+    """Computes root_node's fingerprint outside the lock and returns its valid oversized entry."""
+    curr_fp = _compute_scope_fingerprint(root_node)
+    with _downstream_cache_lock:
+        entry = _oversized_scope_parent_maps.get(root_node)
+        if entry is None or not _verify_oversized_fingerprint_locked(
+            root_node, entry, curr_fp
+        ):
+            return None
+        if next(reversed(_oversized_scope_parent_maps)) != root_node:
+            _oversized_scope_parent_maps.move_to_end(root_node)
+        return entry
+
+
 def _tree_contains_scope_node(tree: ast.AST, node: ast.AST) -> bool:
     """Returns True if node is tree or belongs to tree without rebuilding oversized parent maps."""
     if _is_ephemeral_unit_ast(node):
@@ -813,19 +882,25 @@ def _tree_contains_scope_node(tree: ast.AST, node: ast.AST) -> bool:
         return True
     if _is_ephemeral_unit_ast(tree):
         return node in _build_parent_map_unlocked(tree)
+    oversized_present = False
     with _downstream_cache_lock:
         if tree in _scope_parent_maps:
             if next(reversed(_scope_parent_maps)) != tree:
                 _scope_parent_maps.move_to_end(tree)
             return node in _scope_parent_maps[tree]
-        entry = _oversized_scope_parent_maps.get(tree)
-        if entry is not None and _check_oversized_fingerprint_locked(tree, entry):
-            if next(reversed(_oversized_scope_parent_maps)) != tree:
-                _oversized_scope_parent_maps.move_to_end(tree)
+        oversized_present = tree in _oversized_scope_parent_maps
+    if oversized_present:
+        entry = _lookup_valid_oversized_entry(tree)
+        if entry is not None:
             return _oversized_entry_contains_node(tree, entry, node)
     built_map = _build_parent_map_unlocked(tree)
+    built_fp = (
+        _compute_scope_fingerprint(tree)
+        if len(built_map) > _MAX_PARENT_MAP_TOTAL_NODES
+        else None
+    )
     with _downstream_cache_lock:
-        stored_map = _store_parent_map_locked(tree, built_map)
+        stored_map = _store_parent_map_locked(tree, built_map, precomputed_fp=built_fp)
     return node in stored_map
 
 
@@ -833,17 +908,24 @@ def _get_scope_ancestor_map(tree: ast.AST) -> Mapping[ast.AST, ast.AST]:
     """Returns cached full parent map or compact scope-only ancestor map for oversized trees."""
     if _is_ephemeral_unit_ast(tree):
         return _build_parent_map_unlocked(tree)
+    oversized_present = False
     with _downstream_cache_lock:
         if tree in _scope_parent_maps:
             _scope_parent_maps.move_to_end(tree)
             return _scope_parent_maps[tree]
-        entry = _oversized_scope_parent_maps.get(tree)
-        if entry is not None and _check_oversized_fingerprint_locked(tree, entry):
-            _oversized_scope_parent_maps.move_to_end(tree)
+        oversized_present = tree in _oversized_scope_parent_maps
+    if oversized_present:
+        entry = _lookup_valid_oversized_entry(tree)
+        if entry is not None:
             return entry.scope_ancestors
     built_map = _build_parent_map_unlocked(tree)
+    built_fp = (
+        _compute_scope_fingerprint(tree)
+        if len(built_map) > _MAX_PARENT_MAP_TOTAL_NODES
+        else None
+    )
     with _downstream_cache_lock:
-        _store_parent_map_locked(tree, built_map)
+        _store_parent_map_locked(tree, built_map, precomputed_fp=built_fp)
         entry = _oversized_scope_parent_maps.get(tree)
         if entry is not None:
             return entry.scope_ancestors
@@ -873,9 +955,14 @@ def _ensure_scope_owner_parent_map(owner: ast.AST) -> None:
         if not _needs_scope_owner_parent_map_locked(owner):
             return
     built_map = _build_parent_map_unlocked(owner)
+    built_fp = (
+        _compute_scope_fingerprint(owner)
+        if len(built_map) > _MAX_PARENT_MAP_TOTAL_NODES
+        else None
+    )
     with _downstream_cache_lock:
         if _needs_scope_owner_parent_map_locked(owner):
-            _store_parent_map_locked(owner, built_map)
+            _store_parent_map_locked(owner, built_map, precomputed_fp=built_fp)
 
 
 def _register_key_ast_nodes(key: Any, nodes: Sequence[ast.AST]) -> None:
@@ -912,6 +999,15 @@ def _resync_key_ast_nodes_locked(
 
 def _unregister_key_if_absent(key: Any) -> None:
     """Removes or resynchronizes key in _scope_owner_keys_index across active scope caches."""
+    if (
+        isinstance(key, _ScopeCacheKey)
+        and key.kind == "tree_source_lines"
+        and key not in _scope_cell_info_cache
+    ):
+        try:
+            _tree_raw_source_cache.pop(key.owner, None)
+        except TypeError:
+            pass
     if key not in _scope_closures_cache and key not in _scope_cell_info_cache:
         _prune_reverse_index_buckets(
             key, _scope_key_nodes_index, _scope_owner_keys_index
@@ -1229,6 +1325,8 @@ class _TrackedScopeCache(OrderedDict[Any, _CacheValT]):
                     prev_val.unbind_owner(self, k)
             self.ensure_kind_keys().clear()
             super().clear()
+            if self is _scope_cell_info_cache:
+                _tree_raw_source_cache.clear()
             other = (
                 _scope_cell_info_cache
                 if self is _scope_closures_cache
@@ -1312,12 +1410,14 @@ def _compute_scope_fingerprint(node: ast.AST) -> Tuple[Any, ...]:
     """Computes a structural AST fingerprint of a scope root outside lock.
 
     Note:
-        Walks up to ``_MAX_PROD_FINGERPRINT_NODES`` AST nodes in BFS order in production
-        mode (covering full subtrees of typical functions and small modules in bounded O(1)
-        time, plus strided top-level statement sampling on large modules) and up to
-        ``_MAX_DEBUG_FINGERPRINT_NODES`` nodes when ``_debug_ast_immutability[0]`` is True.
-        Callers that mutate a cached AST in place must still call ``evict_tree_scopes(tree)``
-        explicitly.
+        Runs in ``O(min(|T|, _MAX_PROD_FINGERPRINT_NODES) + |body|)`` time in production
+        mode: walks up to ``_MAX_PROD_FINGERPRINT_NODES`` (512) AST nodes in BFS order and
+        hashes every direct statement interval in ``body``/``orelse``/``finalbody`` without
+        striding, and walks up to ``_MAX_DEBUG_FINGERPRINT_NODES`` (65,536) nodes when
+        ``_debug_ast_immutability[0]`` is True. Deep interior expression mutations beyond
+        the 512-node BFS prefix in large modules are outside the production diagnostic
+        bound, so callers that mutate a cached AST in place must still call
+        ``evict_tree_scopes(tree)`` explicitly.
     """
     max_nodes = (
         _MAX_DEBUG_FINGERPRINT_NODES
@@ -1353,34 +1453,36 @@ def _compute_scope_fingerprint(node: ast.AST) -> Tuple[Any, ...]:
         )
         acc = ((acc ^ (item_hash & mask)) * 0xBF58476D1CE4E5B9) & mask
 
-    body = getattr(node, "body", None)
-    if isinstance(body, list):
-        n_body = len(body)
-        step = max(1, n_body // 32)
-        sampled = tuple(
-            (
-                id(s),
-                type(s),
-                getattr(s, "lineno", None),
-                getattr(s, "end_lineno", None),
-            )
-            for s in body[::step]
-        )
-        last_stmt = body[-1] if n_body else None
-        body_sig: Any = (
-            n_body,
-            sampled,
-            id(last_stmt),
-            getattr(last_stmt, "lineno", None) if last_stmt is not None else None,
-            getattr(last_stmt, "end_lineno", None) if last_stmt is not None else None,
-        )
-    else:
-        body_sig = id(body)
+    stmt_acc = 0x9E3779B97F4A7C15
+    total_stmts = 0
+    suite_ids: List[int] = []
+    for attr_name in ("body", "orelse", "finalbody"):
+        suite = getattr(node, attr_name, None)
+        if isinstance(suite, list):
+            suite_ids.append(len(suite))
+            total_stmts += len(suite)
+            for s in suite:
+                s_hash = hash(
+                    (
+                        id(s),
+                        type(s),
+                        getattr(s, "lineno", None),
+                        getattr(s, "end_lineno", None),
+                        getattr(s, "col_offset", None),
+                        getattr(s, "end_col_offset", None),
+                    )
+                )
+                stmt_acc = ((stmt_acc ^ (s_hash & mask)) * 0x94D049BB133111EB) & mask
+        elif suite is not None:
+            suite_ids.append(id(suite))
+    body_sig: Any = (total_stmts, tuple(suite_ids), stmt_acc)
     return (
         type(node),
         getattr(node, "name", None),
         getattr(node, "lineno", None),
         getattr(node, "end_lineno", None),
+        getattr(node, "col_offset", None),
+        getattr(node, "end_col_offset", None),
         visited,
         acc,
         body_sig,
@@ -1412,12 +1514,14 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
     """Purges scope-cache entries belonging to an evicted AST tree or detached subtree.
 
     Note:
-        Runs in O(|T| + k) time under ``_downstream_cache_lock`` where |T| is the number
-        of AST nodes in ``tree`` (including previously cached children detached prior to
-        eviction via ``_scope_children_maps``, plus its ancestor chain in
-        ``_scope_parent_maps``) and k is the number of dependent cache entries indexed
-        for those nodes in ``_node_to_parent_map_roots`` and ``_scope_owner_keys_index``,
-        without scanning global cache tables or flushing unrelated sibling scopes.
+        For indexed scope roots (``_INDEXED_PARENT_MAP_TYPES``), runs in ``O(|T| + k)`` time
+        under ``_downstream_cache_lock`` via ``_node_to_parent_map_roots`` and
+        ``_scope_owner_keys_index`` without scanning ``_scope_closures_cache`` or
+        ``_scope_cell_info_cache``. For non-indexed statement/expression subtrees, also
+        checks up to ``_MAX_PARENT_MAP_CACHE_ENTRIES`` (256) entries in
+        ``_scope_parent_maps`` and ``_MAX_OVERSIZED_PARENT_MAP_ROOTS`` (16) entries in
+        ``_oversized_scope_parent_maps`` to locate enclosing roots without flushing
+        unrelated sibling scopes.
     """
     if tree is None or not isinstance(tree, ast.AST):
         return
@@ -1541,7 +1645,10 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
         for node in scope_nodes:
             _pop_parent_map_locked(node)
             _cached_scope_fingerprints.pop(node, None)
-            _tree_raw_source_cache.pop(node, None)
+            try:
+                _tree_raw_source_cache.pop(node, None)
+            except TypeError:
+                pass
             _scope_stmts_by_end.pop(node, None)
             _scope_stmts_by_start.pop(node, None)
             _scope_loops_cache.pop(node, None)
@@ -1603,7 +1710,12 @@ def _store_lru_cache_entry(
             and isinstance(key, ast.AST)
             and isinstance(value, dict)
         ):
-            return cast(_CacheValT, _store_parent_map_locked(key, value))
+            return cast(
+                _CacheValT,
+                _store_parent_map_locked(
+                    key, value, precomputed_fp=_cached_scope_fingerprints.get(key)
+                ),
+            )
         _ensure_cache_key_parent_maps(cache, key, _ensure_scope_owner_parent_map_locked)
         if key in cache:
             cache.move_to_end(key)
@@ -1699,11 +1811,43 @@ def _split_source_lines_stripped(source_text: str) -> Tuple[str, ...]:
     return tuple(ln.rstrip("\r\n") for ln in split_source_lines(normalized))
 
 
+def _safe_get_raw_source_digest(
+    tree: ast.AST,
+) -> Optional[Tuple[int, int, str]]:
+    """Returns cached (text_hash, text_len, digest_str) for tree without failing on non-weakrefable ASTs."""
+    try:
+        return _tree_raw_source_cache.get(tree)
+    except TypeError:
+        return None
+
+
+def _safe_set_raw_source_digest(
+    tree: ast.AST, entry: Tuple[int, int, str]
+) -> None:
+    """Stores (text_hash, text_len, digest_str) in WeakKeyDictionary without pinning tree or raw text."""
+    try:
+        _tree_raw_source_cache[tree] = entry
+    except TypeError:
+        pass
+
+
+def _resolve_raw_text_digest(
+    source_text: str, source_digest: Optional[str]
+) -> str:
+    """Returns caller-provided source_digest or computes hex SHA-256 of source_text."""
+    if source_digest is not None:
+        return str(source_digest)
+    return hashlib.sha256(
+        source_text.encode("utf-8", errors="replace")
+    ).hexdigest()
+
+
 def _register_tree_source_lines(
     tree: Optional[ast.AST],
     source_lines: Optional[Sequence[str]] = None,
     *,
     source_text: Optional[str] = None,
+    source_digest: Optional[str] = None,
 ) -> Optional[Tuple[str, ...]]:
     """Associates stripped source_lines with tree in _scope_cell_info_cache and indexes tree's parent map."""
     if (
@@ -1715,20 +1859,30 @@ def _register_tree_source_lines(
         return None
     ck = _make_trusted_scope_cache_key(owner=tree, kind="tree_source_lines")
     text_hash: Optional[int] = hash(source_text) if source_text is not None else None
+    text_len: int = len(source_text) if source_text is not None else 0
+    text_digest: Optional[str] = (
+        str(source_digest) if source_digest is not None else None
+    )
     with _downstream_cache_lock:
         if ck in _scope_cell_info_cache:
             existing_lines = cast(Tuple[str, ...], _scope_cell_info_cache[ck])
             if source_lines is not None and existing_lines is source_lines:
                 _scope_cell_info_cache.move_to_end(ck)
                 return existing_lines
-            if source_lines is None and source_text is not None:
-                cached_raw = _tree_raw_source_cache.get(tree)
-                if cached_raw is not None and (
-                    cached_raw[1] is source_text
-                    or (cached_raw[0] == text_hash and cached_raw[1] == source_text)
+            if source_lines is None and source_text is not None and text_hash is not None:
+                cached_raw = _safe_get_raw_source_digest(tree)
+                if (
+                    cached_raw is not None
+                    and cached_raw[0] == text_hash
+                    and cached_raw[1] == text_len
                 ):
-                    _scope_cell_info_cache.move_to_end(ck)
-                    return existing_lines
+                    if text_digest is None:
+                        text_digest = _resolve_raw_text_digest(
+                            source_text, source_digest
+                        )
+                    if cached_raw[2] == text_digest:
+                        _scope_cell_info_cache.move_to_end(ck)
+                        return existing_lines
     norm_lines = (
         tuple(ln.rstrip("\r\n") for ln in source_lines)
         if source_lines is not None
@@ -1736,19 +1890,28 @@ def _register_tree_source_lines(
     )
     if not norm_lines:
         return None
+    if source_text is not None and text_hash is not None and text_digest is None:
+        text_digest = _resolve_raw_text_digest(source_text, source_digest)
+    raw_digest_entry: Optional[Tuple[int, int, str]] = (
+        (text_hash, text_len, text_digest)
+        if source_text is not None
+        and text_hash is not None
+        and text_digest is not None
+        else None
+    )
+    matched_existing: Optional[Tuple[str, ...]] = None
     with _downstream_cache_lock:
         if ck in _scope_cell_info_cache:
             existing_lines = cast(Tuple[str, ...], _scope_cell_info_cache[ck])
             if existing_lines == norm_lines:
-                if source_text is not None and text_hash is not None:
-                    _tree_raw_source_cache[tree] = (text_hash, source_text)
                 _scope_cell_info_cache.move_to_end(ck)
-                return existing_lines
-            _evict_tree_scopes(tree)
-        if source_text is not None and text_hash is not None:
-            _tree_raw_source_cache[tree] = (text_hash, source_text)
-            while len(_tree_raw_source_cache) > _MAX_SCOPE_CACHE_SIZE:
-                _tree_raw_source_cache.pop(next(iter(_tree_raw_source_cache)), None)
+                matched_existing = existing_lines
+            else:
+                _evict_tree_scopes(tree)
+        if raw_digest_entry is not None:
+            _safe_set_raw_source_digest(tree, raw_digest_entry)
+    if matched_existing is not None:
+        return matched_existing
     _ensure_scope_owner_parent_map(tree)
     return cast(
         Tuple[str, ...],
@@ -1821,7 +1984,9 @@ def _get_or_parse_tree(
             cached_tree = _parsed_tree_cache[key]
             _parsed_tree_cache.move_to_end(key)
             if cached_tree is not None:
-                _register_tree_source_lines(cached_tree, source_text=source_text)
+                _register_tree_source_lines(
+                    cached_tree, source_text=source_text, source_digest=content_hash
+                )
             return cached_tree
 
     parsed: Optional[ast.AST] = None
@@ -1841,7 +2006,9 @@ def _get_or_parse_tree(
         _parsed_tree_cache, key, parsed, _MAX_PARSED_TREE_CACHE_SIZE
     )
     if stored_tree is not None:
-        _register_tree_source_lines(stored_tree, source_text=source_text)
+        _register_tree_source_lines(
+            stored_tree, source_text=source_text, source_digest=content_hash
+        )
     return stored_tree
 
 
@@ -1853,7 +2020,9 @@ def _parse_source_tree(
     """Parses Python source code into an AST tree if not already provided."""
     if tree is not None:
         if source_text and source_text.strip():
-            _register_tree_source_lines(tree, source_text=source_text)
+            _register_tree_source_lines(
+                tree, source_text=source_text, source_digest=source_digest
+            )
         return tree
     return _get_or_parse_tree(source_text, source_digest=source_digest)
 
@@ -1896,46 +2065,68 @@ def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
 
 def _get_scope_parent_map(
     scope_node: ast.AST, *, use_cache: bool = True
-) -> Dict[ast.AST, ast.AST]:
+) -> Mapping[ast.AST, ast.AST]:
     """Retrieves or builds cached parent map for AST nodes within the scope.
 
     Note:
-        The returned dictionary is stored in ``_scope_parent_maps`` and wrapped in
-        ``MappingProxyType`` by ``_FnScopeContext`` (and shared across nested scope
-        contexts). Callers must treat the underlying dictionary as strictly
-        read-only and never mutate it after construction.
+        The returned mapping is stored in ``_scope_parent_maps`` (or as a weak-referenced
+        ``_WeakParentMap`` in ``_oversized_scope_parent_maps`` for oversized roots) and
+        wrapped in ``MappingProxyType`` by ``_FnScopeContext``. Callers must treat the
+        returned mapping as strictly read-only and never mutate it after construction.
     """
 
-    if not use_cache:
+    if not use_cache or _is_ephemeral_unit_ast(scope_node):
         return _build_parent_map_unlocked(scope_node)
+    chosen_root: Optional[ast.AST] = None
+    oversized_root: Optional[ast.AST] = None
     with _downstream_cache_lock:
         if scope_node not in _scope_parent_maps:
-            roots = _node_to_parent_map_roots.get(scope_node)
-            if roots:
-                chosen_root: Optional[ast.AST] = None
-                for r in roots:
-                    if r in _scope_parent_maps:
-                        if isinstance(r, ast.Module):
-                            chosen_root = r
+            if scope_node in _oversized_scope_parent_maps:
+                oversized_root = scope_node
+            else:
+                roots = _node_to_parent_map_roots.get(scope_node)
+                if roots:
+                    for r in roots:
+                        if r in _scope_parent_maps:
+                            if isinstance(r, ast.Module):
+                                chosen_root = r
+                                break
+                            if chosen_root is None:
+                                chosen_root = r
+                if chosen_root is None and _oversized_scope_parent_maps:
+                    for o_cand, o_ent in reversed(
+                        list(_oversized_scope_parent_maps.items())
+                    ):
+                        if _oversized_entry_contains_node(o_cand, o_ent, scope_node):
+                            oversized_root = o_cand
                             break
-                        if chosen_root is None:
-                            chosen_root = r
-                if chosen_root is not None:
-                    curr_fp = _compute_scope_fingerprint(chosen_root)
-                    prev_fp = _cached_scope_fingerprints.get(chosen_root)
-                    if prev_fp is not None and prev_fp != curr_fp:
-                        if _debug_ast_immutability[0]:
-                            raise RuntimeError(
-                                "Cached AST node was mutated in-place without calling "
-                                "evict_tree_scopes(tree)"
-                            )
-                        _evict_tree_scopes(chosen_root)
-                    else:
-                        _scope_parent_maps.move_to_end(chosen_root)
-                        return _scope_parent_maps[chosen_root]
-    return _get_or_compute_scope_cached(
+    if oversized_root is not None:
+        o_entry = _lookup_valid_oversized_entry(oversized_root)
+        if o_entry is not None:
+            return o_entry.weak_parent_map
+    if chosen_root is not None:
+        curr_fp = _compute_scope_fingerprint(chosen_root)
+        with _downstream_cache_lock:
+            if chosen_root in _scope_parent_maps:
+                prev_fp = _cached_scope_fingerprints.get(chosen_root)
+                if prev_fp is not None and prev_fp != curr_fp:
+                    if _debug_ast_immutability[0]:
+                        raise RuntimeError(
+                            "Cached AST node was mutated in-place without calling "
+                            "evict_tree_scopes(tree)"
+                        )
+                    _evict_tree_scopes(chosen_root)
+                else:
+                    _scope_parent_maps.move_to_end(chosen_root)
+                    return _scope_parent_maps[chosen_root]
+    built = _get_or_compute_scope_cached(
         _scope_parent_maps, scope_node, lambda: _build_parent_map_unlocked(scope_node)
     )
+    with _downstream_cache_lock:
+        o_stored = _oversized_scope_parent_maps.get(scope_node)
+        if o_stored is not None:
+            return o_stored.weak_parent_map
+    return built
 
 
 def _index_scope_stmts(

@@ -3832,3 +3832,121 @@ def test_partial_column_inference_all_four_combinations_and_utf8() -> None:
         sc = inspect_single_unit_scope(u_utf8, tree=ast.parse(utf8_src))
         assert sc["inputs"] == ["café"]
         assert sc["outputs"] == ["résumé"]
+
+
+def test_closure_strictness_three_tier_monotonicity_across_scenario_table() -> None:
+    """Verifies lenient <= strict <= pedantic hazard monotonicity and strict separation across scenario fixtures."""
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
+
+    cases: list[tuple[str, str, dict[str, Any]]] = [
+        (name, src, dict(unit)) for name, src, unit, _expected in _CLOSURE_CELL_SCENARIOS
+    ]
+    # Explicit separation witnesses for strict < pedantic (neutral context manager + allowlisted builtin on global)
+    neutral_cm_src = (
+        "def run_neutral_cm(AuditSpan, compute):\n"
+        "    with AuditSpan():\n"
+        "        computed = compute()\n"
+        "    cb = lambda: computed\n"
+        "    return cb()\n"
+    )
+    cases.append(
+        (
+            "neutral_ctx_manager_strict_vs_pedantic",
+            neutral_cm_src,
+            {
+                "start": 4,
+                "end": 4,
+                "kind": "basic_block",
+                "source_code": "    cb = lambda: computed\n",
+            },
+        )
+    )
+    allowlisted_global_src = (
+        "GLOBAL_STATE = 1\n"
+        "def run_global_len(box):\n"
+        "    global GLOBAL_STATE\n"
+        "    a = GLOBAL_STATE\n"
+        "    n = len(box)\n"
+        "    b = GLOBAL_STATE + n\n"
+        "    return a, b\n"
+    )
+    cases.append(
+        (
+            "allowlisted_builtin_global_strict_vs_pedantic",
+            allowlisted_global_src,
+            {
+                "start": 4,
+                "end": 6,
+                "kind": "compound_block",
+            },
+        )
+    )
+
+    witnessed_lenient_lt_strict = False
+    witnessed_strict_lt_pedantic = False
+
+    for case_name, src, base_unit in cases:
+        tree = ast.parse(src)
+        clean_unit = {
+            k: v
+            for k, v in base_unit.items()
+            if k
+            not in {
+                "scope",
+                "closure_strictness",
+                "skip_pre_unit_closures",
+                "strict_with_suppression",
+            }
+        }
+        clean_unit["source_text"] = src
+
+        sc_lenient = inspect_single_unit_scope(
+            {**clean_unit, "closure_strictness": "lenient"},
+            tree=tree,
+        )
+        sc_strict = inspect_single_unit_scope(
+            {**clean_unit, "closure_strictness": "strict"},
+            tree=tree,
+        )
+        sc_pedantic = inspect_single_unit_scope(
+            {**clean_unit, "closure_strictness": "pedantic"},
+            tree=tree,
+        )
+
+        haz_lenient = set(sc_lenient["control_flow_hazards"])
+        haz_strict = set(sc_strict["control_flow_hazards"])
+        haz_pedantic = set(sc_pedantic["control_flow_hazards"])
+        assert haz_lenient <= haz_strict <= haz_pedantic, (
+            case_name,
+            haz_lenient,
+            haz_strict,
+            haz_pedantic,
+        )
+
+        reasons_lenient = set(sc_lenient["closure_hazard_reasons"])
+        reasons_strict = set(sc_strict["closure_hazard_reasons"])
+        reasons_pedantic = set(sc_pedantic["closure_hazard_reasons"])
+        assert reasons_lenient <= reasons_strict <= reasons_pedantic, (
+            case_name,
+            reasons_lenient,
+            reasons_strict,
+            reasons_pedantic,
+        )
+
+        defs_lenient = set(sc_lenient["definite_stores"])
+        defs_strict = set(sc_strict["definite_stores"])
+        defs_pedantic = set(sc_pedantic["definite_stores"])
+        assert defs_pedantic <= defs_strict <= defs_lenient, (
+            case_name,
+            defs_lenient,
+            defs_strict,
+            defs_pedantic,
+        )
+
+        if haz_lenient < haz_strict or reasons_lenient < reasons_strict:
+            witnessed_lenient_lt_strict = True
+        if haz_strict < haz_pedantic or reasons_strict < reasons_pedantic:
+            witnessed_strict_lt_pedantic = True
+
+    assert witnessed_lenient_lt_strict is True
+    assert witnessed_strict_lt_pedantic is True

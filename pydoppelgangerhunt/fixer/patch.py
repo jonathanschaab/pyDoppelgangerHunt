@@ -6,12 +6,26 @@ import ast
 import builtins
 from collections import defaultdict
 import difflib
+import functools
 import hashlib
 import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, TypedDict, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TypeVar,
+    TypedDict,
+    Union,
+    cast,
+)
 
 from pydoppelgangerhunt.config import (
     format_heuristic_ctx_manager_comment,
@@ -34,7 +48,10 @@ from pydoppelgangerhunt.fixer.binding import (
     find_enclosing_class,
     find_enclosing_function,
 )
-from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
+from pydoppelgangerhunt.fixer._df_cache import (
+    _get_or_parse_tree,
+    _suppress_syntax_warnings,
+)
 from pydoppelgangerhunt.fixer._df_closures import (
     _extract_comprehension_walrus_names,
     iter_nested_scope_header_nodes,
@@ -3172,7 +3189,27 @@ def _unit_start(u: Dict[str, Any]) -> int:
     return max(1, parse_unit_coord(u, "start", default=1))
 
 
-@heuristic_ctx_manager_session()
+_PatchCallableT = TypeVar("_PatchCallableT", bound=Callable[..., str])
+
+
+def _with_patch_session(fn: _PatchCallableT) -> _PatchCallableT:
+    """Enters heuristic session (escalating to WARNING on replace_clones) and syntax-warning guard."""
+
+    @functools.wraps(fn)
+    def _wrapped(*args: Any, **kwargs: Any) -> str:
+        warn_mode = bool(
+            kwargs.get("replace_clones", args[3] if len(args) > 3 else False)
+        )
+        with (
+            heuristic_ctx_manager_session(warn=warn_mode),
+            _suppress_syntax_warnings(),
+        ):
+            return fn(*args, **kwargs)
+
+    return cast(_PatchCallableT, _wrapped)
+
+
+@_with_patch_session
 def generate_refactoring_patch(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     repo_root: Optional[str] = None,
@@ -3568,7 +3605,7 @@ def generate_refactoring_patch(
                         u1_eff,
                         [ln.rstrip("\r\n") for ln in raw_l1],
                     ),
-                    is_pre_sliced=origin1.is_pre_sliced or origin1.is_placeholder,
+                    is_pre_sliced=origin1.is_pre_sliced,
                 )
                 stmt_lines2 = _slice_unit_token_lines(
                     u2_eff,
@@ -3576,7 +3613,7 @@ def generate_refactoring_patch(
                         u2_eff,
                         [ln.rstrip("\r\n") for ln in raw_l2],
                     ),
-                    is_pre_sliced=origin2.is_pre_sliced or origin2.is_placeholder,
+                    is_pre_sliced=origin2.is_pre_sliced,
                 )
                 if not _prune_pair_lhs_and_augassign_scopes(
                     u1_eff, u2_eff, s1, s2, stmt_lines1, stmt_lines2
@@ -3624,9 +3661,13 @@ def generate_refactoring_patch(
             hazards1 = set(s1.get("control_flow_hazards", []))
             hazards2 = set(s2.get("control_flow_hazards", []))
             combined_pair_hazards = hazards1 | hazards2
+            # Intentional host-caller asymmetry: u1 supplies the extracted helper AST and
+            # always rejects unavailable_source_placeholder; u2 permits preview-only
+            # (not replace_clones, not is_sub1, f2_text is None) host-module helper emission
+            # with a manual-import note when u2's caller file is missing on disk.
             if "unavailable_source_placeholder" in hazards1 or (
-                (replace_clones or is_sub1 or is_sub2 or u2_lines is not None)
-                and "unavailable_source_placeholder" in hazards2
+                "unavailable_source_placeholder" in hazards2
+                and (is_sub1 or replace_clones or f2_text is not None)
             ):
                 skip_reasons["unavailable source placeholder"] += 1
                 continue
@@ -3760,6 +3801,15 @@ def generate_refactoring_patch(
                     inputs, u1_eff, u2_eff, s1, s2, repo_root=str(root)
                 )
 
+            effective_pair_strictness = (
+                "lenient"
+                if pair_flags.effective_skip_pre_unit_closures
+                else (
+                    "pedantic"
+                    if pair_flags.effective_strict_with_suppression
+                    else "strict"
+                )
+            )
             resolved_outs = resolve_clone_pair_outputs(
                 u1=u1_eff,
                 u2=u2_eff,
@@ -3770,10 +3820,10 @@ def generate_refactoring_patch(
                 tree1=tree1,
                 tree2=tree2,
                 repo_root=str(root),
-                skip_pre_unit_closures=skip_pre_unit_closures,
+                skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
                 source_digest1=digest1,
                 source_digest2=digest2,
-                closure_strictness=closure_strictness,
+                closure_strictness=effective_pair_strictness,
                 non_suppressing_ctx_managers=eff_non_sup or None,
                 require_pairing=replace_clones,
                 return_details=True,

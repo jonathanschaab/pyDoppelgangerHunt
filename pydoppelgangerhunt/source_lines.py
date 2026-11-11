@@ -7,7 +7,7 @@ import logging
 import math
 from pathlib import Path
 import re
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union, overload
+from typing import Any, Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence, Tuple, Union, overload
 
 from pydoppelgangerhunt.config import normalize_path_string
 
@@ -59,6 +59,13 @@ class SourceLinesOrigin(enum.Enum):
     def has_real_source(self) -> bool:
         """True if lines come from actual source text rather than a synthetic placeholder."""
         return not self._is_placeholder
+
+    def __bool__(self) -> NoReturn:
+        """Rejects implicit truth-value testing so callers inspect explicit origin properties."""
+        raise TypeError(
+            "SourceLinesOrigin has no implicit truth value; check "
+            ".is_pre_sliced, .is_placeholder, or .has_real_source explicitly"
+        )
 
 _COORD_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
     "start_col": ("start_col", "start_col_offset"),

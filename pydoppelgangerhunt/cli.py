@@ -37,6 +37,7 @@ from pydoppelgangerhunt.config import (
 from pydoppelgangerhunt.canonical_path import CanonicalPathResolver
 from pydoppelgangerhunt.coverage import check_asymmetric_coverage, read_coverage_data
 from pydoppelgangerhunt.fixer import generate_refactoring_patch
+from pydoppelgangerhunt.fixer._df_cache import _suppress_syntax_warnings
 from pydoppelgangerhunt.git_diff import (
     DiffRangeMap,
     check_temporal_divergence,
@@ -421,47 +422,80 @@ def _render_pair_diff_and_suggestions(
     tree1: Optional[ast.AST] = None
     tree2: Optional[ast.AST] = None
     if (args.suggest or args.diff) and file_cache is not None:
-        src1, tree1 = resolve_cached_unit_source_and_tree(
-            u1, repo_root=effective_root, file_cache=file_cache
-        )
-        src2, tree2 = resolve_cached_unit_source_and_tree(
-            u2, repo_root=effective_root, file_cache=file_cache
-        )
-    if args.suggest:
-        sug_kwargs: Dict[str, Any] = {"repo_root": effective_root}
-        if src1 is not None or tree1 is not None:
-            sug_kwargs["source_text1"] = src1
-            sug_kwargs["tree1"] = tree1
-        if src2 is not None or tree2 is not None:
-            sug_kwargs["source_text2"] = src2
-            sug_kwargs["tree2"] = tree2
-        if closure_strictness is not None:
-            sug_kwargs["closure_strictness"] = closure_strictness
-            sug_kwargs["skip_pre_unit_closures"] = bool(skip_pre_unit_closures)
-        elif skip_pre_unit_closures is not None:
-            sug_kwargs["skip_pre_unit_closures"] = skip_pre_unit_closures
-        if non_suppressing_ctx_managers is not None:
-            sug_kwargs["non_suppressing_ctx_managers"] = (
-                non_suppressing_ctx_managers
+        try:
+            src1, tree1 = resolve_cached_unit_source_and_tree(
+                u1, repo_root=effective_root, file_cache=file_cache
             )
-        sug = synthesize_refactoring_suggestion(u1, u2, **sug_kwargs)
+            src2, tree2 = resolve_cached_unit_source_and_tree(
+                u2, repo_root=effective_root, file_cache=file_cache
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "Failed to preload cached source/AST for clone pair (%r, %r)",
+                u1.get("name") if isinstance(u1, dict) else u1,
+                u2.get("name") if isinstance(u2, dict) else u2,
+                exc_info=True,
+            )
+    if args.suggest:
+        try:
+            sug_kwargs: Dict[str, Any] = {"repo_root": effective_root}
+            if src1 is not None or tree1 is not None:
+                sug_kwargs["source_text1"] = src1
+                sug_kwargs["tree1"] = tree1
+            if src2 is not None or tree2 is not None:
+                sug_kwargs["source_text2"] = src2
+                sug_kwargs["tree2"] = tree2
+            if closure_strictness is not None:
+                sug_kwargs["closure_strictness"] = closure_strictness
+                sug_kwargs["skip_pre_unit_closures"] = bool(skip_pre_unit_closures)
+            elif skip_pre_unit_closures is not None:
+                sug_kwargs["skip_pre_unit_closures"] = skip_pre_unit_closures
+            if non_suppressing_ctx_managers is not None:
+                sug_kwargs["non_suppressing_ctx_managers"] = (
+                    non_suppressing_ctx_managers
+                )
+            sug = synthesize_refactoring_suggestion(u1, u2, **sug_kwargs)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "Failed to synthesize refactoring suggestion for clone pair (%r, %r)",
+                u1.get("name") if isinstance(u1, dict) else u1,
+                u2.get("name") if isinstance(u2, dict) else u2,
+                exc_info=True,
+            )
+            sug = (
+                f"[REFACTOR SUGGESTION] Diagnostic: suggestion skipped due to "
+                f"{type(exc).__name__}: {exc}"
+            )
         sug_colored = colorize(sug, COLOR_YELLOW, use_color)
         print(indent + sug_colored.replace("\n", "\n" + indent))
         lines.append(indent + sug.replace("\n", "\n" + indent))
     if args.diff:
-        u1_diff = (
-            {**u1, "source_text": src1}
-            if src1 is not None and "source_text" not in u1 and "source_lines" not in u1
-            else u1
-        )
-        u2_diff = (
-            {**u2, "source_text": src2}
-            if src2 is not None and "source_text" not in u2 and "source_lines" not in u2
-            else u2
-        )
-        diff_out = generate_clone_diff(
-            u1_diff, u2_diff, repo_root=effective_root, color=use_color
-        )
+        try:
+            u1_diff = (
+                {**u1, "source_text": src1}
+                if src1 is not None
+                and "source_text" not in u1
+                and "source_lines" not in u1
+                else u1
+            )
+            u2_diff = (
+                {**u2, "source_text": src2}
+                if src2 is not None
+                and "source_text" not in u2
+                and "source_lines" not in u2
+                else u2
+            )
+            diff_out = generate_clone_diff(
+                u1_diff, u2_diff, repo_root=effective_root, color=use_color
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "Failed to render unified diff for clone pair (%r, %r)",
+                u1.get("name") if isinstance(u1, dict) else u1,
+                u2.get("name") if isinstance(u2, dict) else u2,
+                exc_info=True,
+            )
+            diff_out = f"# Diagnostic: diff skipped due to {type(exc).__name__}: {exc}"
         if diff_out:
             print(f"{indent}--- Diff ---")
             print(indent + diff_out.replace("\n", "\n" + indent))
@@ -1217,13 +1251,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         and tool_cfg.get("strict_with_suppression") is not None
         else None
     )
-    has_explicit_closure_cfg = (
-        args.closure_strictness is not None
-        or bool(args.skip_pre_unit_closures)
-        or cfg_strictness is not None
-        or has_cfg_skip
-        or cfg_strict_with is not None
+    has_cfg_closure = (
+        cfg_strictness is not None or has_cfg_skip or cfg_strict_with is not None
     )
+    has_cli_closure = args.closure_strictness is not None or bool(
+        args.skip_pre_unit_closures
+    )
+    has_explicit_closure_cfg = has_cfg_closure or has_cli_closure
     closure_strictness: Optional[str]
     skip_pre_unit_closures: Optional[bool]
     if not has_explicit_closure_cfg:
@@ -1234,55 +1268,56 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             closure_strictness = None
             skip_pre_unit_closures = None
     else:
-        eff_cfg_strict_with: Optional[bool] = None
+        cfg_resolved_strictness: Optional[str] = None
+        cfg_resolved_skip: bool = False
+        if has_cfg_closure:
+            cfg_resolved_strictness, cfg_resolved_skip = (
+                resolve_closure_strictness_mode(
+                    closure_strictness=cfg_strictness,
+                    skip_pre_unit_closures=cfg_skip,
+                    strict_with_suppression=cfg_strict_with,
+                )
+            )
         if args.closure_strictness is not None:
-            cli_strictness: Optional[str] = args.closure_strictness
-            cli_skip: bool = _safe_bool(args.skip_pre_unit_closures)
-            if cli_skip and str(cli_strictness).strip().lower() in (
-                "strict",
-                "pedantic",
-            ):
+            cli_strictness_str = str(args.closure_strictness)
+            cli_skip = _safe_bool(args.skip_pre_unit_closures)
+            closure_strictness, skip_pre_unit_closures = (
+                resolve_closure_strictness_mode(
+                    closure_strictness=cli_strictness_str,
+                    skip_pre_unit_closures=False,
+                )
+            )
+            if cli_skip and not skip_pre_unit_closures:
                 logger.warning(
                     "Conflicting configuration: closure_strictness '%s' takes precedence over "
                     "skip_pre_unit_closures=True (--skip-pre-unit-closures)",
-                    cli_strictness,
+                    cli_strictness_str,
                 )
-                cli_skip = False
         elif args.skip_pre_unit_closures:
-            cli_strictness = "lenient"
-            cli_skip = True
-            if cfg_strictness is not None and str(cfg_strictness).strip().lower() in (
-                "strict",
-                "pedantic",
-            ):
-                logger.warning(
-                    "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
-                    "configured closure_strictness='%s'",
-                    cfg_strictness,
+            if cfg_resolved_strictness in ("strict", "pedantic"):
+                if cfg_strictness is not None and str(cfg_strictness).strip().lower() in (
+                    "strict",
+                    "pedantic",
+                ):
+                    logger.warning(
+                        "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
+                        "configured closure_strictness='%s'",
+                        cfg_strictness,
+                    )
+                elif cfg_strict_with:
+                    logger.warning(
+                        "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
+                        "configured strict_with_suppression=True"
+                    )
+            closure_strictness, skip_pre_unit_closures = (
+                resolve_closure_strictness_mode(
+                    closure_strictness="lenient",
+                    skip_pre_unit_closures=True,
                 )
-            elif cfg_strict_with:
-                logger.warning(
-                    "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
-                    "configured strict_with_suppression=True"
-                )
-        elif (
-            cfg_strict_with is True
-            and cfg_strictness is not None
-            and str(cfg_strictness).strip().lower() == "strict"
-        ):
-            cli_strictness = "pedantic"
-            cli_skip = cfg_skip
-            eff_cfg_strict_with = True
+            )
         else:
-            cli_strictness = cfg_strictness
-            cli_skip = cfg_skip
-            eff_cfg_strict_with = cfg_strict_with
-
-        closure_strictness, skip_pre_unit_closures = resolve_closure_strictness_mode(
-            closure_strictness=cli_strictness,
-            skip_pre_unit_closures=cli_skip,
-            strict_with_suppression=eff_cfg_strict_with,
-        )
+            closure_strictness = cfg_resolved_strictness
+            skip_pre_unit_closures = cfg_resolved_skip
     non_suppressing_ctx_managers = normalize_non_suppressing_ctx_managers(
         tool_cfg.get("non_suppressing_ctx_managers"),
         getattr(args, "non_suppressing_ctx_managers", ()),
@@ -1595,30 +1630,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.coverage:
         cov_data = read_coverage_data(args.coverage)
 
-    return _emit_scan_artifacts_and_report(
-        args=args,
-        clones=clones,
-        target=target,
-        threshold=threshold,
-        sort_by=sort_by,
-        families=families,
-        stats=stats,
-        cov_data=cov_data,
-        use_color=use_color,
-        git_worktree_root=git_worktree_root,
-        audit_tests_enabled=audit_tests_enabled,
-        type_merge_strategy=type_merge_strategy,
-        replace_clones=replace_clones,
-        method_binding=method_binding,
-        cross_file_strategy=cross_file_strategy,
-        shared_module_name=shared_module_name,
-        skip_pre_unit_closures=skip_pre_unit_closures,
-        closure_strictness=closure_strictness,
-        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
-    )
+    with (
+        heuristic_ctx_manager_session(warn=replace_clones),
+        _suppress_syntax_warnings(),
+    ):
+        return _emit_scan_artifacts_and_report(
+            args=args,
+            clones=clones,
+            target=target,
+            threshold=threshold,
+            sort_by=sort_by,
+            families=families,
+            stats=stats,
+            cov_data=cov_data,
+            use_color=use_color,
+            git_worktree_root=git_worktree_root,
+            audit_tests_enabled=audit_tests_enabled,
+            type_merge_strategy=type_merge_strategy,
+            replace_clones=replace_clones,
+            method_binding=method_binding,
+            cross_file_strategy=cross_file_strategy,
+            shared_module_name=shared_module_name,
+            skip_pre_unit_closures=skip_pre_unit_closures,
+            closure_strictness=closure_strictness,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        )
 
 
-@heuristic_ctx_manager_session()
 def _emit_scan_artifacts_and_report(
     *,
     args: argparse.Namespace,

@@ -303,6 +303,16 @@ def _extract_effective_unit_outputs(
     return list(dict.fromkeys(v for v in cands if v not in excluded))
 
 
+_BLOCKING_SCOPE_HAZARDS: Tuple[Tuple[str, str], ...] = (
+    ("unavailable_source_for_closure_mode", "unavailable source for closure mode"),
+    ("unavailable_source_placeholder", "unavailable source placeholder"),
+    ("invalid_unit_columns", "invalid unit columns"),
+    ("severed_closure_cell", "severed closure cell"),
+    ("stale_source_code", "stale source code"),
+    ("pathological_ast", "pathological ast"),
+)
+
+
 def _ensure_pair_scopes_closure_mode(
     u1: Dict[str, Any],
     u2: Dict[str, Any],
@@ -478,19 +488,7 @@ def resolve_clone_generator_subroutine_outputs(
                 "ambiguous outputs",
                 "ambiguous scope outputs lack positional ordering",
             )
-        for hazard_key, reason_str in (
-            (
-                "unavailable_source_for_closure_mode",
-                "unavailable source for closure mode",
-            ),
-            (
-                "unavailable_source_placeholder",
-                "unavailable source placeholder",
-            ),
-            ("severed_closure_cell", "severed closure cell"),
-            ("stale_source_code", "stale source code"),
-            ("pathological_ast", "pathological ast"),
-        ):
+        for hazard_key, reason_str in _BLOCKING_SCOPE_HAZARDS:
             if hazard_key in s_chk.get("control_flow_hazards", ()):
                 return _reject_gen_pair(
                     reason_str, f"{reason_str} on {side_lbl}"
@@ -809,42 +807,21 @@ def resolve_clone_pair_outputs(
     outs2 = _extract_effective_unit_outputs(u2, scope2)
     hazards1 = scope1.get("control_flow_hazards", ())
     hazards2 = scope2.get("control_flow_hazards", ())
-    has_blocking_placeholder = (
-        "unavailable_source_placeholder" in hazards1
-        or (
-            (is_sub or require_pairing is not False or source_text2 is not None)
-            and "unavailable_source_placeholder" in hazards2
-        )
+    # Intentional host-caller asymmetry: u1 supplies the extracted helper AST and
+    # unconditionally rejects unavailable_source_placeholder so placeholder comment
+    # lines can never enter a helper. For u2, non-subroutine preview-only extraction
+    # (not is_sub, require_pairing is False, source_text2 is None) permits generating
+    # the host helper from u1's verified AST and emitting a manual-import note when
+    # u2's caller file is missing on disk.
+    u2_blocks_placeholder = (
+        is_sub or require_pairing is not False or source_text2 is not None
     )
-    if (
-        "unavailable_source_for_closure_mode" in hazards1
-        or "unavailable_source_for_closure_mode" in hazards2
-    ):
-        logger.debug(
-            "Rejecting clone pair output resolution: unavailable source for closure mode"
+    for hazard_key, reason_str in _BLOCKING_SCOPE_HAZARDS:
+        blocked = hazard_key in hazards1 or (
+            hazard_key in hazards2
+            and (hazard_key != "unavailable_source_placeholder" or u2_blocks_placeholder)
         )
-        return (
-            CloneOutputResolution(None, "unavailable source for closure mode")
-            if return_details
-            else None
-        )
-    if has_blocking_placeholder:
-        logger.debug(
-            "Rejecting clone pair output resolution: unavailable source placeholder"
-        )
-        return (
-            CloneOutputResolution(None, "unavailable source placeholder")
-            if return_details
-            else None
-        )
-    blocking_hazards: List[Tuple[str, str]] = [
-        ("invalid_unit_columns", "invalid unit columns"),
-        ("severed_closure_cell", "severed closure cell"),
-        ("stale_source_code", "stale source code"),
-        ("pathological_ast", "pathological ast"),
-    ]
-    for hazard_key, reason_str in blocking_hazards:
-        if hazard_key in hazards1 or hazard_key in hazards2:
+        if blocked:
             logger.debug(
                 "Rejecting clone pair output resolution: %s", reason_str
             )
