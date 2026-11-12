@@ -189,6 +189,8 @@ from pydoppelgangerhunt import (
 - **`count_physical_newlines(text)`**: Accurately counts physical line endings (`\r\n`, `\r`, `\n`) across mixed and legacy lone-CR formats.
 - **`detect_line_ending(*sources)`**: Detects predominant line ending format across source strings or iterables via majority vote (`\n`, `\r\n`, or `\r`), breaking ties in priority order (`\n` → `\r\n` → `\r`).
 - **`intervals_overlap(s1, e1, s2, e2)`**: Fast primitive returning `True` if two half-open intervals `[s1, e1)` and `[s2, e2)` intersect; `False` otherwise.
+- **`validate_unit_schema(unit, strict=False)`**: Validates a unit dictionary against `UnitSchema`, returning unrecognized keys (or raising `ValueError` under `strict=True`). Positionally consumed fields (`source_lines`, `inputs`, `outputs`, `precomputed_outputs`, `norm_tokens`, `calls`, list-valued `tokens`) must be ordered sequences—sets are rejected because they make helper parameter order and output pairing nondeterministic—while `non_suppressing_ctx_managers` and `shingles` also accept sets. `docstring_end` and `enclosing_class_start` are 1-based and reject `0`, and aliased coordinates (`start`/`lineno`, `end`/`end_lineno`, `start_col`/`col_offset`/`start_col_offset`, `end_col`/`end_col_offset`) must agree.
+- **Notebook cell sources**: Code-cell `source` fragments are concatenated per nbformat before physical line splitting (line endings normalized to `\n`); cells whose `source` is missing or contains non-string fragments, and non-code cells, are skipped during harvesting and resolve to a `SourceLinesOrigin.PLACEHOLDER` (failing closed) in `extract_unit_source_lines_with_state`.
 - **`is_subroutine_unit(unit, source_text=None, tree=None)`**: Inspects unit metadata to
   determine if a clone unit represents an inner compound block, sliding window, or clause branch
   rather than an entire callable. Explicit `is_subroutine` boolean takes precedence; returns `True`
@@ -343,6 +345,13 @@ escaping callbacks across lexical scopes.
     (never polluting `stdout` or `--output` report files, while recording a per-hunk advisory
     comment in `--patch` unified diffs); automated call-site delegation (`--replace-clones` /
     `replace_clones=True`) defaults to `pedantic` unless `closure_strictness` is explicitly set.
+    In every mode, positive non-suppression proofs (local class bodies and pure-Python stdlib
+    managers such as `contextlib.nullcontext`) are withdrawn for the whole module when it patches
+    the exit protocol at runtime anywhere (`Cls.__exit__ = ...`, `del Cls.__aexit__`,
+    `obj.__class__ = ...`, `setattr`/`delattr`/`type.__setattr__` targeting `__exit__`/`__aexit__`
+    or a non-literal attribute name) or calls `exec`/`eval`; directly patched names are treated as
+    suspicious (potentially suppressing), and only builtin `open(...)` and explicit
+    `non_suppressing_ctx_managers` entries remain trusted.
   - `pedantic` (default when `--replace-clones` / `replace_clones=True` is enabled without an
     explicit `closure_strictness`, or when `strict_with_suppression = true` is set while
     `closure_strictness` is unset in `pyproject.toml` or `UnitSchema` dicts): **Stricter static conservative mode**
@@ -357,8 +366,8 @@ escaping callbacks across lexical scopes.
     class/value/mapping/sequence patterns on unproven subjects, `import`, non-builtin `raise`, and
     boolean truth-value evaluations) unless operands are statically proven built-in primitives or
     immutable literals. Static analysis remains bounded by Python's dynamic runtime (e.g., runtime
-    frame introspection via `sys._getframe()`, metaclasses, or out-of-module monkeypatching are not
-    modeled). Allowlist entries support bare names (including locally defined classes), relative
+    frame introspection via `sys._getframe()`, metaclasses, or out-of-module monkeypatching of a
+    module's context-manager classes are not modeled). Allowlist entries support bare names (including locally defined classes), relative
     imports (`.Name` matching `from . import Name`), dotted paths (e.g., `pkg.tx.atomic` or
     `unittest.mock.patch.object`), and wildcard attribute suffixes (`*.atomic` or `*.lock` matching
     `<any_receiver>.atomic` / `<any_receiver>.lock(...)`).

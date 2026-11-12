@@ -19,6 +19,7 @@ __all__ = [
     "SourceLinesOrigin",
     "count_physical_newlines",
     "detect_line_ending",
+    "extract_notebook_code_cell_text",
     "is_sliced_unit_source_lines",
     "normalize_unit_coordinates",
     "parse_unit_coord",
@@ -308,6 +309,26 @@ def split_source_lines(source_text: str) -> List[str]:
     if not source_text:
         return []
     return [m.group(0) for m in _PHYSICAL_LINE_RE.finditer(source_text) if m.group(0)]
+
+
+def extract_notebook_code_cell_text(cell: Any) -> Optional[str]:
+    """Returns the joined source text of a Jupyter notebook code cell, or None if malformed.
+
+    Follows nbformat semantics: ``source`` is either a string or a list of string
+    fragments concatenated verbatim (fragments may embed or omit newlines, so they
+    are joined rather than treated as one physical line each). Returns None for
+    non-dict cells, non-``"code"`` cell types, a missing ``source`` key, or a
+    ``source`` that is neither a string nor a list consisting solely of strings, so
+    malformed notebook data is never coerced into Python source.
+    """
+    if not isinstance(cell, dict) or cell.get("cell_type") != "code":
+        return None
+    src = cell.get("source")
+    if isinstance(src, str):
+        return src
+    if isinstance(src, list) and all(isinstance(fragment, str) for fragment in src):
+        return "".join(src)
+    return None
 
 
 def count_physical_newlines(text: str) -> int:

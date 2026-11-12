@@ -2933,3 +2933,219 @@ def test_carrier_alias_rebinding_and_non_closure_class_negative_controls() -> No
         tree=ast.parse(plain_cls_src),
     )
     assert "severed_closure_cell" not in sc_plain["control_flow_hazards"]
+
+
+_ATTR_FACTORY_CLASS_SRC = (
+    "    class Factory:\n"
+    "        def make(self):\n"
+    "            return lambda: value\n"
+    "        def read(self):\n"
+    "            return value\n"
+)
+_ATTR_FACTORY_GETTER_SRC = "    def get_factory():\n        return Factory()\n"
+
+
+def _attr_factory_unit_scopes(
+    tmp_path: Path, scenario_id: str, pre_setup: str, in_unit_expr: str
+) -> list[tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]]:
+    """Builds a duplicated outer function whose loop unit rebinds `value` then evaluates in_unit_expr.
+
+    Returns (mode, unit_a, unit_b, scope_a) for every closure strictness mode.
+    """
+    loop_unit_src = (
+        "    for item in items:\n"
+        "        value = item * 2\n"
+        f"        step = {in_unit_expr}\n"
+    )
+    fn_a = (
+        "def outer_alpha(self, items):\n"
+        "    value = 0\n"
+        f"{pre_setup}"
+        f"{loop_unit_src}"
+        "    return value, step\n"
+    )
+    fn_b = fn_a.replace("outer_alpha", "outer_beta")
+    full_src = f"{fn_a}\n{fn_b}"
+    mod_file = tmp_path / f"attr_factory_{scenario_id}.py"
+    mod_file.write_text(full_src, encoding="utf-8")
+    fn_a_lines = fn_a.splitlines()
+    u1_start = next(
+        idx for idx, ln in enumerate(fn_a_lines, start=1) if ln.strip() == "for item in items:"
+    )
+    offset_b = len(fn_a_lines) + 1
+    results = []
+    for mode in ("strict", "lenient", "pedantic"):
+        base = {
+            "file": str(mod_file),
+            "kind": "compound_block",
+            "source_text": full_src,
+            "source_code": loop_unit_src,
+            "closure_strictness": mode,
+        }
+        u1 = {**base, "start": u1_start, "end": u1_start + 2}
+        u2 = {**base, "start": u1_start + offset_b, "end": u1_start + 2 + offset_b}
+        results.append((mode, u1, u2, inspect_single_unit_scope(u1, repo_root=str(tmp_path))))
+    return results
+
+
+@pytest.mark.parametrize(
+    ("scenario_id", "pre_setup", "in_unit_expr"),
+    [
+        pytest.param(
+            "instance_method_factory_callback",
+            _ATTR_FACTORY_CLASS_SRC + "    factory = Factory()\n    callback = factory.make()\n",
+            "callback()",
+            id="instance_method_factory_callback",
+        ),
+        pytest.param(
+            "self_attribute_factory_callback",
+            _ATTR_FACTORY_CLASS_SRC
+            + "    self.factory = Factory()\n    callback = self.factory.make()\n",
+            "callback()",
+            id="self_attribute_factory_callback",
+        ),
+        pytest.param(
+            "call_result_factory_callback",
+            _ATTR_FACTORY_CLASS_SRC
+            + _ATTR_FACTORY_GETTER_SRC
+            + "    callback = get_factory().make()\n",
+            "callback()",
+            id="call_result_factory_callback",
+        ),
+        pytest.param(
+            "unbound_class_method_factory_callback",
+            _ATTR_FACTORY_CLASS_SRC
+            + "    factory = Factory()\n    callback = Factory.make(factory)\n",
+            "callback()",
+            id="unbound_class_method_factory_callback",
+        ),
+        pytest.param(
+            "instance_method_factory_list_container",
+            _ATTR_FACTORY_CLASS_SRC + "    factory = Factory()\n    cbs = [factory.make()]\n",
+            "cbs[0]()",
+            id="instance_method_factory_list_container",
+        ),
+        pytest.param(
+            "self_attribute_factory_tuple_container",
+            _ATTR_FACTORY_CLASS_SRC
+            + "    self.factory = Factory()\n    cbs = (self.factory.make(),)\n",
+            "cbs[0]()",
+            id="self_attribute_factory_tuple_container",
+        ),
+        pytest.param(
+            "call_result_factory_dict_container",
+            _ATTR_FACTORY_CLASS_SRC
+            + _ATTR_FACTORY_GETTER_SRC
+            + "    cbs = {'key': get_factory().make()}\n",
+            "cbs['key']()",
+            id="call_result_factory_dict_container",
+        ),
+        pytest.param(
+            "unbound_class_method_factory_appended_container",
+            _ATTR_FACTORY_CLASS_SRC
+            + "    factory = Factory()\n    cbs = []\n    cbs.append(Factory.make(factory))\n",
+            "cbs[0]()",
+            id="unbound_class_method_factory_appended_container",
+        ),
+        pytest.param(
+            "inline_attribute_factory_invocation",
+            _ATTR_FACTORY_CLASS_SRC + "    factory = Factory()\n",
+            "factory.make()()",
+            id="inline_attribute_factory_invocation",
+        ),
+        pytest.param(
+            "instance_method_reads_cell_directly",
+            _ATTR_FACTORY_CLASS_SRC + "    factory = Factory()\n",
+            "factory.read()",
+            id="instance_method_reads_cell_directly",
+        ),
+        pytest.param(
+            "nested_class_method_factory",
+            "    class Outer:\n"
+            "        class Inner:\n"
+            "            def make(self):\n"
+            "                return lambda: value\n"
+            "    callback = Outer.Inner().make()\n",
+            "callback()",
+            id="nested_class_method_factory",
+        ),
+        pytest.param(
+            "staticmethod_factory",
+            "    class Factory:\n"
+            "        @staticmethod\n"
+            "        def make():\n"
+            "            return lambda: value\n"
+            "    callback = Factory.make()\n",
+            "callback()",
+            id="staticmethod_factory",
+        ),
+    ],
+)
+def test_attribute_call_closure_factories_block_in_unit_cell_invocation(
+    tmp_path: Path,
+    scenario_id: str,
+    pre_setup: str,
+    in_unit_expr: str,
+) -> None:
+    """Verifies closures produced through attribute calls and invoked inside the unit block cell severance."""
+    clear_dataflow_cache()
+    for mode, u1, u2, sc1 in _attr_factory_unit_scopes(
+        tmp_path, scenario_id, pre_setup, in_unit_expr
+    ):
+        assert "severed_closure_cell" in sc1["control_flow_hazards"], (scenario_id, mode)
+        assert "cell_severing" in sc1["closure_hazard_reasons"], (scenario_id, mode)
+        sc2 = inspect_single_unit_scope(u2, repo_root=str(tmp_path))
+        assert resolve_clone_pair_outputs(u1, u2, sc1, sc2, repo_root=str(tmp_path)) is None
+        patch = generate_refactoring_patch(
+            [(1.0, u1, u2)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+            closure_strictness=mode,
+        )
+        assert patch == "", (scenario_id, mode)
+
+
+@pytest.mark.parametrize(
+    ("scenario_id", "pre_setup", "in_unit_expr"),
+    [
+        pytest.param(
+            "factory_closure_never_captures_cell",
+            "    class Factory:\n"
+            "        def make(self):\n"
+            "            return lambda: 1\n"
+            "    factory = Factory()\n"
+            "    callback = factory.make()\n",
+            "callback()",
+            id="factory_closure_never_captures_cell",
+        ),
+        pytest.param(
+            "capturing_factory_not_invoked_in_unit",
+            _ATTR_FACTORY_CLASS_SRC + "    factory = Factory()\n    callback = factory.make()\n",
+            "item + 1",
+            id="capturing_factory_not_invoked_in_unit",
+        ),
+        pytest.param(
+            "unrelated_callable_invoked_in_unit",
+            _ATTR_FACTORY_CLASS_SRC
+            + "    factory = Factory()\n"
+            "    callback = factory.make()\n"
+            "    def unrelated():\n"
+            "        return 1\n"
+            "    other = unrelated\n",
+            "other()",
+            id="unrelated_callable_invoked_in_unit",
+        ),
+    ],
+)
+def test_attribute_call_closure_factory_negative_controls_do_not_flag_severance(
+    tmp_path: Path,
+    scenario_id: str,
+    pre_setup: str,
+    in_unit_expr: str,
+) -> None:
+    """Verifies attribute-call carrier tracking stays precise when no captured cell is reachable from the unit."""
+    clear_dataflow_cache()
+    for mode, _u1, _u2, sc1 in _attr_factory_unit_scopes(
+        tmp_path, scenario_id, pre_setup, in_unit_expr
+    ):
+        assert "severed_closure_cell" not in sc1["control_flow_hazards"], (scenario_id, mode)

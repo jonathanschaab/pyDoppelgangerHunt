@@ -44,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Compiler Validation in Test Assertions (`assert_valid_python`)**: Added `assert_valid_python`
   test helper verifying that synthesized code is valid Python at both parser and bytecode
   compiler stages.
+- **Runtime Exit-Protocol Patch Detection**: Modules that reassign or delete `__exit__`/`__aexit__`/`__class__` on any object, call `setattr`/`delattr`/`type.__setattr__` targeting those attributes (or a non-literal attribute name), or call `exec`/`eval` withdraw all class-body and pure-Python stdlib (`contextlib.nullcontext`, ...) non-suppression proofs in every closure strictness mode; directly patched names are treated as suspicious suppressors, while builtin `open(...)` and explicit `non_suppressing_ctx_managers` entries remain trusted.
+- **Strict `UnitSchema` Field Validation**: `validate_unit_schema` requires ordered sequences (rejecting sets) for positionally consumed fields (`source_lines`, `inputs`, `outputs`, `precomputed_outputs`, `norm_tokens`, `calls`, list-valued `tokens`), rejects `0` for the 1-based `docstring_end` and `enclosing_class_start`, and rejects disagreeing coordinate aliases (`start`/`lineno`, `end`/`end_lineno`, `start_col`/`col_offset`/`start_col_offset`, `end_col`/`end_col_offset`); `non_suppressing_ctx_managers` and `shingles` continue to accept sets.
+- **Notebook Cell Source Validation**: Code-cell `source` fragments are concatenated per nbformat before physical line splitting (normalizing line endings to `\n`), and cells with a missing `source`, non-string fragments, or a non-`code` cell type are skipped during harvesting and DRY metrics and resolve to `SourceLinesOrigin.PLACEHOLDER` (failing closed) instead of being coerced into Python source.
 
 ### Changed
 - **BREAKING** - **Default `strict` Mode Tightened, `pedantic` Default for `--replace-clones`, & Strictness Precedence**:

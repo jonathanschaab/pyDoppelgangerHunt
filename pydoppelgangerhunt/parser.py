@@ -10,7 +10,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
-from pydoppelgangerhunt.source_lines import split_source_lines
+from pydoppelgangerhunt.source_lines import extract_notebook_code_cell_text, split_source_lines
 
 BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
@@ -1135,7 +1135,7 @@ def harvest_notebook_units(
     except (json.JSONDecodeError, OSError):
         return units
 
-    cells = data.get("cells", [])
+    cells = data.get("cells", []) if isinstance(data, dict) else None
     if not isinstance(cells, list):
         return units
 
@@ -1145,11 +1145,8 @@ def harvest_notebook_units(
         rel_file = str(p).replace("\\", "/")
 
     for idx, cell in enumerate(cells):
-        if not isinstance(cell, dict) or cell.get("cell_type") != "code":
-            continue
-        source_raw = cell.get("source", [])
-        cell_code = "".join(source_raw) if isinstance(source_raw, list) else str(source_raw)
-        if not cell_code.strip():
+        cell_code = extract_notebook_code_cell_text(cell)
+        if cell_code is None or not cell_code.strip():
             continue
 
         cell_label = f"{rel_file}#cell_{idx + 1}"

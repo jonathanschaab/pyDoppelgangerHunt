@@ -1556,17 +1556,48 @@ def test_col_sliced_flag_separation_and_unrecognized_strictness_rejection(
         ),
         (
             {"start": 1, "end": 2, "non_suppressing_ctx_managers": "SafeTx"},
-            "Expected sequence of str",
+            "Expected sequence or set of str",
         ),
         (
             {"start": 1, "end": 2, "non_suppressing_ctx_managers": [123]},
-            "Expected sequence of str",
+            "Expected sequence or set of str",
         ),
         ({"start": 1, "end": 2, "token_count": -1}, "Expected non-negative int"),
         ({"start": 1, "end": 2, "token_count": True}, "Expected non-negative int"),
         (
             {"start": 1, "end": 2, "tokens": -5},
-            "Expected non-negative int or sequence of str",
+            "Expected non-negative int or ordered sequence of str",
+        ),
+        (
+            {"start": 1, "end": 2, "tokens": {"tok_a", "tok_b"}},
+            "Expected non-negative int or ordered sequence of str",
+        ),
+        ({"start": 1, "end": 2, "inputs": {"first", "second"}}, "ordered sequence of str"),
+        ({"start": 1, "end": 2, "outputs": frozenset({"res_a"})}, "ordered sequence of str"),
+        (
+            {"start": 1, "end": 2, "precomputed_outputs": {"res_a", "res_b"}},
+            "ordered sequence of str",
+        ),
+        ({"start": 1, "end": 2, "norm_tokens": {"NAME"}}, "ordered sequence of str"),
+        ({"start": 1, "end": 2, "calls": {"len"}}, "ordered sequence of str"),
+        ({"start": 1, "end": 2, "source_lines": {"x = 1\n"}}, "ordered sequence of str"),
+        ({"start": 1, "end": 2, "outputs": {"res": 1}}, "ordered sequence of str"),
+        ({"start": 1, "end": 2, "docstring_end": 0}, "Expected positive int"),
+        ({"start": 1, "end": 2, "enclosing_class_start": 0}, "Expected positive int"),
+        ({"start": 1, "end": 2, "docstring_end": True}, "Expected positive int"),
+        ({"start": 1, "end": 2, "lineno": 3}, "Conflicting coordinate aliases"),
+        ({"start": 1, "end": 2, "end_lineno": 4}, "Conflicting coordinate aliases"),
+        (
+            {"start": 1, "end": 2, "start_col": 0, "col_offset": 4},
+            "Conflicting coordinate aliases",
+        ),
+        (
+            {"start": 1, "end": 2, "start_col": 0, "start_col_offset": 2},
+            "Conflicting coordinate aliases",
+        ),
+        (
+            {"start": 1, "end": 2, "end_col": 5, "end_col_offset": 6},
+            "Conflicting coordinate aliases",
         ),
         ({"start": 1, "end": 2, "scope": "not_a_dict"}, "Expected mapping for 'scope'"),
         (
@@ -1738,8 +1769,8 @@ def test_invalid_unit_columns_propagates_across_pairing_synthesis_patch_and_sugg
     assert "invalid unit columns" in sug
 
 
-def test_validate_unit_schema_accepts_frozenset_and_custom_abstract_set() -> None:
-    """Verifies validate_unit_schema accepts frozenset and custom collections.abc.Set instances while rejecting non-string members."""
+def test_validate_unit_schema_accepts_sets_only_for_membership_fields() -> None:
+    """Verifies sets are accepted only for order-insensitive fields while ordered fields require sequences."""
     from pydoppelgangerhunt.fixer.source import validate_unit_schema
 
     class _CustomStringSet(AbstractSet[str]):
@@ -1758,19 +1789,46 @@ def test_validate_unit_schema_accepts_frozenset_and_custom_abstract_set() -> Non
     unit_with_sets = {
         "start": 1,
         "end": 3,
-        "inputs": frozenset({"x", "y"}),
-        "outputs": _CustomStringSet(("z",)),
-        "precomputed_outputs": frozenset({"z"}),
-        "shingles": frozenset({"tok_a", "tok_b"}),
+        "inputs": ("x", "y"),
+        "outputs": ["z"],
+        "precomputed_outputs": ("z",),
+        "shingles": frozenset({("tok_a", "tok_b", "tok_c")}),
         "non_suppressing_ctx_managers": _CustomStringSet(("SafeTx", "db.atomic")),
     }
     assert validate_unit_schema(unit_with_sets, strict=True) == set()
 
+    with pytest.raises(ValueError, match="ordered sequence of str for unit field 'outputs'"):
+        validate_unit_schema(
+            {**unit_with_sets, "outputs": _CustomStringSet(("z",))}, strict=True
+        )
     with pytest.raises(ValueError, match="non_suppressing_ctx_managers"):
         validate_unit_schema(
             {"start": 1, "end": 2, "non_suppressing_ctx_managers": frozenset({123})},  # type: ignore[arg-type]
             strict=True,
         )
+
+
+@pytest.mark.parametrize(
+    "good_unit",
+    [
+        pytest.param({"start": 1, "end": 2, "docstring_end": 1}, id="docstring_end_one"),
+        pytest.param({"start": 1, "end": 2, "enclosing_class_start": 1}, id="class_start_one"),
+        pytest.param({"start": 1, "end": 2, "token_count": 0}, id="zero_token_count"),
+        pytest.param({"start": 3, "end": 4, "lineno": 3, "end_lineno": 4}, id="agreeing_lines"),
+        pytest.param(
+            {"start": 1, "end": 1, "start_col": 2, "col_offset": "2", "end_col": 9, "end_col_offset": 9},
+            id="agreeing_columns_across_int_and_str",
+        ),
+        pytest.param({"start": 1, "end": 2, "tokens": ["NAME", "OP"]}, id="ordered_token_list"),
+    ],
+)
+def test_validate_unit_schema_accepts_positive_lines_and_agreeing_aliases(
+    good_unit: dict[str, Any],
+) -> None:
+    """Verifies 1-based metadata, zero-valued counters, and agreeing coordinate aliases pass strict validation."""
+    from pydoppelgangerhunt.fixer.source import validate_unit_schema
+
+    assert validate_unit_schema(good_unit, strict=True) == set()
 
 
 def test_tree_only_placeholder_unit_fails_closed_and_host_caller_placeholder_contract(
@@ -2216,3 +2274,164 @@ def test_source_lines_origin_disk_notebooks_col_sliced_and_comment_impostor(
     assert sc_real_comment["is_control_flow_safe"] is True
     assert "unavailable_source_placeholder" in sc_missing_comment["control_flow_hazards"]
     assert sc_missing_comment["is_control_flow_safe"] is False
+
+
+@pytest.mark.parametrize(
+    ("cell", "expected_lines"),
+    [
+        pytest.param(
+            {"cell_type": "code", "source": [None, 123, False]},
+            None,
+            id="non_string_fragments",
+        ),
+        pytest.param(
+            {"cell_type": "code", "source": ["x = 1\n", 2]},
+            None,
+            id="mixed_string_and_int_fragments",
+        ),
+        pytest.param({"cell_type": "code"}, None, id="missing_source"),
+        pytest.param({"cell_type": "code", "source": {"x": 1}}, None, id="mapping_source"),
+        pytest.param({"cell_type": "markdown", "source": ["x = 1\n"]}, None, id="markdown_cell"),
+        pytest.param({"source": ["x = 1\n"]}, None, id="missing_cell_type"),
+        pytest.param(["x = 1\n"], None, id="non_dict_cell"),
+        pytest.param({"cell_type": "code", "source": []}, [], id="empty_fragment_list"),
+        pytest.param({"cell_type": "code", "source": ""}, [], id="empty_source_string"),
+        pytest.param(
+            {"cell_type": "code", "source": ["a = 1\nb = 2\n", "c = 3"]},
+            ["a = 1\n", "b = 2\n", "c = 3\n"],
+            id="embedded_newlines_in_fragment",
+        ),
+        pytest.param(
+            {"cell_type": "code", "source": ["total = ", "1 + 2\n", "out = total\n"]},
+            ["total = 1 + 2\n", "out = total\n"],
+            id="fragments_without_newline_are_concatenated",
+        ),
+        pytest.param(
+            {"cell_type": "code", "source": ["a = 1\r\n", "b = 2\r\n"]},
+            ["a = 1\n", "b = 2\n"],
+            id="crlf_fragments_normalized",
+        ),
+        pytest.param(
+            {"cell_type": "code", "source": "a = 1\rb = 2\r"},
+            ["a = 1\n", "b = 2\n"],
+            id="lone_cr_string_normalized",
+        ),
+        pytest.param(
+            {"cell_type": "code", "source": "val = 1\n\x0cres = val + 2\n"},
+            ["val = 1\n", "\x0cres = val + 2\n"],
+            id="form_feed_is_not_a_line_break",
+        ),
+    ],
+)
+def test_notebook_cell_lines_reject_malformed_source_and_split_physical_lines(
+    cell: Any, expected_lines: Any
+) -> None:
+    """Verifies notebook cell extraction never coerces malformed source and splits joined fragments on physical newlines."""
+    from pydoppelgangerhunt.reporters import _extract_notebook_cell_lines
+
+    assert _extract_notebook_cell_lines({"cells": [cell]}, 0) == expected_lines
+
+
+@pytest.mark.parametrize(
+    "bad_cell",
+    [
+        pytest.param({"cell_type": "code", "source": [None, 123, False]}, id="non_string_fragments"),
+        pytest.param({"cell_type": "code"}, id="missing_source"),
+        pytest.param({"cell_type": "markdown", "source": ["x = 1\n"]}, id="markdown_cell"),
+        pytest.param("not_a_cell", id="non_dict_cell"),
+    ],
+)
+def test_malformed_notebook_cell_reports_placeholder_origin_and_fails_closed(
+    tmp_path: Path, bad_cell: Any
+) -> None:
+    """Verifies malformed notebook cells yield placeholder origin and unavailable_source_placeholder hazards."""
+    import json
+
+    from pydoppelgangerhunt.reporters import extract_unit_source_lines_with_state
+    from pydoppelgangerhunt.source_lines import SourceLinesOrigin
+
+    nb_file = tmp_path / "malformed.ipynb"
+    nb_file.write_text(json.dumps({"cells": [bad_cell]}), encoding="utf-8")
+    unit = {"file": "malformed.ipynb#cell_1", "name": "bad_cell", "start": 1, "end": 3}
+    lines, origin = extract_unit_source_lines_with_state(unit, repo_root=str(tmp_path))
+    assert lines == []
+    assert origin is SourceLinesOrigin.PLACEHOLDER
+    scope = inspect_single_unit_scope(unit, repo_root=str(tmp_path))
+    assert "unavailable_source_placeholder" in scope["control_flow_hazards"]
+    assert scope["is_control_flow_safe"] is False
+
+
+def test_valid_notebook_cell_with_embedded_newline_fragments_matches_parser_coordinates(
+    tmp_path: Path,
+) -> None:
+    """Verifies reporter line coordinates match parser-harvested units when fragments embed newlines."""
+    import json
+
+    from pydoppelgangerhunt.parser import harvest_notebook_units
+    from pydoppelgangerhunt.reporters import extract_unit_source_lines_with_state
+    from pydoppelgangerhunt.source_lines import SourceLinesOrigin
+
+    nb_file = tmp_path / "joined.ipynb"
+    nb_file.write_text(
+        json.dumps(
+            {
+                "cells": [
+                    {
+                        "cell_type": "code",
+                        "source": [
+                            "def scale(items, factor):\n    out = []\n",
+                            "    for item in items:\n        out.append(item * factor)\n",
+                            "    return out",
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    units = harvest_notebook_units(str(nb_file), str(tmp_path), min_lines=1, min_tokens=1)
+    fn_unit = next(u for u in units if u.get("kind") == "function")
+    lines, origin = extract_unit_source_lines_with_state(fn_unit, repo_root=str(tmp_path))
+    assert origin is SourceLinesOrigin.DISK
+    assert lines == [
+        "def scale(items, factor):\n",
+        "    out = []\n",
+        "    for item in items:\n",
+        "        out.append(item * factor)\n",
+        "    return out\n",
+    ]
+
+
+def test_notebook_harvest_and_metrics_skip_malformed_cells_without_crashing(tmp_path: Path) -> None:
+    """Verifies parser harvesting and DRY metrics skip malformed cells and non-object notebook roots."""
+    import json
+
+    from pydoppelgangerhunt.metrics import compute_repository_dry_stats
+    from pydoppelgangerhunt.parser import harvest_notebook_units
+
+    nb_file = tmp_path / "mixed.ipynb"
+    nb_file.write_text(
+        json.dumps(
+            {
+                "cells": [
+                    {"cell_type": "code", "source": [None, 7]},
+                    {"cell_type": "code", "source": {"bogus": True}},
+                    {
+                        "cell_type": "code",
+                        "source": ["def keep(a):\n", "    b = a + 1\n", "    return b\n"],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    units = harvest_notebook_units(str(nb_file), str(tmp_path), min_lines=1, min_tokens=1)
+    assert units
+    assert {str(u["file"]).rsplit("#", 1)[-1] for u in units} == {"cell_3"}
+
+    root_list_nb = tmp_path / "root_list.ipynb"
+    root_list_nb.write_text(json.dumps([{"cell_type": "code", "source": "x = 1\n"}]), encoding="utf-8")
+    assert harvest_notebook_units(str(root_list_nb), str(tmp_path), min_lines=1, min_tokens=1) == []
+
+    stats = compute_repository_dry_stats(str(tmp_path), [], include_notebooks=True)
+    assert stats["sloc"] == 3

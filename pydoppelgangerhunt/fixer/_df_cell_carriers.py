@@ -1275,6 +1275,16 @@ def _extract_expr_closure_and_load_info(
         and ``curr`` is not an unshadowed scalar built-in call) are routed to
         ``called_names_out`` when provided; when ``called_names_out`` is None, direct
         callee names are included in ``loaded_names`` so they are never silently dropped.
+        Attribute calls (``factory.make()``, ``self.factory.make()``,
+        ``get_factory().make()``, ``Factory.make(factory)``) traverse the receiver
+        expression, so the receiver's root names land in ``loaded_names`` (or its direct
+        callees in ``called_names_out``) and the call result is aliased to the receiver
+        object. This over-approximates every method of a closure-carrying instance or
+        class: a method can only close over enclosing function cells when it is lexically
+        defined inside a local class or factory that is itself recorded as a closure
+        carrier, so resolving the individual method name cannot add escaping cells
+        (closures handed to external receivers are already recorded as escaping when
+        passed as call arguments).
     """
     inline_reads: Set[str] = set()
     inline_muts: Set[str] = set()

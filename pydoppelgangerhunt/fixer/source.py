@@ -11,6 +11,7 @@ import warnings
 from typing import (
     AbstractSet,
     Any,
+    Callable,
     Dict,
     List,
     Mapping,
@@ -155,7 +156,8 @@ class UnitSchema(TypedDict, total=False):
         lines: Total line span count emitted by the parser.
         sloc: Source lines of code count.
         complexity: McCabe cyclomatic complexity of the unit.
-        shingles: Normalized AST shingle sequence emitted by the parser.
+        shingles: Normalized AST k-shingle collection emitted by the parser (a set of
+            token tuples; order-insensitive, so sequences and sets are both accepted).
         vector: Characteristic token/shingle Counter or vector emitted by the parser.
         calls: Sequence of called function/method names extracted by the parser.
         structural_hash: Exact structural AST digest emitted by the parser.
@@ -213,7 +215,7 @@ class UnitSchema(TypedDict, total=False):
     lines: Optional[int]
     sloc: Optional[int]
     complexity: Optional[int]
-    shingles: Optional[Sequence[Any]]
+    shingles: Optional[Union[Sequence[Any], AbstractSet[Any]]]
     vector: Optional[Any]
     calls: Optional[Sequence[str]]
     structural_hash: Optional[str]
@@ -261,10 +263,14 @@ _UNIT_STR_KEYS: frozenset[str] = frozenset(
         "structural_hash",
     }
 )
-_UNIT_NONNEG_INT_KEYS: frozenset[str] = frozenset(
+_UNIT_POSITIVE_INT_KEYS: frozenset[str] = frozenset(
     {
         "docstring_end",
         "enclosing_class_start",
+    }
+)
+_UNIT_NONNEG_INT_KEYS: frozenset[str] = frozenset(
+    {
         "token_count",
         "lines",
         "sloc",
@@ -277,20 +283,37 @@ _UNIT_LINE_COORD_KEYS: frozenset[str] = frozenset(
 _UNIT_COL_COORD_KEYS: frozenset[str] = frozenset(
     {"start_col", "end_col", "col_offset", "start_col_offset", "end_col_offset"}
 )
-_UNIT_STR_SEQ_KEYS: frozenset[str] = frozenset(
+# Positionally consumed fields (helper parameter order, output pairing, token streams)
+# require ordered sequences; unordered sets would make helper signatures nondeterministic.
+_UNIT_ORDERED_STR_SEQ_KEYS: frozenset[str] = frozenset(
     {
         "source_lines",
         "inputs",
         "outputs",
         "precomputed_outputs",
-        "non_suppressing_ctx_managers",
         "norm_tokens",
         "calls",
     }
 )
+# Membership-only fields accept either ordered sequences or unordered sets.
+_UNIT_STR_COLLECTION_KEYS: frozenset[str] = frozenset({"non_suppressing_ctx_managers"})
+# Mutually aliased coordinate keys that must agree when more than one is supplied.
+_UNIT_COORD_ALIAS_GROUPS: Tuple[Tuple[str, ...], ...] = (
+    ("start", "lineno"),
+    ("end", "end_lineno"),
+    ("start_col", "col_offset", "start_col_offset"),
+    ("end_col", "end_col_offset"),
+)
 _VALID_CLOSURE_STRICTNESS_VALUES: frozenset[str] = frozenset(
     {"strict", "pedantic", "lenient"}
 )
+
+
+def _is_valid_ordered_str_sequence(val: Any) -> bool:
+    """Returns True if val is an ordered non-string sequence of strings (sets are rejected)."""
+    if isinstance(val, (str, bytes, bytearray)) or not isinstance(val, Sequence):
+        return False
+    return all(isinstance(item, str) for item in val)
 
 
 def _is_valid_str_collection(val: Any) -> bool:
@@ -300,6 +323,24 @@ def _is_valid_str_collection(val: Any) -> bool:
     ):
         return False
     return all(isinstance(item, str) for item in val)
+
+
+# (field keys, validator, error description) for string-collection UnitSchema fields.
+_UNIT_STR_COLLECTION_RULES: Tuple[
+    Tuple[frozenset[str], Callable[[Any], bool], str], ...
+] = (
+    (_UNIT_ORDERED_STR_SEQ_KEYS, _is_valid_ordered_str_sequence, "ordered sequence"),
+    (_UNIT_STR_COLLECTION_KEYS, _is_valid_str_collection, "sequence or set"),
+)
+
+
+def _validate_int_field(key: str, val: Any, *, minimum: int) -> None:
+    """Raises ValueError unless val is a non-bool int >= minimum."""
+    if isinstance(val, bool) or not isinstance(val, int) or val < minimum:
+        qualifier = "positive" if minimum > 0 else "non-negative"
+        raise ValueError(
+            f"Expected {qualifier} int for unit field {key!r}, got {val!r}"
+        )
 
 
 def _validate_known_unit_field_value(key: str, val: Any) -> None:
@@ -320,11 +361,11 @@ def _validate_known_unit_field_value(key: str, val: Any) -> None:
                 f"{sorted(_VALID_CLOSURE_STRICTNESS_VALUES)}"
             )
         return
+    if key in _UNIT_POSITIVE_INT_KEYS:
+        _validate_int_field(key, val, minimum=1)
+        return
     if key in _UNIT_NONNEG_INT_KEYS:
-        if isinstance(val, bool) or not isinstance(val, int) or val < 0:
-            raise ValueError(
-                f"Expected non-negative int for unit field {key!r}, got {val!r}"
-            )
+        _validate_int_field(key, val, minimum=0)
         return
     if key in _UNIT_LINE_COORD_KEYS or key in _UNIT_COL_COORD_KEYS:
         min_coord = 1 if key in _UNIT_LINE_COORD_KEYS else 0
@@ -343,29 +384,44 @@ def _validate_known_unit_field_value(key: str, val: Any) -> None:
                 f"Invalid coordinate value for unit field {key!r}: {val!r}"
             )
         return
-    if key in _UNIT_STR_SEQ_KEYS:
-        if not _is_valid_str_collection(val):
-            raise ValueError(
-                f"Expected sequence of str for unit field {key!r}, got {val!r}"
-            )
-        return
+    for keys, is_valid, description in _UNIT_STR_COLLECTION_RULES:
+        if key in keys:
+            if not is_valid(val):
+                raise ValueError(
+                    f"Expected {description} of str for unit field {key!r}, got {val!r}"
+                )
+            return
     if key == "tokens":
         is_nonneg_int = not isinstance(val, bool) and isinstance(val, int) and val >= 0
-        if not (is_nonneg_int or _is_valid_str_collection(val)):
+        if not (is_nonneg_int or _is_valid_ordered_str_sequence(val)):
             raise ValueError(
-                f"Expected non-negative int or sequence of str for 'tokens', got {val!r}"
+                f"Expected non-negative int or ordered sequence of str for 'tokens', got {val!r}"
             )
         return
     if key == "shingles":
         if isinstance(val, (str, bytes, bytearray, Mapping)) or not isinstance(
             val, (Sequence, AbstractSet)
         ):
-            raise ValueError(f"Expected sequence for 'shingles', got {val!r}")
+            raise ValueError(f"Expected sequence or set for 'shingles', got {val!r}")
         return
     if key == "scope" and not isinstance(val, Mapping):
         raise ValueError(f"Expected mapping for 'scope', got {val!r}")
     if key == "ast_node" and not isinstance(val, ast.AST):
         raise ValueError(f"Expected ast.AST for 'ast_node', got {val!r}")
+
+
+def _validate_coordinate_alias_agreement(unit: Mapping[str, Any]) -> None:
+    """Raises ValueError when aliased coordinate keys (e.g. ``start`` / ``lineno``) disagree."""
+    for group in _UNIT_COORD_ALIAS_GROUPS:
+        parsed = {
+            key: parse_unit_coord({key: unit[key]}, key, default=None, strict=True)
+            for key in group
+            if unit.get(key) is not None
+        }
+        if len(set(parsed.values())) > 1:
+            raise ValueError(
+                f"Conflicting coordinate aliases in unit dictionary: {parsed}"
+            )
 
 
 def validate_unit_schema(
@@ -377,6 +433,16 @@ def validate_unit_schema(
     known field has an invalid value type/range (or when ``strict=True`` and
     unrecognized keys are present). Returns the set of unrecognized keys not
     declared on ``UnitSchema``.
+
+    Note:
+        Positionally consumed fields (``source_lines``, ``inputs``, ``outputs``,
+        ``precomputed_outputs``, ``norm_tokens``, ``calls``, and list-valued
+        ``tokens``) must be ordered sequences; unordered sets are rejected because
+        they make helper parameter order and output pairing nondeterministic.
+        ``docstring_end`` and ``enclosing_class_start`` are 1-based line numbers and
+        reject zero. Aliased coordinates (``start`` / ``lineno``, ``end`` /
+        ``end_lineno``, ``start_col`` / ``col_offset`` / ``start_col_offset``, and
+        ``end_col`` / ``end_col_offset``) must agree when more than one is supplied.
     """
     if not isinstance(unit, Mapping):
         raise TypeError(f"Expected a unit mapping, got {type(unit).__name__}")
@@ -388,6 +454,7 @@ def validate_unit_schema(
     for k, v in unit.items():
         if k in _UNIT_SCHEMA_KEYS and v is not None:
             _validate_known_unit_field_value(str(k), v)
+    _validate_coordinate_alias_agreement(unit)
     start_raw = unit.get("start") if unit.get("start") is not None else unit.get("lineno")
     end_raw = unit.get("end") if unit.get("end") is not None else unit.get("end_lineno")
     if start_raw is not None and end_raw is not None:

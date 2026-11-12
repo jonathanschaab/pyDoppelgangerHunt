@@ -46,6 +46,7 @@ from pydoppelgangerhunt.fixer._df_cell_carriers import (
     _can_bind_in_fn_scope,
     _extract_store_names_in_node,
 )
+from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
 from pydoppelgangerhunt.fixer._df_span_index import (
     _extract_type_alias_or_pattern_name,
     _find_enclosing_function_chain,
@@ -369,7 +370,16 @@ def _ident_has_suspicious_suppress_token(ident: str) -> bool:
 
 @dataclass(frozen=True)
 class _SuppressProvenance:
-    """Structured provenance for context-manager suppression and stdlib non-suppression."""
+    """Structured provenance for context-manager suppression and stdlib non-suppression.
+
+    Note:
+        ``has_exit_patch`` records that the analyzed module patches the
+        ``__exit__`` / ``__aexit__`` protocol at runtime (or executes dynamic code).
+        While set, positive non-suppression proofs derived from class bodies or
+        pure-Python stdlib managers are withheld (only unpatchable builtin ``open``
+        and explicit ``non_suppressing_ctx_managers`` entries remain trusted), and
+        names in ``exit_patch_targets`` bind as suspicious aliases.
+    """
 
     suppressors: frozenset[str] = frozenset()
     non_suppressors: frozenset[str] = frozenset()
@@ -383,6 +393,8 @@ class _SuppressProvenance:
     cross_scope_mutated: frozenset[str] = frozenset()
     cross_scope_suppressors: frozenset[str] = frozenset()
     cross_scope_suspicious: frozenset[str] = frozenset()
+    exit_patch_targets: frozenset[str] = frozenset()
+    has_exit_patch: bool = False
 
     @property
     def suppress_names(self) -> frozenset[str]:
@@ -413,6 +425,8 @@ class _SuppressProvenance:
             tuple(sorted(self.cross_scope_mutated)),
             tuple(sorted(self.cross_scope_suppressors)),
             tuple(sorted(self.cross_scope_suspicious)),
+            tuple(sorted(self.exit_patch_targets)),
+            self.has_exit_patch,
         )
 
     def __bool__(self) -> bool:
@@ -427,6 +441,7 @@ class _SuppressProvenance:
             or self.non_suppressor_instances
             or self.suspicious_aliases
             or self.cross_scope_mutated
+            or self.has_exit_patch
         )
 
     def clear_name(
@@ -510,6 +525,11 @@ class _SuppressProvenance:
         imported_qualname: Optional[str] = None,
     ) -> _SuppressProvenance:
         """Clears prior bindings for name and optionally records a new provenance entry."""
+        if self.has_exit_patch and not is_suppressor:
+            if name in self.exit_patch_targets:
+                is_suspicious_alias = True
+            is_non_suppressor = False
+            is_non_suppressor_instance = False
         is_shadowable_builtin = name in _SHADOWABLE_BUILTIN_CTX_NAMES
         has_pos_binding = bool(
             allow_positive
@@ -668,6 +688,30 @@ class _SuppressProvenance:
             return self
         return replace(self, has_star_import=True)
 
+    def with_exit_protocol_patches(
+        self, patched_names: AbstractSet[str], *, has_patch: bool
+    ) -> _SuppressProvenance:
+        """Withdraws patchable positive non-suppression proofs after runtime exit-protocol patching.
+
+        Clears every proven non-suppressing factory and instance binding (pure-Python
+        classes, including stdlib managers such as ``contextlib.nullcontext``, can have
+        ``__exit__`` reassigned after definition) and rebinds each name in
+        ``patched_names`` that is not already a known suppressor as a suspicious alias.
+        """
+        if not has_patch:
+            return self
+        demoted = replace(
+            self,
+            non_suppressors=frozenset(),
+            non_suppressor_instances=frozenset(),
+            exit_patch_targets=self.exit_patch_targets | frozenset(patched_names),
+            has_exit_patch=True,
+        )
+        for name in sorted(patched_names):
+            if name not in demoted.suppressors:
+                demoted = demoted.with_suspicious_alias(name)
+        return demoted
+
     def with_cross_scope_mutations(
         self,
         mutated: AbstractSet[str],
@@ -738,6 +782,10 @@ class _SuppressProvenance:
             cross_scope_suspicious=(
                 self.cross_scope_suspicious | branch_prov.cross_scope_suspicious
             ),
+            exit_patch_targets=(
+                self.exit_patch_targets | branch_prov.exit_patch_targets
+            ),
+            has_exit_patch=self.has_exit_patch or branch_prov.has_exit_patch,
         )
 
     def apply_branch_delta(
@@ -965,7 +1013,7 @@ def _is_proven_non_suppressing_target_expr(
             curr_val, attr_name, chain_parts, prov, extra_non_suppressing_ctx_managers
         ):
             return True
-        if isinstance(curr_val, ast.Name) and len(chain_parts) >= 2:
+        if isinstance(curr_val, ast.Name) and len(chain_parts) >= 2 and not prov.has_exit_patch:
             for alias, qual in prov.imported_symbols:
                 if alias == curr_val.id:
                     mod_candidate = ".".join((qual, *chain_parts[:-1]))
@@ -974,7 +1022,7 @@ def _is_proven_non_suppressing_target_expr(
                     )
                     if attr_name in allowed_sub_attrs:
                         return True
-        if isinstance(expr.value, ast.Name):
+        if isinstance(expr.value, ast.Name) and not prov.has_exit_patch:
             base_id = expr.value.id
             for alias, mod_name in prov.stdlib_modules:
                 if alias == base_id:
@@ -3381,7 +3429,10 @@ def _seed_scope_suppress_aliases_uncached(
     }
     if shadowed_b:
         prov = prov.with_shadowed_builtins(shadowed_b)
-    return prov
+    patch_scan = scan_exit_protocol_patches(eff_mod if eff_mod is not None else fn_node)
+    return prov.with_exit_protocol_patches(
+        patch_scan.patched_names, has_patch=patch_scan.has_patch
+    )
 
 
 def _seed_scope_suppress_aliases(

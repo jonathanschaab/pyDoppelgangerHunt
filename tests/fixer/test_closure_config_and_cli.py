@@ -2723,3 +2723,76 @@ def test_unrecognized_closure_strictness_falls_back_to_boolean_flags(
         strict_with_suppression=loaded.get("strict_with_suppression"),
     )
     assert (cfg_mode, cfg_skip) == (expected_mode, expected_skip)
+
+
+_HEURISTIC_TX_CLONE_SRC = (
+    "def process_alpha(records, sink):\n"
+    "    with Transaction():\n"
+    "        total = sum(records)\n"
+    "        sink.write(total)\n"
+    "    return total\n"
+    "\n"
+    "def process_beta(records, sink):\n"
+    "    with Transaction():\n"
+    "        total = sum(records)\n"
+    "        sink.write(total)\n"
+    "    return total\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("closure_strictness", "allowlist", "expect_heuristic"),
+    [
+        pytest.param("strict", None, True, id="strict_heuristic_assumption_recorded"),
+        pytest.param("pedantic", None, False, id="pedantic_makes_no_heuristic_assumption"),
+        pytest.param("strict", ["Transaction"], False, id="allowlisted_manager_is_not_heuristic"),
+    ],
+)
+def test_suggestion_and_html_report_record_strict_heuristic_ctx_manager_assumptions(
+    tmp_path: Path,
+    closure_strictness: str,
+    allowlist: list[str] | None,
+    expect_heuristic: bool,
+) -> None:
+    """Verifies --suggest and --html record neutrally named managers assumed non-suppressing in strict mode only.
+
+    The assumption is disclosed through heuristic diagnostics (stderr/logging), never in the
+    report body, so pedantic and allowlisted runs must record nothing while strict runs record
+    the manager and still synthesize the helper (documented fail-open behavior).
+    """
+    from pydoppelgangerhunt.config import collect_heuristic_ctx_managers
+    from pydoppelgangerhunt.reporters import (
+        generate_html_report,
+        synthesize_refactoring_suggestion,
+    )
+
+    mod_file = tmp_path / "tx_clones.py"
+    mod_file.write_text(_HEURISTIC_TX_CLONE_SRC, encoding="utf-8")
+    u1 = {"file": str(mod_file), "start": 2, "end": 4, "name": "process_alpha", "kind": "compound_block"}
+    u2 = {"file": str(mod_file), "start": 8, "end": 10, "name": "process_beta", "kind": "compound_block"}
+
+    clear_dataflow_cache()
+    with collect_heuristic_ctx_managers() as suggest_heuristics:
+        suggestion = synthesize_refactoring_suggestion(
+            u1,
+            u2,
+            repo_root=str(tmp_path),
+            closure_strictness=closure_strictness,
+            non_suppressing_ctx_managers=allowlist,
+        )
+    assert "Extract duplicated logic into common helper" in suggestion
+    assert "# Note:" not in suggestion
+    assert ("Transaction" in suggest_heuristics) is expect_heuristic
+
+    clear_dataflow_cache()
+    with collect_heuristic_ctx_managers() as html_heuristics:
+        html_report = generate_html_report(
+            [(1.0, u1, u2)],
+            str(tmp_path),
+            0.9,
+            repo_root=str(tmp_path),
+            closure_strictness=closure_strictness,
+            non_suppressing_ctx_managers=allowlist,
+        )
+    assert "unproven context manager(s)" not in html_report
+    assert ("Transaction" in html_heuristics) is expect_heuristic

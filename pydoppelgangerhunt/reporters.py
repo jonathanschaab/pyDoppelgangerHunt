@@ -21,6 +21,7 @@ from pydoppelgangerhunt.config import (
 )
 from pydoppelgangerhunt.source_lines import (
     SourceLinesOrigin,
+    extract_notebook_code_cell_text,
     is_sliced_unit_source_lines,
     parse_unit_coord,
     resolve_safe_unit_file_path,
@@ -83,23 +84,23 @@ def _ensure_trailing_lf(line: str) -> str:
 
 
 def _extract_notebook_cell_lines(nb_data: Any, cell_idx: int) -> Optional[List[str]]:
-    """Extracts newline-terminated source lines for a 0-indexed Jupyter notebook cell, or None if invalid."""
+    """Extracts LF-terminated physical source lines for a 0-indexed notebook code cell, or None if invalid.
+
+    Source fragments are joined per nbformat semantics before splitting on physical
+    newlines (``\\r\\n``, ``\\r``, ``\\n``), and every line terminator is normalized to
+    ``\\n`` to match universal-newline disk reads. Malformed cells (non-code cells,
+    missing or non-string source fragments) return None so callers fall back to a
+    placeholder rather than treating coerced values as real source.
+    """
     if not isinstance(nb_data, dict):
         return None
     cells = nb_data.get("cells")
     if not isinstance(cells, list) or cell_idx < 0 or cell_idx >= len(cells):
         return None
-    cell = cells[cell_idx]
-    if not isinstance(cell, dict):
+    cell_text = extract_notebook_code_cell_text(cells[cell_idx])
+    if cell_text is None:
         return None
-    src = cell.get("source", [])
-    if isinstance(src, list):
-        raw_lines = [str(ln) for ln in src]
-    elif isinstance(src, str):
-        raw_lines = split_source_lines(src)
-    else:
-        return None
-    return [_ensure_trailing_lf(ln) for ln in raw_lines]
+    return [ln.rstrip("\r\n") + "\n" for ln in split_source_lines(cell_text)]
 
 
 def _read_notebook_cell_lines(resolved_file: Path, cell_idx: int) -> Optional[List[str]]:
