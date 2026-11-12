@@ -73,25 +73,43 @@ def _unit_line_bounds(unit: Dict[str, Any]) -> Tuple[int, int]:
     return resolve_unit_line_bounds(unit)
 
 
-def _read_notebook_cell_lines(resolved_file: Path, cell_idx: int) -> List[str]:
-    """Reads newline-terminated source lines for a 0-indexed Jupyter notebook cell."""
+def _ensure_trailing_lf(line: str) -> str:
+    """Ensures line ends with '\\n', converting lone trailing '\\r' to '\\n' while preserving '\\r\\n'."""
+    if line.endswith("\n"):
+        return line
+    if line.endswith("\r"):
+        return line[:-1] + "\n"
+    return line + "\n"
+
+
+def _extract_notebook_cell_lines(nb_data: Any, cell_idx: int) -> Optional[List[str]]:
+    """Extracts newline-terminated source lines for a 0-indexed Jupyter notebook cell, or None if invalid."""
+    if not isinstance(nb_data, dict):
+        return None
+    cells = nb_data.get("cells")
+    if not isinstance(cells, list) or cell_idx < 0 or cell_idx >= len(cells):
+        return None
+    cell = cells[cell_idx]
+    if not isinstance(cell, dict):
+        return None
+    src = cell.get("source", [])
+    if isinstance(src, list):
+        raw_lines = [str(ln) for ln in src]
+    elif isinstance(src, str):
+        raw_lines = split_source_lines(src)
+    else:
+        return None
+    return [_ensure_trailing_lf(ln) for ln in raw_lines]
+
+
+def _read_notebook_cell_lines(resolved_file: Path, cell_idx: int) -> Optional[List[str]]:
+    """Reads and extracts newline-terminated source lines for a 0-indexed Jupyter notebook cell on disk."""
     try:
-        nb_data = json.loads(resolved_file.read_text(encoding="utf-8", errors="replace"))
-        cells = nb_data.get("cells", [])
-        if isinstance(cells, list) and 0 <= cell_idx < len(cells):
-            cell = cells[cell_idx]
-            if isinstance(cell, dict):
-                src = cell.get("source", [])
-                raw_lines = (
-                    src if isinstance(src, list) else split_source_lines(str(src))
-                )
-                return [
-                    str(ln) if str(ln).endswith("\n") else str(ln) + "\n"
-                    for ln in raw_lines
-                ]
+        raw_nb_text = resolved_file.read_text(encoding="utf-8", errors="replace")
+        nb_data = json.loads(raw_nb_text)
     except (OSError, json.JSONDecodeError, ValueError, TypeError):
-        return []
-    return []
+        return None
+    return _extract_notebook_cell_lines(nb_data, cell_idx)
 
 
 def extract_unit_source_lines_with_state(
@@ -133,20 +151,14 @@ def extract_unit_source_lines_with_state(
         # the list is treated as already sliced to unit boundaries (unless from full source_text).
         if not from_source_text and is_sliced_unit_source_lines(unit, source_lines):
             return (
-                [
-                    ln if ln.endswith("\n") else ln + "\n"
-                    for ln in source_lines
-                ],
+                [_ensure_trailing_lf(str(ln)) for ln in source_lines],
                 SourceLinesOrigin.PRE_SLICED,
             )
         start = max(1, s_d)
         end = min(len(source_lines), e_d)
         sliced_buf = source_lines[start - 1 : end]
         return (
-            [
-                ln if ln.endswith("\n") else ln + "\n"
-                for ln in sliced_buf
-            ],
+            [_ensure_trailing_lf(str(ln)) for ln in sliced_buf],
             SourceLinesOrigin.FULL_BUFFER,
         )
 
@@ -164,8 +176,23 @@ def extract_unit_source_lines_with_state(
                 cell_idx = parsed_nb[1]
                 is_cell_anchor = True
 
-        if is_cell_anchor:
-            all_lines = _read_notebook_cell_lines(resolved_file, cell_idx)
+        if resolved_file.suffix.lower() == ".ipynb":
+            nb_fallback: List[str] = [] if is_cell_anchor else placeholder
+            raw_nb_text = resolved_file.read_text(encoding="utf-8", errors="replace")
+            try:
+                nb_data = json.loads(raw_nb_text)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                return nb_fallback, SourceLinesOrigin.PLACEHOLDER
+            if not isinstance(nb_data, dict):
+                return nb_fallback, SourceLinesOrigin.PLACEHOLDER
+            if is_cell_anchor:
+                cell_lines = _extract_notebook_cell_lines(nb_data, cell_idx)
+                if cell_lines is None:
+                    return [], SourceLinesOrigin.PLACEHOLDER
+                all_lines = cell_lines
+            else:
+                with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
+                    all_lines = fh.readlines()
         else:
             with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
                 all_lines = fh.readlines()

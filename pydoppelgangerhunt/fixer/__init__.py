@@ -65,13 +65,15 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _is_irrefutable_case,
     _is_irrefutable_pattern,
 )
+from pydoppelgangerhunt.fixer._df_with_provenance import (
+    _demote_deletions_to_conditional,
+)
 from pydoppelgangerhunt.fixer.scope import (
     BUILTIN_NAMES,
     SCOPE_SCHEMA_VERSION,
     _ScopeVisitor,
     _analyze_block_assignment,
     _block_terminates,
-    _demote_deletions_to_conditional,
     _determine_binding_kind,
     _extract_deleted_names,
     _inspect_unit_scope,

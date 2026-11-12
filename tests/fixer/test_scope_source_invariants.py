@@ -1902,3 +1902,317 @@ def test_validate_unit_schema_strict_accepts_post_fixer_mutated_unit_dicts(
     for u_item in harvested:
         inspect_single_unit_scope(u_item, repo_root=str(tmp_path))
         assert validate_unit_schema(u_item, strict=True) == set()
+
+
+def test_source_lines_origin_enum_properties_and_truthiness_guard() -> None:
+    """Verifies all four SourceLinesOrigin enum members, explicit properties, and implicit-bool rejection."""
+    from pydoppelgangerhunt.source_lines import SourceLinesOrigin
+
+    expected = {
+        SourceLinesOrigin.PRE_SLICED: (True, False, True),
+        SourceLinesOrigin.PLACEHOLDER: (True, True, False),
+        SourceLinesOrigin.FULL_BUFFER: (False, False, True),
+        SourceLinesOrigin.DISK: (False, False, True),
+    }
+    assert set(SourceLinesOrigin) == set(expected.keys())
+    for member, (exp_sliced, exp_placeholder, exp_real) in expected.items():
+        assert member.is_pre_sliced is exp_sliced
+        assert member.is_placeholder is exp_placeholder
+        assert member.has_real_source is exp_real
+        with pytest.raises(TypeError, match="no implicit truth value"):
+            bool(member)
+
+
+@pytest.mark.parametrize(
+    ("case_id", "unit_dict", "expected_lines", "expected_origin_name"),
+    [
+        (
+            "empty_source_lines_list",
+            {"name": "fn", "start": 1, "end": 2, "source_lines": []},
+            ["# Source for fn lines 1-2\n"],
+            "PLACEHOLDER",
+        ),
+        (
+            "empty_source_text_and_file_source",
+            {"name": "fn", "start": 1, "end": 1, "source_text": "", "file_source": ""},
+            ["# Source for fn lines 1-1\n"],
+            "PLACEHOLDER",
+        ),
+        (
+            "whitespace_only_source_text_and_file_source",
+            {
+                "name": "fn",
+                "start": 1,
+                "end": 2,
+                "source_text": "   \n\t\r\n",
+                "file_source": "  \n",
+            },
+            ["# Source for fn lines 1-2\n"],
+            "PLACEHOLDER",
+        ),
+        (
+            "source_text_precedes_file_source",
+            {
+                "name": "fn",
+                "start": 1,
+                "end": 1,
+                "source_text": "from_source_text = 1\nsecond = 2\n",
+                "file_source": "from_file_source = 99\n",
+            },
+            ["from_source_text = 1\n"],
+            "FULL_BUFFER",
+        ),
+        (
+            "file_source_used_when_source_text_blank",
+            {
+                "name": "fn",
+                "start": 2,
+                "end": 2,
+                "source_text": "   \n",
+                "file_source": "line_one = 1\nline_two = 2\n",
+            },
+            ["line_two = 2\n"],
+            "FULL_BUFFER",
+        ),
+        (
+            "explicit_pre_sliced_lines",
+            {
+                "name": "fn",
+                "start": 10,
+                "end": 12,
+                "source_lines": ["alpha = 1", "beta = 2\n"],
+                "source_lines_is_sliced": True,
+            },
+            ["alpha = 1\n", "beta = 2\n"],
+            "PRE_SLICED",
+        ),
+        (
+            "explicit_unsliced_full_buffer_line_one_excerpt",
+            {
+                "name": "fn",
+                "start": 1,
+                "end": 1,
+                "source_lines": ["only_line = 42\n"],
+                "source_lines_is_sliced": False,
+            },
+            ["only_line = 42\n"],
+            "FULL_BUFFER",
+        ),
+        (
+            "heuristic_pre_sliced_line_one_excerpt",
+            {
+                "name": "fn",
+                "start": 1,
+                "end": 1,
+                "source_lines": ["only_line = 42\n"],
+            },
+            ["only_line = 42\n"],
+            "PRE_SLICED",
+        ),
+        (
+            "crlf_source_text_full_buffer",
+            {
+                "name": "fn",
+                "start": 2,
+                "end": 3,
+                "source_text": "a = 1\r\nb = 2\r\nc = 3\r\n",
+            },
+            ["b = 2\r\n", "c = 3\r\n"],
+            "FULL_BUFFER",
+        ),
+        (
+            "lone_cr_source_text_normalized_trailing_lf",
+            {
+                "name": "fn",
+                "start": 1,
+                "end": 2,
+                "source_text": "a = 1\rb = 2\rc = 3\r",
+            },
+            ["a = 1\n", "b = 2\n"],
+            "FULL_BUFFER",
+        ),
+        (
+            "end_exceeds_available_buffer_lines_clamps_slice",
+            {
+                "name": "fn",
+                "start": 2,
+                "end": 25,
+                "source_lines": ["l1 = 1\n", "l2 = 2\n", "l3 = 3\n"],
+                "source_lines_is_sliced": False,
+            },
+            ["l2 = 2\n", "l3 = 3\n"],
+            "FULL_BUFFER",
+        ),
+    ],
+)
+def test_extract_unit_source_lines_with_state_buffer_and_line_ending_matrix(
+    case_id: str,
+    unit_dict: dict[str, Any],
+    expected_lines: list[str],
+    expected_origin_name: str,
+) -> None:
+    """Verifies extract_unit_source_lines_with_state across buffer precedence, flags, CRLF/CR, and bounds."""
+    from pydoppelgangerhunt.reporters import (
+        extract_unit_source_code,
+        extract_unit_source_lines_with_state,
+    )
+    from pydoppelgangerhunt.source_lines import SourceLinesOrigin
+
+    lines, origin = extract_unit_source_lines_with_state(unit_dict)
+    assert lines == expected_lines, case_id
+    assert origin is SourceLinesOrigin[expected_origin_name], case_id
+    assert extract_unit_source_code(unit_dict) == expected_lines, case_id
+
+
+def test_source_lines_origin_disk_notebooks_col_sliced_and_comment_impostor(
+    tmp_path: Path,
+) -> None:
+    """Verifies DISK vs PLACEHOLDER across notebooks, CRLF/CR files, col-sliced flags, and comment-only files."""
+    import json
+    from pydoppelgangerhunt.reporters import extract_unit_source_lines_with_state
+    from pydoppelgangerhunt.source_lines import SourceLinesOrigin
+
+    # 1. Valid notebook cell vs out-of-range cell vs corrupt JSON notebook
+    valid_nb = tmp_path / "valid.ipynb"
+    valid_nb.write_text(
+        json.dumps(
+            {
+                "cells": [
+                    {"cell_type": "code", "source": ["x = 10\n", "y = x + 5"]},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    nb_lines, nb_origin = extract_unit_source_lines_with_state(
+        {"file": "valid.ipynb#cell_1", "name": "nb_u", "start": 1, "end": 2},
+        repo_root=str(tmp_path),
+    )
+    assert nb_lines == ["x = 10\n", "y = x + 5\n"]
+    assert nb_origin is SourceLinesOrigin.DISK
+
+    oob_lines, oob_origin = extract_unit_source_lines_with_state(
+        {"file": "valid.ipynb#cell_9", "name": "nb_oob", "start": 1, "end": 2},
+        repo_root=str(tmp_path),
+    )
+    assert oob_lines == []
+    assert oob_origin is SourceLinesOrigin.PLACEHOLDER
+    oob_scope = inspect_single_unit_scope(
+        {"file": "valid.ipynb#cell_9", "name": "nb_oob", "start": 1, "end": 2},
+        repo_root=str(tmp_path),
+    )
+    assert "unavailable_source_placeholder" in oob_scope["control_flow_hazards"]
+
+    corrupt_nb = tmp_path / "corrupt.ipynb"
+    corrupt_nb.write_text("{not: valid json", encoding="utf-8")
+    bad_cell_lines, bad_cell_origin = extract_unit_source_lines_with_state(
+        {"file": "corrupt.ipynb#cell_1", "name": "bad_nb", "start": 1, "end": 2},
+        repo_root=str(tmp_path),
+    )
+    assert bad_cell_lines == []
+    assert bad_cell_origin is SourceLinesOrigin.PLACEHOLDER
+
+    bad_raw_lines, bad_raw_origin = extract_unit_source_lines_with_state(
+        {"file": "corrupt.ipynb", "name": "bad_nb", "start": 1, "end": 2},
+        repo_root=str(tmp_path),
+    )
+    assert bad_raw_lines == ["# Source for bad_nb lines 1-2\n"]
+    assert bad_raw_origin is SourceLinesOrigin.PLACEHOLDER
+
+    # 2. Disk files with CRLF and lone-CR line endings, plus end > available lines
+    crlf_py = tmp_path / "crlf_mod.py"
+    crlf_py.write_bytes(b"first = 1\r\nsecond = 2\r\n")
+    d_crlf, o_crlf = extract_unit_source_lines_with_state(
+        {"file": "crlf_mod.py", "start": 1, "end": 10},
+        repo_root=str(tmp_path),
+    )
+    assert d_crlf == ["first = 1\n", "second = 2\n"]
+    assert o_crlf is SourceLinesOrigin.DISK
+
+    cr_py = tmp_path / "cr_mod.py"
+    cr_py.write_bytes(b"alpha = 1\rbeta = 2\r")
+    d_cr, o_cr = extract_unit_source_lines_with_state(
+        {"file": "cr_mod.py", "start": 2, "end": 2},
+        repo_root=str(tmp_path),
+    )
+    assert d_cr == ["beta = 2\n"]
+    assert o_cr is SourceLinesOrigin.DISK
+
+    # 3. source_lines_is_col_sliced=False trims columns on line-sliced excerpt; True preserves pre-trimmed excerpt
+    full_line = "    result = [item * 2 for item in items] + suffix\n"
+    s_col = full_line.index("[")
+    e_col = full_line.index("]") + 1
+    sc_line_only = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 2,
+            "start_col": s_col,
+            "end_col": e_col,
+            "kind": "comprehension",
+            "source_lines": [full_line],
+            "source_lines_is_sliced": True,
+            "source_lines_is_col_sliced": False,
+            "allow_snippet_only": True,
+        }
+    )
+    assert sc_line_only["inputs"] == ["items"]
+    assert "suffix" not in sc_line_only["inputs"]
+
+    sc_col_sliced = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 2,
+            "start_col": s_col,
+            "end_col": e_col,
+            "kind": "comprehension",
+            "source_lines": ["[item * 2 for item in items]\n"],
+            "source_lines_is_sliced": True,
+            "source_lines_is_col_sliced": True,
+            "allow_snippet_only": True,
+        }
+    )
+    assert sc_col_sliced["inputs"] == ["items"]
+
+    # 4. Real file containing literal `# Source for ...` comment vs missing-file placeholder with identical text
+    impostor_text = "# Source for comment_unit lines 1-1\n"
+    real_comment_file = tmp_path / "real_comment.py"
+    real_comment_file.write_text(impostor_text, encoding="utf-8")
+
+    real_lines, real_origin = extract_unit_source_lines_with_state(
+        {"file": "real_comment.py", "name": "comment_unit", "start": 1, "end": 1},
+        repo_root=str(tmp_path),
+    )
+    missing_lines, missing_origin = extract_unit_source_lines_with_state(
+        {"file": "missing_comment.py", "name": "comment_unit", "start": 1, "end": 1},
+        repo_root=str(tmp_path),
+    )
+    assert real_lines == missing_lines == [impostor_text]
+    assert real_origin is SourceLinesOrigin.DISK
+    assert real_origin.has_real_source is True
+    assert missing_origin is SourceLinesOrigin.PLACEHOLDER
+    assert missing_origin.is_placeholder is True
+
+    sc_real_comment = inspect_single_unit_scope(
+        {
+            "file": "real_comment.py",
+            "name": "comment_unit",
+            "start": 1,
+            "end": 1,
+            "kind": "data_table",
+        },
+        repo_root=str(tmp_path),
+    )
+    sc_missing_comment = inspect_single_unit_scope(
+        {
+            "file": "missing_comment.py",
+            "name": "comment_unit",
+            "start": 1,
+            "end": 1,
+            "kind": "data_table",
+        },
+        repo_root=str(tmp_path),
+    )
+    assert "unavailable_source_placeholder" not in sc_real_comment["control_flow_hazards"]
+    assert sc_real_comment["is_control_flow_safe"] is True
+    assert "unavailable_source_placeholder" in sc_missing_comment["control_flow_hazards"]
+    assert sc_missing_comment["is_control_flow_safe"] is False

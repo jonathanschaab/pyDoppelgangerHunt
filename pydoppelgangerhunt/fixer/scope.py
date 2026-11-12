@@ -83,7 +83,6 @@ from pydoppelgangerhunt.fixer._df_with_provenance import (  # pylint: disable=un
     _SuppressProvenance,
     _analyze_block_assignment,
     _block_terminates,
-    _demote_deletions_to_conditional,
     _extract_deleted_names,
     _seed_scope_suppress_aliases,
     _walrus_assignment_in_expr,
@@ -2625,6 +2624,8 @@ def _inspect_unit_scope(
                 mod_tree=mod_tree,
                 u_start=u_start,
                 scope_ctx=sup_scope_ctx,
+                extra_non_suppressing_ctx_managers=extra_non_sup,
+                strict_with_suppression=strict_with_flag,
             )
         if "open" in visitor.params:
             initial_sup_prov = initial_sup_prov.with_shadowed_builtins(

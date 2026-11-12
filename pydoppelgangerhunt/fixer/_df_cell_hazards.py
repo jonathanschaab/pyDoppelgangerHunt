@@ -310,6 +310,7 @@ def _collect_unshadowed_chain_closure_info(
     post_reads: Set[str] = set()
     unshadowed_sibs: List[Tuple[Optional[str], AbstractSet[str], AbstractSet[str]]] = []
     unshadowed_edges: List[Tuple[str, AbstractSet[str]]] = []
+    unshadowed_mut_edges: List[Tuple[str, AbstractSet[str]]] = []
     for idx, info in enumerate(chain_infos):
         inner_shadowed: Set[str] = (
             set().union(
@@ -336,9 +337,14 @@ def _collect_unshadowed_chain_closure_info(
             if t_name in inner_shadowed:
                 continue
             unshadowed_edges.append((t_name, src_names - inner_shadowed))
+        for t_name, src_names in info.mutation_edges:
+            if t_name in inner_shadowed:
+                continue
+            unshadowed_mut_edges.append((t_name, src_names - inner_shadowed))
     sib_closures = _propagate_sibling_closures(
         unshadowed_sibs,
         alias_edges=unshadowed_edges,
+        mutation_edges=unshadowed_mut_edges,
     )
     return _UnshadowedChainClosureInfo(
         chain_locals=chain_locals,

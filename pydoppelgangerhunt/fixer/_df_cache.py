@@ -1642,6 +1642,8 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
             _cached_scope_fingerprints.pop(node, None)
             if isinstance(node, ast.stmt):
                 _stmt_with_summary_cache.pop(node, None)
+            _scope_loops_cache.pop(node, None)
+            _scope_try_with_cache.pop(node, None)
         for node in scope_nodes:
             _pop_parent_map_locked(node)
             _cached_scope_fingerprints.pop(node, None)
@@ -1653,6 +1655,14 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
             _scope_stmts_by_start.pop(node, None)
             _scope_loops_cache.pop(node, None)
             _scope_try_with_cache.pop(node, None)
+        stale_parsed_keys = [
+            pk
+            for pk, pv in _parsed_tree_cache.items()
+            if pv is not None
+            and (pv is tree or pv in scope_nodes or pv in tree_nodes)
+        ]
+        for pk in stale_parsed_keys:
+            _parsed_tree_cache.pop(pk, None)
 
 
 evict_tree_scopes = _evict_tree_scopes

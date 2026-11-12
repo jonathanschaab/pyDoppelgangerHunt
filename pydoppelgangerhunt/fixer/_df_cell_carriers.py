@@ -55,6 +55,7 @@ from pydoppelgangerhunt.fixer._df_span_index import (
     _extract_type_alias_or_pattern_name,
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
+    _collect_reachable_names,
     _extract_nested_scope_free_reads,
     _is_ast_node_within_unit_bounds,
     _record_import_names,
@@ -1015,6 +1016,7 @@ class _EnclosingFnCellInfo(NamedTuple):
     pre_unbound: frozenset[str] = frozenset()
     concurrent_sibling_vars: frozenset[str] = frozenset()
     heuristic_ctx_managers: Tuple[str, ...] = ()
+    mutation_edges: Tuple[Tuple[str, frozenset[str]], ...] = ()
 
     def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
         """Returns an empty tuple because _EnclosingFnCellInfo retains only string sets."""
@@ -1406,6 +1408,9 @@ def _extract_assignment_targets_and_value(
     ):
         targets = _collect_target_names(node.target, mode=mode)
         return (targets, (node.value,)) if targets else None
+    if isinstance(node, (ast.For, ast.AsyncFor)):
+        targets = _collect_target_names(node.target, mode=mode)
+        return (targets, (node.iter,)) if targets else None
     return None
 
 
@@ -1423,6 +1428,12 @@ def _extract_closure_carrier_mutation_targets_and_values(
     assign_res = _extract_assignment_targets_and_value(node, mode="mutated")
     if assign_res is not None:
         return assign_res
+    if (
+        isinstance(node, ast.AugAssign)
+        and isinstance(node.target, ast.Name)
+        and node.value is not None
+    ):
+        return ({node.target.id}, (node.value,))
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         val_nodes: Sequence[ast.AST] = [
             *node.args,
@@ -1884,6 +1895,7 @@ def _propagate_sibling_closures(
     closures: Sequence[Tuple[Optional[str], AbstractSet[str], AbstractSet[str]]],
     post_reads: Optional[Set[str]] = None,
     alias_edges: Sequence[Tuple[str, AbstractSet[str]]] = (),
+    mutation_edges: Sequence[Tuple[str, AbstractSet[str]]] = (),
 ) -> List[Tuple[Optional[str], Set[str], Set[str]]]:
     """Propagates free reads and nonlocal mutations transitively across named sibling closures."""
     result: List[Tuple[Optional[str], Set[str], Set[str]]] = [
@@ -1897,6 +1909,14 @@ def _propagate_sibling_closures(
             else:
                 by_name[name][0].update(reads)
                 by_name[name][1].update(muts)
+    effective_edges: List[Tuple[str, AbstractSet[str]]] = list(alias_edges)
+    if mutation_edges:
+        rev_rebind: Dict[str, Set[str]] = {}
+        for tgt_name, src_names in alias_edges:
+            rev_rebind.setdefault(tgt_name, set()).update(src_names)
+        for mut_tgt, mut_srcs in mutation_edges:
+            for origin_name in _collect_reachable_names(mut_tgt, rev_rebind):
+                effective_edges.append((origin_name, mut_srcs))
     changed = True
     while changed:
         changed = False
@@ -1915,7 +1935,7 @@ def _propagate_sibling_closures(
             if name is not None:
                 by_name[name][0].update(reads)
                 by_name[name][1].update(muts)
-        for tgt_name, src_names in alias_edges:
+        for tgt_name, src_names in effective_edges:
             for src in src_names:
                 target = by_name.get(src)
                 if target is None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Set as AbstractSet
 import contextlib
+import contextvars
 from dataclasses import dataclass, field
 import itertools
 import logging
@@ -63,20 +64,14 @@ class _HeuristicSessionBucket:
 
 _active_heuristic_sessions: Dict[int, _HeuristicSessionBucket] = {}
 _default_thread_buckets: OrderedDict[int, _HeuristicSessionBucket] = OrderedDict()
-
-
-def _get_current_session_stack() -> List[int]:
-    """Returns the thread-local stack of active heuristic session IDs."""
-    stack: Optional[List[int]] = getattr(_heuristic_collector_tls, "session_stack", None)
-    if stack is None:
-        stack = []
-        _heuristic_collector_tls.session_stack = stack
-    return stack
+_heuristic_session_stack: contextvars.ContextVar[Tuple[int, ...]] = (
+    contextvars.ContextVar("_heuristic_session_stack", default=())
+)
 
 
 def _get_or_create_thread_bucket_locked() -> _HeuristicSessionBucket:
-    """Returns the active session bucket for the current thread or a bounded per-thread fallback bucket."""
-    sess_stack = _get_current_session_stack()
+    """Returns the active session bucket for the current context or a bounded per-thread fallback bucket."""
+    sess_stack = _heuristic_session_stack.get()
     if sess_stack:
         sid = sess_stack[-1]
         active = _active_heuristic_sessions.get(sid)
@@ -177,17 +172,6 @@ def record_heuristic_non_suppressing_ctx_manager(mgr_name: str) -> None:
         for bucket in stack:
             bucket.add(mgr_name)
     with _warned_closure_lock:
-        sess_stack = _get_current_session_stack()
-        if sess_stack:
-            sid = sess_stack[-1]
-            sess_bucket = _active_heuristic_sessions.get(sid)
-            if sess_bucket is not None:
-                sess_bucket.add(mgr_name)
-                return
-        if _active_heuristic_sessions:
-            for active_bucket in _active_heuristic_sessions.values():
-                active_bucket.add(mgr_name)
-            return
         _get_or_create_thread_bucket_locked().add(mgr_name)
 
 
@@ -229,10 +213,15 @@ def defer_heuristic_ctx_manager_summary() -> Iterator[None]:
 
 @contextlib.contextmanager
 def heuristic_ctx_manager_session(*, warn: bool = False) -> Iterator[None]:
-    """Scopes a batch CLI or patch-generation run in an isolated session keyed by session ID."""
-    sess_stack = _get_current_session_stack()
+    """Scopes a batch CLI or patch-generation run in a context-isolated session keyed by session ID.
+
+    Propagates across ``asyncio`` tasks automatically via ``contextvars`` and across worker
+    threads when tasks are submitted with ``contextvars.copy_context().run``; unassociated
+    threads record into their own isolated per-thread fallback bucket without cross-session leakage.
+    """
+    prev_stack = _heuristic_session_stack.get()
     with _warned_closure_lock:
-        existing_sid = sess_stack[-1] if sess_stack else None
+        existing_sid = prev_stack[-1] if prev_stack else None
         existing_bucket = (
             _active_heuristic_sessions.get(existing_sid)
             if existing_sid is not None
@@ -250,7 +239,7 @@ def heuristic_ctx_manager_session(*, warn: bool = False) -> Iterator[None]:
             bucket.defer_depth += 1
             if warn:
                 bucket.warn_on_summary = True
-        sess_stack.append(sid)
+    token = _heuristic_session_stack.set((*prev_stack, sid))
     try:
         yield
     finally:
@@ -265,10 +254,9 @@ def heuristic_ctx_manager_session(*, warn: bool = False) -> Iterator[None]:
             if should_flush:
                 log_heuristic_ctx_manager_summary(force=True, warn=emit_warn)
         finally:
-            with _warned_closure_lock:
-                if sess_stack and sess_stack[-1] == sid:
-                    sess_stack.pop()
-                if is_outermost:
+            _heuristic_session_stack.reset(token)
+            if is_outermost:
+                with _warned_closure_lock:
                     _active_heuristic_sessions.pop(sid, None)
 
 
@@ -351,6 +339,10 @@ def resolve_closure_strictness_mode(
     introspection, metaclasses, and out-of-module monkeypatching).
     'lenient' relaxes speculative unreferenced-sibling closure checks while still enforcing
     direct cell-capture, intra-unit nonlocal mutator, and referenced-sibling closure checks.
+
+    Unrecognized ``closure_strictness`` strings log a deduplicated warning and fall back to the
+    supplied boolean flags: ``'lenient'`` when ``skip_pre_unit_closures=True``, ``'pedantic'``
+    when ``strict_with_suppression=True``, and ``'strict'`` otherwise.
     """
     if closure_strictness is not None:
         c_mode = str(closure_strictness).strip().lower()

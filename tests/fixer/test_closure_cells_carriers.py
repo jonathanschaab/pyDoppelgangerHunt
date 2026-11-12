@@ -2630,3 +2630,306 @@ def test_span_line_index_missing_end_positions_and_duplicate_boundary_statements
     s_col, e_col = _resolve_unit_col_bounds(cand_stmt, ambig_tree, 2, 2, None, None)
     assert (s_col, e_col) == (None, None)
     assert _has_unresolved_span_bounds(ambig_fn, 2, 2, s_col, e_col, cand_stmt) is True
+
+
+@pytest.mark.parametrize(
+    ("scenario_id", "pre_setup", "post_escape"),
+    [
+        (
+            "list_carrier_rebound_alias",
+            (
+                "    callbacks = [reader]\n"
+                "    alias = callbacks\n"
+            ),
+            "    return alias\n",
+        ),
+        (
+            "multiple_chained_container_aliases",
+            (
+                "    callbacks = [reader]\n"
+                "    alias_one = callbacks\n"
+                "    alias_two = alias_one\n"
+            ),
+            "    return alias_two\n",
+        ),
+        (
+            "container_mutation_after_aliasing_via_origin",
+            (
+                "    callbacks = []\n"
+                "    alias = callbacks\n"
+                "    callbacks.append(reader)\n"
+            ),
+            "    return alias\n",
+        ),
+        (
+            "container_mutation_after_aliasing_via_alias_append",
+            (
+                "    callbacks = []\n"
+                "    alias = callbacks\n"
+                "    alias.append(reader)\n"
+            ),
+            "    return callbacks\n",
+        ),
+        (
+            "container_augassign_mutation_via_alias",
+            (
+                "    callbacks = []\n"
+                "    alias = callbacks\n"
+                "    alias += [reader]\n"
+            ),
+            "    return callbacks\n",
+        ),
+        (
+            "attribute_reassignment_onto_holder",
+            (
+                "    def safe_fn():\n"
+                "        return 1\n"
+                "    holder = make_holder()\n"
+                "    holder.cb = safe_fn\n"
+                "    holder.cb = reader\n"
+            ),
+            "    return holder\n",
+        ),
+        (
+            "multi_layer_factory_chain",
+            (
+                "    def layer_one():\n"
+                "        return reader\n"
+                "    def layer_two():\n"
+                "        return layer_one\n"
+                "    mid_factory = layer_two()\n"
+                "    escaped_cb = mid_factory()\n"
+            ),
+            "    return escaped_cb\n",
+        ),
+        (
+            "class_body_attribute_carrier_and_instance",
+            (
+                "    class Holder:\n"
+                "        cb = reader\n"
+                "    inst = Holder()\n"
+            ),
+            "    return inst\n",
+        ),
+        (
+            "class_dynamic_attribute_assignment",
+            (
+                "    class Holder:\n"
+                "        pass\n"
+                "    Holder.cb = reader\n"
+            ),
+            "    return Holder\n",
+        ),
+        (
+            "recursive_factory_call",
+            (
+                "    def select_cb(depth):\n"
+                "        return reader if depth == 0 else select_cb(depth - 1)\n"
+                "    chosen = select_cb(2)\n"
+            ),
+            "    return chosen\n",
+        ),
+        (
+            "conditional_carrier_assignment",
+            (
+                "    if flag:\n"
+                "        carrier = [reader]\n"
+                "    else:\n"
+                "        carrier = []\n"
+            ),
+            "    return carrier\n",
+        ),
+        (
+            "replaced_carrier_after_aliasing_still_escapes",
+            (
+                "    callbacks = [reader]\n"
+                "    saved = callbacks\n"
+                "    callbacks = []\n"
+            ),
+            "    return saved\n",
+        ),
+        (
+            "tuple_and_loop_unpacking_carriers",
+            (
+                "    first_cb, _other = (reader, 0)\n"
+                "    chosen_cb = None\n"
+                "    for loop_cb in [first_cb]:\n"
+                "        chosen_cb = loop_cb\n"
+            ),
+            "    return chosen_cb\n",
+        ),
+    ],
+)
+def test_adversarial_closure_carrier_alias_propagation_rejects_escaped_cell_mutations(
+    tmp_path: Path,
+    scenario_id: str,
+    pre_setup: str,
+    post_escape: str,
+) -> None:
+    """Verifies closure-carrier alias, container-mutation, factory, class, and unpacking graphs block cell severance."""
+    from pydoppelgangerhunt.fixer import collect_downstream_read_names
+
+    clear_dataflow_cache()
+    loop_unit_src = (
+        "    for item in items:\n"
+        "        value = item * 2\n"
+        "        step = value + 1\n"
+    )
+    fn_a = (
+        "def outer_alpha(items, flag, make_holder):\n"
+        "    def reader():\n"
+        "        return value\n"
+        f"{pre_setup}"
+        f"{loop_unit_src}"
+        f"{post_escape}"
+    )
+    fn_b = fn_a.replace("outer_alpha", "outer_beta")
+    full_src = f"{fn_a}\n{fn_b}"
+    mod_file = tmp_path / f"carrier_{scenario_id}.py"
+    mod_file.write_text(full_src, encoding="utf-8")
+
+    fn_a_lines = fn_a.splitlines()
+    u1_start = next(
+        idx for idx, ln in enumerate(fn_a_lines, start=1) if ln.strip() == "for item in items:"
+    )
+    u1_end = u1_start + 2
+    offset_b = len(fn_a_lines) + 1
+    u2_start = u1_start + offset_b
+    u2_end = u1_end + offset_b
+
+    for mode in ("strict", "lenient"):
+        u1 = {
+            "file": str(mod_file),
+            "start": u1_start,
+            "end": u1_end,
+            "kind": "compound_block",
+            "source_text": full_src,
+            "source_code": loop_unit_src,
+            "closure_strictness": mode,
+        }
+        u2 = {
+            "file": str(mod_file),
+            "start": u2_start,
+            "end": u2_end,
+            "kind": "compound_block",
+            "source_text": full_src,
+            "source_code": loop_unit_src,
+            "closure_strictness": mode,
+        }
+        sc1 = inspect_single_unit_scope(u1, repo_root=str(tmp_path))
+        sc2 = inspect_single_unit_scope(u2, repo_root=str(tmp_path))
+        assert "severed_closure_cell" in sc1["control_flow_hazards"], (scenario_id, mode)
+        assert resolve_clone_pair_outputs(u1, u2, sc1, sc2, repo_root=str(tmp_path)) is None
+        patch = generate_refactoring_patch(
+            [(1.0, u1, u2)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+            closure_strictness=mode,
+        )
+        assert patch == "", (scenario_id, mode)
+
+    downstream_strict = collect_downstream_read_names(
+        full_src,
+        {"start": u1_start, "end": u1_end},
+        candidates={"value", "step"},
+        skip_pre_unit_closures=False,
+    )
+    assert downstream_strict is not None and "value" in downstream_strict, scenario_id
+
+    downstream_lenient = collect_downstream_read_names(
+        full_src,
+        {"start": u1_start, "end": u1_end},
+        candidates={"value", "step"},
+        skip_pre_unit_closures=True,
+    )
+    assert downstream_lenient is not None and "value" not in downstream_lenient, scenario_id
+
+    # Also verify nested `nonlocal value` mutator body inside the same escaped carrier graph is blocked
+    nonlocal_fn_src = (
+        "def outer_nl_alpha(flag, make_holder):\n"
+        "    value = 0\n"
+        "    def reader():\n"
+        "        return value\n"
+        f"{pre_setup}"
+        "    def process():\n"
+        "        nonlocal value\n"
+        "        value += 1\n"
+        "        return value\n"
+        "    process()\n"
+        f"{post_escape}"
+    )
+    nl_lines = nonlocal_fn_src.splitlines()
+    nl_start = next(
+        idx for idx, ln in enumerate(nl_lines, start=1) if ln.strip() == "def process():"
+    )
+    nl_end = nl_start + 3
+    nl_sc = inspect_single_unit_scope(
+        {
+            "start": nl_start,
+            "end": nl_end,
+            "kind": "closure",
+            "source_text": nonlocal_fn_src,
+            "source_code": (
+                "    def process():\n"
+                "        nonlocal value\n"
+                "        value += 1\n"
+                "        return value\n"
+            ),
+            "closure_strictness": "lenient",
+        }
+    )
+    assert "severed_closure_cell" in nl_sc["control_flow_hazards"], scenario_id
+
+
+def test_carrier_alias_rebinding_and_non_closure_class_negative_controls() -> None:
+    """Verifies rebinding an alias variable does not retroactively taint the original container or plain data classes."""
+    clear_dataflow_cache()
+    # Rebinding `alias = reader` does NOT mutate `callbacks = []`, so in lenient mode `return callbacks` is safe
+    rebind_only_src = (
+        "def outer_rebind_only(items):\n"
+        "    value = 0\n"
+        "    def reader():\n"
+        "        return value\n"
+        "    callbacks = []\n"
+        "    alias = callbacks\n"
+        "    alias = reader\n"
+        "    for item in items:\n"
+        "        value = value + item\n"
+        "    return callbacks\n"
+    )
+    sc_lenient = inspect_single_unit_scope(
+        {
+            "start": 8,
+            "end": 9,
+            "kind": "compound_block",
+            "source_text": rebind_only_src,
+            "source_code": "    for item in items:\n        value = value + item\n",
+            "closure_strictness": "lenient",
+        },
+        tree=ast.parse(rebind_only_src),
+    )
+    assert "severed_closure_cell" not in sc_lenient["control_flow_hazards"]
+
+    # Plain class without closures reading `value` eagerly at class creation does not make `inst` a closure carrier
+    plain_cls_src = (
+        "def outer_plain_class(items):\n"
+        "    value = 10\n"
+        "    class Snapshot:\n"
+        "        initial = value\n"
+        "    inst = Snapshot()\n"
+        "    for item in items:\n"
+        "        value = value + item\n"
+        "    return inst\n"
+    )
+    sc_plain = inspect_single_unit_scope(
+        {
+            "start": 6,
+            "end": 7,
+            "kind": "compound_block",
+            "source_text": plain_cls_src,
+            "source_code": "    for item in items:\n        value = value + item\n",
+            "closure_strictness": "lenient",
+        },
+        tree=ast.parse(plain_cls_src),
+    )
+    assert "severed_closure_cell" not in sc_plain["control_flow_hazards"]

@@ -202,6 +202,7 @@ from pydoppelgangerhunt import (
 - **`extract_unit_source_code(unit, repo_root=None)`**: Extracts the source lines corresponding to a code unit from memory or disk. When an AST unit is missing an `end` line coordinate, it safely falls back to returning the single line at `start` rather than slicing to the end of the file.
 - **`refactor_module_units(source_text, replacements, lines=None, line_char_offsets=None, line_byte_offsets=None, dry_run=False, tier1=True, tier2=True, strict=True)`**: Applies multiple non-overlapping unit replacements in strict **reverse source order** (descending byte offsets) using single-pass buffer slicing, guaranteeing that downstream text expansions or contractions never invalidate upstream coordinates.
 - **`validate_module_unit_replacements(source_text, replacements, lines=None, line_char_offsets=None, line_byte_offsets=None, tier1=True, tier2=True, strict=True)`**: Non-mutating validation helper that verifies candidate replacements for collisions across Tier 1 (AST coordinate overlap) and Tier 2 (physical byte interval sweep) without modifying or allocating new source string buffers.
+- **`heuristic_ctx_manager_session(*, warn=False)`**: Context manager that isolates unproven context-manager heuristic diagnostics to the active `contextvars` execution context (propagating to worker threads via `contextvars.copy_context().run` without cross-session leakage) and emits a single consolidated summary on exit.
 - **`generate_refactoring_patch(candidate_pairs, repo_root=..., replace_clones=..., ...)`**:
   Synthesizes a multi-file unified diff (`git apply` compatible) with dependency cycle detection
   and per-pair transactional snapshot rollback. For generator subroutines (within function or
@@ -286,10 +287,13 @@ escaping callbacks across lexical scopes.
   or setting `closure_strictness = "strict"|"pedantic"|"lenient"`, `strict_with_suppression = true|false`,
   and `non_suppressing_ctx_managers = [...]` in `pyproject.toml` or per-unit `UnitSchema` dicts;
   applicable across text/`--suggest` reports, `--html` reports, and `--patch`). Precedence is uniform
-  across CLI and programmatic APIs: explicit `closure_strictness` takes precedence over
+  across CLI and programmatic APIs: explicit valid `closure_strictness` takes precedence over
   `strict_with_suppression` and `skip_pre_unit_closures` (logging a once-per-run conflict warning when
   both are supplied and disagree), while `strict_with_suppression = true` selects `pedantic` when
-  `closure_strictness` is unset:
+  `closure_strictness` is unset, and unrecognized `closure_strictness` strings in configuration files or
+  unit dictionaries log a warning and fall back to the boolean flags (`lenient` when
+  `skip_pre_unit_closures = true`, `pedantic` when `strict_with_suppression = true`, and `strict`
+  otherwise):
   - `strict` (default for reporting, `--suggest`, `--html`, and preview patch generation with
     `replace_clones=False`): **Heuristic context-manager safety mode** with conservative closure-cell
     analysis. Treats pre-unit closures capturing candidate outputs as live escaping callbacks and

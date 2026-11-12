@@ -2648,3 +2648,253 @@ def test_batch_entrypoints_outer_syntax_warning_guard_preserves_warning_registry
             assert sentinel_reg == {("external warning", UserWarning, 10): 1}
         finally:
             globals().pop("__warningregistry__", None)
+
+
+def test_fingerprint_horizon_deep_ast_mutation_in_production_and_debug_modes() -> None:
+    """Verifies deep interior AST mutations beyond node 512 require evict_tree_scopes in prod and raise RuntimeError in debug mode."""
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _extract_cached_scope_free_reads,
+    )
+
+    clear_dataflow_cache()
+    filler_lines = [f"        step_{i} = {i}\n" for i in range(300)]
+    src = (
+        "def outer(obj):\n"
+        "    first_var = 1\n"
+        "    second_var = 2\n"
+        "    def inner():\n"
+        + "".join(filler_lines)
+        + "        return obj.attribute(first_var)\n"
+        "    return inner\n"
+    )
+
+    # 1. Production mode (512-node BFS horizon): deep mutation is outside fingerprint until evict_tree_scopes(tree)
+    prod_tree = ast.parse(src)
+    prod_outer = prod_tree.body[0]
+    assert isinstance(prod_outer, ast.FunctionDef)
+    prod_inner = prod_outer.body[2]
+    assert isinstance(prod_inner, ast.FunctionDef)
+    prod_ret = prod_inner.body[-1]
+    assert isinstance(prod_ret, ast.Return) and isinstance(prod_ret.value, ast.Call)
+    assert isinstance(prod_ret.value.func, ast.Attribute)
+    assert isinstance(prod_ret.value.args[0], ast.Name)
+
+    df_cache_mod._debug_ast_immutability[0] = False
+    try:
+        initial_reads = _extract_cached_scope_free_reads(prod_inner)
+        assert initial_reads == frozenset({"obj", "first_var"})
+        fp_before = df_cache_mod._compute_scope_fingerprint(prod_inner)
+
+        # Mutate deep interior Attribute and free-variable Name beyond the 512-node BFS horizon
+        prod_ret.value.func.attr = "other_attribute"
+        prod_ret.value.args[0].id = "second_var"
+        fp_after_prod = df_cache_mod._compute_scope_fingerprint(prod_inner)
+        assert fp_after_prod == fp_before
+        assert _extract_cached_scope_free_reads(prod_inner) == frozenset(
+            {"obj", "first_var"}
+        )
+
+        # Explicit eviction refreshes the cached result to reflect the mutated AST
+        df_cache_mod.evict_tree_scopes(prod_tree)
+        assert _extract_cached_scope_free_reads(prod_inner) == frozenset(
+            {"obj", "second_var"}
+        )
+
+        # 2. Debug immutability mode (65,536-node BFS horizon): deep `obj.attribute` -> `obj.other_attribute` raises RuntimeError
+        clear_dataflow_cache()
+        df_cache_mod._debug_ast_immutability[0] = True
+        dbg_tree = ast.parse(src)
+        dbg_outer = dbg_tree.body[0]
+        assert isinstance(dbg_outer, ast.FunctionDef)
+        dbg_inner = dbg_outer.body[2]
+        assert isinstance(dbg_inner, ast.FunctionDef)
+        dbg_ret = dbg_inner.body[-1]
+        assert isinstance(dbg_ret, ast.Return) and isinstance(dbg_ret.value, ast.Call)
+        assert isinstance(dbg_ret.value.func, ast.Attribute)
+
+        assert _extract_cached_scope_free_reads(dbg_inner) == frozenset(
+            {"obj", "first_var"}
+        )
+        dbg_ret.value.func.attr = "other_attribute"
+        with pytest.raises(
+            RuntimeError,
+            match="mutated in-place without calling evict_tree_scopes",
+        ):
+            _extract_cached_scope_free_reads(dbg_inner)
+
+        df_cache_mod.evict_tree_scopes(dbg_tree)
+        assert _extract_cached_scope_free_reads(dbg_inner) == frozenset(
+            {"obj", "first_var"}
+        )
+    finally:
+        df_cache_mod._debug_ast_immutability[0] = False
+
+
+def test_evict_tree_scopes_purges_all_eight_cache_categories_selectively() -> None:
+    """Verifies evict_tree_scopes(tree_a) purges all 8 cache categories for tree_a while preserving tree_b."""
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+    from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _analyze_enclosing_fn_cells,
+        _get_stmt_with_summary,
+    )
+    from pydoppelgangerhunt.fixer._df_closures import (
+        _collect_scope_closures,
+        _get_tree_expr_scope_intervals,
+        _get_tree_scope_intervals,
+    )
+    from pydoppelgangerhunt.fixer._df_hazards import (
+        _enclosing_try_reads_outputs,
+        collect_downstream_read_names,
+    )
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _find_enclosing_function_chain,
+        _get_span_line_index,
+    )
+    from pydoppelgangerhunt.fixer.scope import _get_tree_sha256_digest
+
+    clear_dataflow_cache()
+
+    def _build_rich_module_source(tag: str) -> str:
+        return (
+            "import contextlib\n"
+            f"def workflow_{tag}(items):\n"
+            "    seed = 1\n"
+            "    reader = lambda: seed\n"
+            "    comp = [x + seed for x in items]\n"
+            "    def factory():\n"
+            "        return reader\n"
+            "    for item in items:\n"
+            "        try:\n"
+            "            with contextlib.nullcontext():\n"
+            "                step = item + seed\n"
+            "        except ValueError:\n"
+            "            step = 0\n"
+            "    return factory(), comp, step\n"
+        )
+
+    src_a = _build_rich_module_source("alpha")
+    src_b = _build_rich_module_source("beta")
+    tree_a = df_cache_mod._get_or_parse_tree(src_a)
+    tree_b = df_cache_mod._get_or_parse_tree(src_b)
+    assert isinstance(tree_a, ast.Module) and isinstance(tree_b, ast.Module)
+    fn_a = tree_a.body[1]
+    fn_b = tree_b.body[1]
+    assert isinstance(fn_a, ast.FunctionDef) and isinstance(fn_b, ast.FunctionDef)
+
+    for src, tree, fn in ((src_a, tree_a, fn_a), (src_b, tree_b, fn_b)):
+        # Categories 1 & 2: scope intervals + expression-scope intervals
+        assert _get_tree_scope_intervals(tree)
+        assert _get_tree_expr_scope_intervals(tree)
+        # Category 3: parent maps + children maps + reverse root index
+        assert df_cache_mod._get_scope_parent_map(tree)
+        # Category 4: enclosing-scope index, span-line index, stmts_by_start/end
+        assert _find_enclosing_function_chain(tree, 11, 11)
+        assert _get_span_line_index(fn)
+        assert df_cache_mod._get_scope_stmts_by_start_lineno(fn)
+        assert df_cache_mod._get_scope_stmts_by_end_lineno(fn)
+        # Category 5: function-scope contexts
+        assert _get_fn_scope_context(fn, tree)
+        # Category 6: cell analysis & scope closures
+        assert _collect_scope_closures(fn, tree)
+        assert _analyze_enclosing_fn_cells(fn, (11, 11, None, None), mod_tree=tree)
+        inspect_single_unit_scope(
+            {
+                "start": 11,
+                "end": 11,
+                "kind": "basic_block",
+                "source_text": src,
+                "source_code": "                step = item + seed\n",
+            },
+            tree=tree,
+        )
+        # Category 7: statement summaries, loop cache, try/with cache
+        for sub in ast.walk(fn):
+            if isinstance(sub, ast.With):
+                assert _get_stmt_with_summary(sub)[0] is True
+        collect_downstream_read_names(
+            src, {"start": 11, "end": 11}, candidates={"step"}, tree=tree
+        )
+        _enclosing_try_reads_outputs(fn, 11, 11, {"step"})
+        # Category 8: source-line registrations, raw source digest, tree sha256, parsed tree
+        assert df_cache_mod._get_cached_tree_source_lines(tree)
+        assert _get_tree_sha256_digest(tree)
+
+    nodes_a = set(ast.walk(tree_a))
+    nodes_b = set(ast.walk(tree_b))
+
+    def _present_in_all_eight_categories(
+        target_tree: ast.AST,
+        target_fn: ast.FunctionDef,
+        target_nodes: set[ast.AST],
+    ) -> dict[str, bool]:
+        cell_kinds = {
+            k.kind
+            for k in df_cache_mod._scope_cell_info_cache
+            if isinstance(k, df_cache_mod._ScopeCacheKey) and k.owner in target_nodes
+        }
+        return {
+            "1_scope_intervals": "tree_scope_intervals" in cell_kinds,
+            "2_expr_scope_intervals": "tree_expr_scope_intervals" in cell_kinds,
+            "3_parent_maps": (
+                target_tree in df_cache_mod._scope_parent_maps
+                and target_tree in df_cache_mod._scope_children_maps
+                and bool(df_cache_mod._node_to_parent_map_roots.get(target_fn))
+            ),
+            "4_enclosing_and_stmt_indexes": (
+                "tree_enclosing_index" in cell_kinds
+                and "span_line_index" in cell_kinds
+                and target_fn in df_cache_mod._scope_stmts_by_start
+                and target_fn in df_cache_mod._scope_stmts_by_end
+            ),
+            "5_fn_scope_contexts": "fn_scope_ctx" in cell_kinds,
+            "6_cell_and_closure_caches": (
+                bool(
+                    {
+                        "enclosing_fn_cells",
+                        "stmt_deltas",
+                        "free_reads",
+                        "is_closure_factory",
+                        "suppress_seed",
+                    }
+                    <= cell_kinds
+                )
+                and any(
+                    df_cache_mod._key_references_scope_nodes(k, target_nodes)
+                    for k in df_cache_mod._scope_closures_cache
+                )
+            ),
+            "7_stmt_loop_try_with_summaries": (
+                any(n in df_cache_mod._stmt_with_summary_cache for n in target_nodes if isinstance(n, ast.stmt))
+                and target_fn in df_cache_mod._scope_loops_cache
+                and target_fn in df_cache_mod._scope_try_with_cache
+            ),
+            "8_source_lines_and_parsed_trees": (
+                "tree_source_lines" in cell_kinds
+                and "tree_sha256_digest" in cell_kinds
+                and target_tree in df_cache_mod._tree_raw_source_cache
+                and any(pv in target_nodes for pv in df_cache_mod._parsed_tree_cache.values() if pv is not None)
+            ),
+        }
+
+    pre_a = _present_in_all_eight_categories(tree_a, fn_a, nodes_a)
+    pre_b = _present_in_all_eight_categories(tree_b, fn_b, nodes_b)
+    assert all(pre_a.values()), pre_a
+    assert all(pre_b.values()), pre_b
+
+    df_cache_mod.evict_tree_scopes(tree_a)
+
+    post_a = _present_in_all_eight_categories(tree_a, fn_a, nodes_a)
+    post_b = _present_in_all_eight_categories(tree_b, fn_b, nodes_b)
+    assert not any(post_a.values()), post_a
+    assert not any(
+        df_cache_mod._key_references_scope_nodes(k, nodes_a)
+        for k in df_cache_mod._scope_cell_info_cache
+    )
+    assert not any(
+        df_cache_mod._key_references_scope_nodes(k, nodes_a)
+        for k in df_cache_mod._scope_closures_cache
+    )
+    assert not any(n in df_cache_mod._cached_scope_fingerprints for n in nodes_a)
+    assert all(post_b.values()), post_b

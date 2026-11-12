@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import contextvars
 from pathlib import Path
 import sys
 import threading
@@ -1711,16 +1712,20 @@ def test_cli_text_report_clean_stdout_and_session_worker_heuristic_harvesting(
     )
     assert set(sc["heuristic_ctx_managers"]) == {"db.atomic", "self.lock"}
 
-    # Verify heuristic_ctx_manager_session harvests worker threads spawned inside the session
+    # Verify heuristic_ctx_manager_session harvests worker threads spawned with copied context
     clear_closure_warning_cache()
     record_heuristic_non_suppressing_ctx_manager("PriorUnrelatedThreadMgr")
     with heuristic_ctx_manager_session():
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             f1 = pool.submit(
-                record_heuristic_non_suppressing_ctx_manager, "worker.db.atomic"
+                contextvars.copy_context().run,
+                record_heuristic_non_suppressing_ctx_manager,
+                "worker.db.atomic",
             )
             f2 = pool.submit(
-                record_heuristic_non_suppressing_ctx_manager, "worker.cache.lock"
+                contextvars.copy_context().run,
+                record_heuristic_non_suppressing_ctx_manager,
+                "worker.cache.lock",
             )
             f1.result()
             f2.result()
@@ -2039,7 +2044,10 @@ def test_heuristic_session_over_1024_live_threads_mid_session_clear_and_intra_un
     with heuristic_ctx_manager_session():
         try:
             for idx in range(thread_count):
-                t = threading.Thread(target=_hold_worker, args=(idx,))
+                worker_ctx = contextvars.copy_context()
+                t = threading.Thread(
+                    target=worker_ctx.run, args=(_hold_worker, idx)
+                )
                 t.start()
                 threads.append(t)
             for _ in range(thread_count):
@@ -2060,7 +2068,7 @@ def test_heuristic_session_over_1024_live_threads_mid_session_clear_and_intra_un
     assert harvested_mid == ("AfterMidClearMgr",)
     assert peek_heuristic_non_suppressing_ctx_managers() == ()
 
-    # 3. Persistent worker thread records before session are excluded by sequence watermark
+    # 3. Persistent worker thread records outside copied session context remain isolated
     clear_closure_warning_cache()
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         pool.submit(
@@ -2068,7 +2076,9 @@ def test_heuristic_session_over_1024_live_threads_mid_session_clear_and_intra_un
         ).result()
         with heuristic_ctx_manager_session():
             pool.submit(
-                record_heuristic_non_suppressing_ctx_manager, "InSessionPoolMgr"
+                contextvars.copy_context().run,
+                record_heuristic_non_suppressing_ctx_manager,
+                "InSessionPoolMgr",
             ).result()
             harvested_pool = log_heuristic_ctx_manager_summary()
     assert harvested_pool == ("InSessionPoolMgr",)
@@ -2529,3 +2539,187 @@ def test_multi_pair_reporting_shared_cache_reuse_benchmark(tmp_path: Path) -> No
     assert rc == 1
     assert len(disk_opens) == num_files
     assert elapsed_cli < 15.0
+
+
+def test_concurrent_heuristic_sessions_isolate_worker_and_unassociated_diagnostics(
+    tmp_path: Path,
+) -> None:
+    """Verifies simultaneous heuristic_ctx_manager_session() runs never cross-contaminate worker or patch diagnostics."""
+    import concurrent.futures
+    from pydoppelgangerhunt.config import (
+        clear_closure_warning_cache,
+        heuristic_ctx_manager_session,
+        log_heuristic_ctx_manager_summary,
+        peek_heuristic_non_suppressing_ctx_managers,
+        record_heuristic_non_suppressing_ctx_manager,
+    )
+
+    clear_closure_warning_cache()
+    entry_barrier = threading.Barrier(3, timeout=10.0)
+    recorded_barrier = threading.Barrier(3, timeout=10.0)
+    results: dict[str, tuple[str, ...]] = {}
+    errors: list[BaseException] = []
+
+    def _run_session_worker(session_key: str, mgr_name: str) -> None:
+        try:
+            with heuristic_ctx_manager_session():
+                entry_barrier.wait()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    fut = pool.submit(
+                        contextvars.copy_context().run,
+                        record_heuristic_non_suppressing_ctx_manager,
+                        mgr_name,
+                    )
+                    fut.result()
+                recorded_barrier.wait()
+                results[session_key] = log_heuristic_ctx_manager_summary()
+        except BaseException as exc:  # pragma: no cover - surfaced on failure
+            errors.append(exc)
+
+    def _run_unassociated_thread() -> None:
+        try:
+            entry_barrier.wait()
+            record_heuristic_non_suppressing_ctx_manager("UnassociatedThreadMgr")
+            recorded_barrier.wait()
+            results["unassociated"] = peek_heuristic_non_suppressing_ctx_managers()
+        except BaseException as exc:  # pragma: no cover - surfaced on failure
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(
+            target=_run_session_worker, args=("session_a", "DatabaseTransaction")
+        ),
+        threading.Thread(
+            target=_run_session_worker, args=("session_b", "CacheLock")
+        ),
+        threading.Thread(target=_run_unassociated_thread),
+    ]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=10.0)
+    if errors:
+        raise errors[0]
+
+    assert results["session_a"] == ("DatabaseTransaction",)
+    assert results["session_b"] == ("CacheLock",)
+    assert results["unassociated"] == ("UnassociatedThreadMgr",)
+
+    # Concurrent generate_refactoring_patch calls emit isolated # Note: comments
+    def _make_pair(label: str, mgr_name: str) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+        repo_dir = tmp_path / label
+        repo_dir.mkdir()
+        src = (
+            f"def run_1({mgr_name}, x):\n"
+            f"    with {mgr_name}():\n"
+            "        y = x + 1\n"
+            "    return y\n\n"
+            f"def run_2({mgr_name}, x):\n"
+            f"    with {mgr_name}():\n"
+            "        y = x + 1\n"
+            "    return y\n"
+        )
+        mod_file = repo_dir / "svc.py"
+        mod_file.write_text(src, encoding="utf-8")
+        u1 = {"name": "run_1:blk", "file": str(mod_file), "start": 2, "end": 3, "kind": "compound_block"}
+        u2 = {"name": "run_2:blk", "file": str(mod_file), "start": 7, "end": 8, "kind": "compound_block"}
+        return repo_dir, u1, u2
+
+    repo_a, ua1, ua2 = _make_pair("repo_a", "DatabaseTransaction")
+    repo_b, ub1, ub2 = _make_pair("repo_b", "CacheLock")
+    patch_barrier = threading.Barrier(2, timeout=10.0)
+    patches: dict[str, str] = {}
+    patch_errors: list[BaseException] = []
+
+    def _run_patch(key: str, repo_dir: Path, u1: dict[str, Any], u2: dict[str, Any]) -> None:
+        try:
+            patch_barrier.wait()
+            patches[key] = generate_refactoring_patch(
+                [(1.0, u1, u2)],
+                repo_root=str(repo_dir),
+                replace_clones=True,
+                closure_strictness="strict",
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced on failure
+            patch_errors.append(exc)
+
+    p_threads = [
+        threading.Thread(target=_run_patch, args=("a", repo_a, ua1, ua2)),
+        threading.Thread(target=_run_patch, args=("b", repo_b, ub1, ub2)),
+    ]
+    for th in p_threads:
+        th.start()
+    for th in p_threads:
+        th.join(timeout=10.0)
+    if patch_errors:
+        raise patch_errors[0]
+
+    assert "'DatabaseTransaction'" in patches["a"]
+    assert "'CacheLock'" not in patches["a"]
+    assert "'CacheLock'" in patches["b"]
+    assert "'DatabaseTransaction'" not in patches["b"]
+
+
+@pytest.mark.parametrize(
+    ("skip_flag", "strict_with_flag", "expected_mode", "expected_skip", "expected_strict_with"),
+    [
+        (False, False, "strict", False, False),
+        (False, True, "pedantic", False, True),
+        (True, False, "lenient", True, False),
+        (True, True, "lenient", True, False),
+    ],
+)
+def test_unrecognized_closure_strictness_falls_back_to_boolean_flags(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    skip_flag: bool,
+    strict_with_flag: bool,
+    expected_mode: str,
+    expected_skip: bool,
+    expected_strict_with: bool,
+) -> None:
+    """Verifies unrecognized closure_strictness strings warn and fall back to boolean flags uniformly."""
+    import logging
+    from pydoppelgangerhunt.config import (
+        UnitClosureFlags,
+        clear_closure_warning_cache,
+        load_tool_config,
+        resolve_closure_strictness_mode,
+        resolve_unit_closure_flags,
+    )
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        mode, is_lenient = resolve_closure_strictness_mode(
+            closure_strictness="unrecognized_custom_mode",
+            skip_pre_unit_closures=skip_flag,
+            strict_with_suppression=strict_with_flag,
+        )
+    assert (mode, is_lenient) == (expected_mode, expected_skip)
+    assert f"falling back to {expected_mode} mode" in caplog.text
+
+    unit_flags = resolve_unit_closure_flags(
+        {
+            "closure_strictness": "unrecognized_custom_mode",
+            "skip_pre_unit_closures": skip_flag,
+            "strict_with_suppression": strict_with_flag,
+        }
+    )
+    assert unit_flags == UnitClosureFlags(expected_skip, expected_strict_with)
+
+    cfg_file = tmp_path / "pyproject.toml"
+    cfg_file.write_text(
+        "[tool.pydoppelgangerhunt]\n"
+        'closure_strictness = "unrecognized_custom_mode"\n'
+        f"skip_pre_unit_closures = {'true' if skip_flag else 'false'}\n"
+        f"strict_with_suppression = {'true' if strict_with_flag else 'false'}\n",
+        encoding="utf-8",
+    )
+    loaded = load_tool_config(repo_root=str(tmp_path))
+    cfg_mode, cfg_skip = resolve_closure_strictness_mode(
+        closure_strictness=loaded.get("closure_strictness"),
+        skip_pre_unit_closures=bool(loaded.get("skip_pre_unit_closures", False)),
+        strict_with_suppression=loaded.get("strict_with_suppression"),
+    )
+    assert (cfg_mode, cfg_skip) == (expected_mode, expected_skip)

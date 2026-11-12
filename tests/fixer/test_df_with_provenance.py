@@ -2923,3 +2923,613 @@ def test_suspicious_suppress_token_boundary_matches_snake_and_camel_case_suppres
     )
     assert sc["is_control_flow_safe"] is False, suspicious_mgr
     assert "severed_closure_cell" in sc["control_flow_hazards"], suspicious_mgr
+
+
+@pytest.mark.parametrize("use_callable_alias", [False, True])
+def test_sequential_local_ctx_manager_rebinding_invalidates_prior_provenance(
+    use_callable_alias: bool,
+) -> None:
+    """Verifies sequential local rebinding of a context-manager variable invalidates prior provenance."""
+    first_bind = "cm = Transaction" if use_callable_alias else "cm = Transaction()"
+    first_with = "cm()" if use_callable_alias else "cm"
+    second_bind = (
+        "cm = SuppressErrors" if use_callable_alias else "cm = SuppressErrors()"
+    )
+    second_with = "cm()" if use_callable_alias else "cm"
+    src = (
+        "def run_pipeline(compute):\n"
+        f"    {first_bind}\n"
+        f"    with {first_with}:\n"
+        "        safe_val = compute()\n"
+        f"    {second_bind}\n"
+        f"    with {second_with}:\n"
+        "        risky_val = compute()\n"
+        "    safe_cb = lambda: safe_val\n"
+        "    risky_cb = lambda: risky_val\n"
+        "    return safe_cb(), risky_cb()\n"
+    )
+    tree = ast.parse(src)
+    for mode, allowlist in (("strict", []), ("pedantic", ["Transaction"])):
+        sc_safe = inspect_single_unit_scope(
+            {
+                "start": 8,
+                "end": 8,
+                "kind": "basic_block",
+                "source_text": src,
+                "source_code": "    safe_cb = lambda: safe_val\n",
+                "closure_strictness": mode,
+                "non_suppressing_ctx_managers": allowlist,
+            },
+            tree=tree,
+        )
+        assert sc_safe["is_control_flow_safe"] is True, (mode, use_callable_alias)
+        sc_risky = inspect_single_unit_scope(
+            {
+                "start": 9,
+                "end": 9,
+                "kind": "basic_block",
+                "source_text": src,
+                "source_code": "    risky_cb = lambda: risky_val\n",
+                "closure_strictness": mode,
+                "non_suppressing_ctx_managers": allowlist,
+            },
+            tree=tree,
+        )
+        assert sc_risky["is_control_flow_safe"] is False, (mode, use_callable_alias)
+        assert "severed_closure_cell" in sc_risky["control_flow_hazards"]
+
+    # Negative control: rebinding from a suppressor to proven contextlib.nullcontext restores safety
+    recover_src = (
+        "import contextlib\n"
+        "def recover_pipeline(compute):\n"
+        "    cm = SuppressErrors()\n"
+        "    with cm:\n"
+        "        _ignored = compute()\n"
+        "    cm = contextlib.nullcontext()\n"
+        "    with cm:\n"
+        "        clean_val = compute()\n"
+        "    clean_cb = lambda: clean_val\n"
+        "    return clean_cb()\n"
+    )
+    sc_recovered = inspect_single_unit_scope(
+        {
+            "start": 9,
+            "end": 9,
+            "kind": "basic_block",
+            "source_text": recover_src,
+            "source_code": "    clean_cb = lambda: clean_val\n",
+            "closure_strictness": "pedantic",
+        },
+        tree=ast.parse(recover_src),
+    )
+    assert sc_recovered["is_control_flow_safe"] is True
+
+
+@pytest.mark.parametrize(
+    ("scope_kind", "initial_mgr"),
+    [
+        ("global", "Transaction"),
+        ("global", "contextlib.nullcontext"),
+        ("nonlocal", "Transaction"),
+        ("nonlocal", "contextlib.nullcontext"),
+    ],
+)
+def test_cross_scope_global_and_nonlocal_helper_rebinding_invalidates_ctx_manager_provenance(
+    scope_kind: str,
+    initial_mgr: str,
+) -> None:
+    """Verifies helper calls that rebind global/nonlocal manager aliases invalidate non-suppression provenance."""
+    if scope_kind == "global":
+        src = (
+            "import contextlib\n"
+            f"cm = {initial_mgr}\n"
+            "def replace_manager():\n"
+            "    global cm\n"
+            "    cm = SuppressErrors\n"
+            "def execute_step(compute):\n"
+            "    with cm():\n"
+            "        replace_manager()\n"
+            "    with cm():\n"
+            "        after_swap = compute()\n"
+            "    cb = lambda: after_swap\n"
+            "    return cb()\n"
+        )
+        unit_line = 11
+    else:
+        src = (
+            "import contextlib\n"
+            "def outer(compute):\n"
+            f"    cm = {initial_mgr}\n"
+            "    def replace_manager():\n"
+            "        nonlocal cm\n"
+            "        cm = SuppressErrors\n"
+            "    with cm():\n"
+            "        replace_manager()\n"
+            "    with cm():\n"
+            "        after_swap = compute()\n"
+            "    cb = lambda: after_swap\n"
+            "    return cb()\n"
+        )
+        unit_line = 11
+
+    tree = ast.parse(src)
+    for mode in ("strict", "pedantic"):
+        sc = inspect_single_unit_scope(
+            {
+                "start": unit_line,
+                "end": unit_line,
+                "kind": "basic_block",
+                "source_text": src,
+                "source_code": "    cb = lambda: after_swap\n",
+                "closure_strictness": mode,
+                "non_suppressing_ctx_managers": ["Transaction"],
+            },
+            tree=tree,
+        )
+        assert sc["is_control_flow_safe"] is False, (scope_kind, initial_mgr, mode)
+        assert "severed_closure_cell" in sc["control_flow_hazards"]
+
+
+def test_strict_heuristic_classification_never_pollutes_pedantic_cache_on_shared_ast() -> None:
+    """Verifies heuristic non-suppression in strict mode never caches permanent proof for pedantic mode on the same AST."""
+    from pydoppelgangerhunt.config import collect_heuristic_ctx_managers
+
+    clear_dataflow_cache()
+    src = (
+        "def run_tx(compute):\n"
+        "    with Transaction():\n"
+        "        result = compute()\n"
+        "    cb = lambda: result\n"
+        "    return cb()\n"
+    )
+    shared_tree = ast.parse(src)
+
+    with collect_heuristic_ctx_managers() as strict_session_mgrs:
+        sc_strict = inspect_single_unit_scope(
+            {
+                "start": 4,
+                "end": 4,
+                "kind": "basic_block",
+                "source_text": src,
+                "source_code": "    cb = lambda: result\n",
+                "closure_strictness": "strict",
+            },
+            tree=shared_tree,
+        )
+    assert sc_strict["is_control_flow_safe"] is True
+    assert sc_strict["heuristic_ctx_managers"] == ["Transaction"]
+    assert strict_session_mgrs == {"Transaction"}
+
+    # Re-inspecting the identical AST object in pedantic mode without cache eviction must reject Transaction()
+    with collect_heuristic_ctx_managers() as pedantic_session_mgrs:
+        sc_pedantic = inspect_single_unit_scope(
+            {
+                "start": 4,
+                "end": 4,
+                "kind": "basic_block",
+                "source_text": src,
+                "source_code": "    cb = lambda: result\n",
+                "closure_strictness": "pedantic",
+            },
+            tree=shared_tree,
+        )
+    assert sc_pedantic["is_control_flow_safe"] is False
+    assert "severed_closure_cell" in sc_pedantic["control_flow_hazards"]
+    assert sc_pedantic["heuristic_ctx_managers"] == []
+    assert pedantic_session_mgrs == set()
+
+    # Supplying explicit allowlist proof on the same AST object succeeds in pedantic mode
+    sc_allowlisted = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 4,
+            "kind": "basic_block",
+            "source_text": src,
+            "source_code": "    cb = lambda: result\n",
+            "closure_strictness": "pedantic",
+            "non_suppressing_ctx_managers": ["Transaction"],
+        },
+        tree=shared_tree,
+    )
+    assert sc_allowlisted["is_control_flow_safe"] is True
+
+
+def _execute_block_runtime_paths(
+    body_src: str,
+    pre_init_names: set[str],
+    input_envs: list[dict[str, object]],
+) -> tuple[int, set[str], set[str]]:
+    """Executes body_src inside a wrapper function across input_envs and returns (fallthrough_runs, always_bound, ever_bound)."""
+    import warnings
+
+    indented_lines = [
+        f"    {line}" if line.strip() else ""
+        for line in body_src.splitlines()
+    ]
+    init_lines = [f"    {name} = 'init'" for name in sorted(pre_init_names)]
+    env_keys = sorted({k for env in input_envs for k in env})
+    unpack_lines = [f"    {k} = __env.get({k!r})" for k in env_keys]
+    fn_src = "\n".join(
+        [
+            "def _probe(__env):",
+            *unpack_lines,
+            *init_lines,
+            *indented_lines,
+            "    return ('__FALLTHROUGH__', set(locals().keys()))",
+        ]
+    )
+    ns: dict[str, object] = {}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        code_obj = compile(fn_src, "<diff_oracle>", "exec")
+    exec(code_obj, ns)  # noqa: S102  # pylint: disable=exec-used
+    probe_fn = ns["_probe"]
+    assert callable(probe_fn)
+
+    excluded = {"__env", *env_keys}
+    fallthrough_sets: list[set[str]] = []
+    for env in input_envs:
+        try:
+            outcome = probe_fn(env)
+        except BaseException:  # noqa: BLE001
+            continue
+        if (
+            isinstance(outcome, tuple)
+            and len(outcome) == 2
+            and outcome[0] == "__FALLTHROUGH__"
+            and isinstance(outcome[1], set)
+        ):
+            fallthrough_sets.append(outcome[1] - excluded)
+
+    if not fallthrough_sets:
+        return 0, set(), set()
+    always_bound = set.intersection(*fallthrough_sets)
+    ever_bound = set.union(*fallthrough_sets)
+    return len(fallthrough_sets), always_bound, ever_bound
+
+
+@pytest.mark.parametrize(
+    ("shape_id", "pre_init", "body_src", "envs", "expected_static_def", "expect_term"),
+    [
+        (
+            "branch_return_vs_fallthrough",
+            set(),
+            (
+                "if flag:\n"
+                "    early = 1\n"
+                "    return early\n"
+                "else:\n"
+                "    kept = 2\n"
+                "after = kept + 1\n"
+            ),
+            [{"flag": True}, {"flag": False}],
+            {"kept", "after"},
+            False,
+        ),
+        (
+            "raise_caught_by_handler",
+            set(),
+            (
+                "try:\n"
+                "    before_raise = 1\n"
+                "    if fail:\n"
+                "        raise ValueError('boom')\n"
+                "    survivor = 10\n"
+                "except ValueError:\n"
+                "    survivor = 20\n"
+                "    only_err = 99\n"
+            ),
+            [{"fail": False}, {"fail": True}],
+            {"survivor"},
+            False,
+        ),
+        (
+            "handler_reraises_to_outer",
+            {"pre"},
+            (
+                "try:\n"
+                "    if mode == 'val':\n"
+                "        del pre\n"
+                "        raise ValueError('v')\n"
+                "    if mode == 'type':\n"
+                "        raise TypeError('t')\n"
+                "    res = 1\n"
+                "except ValueError:\n"
+                "    dead_on_fallthrough = 1\n"
+                "    raise RuntimeError('escalate')\n"
+                "except TypeError:\n"
+                "    res = 2\n"
+            ),
+            [{"mode": "ok"}, {"mode": "val"}, {"mode": "type"}],
+            {"res"},
+            False,
+        ),
+        (
+            "terminating_finally_block",
+            set(),
+            (
+                "try:\n"
+                "    body_var = 1\n"
+                "finally:\n"
+                "    fin_var = 2\n"
+                "    return fin_var\n"
+            ),
+            [{}],
+            {"body_var", "fin_var"},
+            True,
+        ),
+        (
+            "conditional_del_followed_by_reassignment",
+            {"x", "victim"},
+            (
+                "if flag:\n"
+                "    del x\n"
+                "    del victim\n"
+                "x = 42\n"
+            ),
+            [{"flag": False}, {"flag": True}],
+            {"x"},
+            False,
+        ),
+        (
+            "loop_break_and_continue_inside_try_finally",
+            set(),
+            (
+                "seen = 0\n"
+                "for item in items:\n"
+                "    try:\n"
+                "        if item < 0:\n"
+                "            neg = item\n"
+                "            break\n"
+                "        if item == 0:\n"
+                "            zero = 0\n"
+                "            continue\n"
+                "        pos = item\n"
+                "    finally:\n"
+                "        fin_loop = 1\n"
+                "else:\n"
+                "    no_break = 1\n"
+            ),
+            [{"items": []}, {"items": [1, 2]}, {"items": [0, -1]}],
+            {"seen"},
+            False,
+        ),
+        (
+            "finally_continue_overrides_try_break",
+            set(),
+            (
+                "for item in items:\n"
+                "    try:\n"
+                "        if item < 0:\n"
+                "            break\n"
+                "    finally:\n"
+                "        if swallow_break:\n"
+                "            continue\n"
+                "    post_try = item\ndone = 1\n"
+            ),
+            [
+                {"items": [], "swallow_break": False},
+                {"items": [-1], "swallow_break": False},
+                {"items": [-1], "swallow_break": True},
+                {"items": [2], "swallow_break": False},
+            ],
+            {"done"},
+            False,
+        ),
+        (
+            "multiple_handlers_distinct_bindings_and_err_cleanup",
+            {"err"},
+            (
+                "try:\n"
+                "    if kind == 1:\n"
+                "        raise ValueError('v')\n"
+                "    if kind == 2:\n"
+                "        raise KeyError('k')\n"
+                "    shared = 'ok'\n"
+                "except ValueError as err:\n"
+                "    shared = 'val'\n"
+                "    only_v = 1\n"
+                "except KeyError:\n"
+                "    shared = 'key'\n"
+                "    only_k = 2\n"
+            ),
+            [{"kind": 0}, {"kind": 1}, {"kind": 2}],
+            {"shared"},
+            False,
+        ),
+    ],
+)
+def test_differential_block_assignment_against_python_runtime_across_control_flow_shapes(
+    shape_id: str,
+    pre_init: set[str],
+    body_src: str,
+    envs: list[dict[str, object]],
+    expected_static_def: set[str],
+    expect_term: bool,
+) -> None:
+    """Compares static definite/conditional/deletion/termination results against actual Python execution."""
+    import warnings
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _analyze_block_assignment_impl,
+        _extract_block_definite_bindings_and_term,
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        stmts = ast.parse(body_src).body
+    may_del: set[str] = set()
+    live_in_del: set[str] = set()
+    static_def, static_cond, static_term, _ = _analyze_block_assignment_impl(
+        stmts,
+        definite=set(pre_init),
+        may_deleted=may_del,
+        live_in_deleted=live_in_del,
+    )
+    def_helper, term_helper = _extract_block_definite_bindings_and_term(
+        stmts, None, initial_bound=frozenset(pre_init)
+    )
+    assert static_def.isdisjoint(static_cond), shape_id
+    assert static_term is expect_term, shape_id
+    assert term_helper is expect_term, shape_id
+    assert def_helper == static_def, shape_id
+    assert static_def == expected_static_def, (shape_id, static_def, expected_static_def)
+
+    runs, always_bound, ever_bound = _execute_block_runtime_paths(
+        body_src, pre_init, envs
+    )
+    if expect_term:
+        assert runs == 0, shape_id
+    else:
+        assert runs > 0, shape_id
+        assert static_def <= always_bound, (shape_id, static_def, always_bound)
+        assert (ever_bound - static_def) <= static_cond, (
+            shape_id,
+            ever_bound,
+            static_def,
+            static_cond,
+        )
+        assert (pre_init - always_bound) <= may_del, (
+            shape_id,
+            pre_init - always_bound,
+            may_del,
+        )
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="except* requires Python 3.11+")
+def test_differential_except_star_exception_group_subset_execution() -> None:
+    """Compares static except* multi-handler subset semantics against Python 3.11+ ExceptionGroup execution."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _analyze_block_assignment_impl,
+        _extract_block_definite_bindings_and_term,
+    )
+
+    body_src = (
+        "try:\n"
+        "    if exc is not None:\n"
+        "        raise exc\n"
+        "    all_paths = 0\n"
+        "    clean_only = 1\n"
+        "except* ValueError as eg_v:\n"
+        "    all_paths = 1\n"
+        "    saw_v = 1\n"
+        "    del survivor\n"
+        "except* TypeError as eg_t:\n"
+        "    all_paths = 2\n"
+        "    saw_t = 1\n"
+        "finally:\n"
+        "    fin_always = 9\n"
+    )
+    eg_cls = getattr(builtins_mod := __import__("builtins"), "ExceptionGroup")
+    envs: list[dict[str, object]] = [
+        {"exc": None},
+        {"exc": ValueError("v")},
+        {"exc": TypeError("t")},
+        {"exc": eg_cls("both", [ValueError("v"), TypeError("t")])},
+        {"exc": eg_cls("partial_unhandled", [ValueError("v"), KeyError("k")])},
+    ]
+    pre_init = {"survivor", "keep"}
+    stmts = ast.parse(body_src).body
+    may_del: set[str] = set()
+    static_def, static_cond, static_term, _ = _analyze_block_assignment_impl(
+        stmts,
+        definite=set(pre_init),
+        may_deleted=may_del,
+    )
+    def_helper, term_helper = _extract_block_definite_bindings_and_term(
+        stmts, None, initial_bound=frozenset(pre_init)
+    )
+    runs, always_bound, ever_bound = _execute_block_runtime_paths(
+        body_src, pre_init, envs
+    )
+    assert runs == 4
+    assert static_term is False
+    assert term_helper is False
+    assert always_bound == {"keep", "all_paths", "fin_always"}
+    assert static_def == {"keep", "fin_always"}
+    assert static_def <= always_bound
+    assert def_helper == static_def
+    assert "all_paths" in static_cond
+    assert (ever_bound - static_def) <= static_cond
+    assert "survivor" in may_del
+    assert {"eg_v", "eg_t"}.isdisjoint(always_bound)
+    assert {"eg_v", "eg_t"}.isdisjoint(static_def)
+    assert builtins_mod is not None
+
+
+def test_generated_try_except_else_finally_combinatorial_differential_oracle() -> None:
+    """Exhaustively compares _analyze_block_assignment_impl against runtime execution across generated try/except/else/finally blocks."""
+    import warnings
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _analyze_block_assignment_impl,
+    )
+
+    try_variants = [
+        "    if mode == 'ret':\n        return 0\n    if mode == 'val':\n        raise ValueError('v')\n    x = 1\n",
+        "    x = 1\n    if mode == 'val':\n        del pre\n        raise ValueError('v')\n",
+    ]
+    handler_variants = [
+        "except ValueError:\n    x = 2\n",
+        "except ValueError:\n    h_only = 2\n",
+        "except ValueError:\n    del pre\n    raise RuntimeError('esc')\n",
+    ]
+    else_variants = [
+        "",
+        "else:\n    e_var = 3\n    x = 3\n",
+    ]
+    finally_variants = [
+        "",
+        "finally:\n    fin = 4\n",
+        "finally:\n    del x\n    fin = 4\n",
+        "finally:\n    fin = 4\n    return fin\n",
+    ]
+    envs: list[dict[str, object]] = [
+        {"mode": "ok"},
+        {"mode": "val"},
+        {"mode": "ret"},
+    ]
+    pre_init = {"pre"}
+
+    checked = 0
+    for t_body in try_variants:
+        for h_clause in handler_variants:
+            for e_clause in else_variants:
+                for f_clause in finally_variants:
+                    if not h_clause and not f_clause:
+                        continue
+                    parts = ["x = 0\n", "try:\n", t_body, h_clause]
+                    if e_clause:
+                        parts.append(e_clause)
+                    if f_clause:
+                        parts.append(f_clause)
+                    prog = "".join(parts)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", SyntaxWarning)
+                        stmts = ast.parse(prog).body
+                    may_del: set[str] = set()
+                    s_def, s_cond, s_term, _ = _analyze_block_assignment_impl(
+                        stmts,
+                        definite=set(pre_init),
+                        may_deleted=may_del,
+                    )
+                    runs, always_bound, ever_bound = _execute_block_runtime_paths(
+                        prog, pre_init, envs
+                    )
+                    assert s_def.isdisjoint(s_cond), prog
+                    if runs == 0:
+                        assert s_term is True, prog
+                    else:
+                        assert s_term is False, prog
+                        assert s_def <= always_bound, (prog, s_def, always_bound)
+                        assert (ever_bound - s_def) <= s_cond, (
+                            prog,
+                            ever_bound,
+                            s_def,
+                            s_cond,
+                        )
+                        assert (pre_init - always_bound) <= may_del, (
+                            prog,
+                            always_bound,
+                            may_del,
+                        )
+                    checked += 1
+    assert checked == 48

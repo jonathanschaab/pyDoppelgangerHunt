@@ -12,6 +12,7 @@ from typing import (
     Dict,
     Iterable,
     List,
+    Mapping,
     Optional,
     Sequence,
     Set,
@@ -53,6 +54,21 @@ def _record_import_names(
                 "shadowing analysis remains optimistic for this scope",
                 mod,
             )
+
+
+def _collect_reachable_names(
+    seed: str, adjacency: Mapping[str, Iterable[str]]
+) -> Set[str]:
+    """Computes reflexive-transitive reachable symbol names from seed in adjacency."""
+    visited: Set[str] = {seed}
+    worklist: List[str] = [seed]
+    while worklist:
+        curr = worklist.pop()
+        for neighbor in adjacency.get(curr, ()):
+            if neighbor not in visited:
+                visited.add(neighbor)
+                worklist.append(neighbor)
+    return visited
 
 
 def _extract_scope_stmts(scope_node: ast.AST) -> List[ast.AST]:
@@ -1288,15 +1304,7 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         )
 
     def _expand_deferred_callers(self, fn_name: str) -> Set[str]:
-        expanded: Set[str] = {fn_name}
-        queue: List[str] = [fn_name]
-        while queue:
-            curr = queue.pop()
-            for caller in self._fn_callers.get(curr, ()):
-                if caller not in expanded:
-                    expanded.add(caller)
-                    queue.append(caller)
-        return expanded
+        return _collect_reachable_names(fn_name, self._fn_callers)
 
     def _commit_unconditional_store(self, name: str) -> None:
         self.stored.add(name)

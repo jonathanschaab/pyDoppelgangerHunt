@@ -788,6 +788,9 @@ def _handle_nested_scope_node(
                         entry = fn_return_refs.setdefault(sib_name, (set(), set()))
                         entry[0].update(ret_loads)
                         entry[1].update(ret_calls)
+                elif fn_return_refs is not None and isinstance(curr, ast.ClassDef) and free_r:
+                    entry = fn_return_refs.setdefault(sib_name, (set(), set()))
+                    entry[0].update(free_r)
             sibling_closures.append((sib_name, free_r, nl_mut))
             for oc_name in outer_carriers:
                 sibling_closures.append((oc_name, set(free_r), set(nl_mut)))
@@ -941,16 +944,14 @@ def _record_carrier_closures_and_aliases(
             c_loads -= set(excluded_names)
             c_calls -= set(excluded_names)
         edge_prefix = "" if is_rebound else "*"
-        record_edges = is_rebound or isinstance(curr, ast.Call)
         for t_name in valid_targets:
             if c_reads or c_muts:
                 sibling_closures.append((t_name, set(c_reads), set(c_muts)))
-            if record_edges:
-                edge_tgt = f"{edge_prefix}{t_name}"
-                if c_loads:
-                    alias_edges.append((edge_tgt, set(c_loads)))
-                if c_calls and call_edges is not None:
-                    call_edges.append((edge_tgt, set(c_calls)))
+            edge_tgt = f"{edge_prefix}{t_name}"
+            if c_loads:
+                alias_edges.append((edge_tgt, set(c_loads)))
+            if c_calls and call_edges is not None:
+                call_edges.append((edge_tgt, set(c_calls)))
 
 
 def _record_simple_node_bindings_and_reads(
@@ -1198,7 +1199,7 @@ def _try_apply_cached_stmt_delta(
     )
     key: Tuple[Any, ...] = (
         (stmt, is_before, sup_key, strict_w, init_pre_bound, extra_non_sup)
-        if has_with and (sup_key or strict_w or init_pre_bound or extra_non_sup)
+        if has_with
         else (stmt, is_before)
     )
     with _downstream_cache_lock:
@@ -1579,7 +1580,13 @@ def _analyze_enclosing_fn_cells_uncached(
         comp_walrus = _extract_comprehension_body_walrus_names(fn_node) - fn_globals
         fn_locals |= comp_targets | comp_walrus
 
-    initial_sup = _seed_scope_suppress_aliases(fn_node, mod_tree, scope_ctx)
+    initial_sup = _seed_scope_suppress_aliases(
+        fn_node,
+        mod_tree,
+        scope_ctx,
+        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+        strict_with_suppression=strict_with_suppression,
+    )
     bufs = _make_empty_traversal_buffers(
         fn_globals,
         scope_ctx,
@@ -1657,46 +1664,18 @@ def _analyze_enclosing_fn_cells_uncached(
         bufs.state.pre_bound.difference_update(bufs.sibling_nl_deletions)
         bufs.state.pre_unbound.update(bufs.sibling_nl_deletions)
 
-    closure_carrier_names: Set[str] = (
-        {name for name, _, _ in bufs.sibling_closures if name is not None}
-        | bufs.factory_names
-        | {t.lstrip("*") for t, _ in bufs.alias_edges}
-        | {t.lstrip("*") for t, _ in bufs.call_edges}
-    )
-    for t_name, called_set in bufs.call_edges:
-        alias_targets: Set[str] = set(called_set & bufs.factory_names)
-        visited_fn_refs: Set[str] = set()
-        pending_fn_refs = list(called_set)
-        while pending_fn_refs:
-            fn_ref = pending_fn_refs.pop()
-            if fn_ref in visited_fn_refs:
-                continue
-            visited_fn_refs.add(fn_ref)
-            if fn_ref in bufs.factory_names:
-                alias_targets.add(fn_ref)
-            ret_loads_set, ret_calls_set = bufs.fn_return_refs.get(fn_ref, (set(), set()))
-            for ret_ref in ret_loads_set:
-                if ret_ref in closure_carrier_names:
-                    alias_targets.add(ret_ref)
-            for call_ref in ret_calls_set:
-                if call_ref in bufs.factory_names:
-                    alias_targets.add(call_ref)
-                if call_ref in bufs.fn_return_refs or call_ref in bufs.factory_names:
-                    pending_fn_refs.append(call_ref)
-        if alias_targets:
-            bufs.alias_edges.append((t_name, alias_targets))
-
-    propagation_edges: List[Tuple[str, Set[str]]] = [
-        (t_name[1:] if t_name.startswith("*") else t_name, srcs)
-        for t_name, srcs in bufs.alias_edges
-    ]
+    _resolve_call_carrier_alias_edges(bufs)
     rebound_alias_edges: List[Tuple[str, Set[str]]] = [
         (t_name, srcs) for t_name, srcs in bufs.alias_edges if not t_name.startswith("*")
+    ]
+    mutation_edges: List[Tuple[str, Set[str]]] = [
+        (t_name[1:], srcs) for t_name, srcs in bufs.alias_edges if t_name.startswith("*")
     ]
     propagated_closures = _propagate_sibling_closures(
         bufs.sibling_closures,
         post_reads=bufs.state.post_reads,
-        alias_edges=propagation_edges,
+        alias_edges=rebound_alias_edges,
+        mutation_edges=mutation_edges,
     )
     concurrent_sib_vars: Set[str] = set()
     for s_idx in bufs.concurrent_sib_indices:
@@ -1721,7 +1700,71 @@ def _analyze_enclosing_fn_cells_uncached(
         pre_unbound=frozenset(bufs.state.pre_unbound),
         concurrent_sibling_vars=frozenset(concurrent_sib_vars),
         heuristic_ctx_managers=tuple(sorted(fn_heuristics)),
+        mutation_edges=tuple((t_name, frozenset(srcs)) for t_name, srcs in mutation_edges),
     )
+
+
+def _resolve_call_carrier_alias_edges(bufs: _CellTraversalBuffers) -> None:
+    """Resolves multi-layer and aliased factory/carrier calls into bufs.alias_edges."""
+    if not bufs.call_edges:
+        return
+    mutated_carrier_targets: Set[str] = {
+        t[1:] for t, _ in bufs.alias_edges if t.startswith("*")
+    } | {t[1:] for t, _ in bufs.call_edges if t.startswith("*")}
+    closure_carrier_names: Set[str] = (
+        {name for name, _, _ in bufs.sibling_closures if name is not None}
+        | bufs.factory_names
+        | {t.lstrip("*") for t, _ in bufs.alias_edges}
+        | {t.lstrip("*") for t, _ in bufs.call_edges}
+    )
+    var_alias_map: Dict[str, Set[str]] = {}
+    for t_name, srcs in bufs.alias_edges:
+        var_alias_map.setdefault(t_name.lstrip("*"), set()).update(srcs)
+    resolved_call_targets: List[Set[str]] = [set() for _ in bufs.call_edges]
+    call_changed = True
+    while call_changed:
+        call_changed = False
+        for idx, (t_name, called_set) in enumerate(bufs.call_edges):
+            alias_targets = resolved_call_targets[idx]
+            visited_fn_refs: Set[str] = set()
+            pending_fn_refs = list(called_set)
+            while pending_fn_refs:
+                fn_ref = pending_fn_refs.pop()
+                if fn_ref in visited_fn_refs:
+                    continue
+                visited_fn_refs.add(fn_ref)
+                for aliased_fn in var_alias_map.get(fn_ref, ()):
+                    if aliased_fn not in visited_fn_refs:
+                        pending_fn_refs.append(aliased_fn)
+                if fn_ref in bufs.factory_names or fn_ref in mutated_carrier_targets:
+                    if fn_ref not in alias_targets:
+                        alias_targets.add(fn_ref)
+                        call_changed = True
+                ret_loads_set, ret_calls_set = bufs.fn_return_refs.get(fn_ref, (set(), set()))
+                for ret_ref in ret_loads_set:
+                    if ret_ref in closure_carrier_names and ret_ref not in alias_targets:
+                        alias_targets.add(ret_ref)
+                        call_changed = True
+                for call_ref in ret_calls_set:
+                    if call_ref in bufs.factory_names and call_ref not in alias_targets:
+                        alias_targets.add(call_ref)
+                        call_changed = True
+                    if (
+                        call_ref in bufs.fn_return_refs
+                        or call_ref in bufs.factory_names
+                        or call_ref in var_alias_map
+                    ) and call_ref not in visited_fn_refs:
+                        pending_fn_refs.append(call_ref)
+            if alias_targets:
+                bare_tgt = t_name[1:] if t_name.startswith("*") else t_name
+                closure_carrier_names.add(bare_tgt)
+                tgt_aliases = var_alias_map.setdefault(bare_tgt, set())
+                if not alias_targets.issubset(tgt_aliases):
+                    tgt_aliases.update(alias_targets)
+                    call_changed = True
+    for idx, (t_name, _) in enumerate(bufs.call_edges):
+        if resolved_call_targets[idx]:
+            bufs.alias_edges.append((t_name, resolved_call_targets[idx]))
 
 
 def _analyze_enclosing_fn_cells(
