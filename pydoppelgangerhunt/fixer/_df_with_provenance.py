@@ -46,7 +46,10 @@ from pydoppelgangerhunt.fixer._df_cell_carriers import (
     _can_bind_in_fn_scope,
     _extract_store_names_in_node,
 )
-from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+from pydoppelgangerhunt.fixer._df_exit_protocol import (
+    is_factory_rebound_target,
+    scan_exit_protocol_patches,
+)
 from pydoppelgangerhunt.fixer._df_span_index import (
     _extract_type_alias_or_pattern_name,
     _find_enclosing_function_chain,
@@ -395,6 +398,7 @@ class _SuppressProvenance:
     cross_scope_suspicious: frozenset[str] = frozenset()
     exit_patch_targets: frozenset[str] = frozenset()
     has_exit_patch: bool = False
+    rebound_factory_targets: frozenset[Tuple[Optional[str], Optional[str]]] = frozenset()
 
     @property
     def suppress_names(self) -> frozenset[str]:
@@ -427,6 +431,11 @@ class _SuppressProvenance:
             tuple(sorted(self.cross_scope_suspicious)),
             tuple(sorted(self.exit_patch_targets)),
             self.has_exit_patch,
+            tuple(
+                sorted(
+                    (t or "", a or "") for t, a in self.rebound_factory_targets
+                )
+            ),
         )
 
     def __bool__(self) -> bool:
@@ -442,6 +451,23 @@ class _SuppressProvenance:
             or self.suspicious_aliases
             or self.cross_scope_mutated
             or self.has_exit_patch
+            or self.rebound_factory_targets
+        )
+
+    def module_aliases_for(self, mod_name: str) -> Set[str]:
+        """Returns mod_name plus any local aliases bound to mod_name in stdlib_modules."""
+        names: Set[str] = {mod_name}
+        for alias, bound_mod in self.stdlib_modules:
+            if bound_mod == mod_name:
+                names.add(alias)
+        return names
+
+    def is_factory_rebound(
+        self, target_names: AbstractSet[str], attr_name: str
+    ) -> bool:
+        """Returns True if any matching module/alias factory attribute or untargeted dynamic patch was seen."""
+        return is_factory_rebound_target(
+            self.rebound_factory_targets, target_names, attr_name
         )
 
     def clear_name(
@@ -689,23 +715,33 @@ class _SuppressProvenance:
         return replace(self, has_star_import=True)
 
     def with_exit_protocol_patches(
-        self, patched_names: AbstractSet[str], *, has_patch: bool
+        self,
+        patched_names: AbstractSet[str],
+        *,
+        has_patch: bool,
+        rebound_attrs: AbstractSet[Tuple[Optional[str], Optional[str]]] = frozenset(),
     ) -> _SuppressProvenance:
-        """Withdraws patchable positive non-suppression proofs after runtime exit-protocol patching.
+        """Withdraws patchable positive non-suppression proofs after runtime exit-protocol or factory patching.
 
         Clears every proven non-suppressing factory and instance binding (pure-Python
         classes, including stdlib managers such as ``contextlib.nullcontext``, can have
         ``__exit__`` reassigned after definition) and rebinds each name in
         ``patched_names`` that is not already a known suppressor as a suspicious alias.
         """
-        if not has_patch:
+        if not has_patch and not rebound_attrs:
             return self
+        if not has_patch:
+            return replace(
+                self,
+                rebound_factory_targets=self.rebound_factory_targets | frozenset(rebound_attrs),
+            )
         demoted = replace(
             self,
             non_suppressors=frozenset(),
             non_suppressor_instances=frozenset(),
             exit_patch_targets=self.exit_patch_targets | frozenset(patched_names),
             has_exit_patch=True,
+            rebound_factory_targets=self.rebound_factory_targets | frozenset(rebound_attrs),
         )
         for name in sorted(patched_names):
             if name not in demoted.suppressors:
@@ -786,6 +822,9 @@ class _SuppressProvenance:
                 self.exit_patch_targets | branch_prov.exit_patch_targets
             ),
             has_exit_patch=self.has_exit_patch or branch_prov.has_exit_patch,
+            rebound_factory_targets=(
+                self.rebound_factory_targets | branch_prov.rebound_factory_targets
+            ),
         )
 
     def apply_branch_delta(
@@ -1004,6 +1043,11 @@ def _is_proven_non_suppressing_target_expr(
     if _is_builtin_or_io_open_target(expr, prov):
         return True
     if isinstance(expr, ast.Name):
+        for alias, qual in prov.imported_symbols:
+            if alias == expr.id and "." in qual:
+                imp_mod, imp_attr = qual.rsplit(".", 1)
+                if prov.is_factory_rebound(prov.module_aliases_for(imp_mod), imp_attr):
+                    return False
         return _name_matches_non_suppressing_set(
             expr.id, prov.non_suppressors, prov, extra_non_suppressing_ctx_managers
         )
@@ -1021,7 +1065,12 @@ def _is_proven_non_suppressing_target_expr(
                         mod_candidate, frozenset()
                     )
                     if attr_name in allowed_sub_attrs:
-                        return True
+                        target_names = prov.module_aliases_for(mod_candidate) | {
+                            curr_val.id,
+                            chain_parts[-2],
+                        }
+                        if not prov.is_factory_rebound(target_names, attr_name):
+                            return True
         if isinstance(expr.value, ast.Name) and not prov.has_exit_patch:
             base_id = expr.value.id
             for alias, mod_name in prov.stdlib_modules:
@@ -1030,7 +1079,9 @@ def _is_proven_non_suppressing_target_expr(
                         mod_name, frozenset()
                     )
                     if attr_name in allowed_attrs:
-                        return True
+                        target_names = prov.module_aliases_for(mod_name) | {base_id}
+                        if not prov.is_factory_rebound(target_names, attr_name):
+                            return True
     return False
 
 
@@ -1046,6 +1097,11 @@ def _is_builtin_or_io_open_target(
             and "open" not in prov.shadowed_builtins
             and "open" not in prov.shadowed_names
             and not prov.has_star_import
+            and not prov.is_factory_rebound(
+                prov.module_aliases_for("builtins")
+                | prov.module_aliases_for("__builtins__"),
+                "open",
+            )
         ):
             return True
         for alias, qual in prov.imported_symbols:
@@ -1054,7 +1110,9 @@ def _is_builtin_or_io_open_target(
                 "__builtins__.open",
                 "io.open",
             ):
-                return True
+                imp_mod = qual.rsplit(".", 1)[0]
+                if not prov.is_factory_rebound(prov.module_aliases_for(imp_mod), "open"):
+                    return True
         return False
     if (
         isinstance(expr, ast.Attribute)
@@ -1067,11 +1125,19 @@ def _is_builtin_or_io_open_target(
             and base_id not in prov.shadowed_builtins
             and base_id not in prov.shadowed_names
             and not prov.has_star_import
+            and not prov.is_factory_rebound(
+                prov.module_aliases_for("builtins")
+                | prov.module_aliases_for("__builtins__"),
+                "open",
+            )
         ):
             return True
         for alias, mod_name in prov.stdlib_modules:
             if alias == base_id and mod_name in ("builtins", "__builtins__", "io"):
-                return True
+                if not prov.is_factory_rebound(
+                    prov.module_aliases_for(mod_name) | {base_id}, "open"
+                ):
+                    return True
     return False
 
 
@@ -3434,7 +3500,9 @@ def _seed_scope_suppress_aliases_uncached(
         prov = prov.with_shadowed_builtins(shadowed_b)
     patch_scan = scan_exit_protocol_patches(eff_mod if eff_mod is not None else fn_node)
     return prov.with_exit_protocol_patches(
-        patch_scan.patched_names, has_patch=patch_scan.has_patch
+        patch_scan.patched_names,
+        has_patch=patch_scan.has_patch,
+        rebound_attrs=patch_scan.rebound_attrs,
     )
 
 
@@ -3607,6 +3675,11 @@ def _looks_like_suppressing_ctx_manager(
         "open" in prov.shadowed_builtins
         or "open" in prov.shadowed_names
         or prov.has_star_import
+        or prov.is_factory_rebound(
+            prov.module_aliases_for("builtins")
+            | prov.module_aliases_for("__builtins__"),
+            "open",
+        )
     ):
         return True
     stack: List[ast.AST] = [expr]
@@ -3617,6 +3690,13 @@ def _looks_like_suppressing_ctx_manager(
             ident = sub.id
             if ident in prov.suppressors or ident in prov.suspicious_aliases:
                 return True
+            for alias, qual in prov.imported_symbols:
+                if alias == ident and "." in qual:
+                    imp_mod, imp_attr = qual.rsplit(".", 1)
+                    if prov.is_factory_rebound(
+                        prov.module_aliases_for(imp_mod), imp_attr
+                    ):
+                        return True
         elif isinstance(sub, ast.Attribute):
             ident = sub.attr
             recv_root, _, _ = _unwind_attribute_chain(sub)
@@ -3625,6 +3705,13 @@ def _looks_like_suppressing_ctx_manager(
                 or recv_root.id in prov.suspicious_aliases
             ):
                 return True
+            if isinstance(recv_root, ast.Name):
+                target_names: Set[str] = {recv_root.id}
+                for alias, mod_name in prov.stdlib_modules:
+                    if alias == recv_root.id:
+                        target_names |= prov.module_aliases_for(mod_name)
+                if prov.is_factory_rebound(target_names, ident):
+                    return True
         elif isinstance(sub, ast.Call):
             stack.append(sub.func)
             is_enter_ctx = (

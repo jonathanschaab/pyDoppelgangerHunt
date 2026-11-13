@@ -13,7 +13,7 @@ non-suppression proofs instead of trusting a stale class body.
 from __future__ import annotations
 
 import ast
-from typing import List, NamedTuple, Optional, Set, Tuple, cast
+from typing import AbstractSet, List, NamedTuple, Optional, Set, Tuple, cast
 
 from pydoppelgangerhunt.fixer._df_cache import (
     _get_or_compute_scope_cached,
@@ -24,48 +24,179 @@ from pydoppelgangerhunt.fixer._df_cache import (
 
 __all__ = [
     "ExitProtocolPatchScan",
+    "is_factory_rebound_target",
     "scan_exit_protocol_patches",
 ]
 
 _EXIT_PROTOCOL_ATTRS: frozenset[str] = frozenset({"__exit__", "__aexit__", "__class__"})
+_STDLIB_FACTORY_ATTRS: frozenset[str] = frozenset(
+    {
+        "open",
+        "StringIO",
+        "BytesIO",
+        "TextIOWrapper",
+        "BufferedReader",
+        "BufferedWriter",
+        "BufferedRandom",
+        "BufferedRWPair",
+        "FileIO",
+        "nullcontext",
+        "suppress",
+        "closing",
+        "aclosing",
+        "redirect_stdout",
+        "redirect_stderr",
+        "chdir",
+        "TemporaryDirectory",
+        "NamedTemporaryFile",
+        "SpooledTemporaryFile",
+        "TemporaryFile",
+        "catch_warnings",
+        "Lock",
+        "RLock",
+        "Condition",
+        "Semaphore",
+        "BoundedSemaphore",
+        "localcontext",
+        "patch",
+        "scandir",
+        "mmap",
+        "socket",
+        "create_connection",
+        "connect",
+        "ZipFile",
+        "TarFile",
+        "GzipFile",
+        "BZ2File",
+        "LZMAFile",
+    }
+)
 _ATTR_MUTATION_BUILTINS: frozenset[str] = frozenset({"setattr", "delattr"})
 _ATTR_MUTATION_DUNDERS: frozenset[str] = frozenset({"__setattr__", "__delattr__"})
 _DYNAMIC_CODE_BUILTINS: frozenset[str] = frozenset({"exec", "eval"})
 
 
 class ExitProtocolPatchScan(NamedTuple):
-    """Result of scanning a tree for runtime exit-protocol patching.
+    """Result of scanning a tree for runtime exit-protocol and stdlib-factory patching.
 
     Attributes:
         patched_names: Bare names whose ``__exit__`` / ``__aexit__`` / ``__class__``
             attribute is assigned, deleted, or targeted by ``setattr`` / ``delattr``.
         has_patch: True when any exit-protocol patch (targeted at a bare name or not)
             or dynamic code execution (``exec`` / ``eval``) occurs anywhere in the tree.
+        rebound_attrs: ``(target_name_or_None, attr_name_or_None)`` pairs for stdlib
+            context-manager factory attributes rebound or deleted anywhere in the tree.
     """
 
     patched_names: frozenset[str]
     has_patch: bool
+    rebound_attrs: frozenset[Tuple[Optional[str], Optional[str]]] = frozenset()
 
     def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
         """Returns AST nodes retained by this cached value (none)."""
         return ()
 
+    def is_factory_rebound(
+        self, target_names: AbstractSet[str], attr_name: str
+    ) -> bool:
+        """Returns True if any matching module/alias attribute or untargeted dynamic patch was seen."""
+        return is_factory_rebound_target(self.rebound_attrs, target_names, attr_name)
 
-_NO_PATCH_SCAN = ExitProtocolPatchScan(frozenset(), False)
+
+def is_factory_rebound_target(
+    rebound_targets: AbstractSet[Tuple[Optional[str], Optional[str]]],
+    target_names: AbstractSet[str],
+    attr_name: str,
+) -> bool:
+    """Returns True if any (target, attr) pair in rebound_targets matches target_names and attr_name."""
+    for t_name, a_name in rebound_targets:
+        if (t_name is None or t_name in target_names) and (
+            a_name is None or a_name == attr_name
+        ):
+            return True
+    return False
 
 
-def _attr_mutation_call_target(node: ast.Call) -> Optional[ast.AST]:
-    """Returns the object expression whose attribute a setattr-style call may mutate, else None.
+_NO_PATCH_SCAN = ExitProtocolPatchScan(frozenset(), False, frozenset())
 
-    Returns the receiver for ``setattr(obj, name, ...)`` / ``delattr(obj, name)``,
-    ``builtins.setattr(obj, name, ...)``, and ``type.__setattr__(obj, name, ...)``
-    when ``name`` is a non-literal or an exit-protocol attribute literal. Calls that
-    provably target an unrelated literal attribute name return None. Calls with
-    unresolvable receivers return the call itself so callers treat the patch as
-    untargeted.
+
+def _collect_builtin_aliases(
+    tree: ast.AST,
+) -> Tuple[Set[str], Set[str], Set[str], bool]:
+    """Collects imported and assigned aliases for exec/eval, setattr/delattr, and getattr.
+
+    Returns ``(exec_eval_aliases, setattr_delattr_aliases, getattr_aliases, has_wildcard)``.
+    """
+    exec_eval_aliases: Set[str] = set(_DYNAMIC_CODE_BUILTINS)
+    setattr_delattr_aliases: Set[str] = set(_ATTR_MUTATION_BUILTINS)
+    getattr_aliases: Set[str] = {"getattr"}
+    has_wildcard = False
+    assign_pairs: List[Tuple[str, ast.AST]] = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in (
+            "builtins",
+            "__builtins__",
+        ):
+            for alias in node.names:
+                if alias.name == "*":
+                    has_wildcard = True
+                    continue
+                bound = alias.asname or alias.name
+                if alias.name in _DYNAMIC_CODE_BUILTINS:
+                    exec_eval_aliases.add(bound)
+                elif alias.name in _ATTR_MUTATION_BUILTINS:
+                    setattr_delattr_aliases.add(bound)
+                elif alias.name == "getattr":
+                    getattr_aliases.add(bound)
+        elif isinstance(node, ast.Assign) and node.value is not None:
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    assign_pairs.append((tgt.id, node.value))
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            if isinstance(node.target, ast.Name):
+                assign_pairs.append((node.target.id, node.value))
+
+    changed = True
+    while changed:
+        changed = False
+        for tgt_name, val in assign_pairs:
+            if isinstance(val, ast.Name):
+                ref_name = val.id
+            elif isinstance(val, ast.Attribute) and val.attr in (
+                _DYNAMIC_CODE_BUILTINS | _ATTR_MUTATION_BUILTINS | frozenset({"getattr"})
+            ):
+                ref_name = val.attr
+            else:
+                continue
+            if ref_name in exec_eval_aliases and tgt_name not in exec_eval_aliases:
+                exec_eval_aliases.add(tgt_name)
+                changed = True
+            if (
+                ref_name in setattr_delattr_aliases
+                and tgt_name not in setattr_delattr_aliases
+            ):
+                setattr_delattr_aliases.add(tgt_name)
+                changed = True
+            if ref_name in getattr_aliases and tgt_name not in getattr_aliases:
+                getattr_aliases.add(tgt_name)
+                changed = True
+
+    return exec_eval_aliases, setattr_delattr_aliases, getattr_aliases, has_wildcard
+
+
+def _attr_mutation_call_info(
+    node: ast.Call,
+    setattr_delattr_aliases: AbstractSet[str],
+) -> Optional[Tuple[ast.AST, Optional[str]]]:
+    """Returns ``(target_expr, literal_attr_name_or_None)`` for a setattr/delattr call, else None.
+
+    Handles direct calls, ``builtins.setattr``, imported/assigned aliases, and
+    ``type.__setattr__`` / ``object.__setattr__``. Returns None when the call
+    provably targets a literal attribute outside ``_EXIT_PROTOCOL_ATTRS | _STDLIB_FACTORY_ATTRS``.
     """
     func = node.func
-    if isinstance(func, ast.Name) and func.id in _ATTR_MUTATION_BUILTINS:
+    if isinstance(func, ast.Name) and func.id in setattr_delattr_aliases:
         target_idx = 0
     elif isinstance(func, ast.Attribute) and func.attr in _ATTR_MUTATION_BUILTINS:
         target_idx = 0
@@ -79,28 +210,35 @@ def _attr_mutation_call_target(node: ast.Call) -> Optional[ast.AST]:
         return None
     name_idx = target_idx + 1
     if any(isinstance(arg, ast.Starred) for arg in node.args) or node.keywords:
-        return node
+        return node, None
     if len(node.args) <= name_idx:
-        return node
+        return node, None
     name_arg = node.args[name_idx]
+    literal_attr: Optional[str] = None
     if isinstance(name_arg, ast.Constant) and isinstance(name_arg.value, str):
-        if name_arg.value not in _EXIT_PROTOCOL_ATTRS:
+        literal_attr = name_arg.value
+        if (
+            literal_attr not in _EXIT_PROTOCOL_ATTRS
+            and literal_attr not in _STDLIB_FACTORY_ATTRS
+        ):
             return None
-    if target_idx < 0:
-        return cast(ast.Attribute, func).value
-    return node.args[target_idx]
+    target_expr = (
+        cast(ast.Attribute, func).value if target_idx < 0 else node.args[target_idx]
+    )
+    return target_expr, literal_attr
 
 
-_REF_TRIGGER_NAMES: frozenset[str] = _ATTR_MUTATION_BUILTINS | _DYNAMIC_CODE_BUILTINS
 _REF_TRIGGER_ATTRS: frozenset[str] = (
     _ATTR_MUTATION_BUILTINS | _ATTR_MUTATION_DUNDERS | _DYNAMIC_CODE_BUILTINS
 )
 
 
-def _is_getattr_of_mutation_builtin(node: ast.Call) -> bool:
+def _is_getattr_of_mutation_builtin(
+    node: ast.Call, getattr_aliases: AbstractSet[str]
+) -> bool:
     """Returns True when node is getattr(..., '<attr_mutation_or_exec_builtin>')."""
     func = node.func
-    is_getattr = (isinstance(func, ast.Name) and func.id == "getattr") or (
+    is_getattr = (isinstance(func, ast.Name) and func.id in getattr_aliases) or (
         isinstance(func, ast.Attribute) and func.attr == "getattr"
     )
     if not is_getattr or len(node.args) < 2:
@@ -114,9 +252,16 @@ def _is_getattr_of_mutation_builtin(node: ast.Call) -> bool:
 
 
 def _scan_exit_protocol_patches_uncached(tree: ast.AST) -> ExitProtocolPatchScan:
-    """Walks every scope of tree collecting exit-protocol patch targets."""
+    """Walks every scope of tree collecting exit-protocol and stdlib-factory patch targets."""
+    exec_eval_aliases, setattr_delattr_aliases, getattr_aliases, has_wildcard = (
+        _collect_builtin_aliases(tree)
+    )
+    ref_trigger_names = exec_eval_aliases | setattr_delattr_aliases
     patched: Set[str] = set()
-    has_patch = False
+    rebound_attrs: Set[Tuple[Optional[str], Optional[str]]] = set()
+    has_patch = has_wildcard
+    if has_wildcard:
+        rebound_attrs.add((None, None))
     call_func_ids: Set[int] = set()
     stack: List[ast.AST] = [tree]
     while stack:
@@ -124,46 +269,69 @@ def _scan_exit_protocol_patches_uncached(tree: ast.AST) -> ExitProtocolPatchScan
         if isinstance(node, ast.Call):
             call_func_ids.add(id(node.func))
         stack.extend(ast.iter_child_nodes(node))
-        target: Optional[ast.AST] = None
-        if (
-            isinstance(node, ast.Attribute)
-            and isinstance(node.ctx, (ast.Store, ast.Del))
-            and node.attr in _EXIT_PROTOCOL_ATTRS
+        if isinstance(node, ast.Attribute) and isinstance(
+            node.ctx, (ast.Store, ast.Del)
         ):
-            target = node.value
+            if node.attr in _EXIT_PROTOCOL_ATTRS:
+                has_patch = True
+                if isinstance(node.value, ast.Name):
+                    patched.add(node.value.id)
+            elif node.attr in _STDLIB_FACTORY_ATTRS:
+                rebound_attrs.add(
+                    (
+                        node.value.id if isinstance(node.value, ast.Name) else None,
+                        node.attr,
+                    )
+                )
         elif isinstance(node, ast.Call):
             func = node.func
             if (
-                (isinstance(func, ast.Name) and func.id in _DYNAMIC_CODE_BUILTINS)
+                (isinstance(func, ast.Name) and func.id in exec_eval_aliases)
                 or (
                     isinstance(func, ast.Attribute)
                     and func.attr in _DYNAMIC_CODE_BUILTINS
                 )
-                or _is_getattr_of_mutation_builtin(node)
+                or _is_getattr_of_mutation_builtin(node, getattr_aliases)
             ):
                 has_patch = True
+                rebound_attrs.add((None, None))
                 continue
-            target = _attr_mutation_call_target(node)
+            mut_info = _attr_mutation_call_info(node, setattr_delattr_aliases)
+            if mut_info is None:
+                continue
+            target_expr, literal_attr = mut_info
+            if literal_attr is not None and literal_attr in _STDLIB_FACTORY_ATTRS:
+                rebound_attrs.add(
+                    (
+                        target_expr.id if isinstance(target_expr, ast.Name) else None,
+                        literal_attr,
+                    )
+                )
+            else:
+                has_patch = True
+                if isinstance(target_expr, ast.Name):
+                    patched.add(target_expr.id)
+                    if literal_attr is None:
+                        rebound_attrs.add((target_expr.id, None))
+                else:
+                    rebound_attrs.add((None, None))
         elif id(node) not in call_func_ids:
             if (
                 isinstance(node, ast.Name)
                 and isinstance(node.ctx, ast.Load)
-                and node.id in _REF_TRIGGER_NAMES
+                and node.id in ref_trigger_names
             ) or (
                 isinstance(node, ast.Attribute)
                 and isinstance(node.ctx, ast.Load)
                 and node.attr in _REF_TRIGGER_ATTRS
             ):
                 has_patch = True
-                continue
-        if target is None:
-            continue
-        has_patch = True
-        if isinstance(target, ast.Name):
-            patched.add(target.id)
-    if not has_patch:
+                rebound_attrs.add((None, None))
+    if not has_patch and not rebound_attrs:
         return _NO_PATCH_SCAN
-    return ExitProtocolPatchScan(frozenset(patched), True)
+    return ExitProtocolPatchScan(
+        frozenset(patched), has_patch, frozenset(rebound_attrs)
+    )
 
 
 def scan_exit_protocol_patches(tree: Optional[ast.AST]) -> ExitProtocolPatchScan:

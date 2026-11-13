@@ -4062,3 +4062,197 @@ def test_exit_protocol_scanner_catches_indirect_setattr_bypasses(
     )
     scan = scan_exit_protocol_patches(ast.parse(src))
     assert scan.has_patch is expect_has_patch
+
+
+@pytest.mark.parametrize(
+    ("module_src", "expected_safe"),
+    [
+        pytest.param(
+            "import contextlib\n"
+            "def suppress_all(*a): return True\n"
+            "contextlib.nullcontext = suppress_all\n"
+            "def run(compute):\n"
+            "    with contextlib.nullcontext():\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="direct_contextlib_nullcontext_rebinding",
+        ),
+        pytest.param(
+            "import contextlib as cl\n"
+            "def suppress_all(*a): return True\n"
+            "cl.nullcontext = suppress_all\n"
+            "def run(compute):\n"
+            "    with cl.nullcontext():\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="aliased_contextlib_nullcontext_rebinding",
+        ),
+        pytest.param(
+            "import contextlib as cl\n"
+            "from contextlib import nullcontext\n"
+            "def suppress_all(*a): return True\n"
+            "cl.nullcontext = suppress_all\n"
+            "def run(compute):\n"
+            "    with nullcontext():\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="from_import_invalidated_by_module_alias_rebinding",
+        ),
+        pytest.param(
+            "import builtins\n"
+            "def suppress_all(*a): return True\n"
+            "builtins.open = suppress_all\n"
+            "def run(compute):\n"
+            "    with builtins.open('x'):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="builtins_open_rebinding",
+        ),
+        pytest.param(
+            "import builtins\n"
+            "def suppress_all(*a): return True\n"
+            "builtins.open = suppress_all\n"
+            "def run(compute):\n"
+            "    with open('x'):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="bare_open_invalidated_by_builtins_open_rebinding",
+        ),
+        pytest.param(
+            "import io\n"
+            "def suppress_all(*a): return True\n"
+            "io.open = suppress_all\n"
+            "def run(compute):\n"
+            "    with io.open('x'):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="io_open_rebinding",
+        ),
+        pytest.param(
+            "import contextlib\n"
+            "def suppress_all(*a): return True\n"
+            "setattr(contextlib, 'nullcontext', suppress_all)\n"
+            "def run(compute):\n"
+            "    with contextlib.nullcontext():\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="setattr_contextlib_nullcontext",
+        ),
+        pytest.param(
+            "import contextlib\n"
+            "delattr(contextlib, 'nullcontext')\n"
+            "def run(compute):\n"
+            "    with contextlib.nullcontext():\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="delattr_contextlib_nullcontext",
+        ),
+        pytest.param(
+            "import contextlib\n"
+            "def patch(name, fn):\n"
+            "    setattr(contextlib, name, fn)\n"
+            "def run(compute):\n"
+            "    with contextlib.nullcontext():\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="setattr_nonliteral_attr_on_contextlib",
+        ),
+        pytest.param(
+            "class Door:\n"
+            "    def close(self):\n"
+            "        self.open = False\n"
+            "def run(compute):\n"
+            "    with open('x'):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            True,
+            id="unrelated_self_open_does_not_invalidate_builtin_open",
+        ),
+    ],
+)
+def test_stdlib_factory_rebinding_invalidates_non_suppression_proof(
+    module_src: str, expected_safe: bool
+) -> None:
+    """Verifies module-attribute rebinding (direct, aliased, setattr, delattr, nonliteral) invalidates stdlib factory proofs."""
+    safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
+    assert safety == {"strict": expected_safe, "pedantic": expected_safe}
+
+
+@pytest.mark.parametrize(
+    ("patch_stmt", "expect_has_patch", "expect_patched_mgr"),
+    [
+        pytest.param(
+            'from builtins import exec as run_code\nrun_code("Mgr.__exit__ = swallow")\n',
+            True,
+            False,
+            id="imported_exec_alias",
+        ),
+        pytest.param(
+            'from builtins import eval as eval_code\neval_code("Mgr.__exit__")\n',
+            True,
+            False,
+            id="imported_eval_alias",
+        ),
+        pytest.param(
+            'from builtins import setattr as patch_attr\npatch_attr(Mgr, "__exit__", swallow)\n',
+            True,
+            True,
+            id="imported_setattr_alias",
+        ),
+        pytest.param(
+            'from builtins import delattr as drop_attr\ndrop_attr(Mgr, "__exit__")\n',
+            True,
+            True,
+            id="imported_delattr_alias",
+        ),
+        pytest.param(
+            'from builtins import setattr as pa\nrebound = pa\nrebound(Mgr, "__exit__", swallow)\n',
+            True,
+            True,
+            id="imported_setattr_chained_assignment_alias",
+        ),
+        pytest.param(
+            'from builtins import setattr as patch_attr\npatch_attr(Mgr, "label", "safe")\n',
+            False,
+            False,
+            id="imported_setattr_alias_unrelated_literal_attr",
+        ),
+    ],
+)
+def test_exit_protocol_scanner_resolves_imported_builtin_aliases(
+    patch_stmt: str, expect_has_patch: bool, expect_patched_mgr: bool
+) -> None:
+    """Verifies imported aliases of exec/eval/setattr/delattr and chained assignments are resolved."""
+    import ast
+
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    src = (
+        "class Mgr:\n"
+        "    def __enter__(self): return self\n"
+        "    def __exit__(self, *a): return False\n"
+        "def swallow(*a): return True\n"
+        f"{patch_stmt}"
+    )
+    scan = scan_exit_protocol_patches(ast.parse(src))
+    assert scan.has_patch is expect_has_patch
+    assert ("Mgr" in scan.patched_names) is expect_patched_mgr
