@@ -2750,6 +2750,7 @@ _HEURISTIC_TX_CLONE_SRC = (
 )
 def test_suggestion_and_html_report_record_strict_heuristic_ctx_manager_assumptions(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
     closure_strictness: str,
     allowlist: list[str] | None,
     expect_heuristic: bool,
@@ -2758,9 +2759,14 @@ def test_suggestion_and_html_report_record_strict_heuristic_ctx_manager_assumpti
 
     The assumption is disclosed through heuristic diagnostics (stderr/logging), never in the
     report body, so pedantic and allowlisted runs must record nothing while strict runs record
-    the manager and still synthesize the helper (documented fail-open behavior).
+    the manager and assumed-safe rationale and still synthesize the helper (documented fail-open behavior).
     """
-    from pydoppelgangerhunt.config import collect_heuristic_ctx_managers
+    import logging
+
+    from pydoppelgangerhunt.config import (
+        clear_closure_warning_cache,
+        collect_heuristic_ctx_managers,
+    )
     from pydoppelgangerhunt.reporters import (
         generate_html_report,
         synthesize_refactoring_suggestion,
@@ -2772,7 +2778,9 @@ def test_suggestion_and_html_report_record_strict_heuristic_ctx_manager_assumpti
     u2 = {"file": str(mod_file), "start": 8, "end": 10, "name": "process_beta", "kind": "compound_block"}
 
     clear_dataflow_cache()
-    with collect_heuristic_ctx_managers() as suggest_heuristics:
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.INFO), collect_heuristic_ctx_managers() as suggest_heuristics:
         suggestion = synthesize_refactoring_suggestion(
             u1,
             u2,
@@ -2783,9 +2791,16 @@ def test_suggestion_and_html_report_record_strict_heuristic_ctx_manager_assumpti
     assert "Extract duplicated logic into common helper" in suggestion
     assert "# Note:" not in suggestion
     assert ("Transaction" in suggest_heuristics) is expect_heuristic
+    suggest_msgs = [record.getMessage() for record in caplog.records]
+    assert (
+        any("'Transaction'" in msg and "non-suppressing via name heuristic" in msg for msg in suggest_msgs)
+        is expect_heuristic
+    )
 
     clear_dataflow_cache()
-    with collect_heuristic_ctx_managers() as html_heuristics:
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.INFO), collect_heuristic_ctx_managers() as html_heuristics:
         html_report = generate_html_report(
             [(1.0, u1, u2)],
             str(tmp_path),
@@ -2796,3 +2811,8 @@ def test_suggestion_and_html_report_record_strict_heuristic_ctx_manager_assumpti
         )
     assert "unproven context manager(s)" not in html_report
     assert ("Transaction" in html_heuristics) is expect_heuristic
+    html_msgs = [record.getMessage() for record in caplog.records]
+    assert (
+        any("'Transaction'" in msg and "non-suppressing via name heuristic" in msg for msg in html_msgs)
+        is expect_heuristic
+    )
