@@ -2647,12 +2647,14 @@ class _LazyModuleStmtSeedMap(Mapping[int, _SuppressProvenance]):
         target_idx = self._idx_by_id[stmt_id]
         self._ensure_tables()
         if self._kind == "prefix":
-            assert self._prefix_table is not None
+            if self._prefix_table is None:
+                raise RuntimeError("prefix provenance table not initialized")
             res = self._prefix_table[target_idx]
             self._cache[stmt_id] = res
             return res
 
-        assert self._suffix_table is not None
+        if self._suffix_table is None:
+            raise RuntimeError("suffix provenance table not initialized")
         s_sup, s_susp, s_shad_b, s_shad_n, s_star = self._suffix_table[target_idx]
         if self._kind == "suffix":
             res = _SuppressProvenance(
@@ -2665,7 +2667,8 @@ class _LazyModuleStmtSeedMap(Mapping[int, _SuppressProvenance]):
             self._cache[stmt_id] = res
             return res
 
-        assert self._prefix_table is not None
+        if self._prefix_table is None:
+            raise RuntimeError("prefix provenance table not initialized")
         pref = self._prefix_table[target_idx]
         res = pref.apply_branch_delta(
             s_shad_n,

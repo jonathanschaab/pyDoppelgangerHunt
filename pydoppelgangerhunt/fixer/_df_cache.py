@@ -136,6 +136,12 @@ def _suppress_syntax_warnings() -> Iterator[None]:
             _syntax_warning_tls.depth = prev_depth
 
 
+def _parse_ast_no_syntax_warnings(source: str) -> ast.Module:
+    """Parses source into an AST module while suppressing SyntaxWarning around ast.parse."""
+    with _suppress_syntax_warnings():
+        return ast.parse(source)
+
+
 _MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
 _MAX_SCOPE_CACHE_SIZE: int = 2048
 _MAX_PARENT_MAP_CACHE_ENTRIES: int = 256

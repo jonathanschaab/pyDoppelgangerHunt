@@ -12,7 +12,7 @@ from pydoppelgangerhunt.config import (
     normalize_path_string,
     resolve_pair_closure_flags,
 )
-from pydoppelgangerhunt.reporters import (
+from pydoppelgangerhunt.source_lines import (
     extract_unit_source_lines_with_state,
 )
 from pydoppelgangerhunt.fixer.binding import (
@@ -26,6 +26,7 @@ from pydoppelgangerhunt.fixer.binding import (
 )
 from pydoppelgangerhunt.fixer._df_cache import (
     _get_or_parse_tree,
+    _parse_ast_no_syntax_warnings,
     _suppress_syntax_warnings,
 )
 from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor
@@ -94,12 +95,12 @@ def _parse_dedented_stmts(raw_text: str) -> List[ast.stmt]:
     if not stripped:
         return []
     try:
-        return ast.parse(stripped).body
+        return _parse_ast_no_syntax_warnings(stripped).body
     except (RecursionError, MemoryError):
         return []
     except (SyntaxError, ValueError, UnicodeDecodeError):
         try:
-            wrapped = ast.parse(f"if 1:\n{dedented}").body
+            wrapped = _parse_ast_no_syntax_warnings(f"if 1:\n{dedented}").body
             if len(wrapped) == 1 and isinstance(wrapped[0], ast.If):
                 return wrapped[0].body
         except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
@@ -790,7 +791,7 @@ def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
     text = signature_or_func_text.strip()
     tree: Optional[ast.AST] = None
     try:
-        tree = ast.parse(text)
+        tree = _parse_ast_no_syntax_warnings(text)
     except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
         pass
 
@@ -801,13 +802,15 @@ def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
             params_part = params_part[1:-1].strip()
         ret_part = parts[1].strip()
         try:
-            tree = ast.parse(f"def _sig_wrapper({params_part}) -> {ret_part}: pass")
+            tree = _parse_ast_no_syntax_warnings(
+                f"def _sig_wrapper({params_part}) -> {ret_part}: pass"
+            )
         except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
             pass
 
     if tree is None:
         try:
-            tree = ast.parse(f"def _sig_wrapper({text}): pass")
+            tree = _parse_ast_no_syntax_warnings(f"def _sig_wrapper({text}): pass")
         except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
             pass
 
@@ -1253,7 +1256,7 @@ def _format_helper_docstring(
 def _extract_probe_active_idents(probe_src: str, return_type: str) -> Set[str]:
     """Extracts referenced AST Name identifiers and annotation string-constant identifiers."""
     try:
-        probe_tree = ast.parse(probe_src)
+        probe_tree = _parse_ast_no_syntax_warnings(probe_src)
     except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
         return set(re.findall(r"\b[A-Za-z_]\w*\b", f"{probe_src}\n{return_type}"))
     all_nodes = list(ast.walk(probe_tree))
@@ -1287,7 +1290,6 @@ def _extract_probe_active_idents(probe_src: str, return_type: str) -> Set[str]:
     } | set(re.findall(r"\b[A-Za-z_]\w*\b", f"{return_type}\n{str_ann_text}"))
 
 
-@_suppress_syntax_warnings()
 def synthesize_shared_helper_code(
     u1: Dict[str, Any],
     u2: Dict[str, Any],
@@ -1350,10 +1352,10 @@ def synthesize_shared_helper_code(
             u_target["source_text"] = src_override
     if not _align_pair_expr_kinds(u1, u2):
         return ""
-    raw_lines1, origin1 = extract_unit_source_lines_with_state(
+    raw_lines1, _ = extract_unit_source_lines_with_state(
         u1, repo_root=repo_root
     )
-    raw_lines2, origin2 = extract_unit_source_lines_with_state(
+    raw_lines2, _ = extract_unit_source_lines_with_state(
         u2, repo_root=repo_root
     )
     lines1 = _slice_unit_token_lines(
@@ -1361,14 +1363,12 @@ def synthesize_shared_helper_code(
         _extract_unit_body_lines(
             u1, [ln.rstrip("\r\n") for ln in raw_lines1]
         ),
-        is_pre_sliced=origin1.is_pre_sliced,
     )
     lines2 = _slice_unit_token_lines(
         u2,
         _extract_unit_body_lines(
             u2, [ln.rstrip("\r\n") for ln in raw_lines2]
         ),
-        is_pre_sliced=origin2.is_pre_sliced,
     )
 
     base_name1 = _base_unit_name(u1)

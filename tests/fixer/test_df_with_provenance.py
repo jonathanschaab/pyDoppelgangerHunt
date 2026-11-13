@@ -4013,3 +4013,52 @@ def test_ctx_manager_alias_rebinding_and_header_shapes_track_actual_object(
     """Verifies provenance follows the object actually bound at with-entry across aliases, rebinding, and header shapes."""
     safety = _late_bound_capture_safety_by_mode(module_src, unit_src)
     assert safety == {"strict": expected_safe, "pedantic": expected_safe}
+
+
+@pytest.mark.parametrize(
+    ("patch_stmt", "expect_has_patch"),
+    [
+        pytest.param(
+            'import builtins\nbuiltins.setattr(Mgr, "__exit__", swallow)\n',
+            True,
+            id="builtins_setattr_exit",
+        ),
+        pytest.param(
+            's = setattr\ns(Mgr, "__exit__", swallow)\n',
+            True,
+            id="aliased_setattr",
+        ),
+        pytest.param(
+            'import functools\nfunctools.partial(setattr, Mgr, "__exit__")(swallow)\n',
+            True,
+            id="functools_partial_setattr",
+        ),
+        pytest.param(
+            'import builtins\ngetattr(builtins, "setattr")(Mgr, "__exit__", swallow)\n',
+            True,
+            id="getattr_builtins_setattr",
+        ),
+        pytest.param(
+            'import builtins\nbuiltins.setattr(Mgr, "label", "safe")\n',
+            False,
+            id="builtins_setattr_unrelated_literal_attr",
+        ),
+    ],
+)
+def test_exit_protocol_scanner_catches_indirect_setattr_bypasses(
+    patch_stmt: str, expect_has_patch: bool
+) -> None:
+    """Verifies indirect setattr forms (builtins.setattr, aliases, partial, getattr) are caught without false positives."""
+    import ast
+
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    src = (
+        "class Mgr:\n"
+        "    def __enter__(self): return self\n"
+        "    def __exit__(self, *a): return False\n"
+        "def swallow(*a): return True\n"
+        f"{patch_stmt}"
+    )
+    scan = scan_exit_protocol_patches(ast.parse(src))
+    assert scan.has_patch is expect_has_patch

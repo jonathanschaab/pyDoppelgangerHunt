@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import sys
 import threading
+import weakref
 from typing import (
     Any,
     Dict,
@@ -62,30 +63,31 @@ class _HeuristicSessionBucket:
             self.overflow_count += 1
 
 
+APP_VERSION = "2.0.0"
+
 _active_heuristic_sessions: Dict[int, _HeuristicSessionBucket] = {}
-_default_thread_buckets: OrderedDict[int, _HeuristicSessionBucket] = OrderedDict()
+_default_thread_buckets: weakref.WeakKeyDictionary[
+    threading.Thread, _HeuristicSessionBucket
+] = weakref.WeakKeyDictionary()
 _heuristic_session_stack: contextvars.ContextVar[Tuple[int, ...]] = (
     contextvars.ContextVar("_heuristic_session_stack", default=())
 )
 
 
 def _get_or_create_thread_bucket_locked() -> _HeuristicSessionBucket:
-    """Returns the active session bucket for the current context or a bounded per-thread fallback bucket."""
+    """Returns the active session bucket for the current context or a per-Thread fallback bucket."""
     sess_stack = _heuristic_session_stack.get()
     if sess_stack:
         sid = sess_stack[-1]
         active = _active_heuristic_sessions.get(sid)
         if active is not None:
             return active
-    tid = threading.get_ident()
-    bucket = _default_thread_buckets.get(tid)
+    curr_thread = threading.current_thread()
+    bucket = _default_thread_buckets.get(curr_thread)
     if bucket is not None:
-        _default_thread_buckets.move_to_end(tid)
         return bucket
     bucket = _HeuristicSessionBucket()
-    _default_thread_buckets[tid] = bucket
-    while len(_default_thread_buckets) > _MAX_DEFAULT_THREAD_BUCKETS:
-        _default_thread_buckets.popitem(last=False)
+    _default_thread_buckets[curr_thread] = bucket
     return bucket
 
 

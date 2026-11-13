@@ -153,9 +153,10 @@ from pydoppelgangerhunt.reporters import (
     supports_color,
     synthesize_refactoring_suggestion,
 )
+from pydoppelgangerhunt.config import APP_VERSION
 from pydoppelgangerhunt.source_lines import SourceLinesOrigin, _PHYSICAL_LINE_RE
 
-__version__ = "2.0.0"
+__version__ = APP_VERSION
 __all__ = [
     "__version__",
     "main",

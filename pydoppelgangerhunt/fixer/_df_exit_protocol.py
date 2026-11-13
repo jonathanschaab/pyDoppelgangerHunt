@@ -57,20 +57,24 @@ _NO_PATCH_SCAN = ExitProtocolPatchScan(frozenset(), False)
 def _attr_mutation_call_target(node: ast.Call) -> Optional[ast.AST]:
     """Returns the object expression whose attribute a setattr-style call may mutate, else None.
 
-    Returns the receiver for ``setattr(obj, name, ...)`` / ``delattr(obj, name)`` and
-    ``type.__setattr__(obj, name, ...)`` when ``name`` is a non-literal or an
-    exit-protocol attribute literal. Calls that provably target an unrelated literal
-    attribute name return None. Calls with unresolvable receivers return the call
-    itself so callers treat the patch as untargeted.
+    Returns the receiver for ``setattr(obj, name, ...)`` / ``delattr(obj, name)``,
+    ``builtins.setattr(obj, name, ...)``, and ``type.__setattr__(obj, name, ...)``
+    when ``name`` is a non-literal or an exit-protocol attribute literal. Calls that
+    provably target an unrelated literal attribute name return None. Calls with
+    unresolvable receivers return the call itself so callers treat the patch as
+    untargeted.
     """
     func = node.func
     if isinstance(func, ast.Name) and func.id in _ATTR_MUTATION_BUILTINS:
         target_idx = 0
+    elif isinstance(func, ast.Attribute) and func.attr in _ATTR_MUTATION_BUILTINS:
+        target_idx = 0
     elif isinstance(func, ast.Attribute) and func.attr in _ATTR_MUTATION_DUNDERS:
-        target_idx = 0 if isinstance(func.value, ast.Name) and func.value.id in (
-            "type",
-            "object",
-        ) else -1
+        target_idx = (
+            0
+            if isinstance(func.value, ast.Name) and func.value.id in ("type", "object")
+            else -1
+        )
     else:
         return None
     name_idx = target_idx + 1
@@ -87,13 +91,38 @@ def _attr_mutation_call_target(node: ast.Call) -> Optional[ast.AST]:
     return node.args[target_idx]
 
 
+_REF_TRIGGER_NAMES: frozenset[str] = _ATTR_MUTATION_BUILTINS | _DYNAMIC_CODE_BUILTINS
+_REF_TRIGGER_ATTRS: frozenset[str] = (
+    _ATTR_MUTATION_BUILTINS | _ATTR_MUTATION_DUNDERS | _DYNAMIC_CODE_BUILTINS
+)
+
+
+def _is_getattr_of_mutation_builtin(node: ast.Call) -> bool:
+    """Returns True when node is getattr(..., '<attr_mutation_or_exec_builtin>')."""
+    func = node.func
+    is_getattr = (isinstance(func, ast.Name) and func.id == "getattr") or (
+        isinstance(func, ast.Attribute) and func.attr == "getattr"
+    )
+    if not is_getattr or len(node.args) < 2:
+        return False
+    attr_arg = node.args[1]
+    return (
+        isinstance(attr_arg, ast.Constant)
+        and isinstance(attr_arg.value, str)
+        and attr_arg.value in _REF_TRIGGER_ATTRS
+    )
+
+
 def _scan_exit_protocol_patches_uncached(tree: ast.AST) -> ExitProtocolPatchScan:
     """Walks every scope of tree collecting exit-protocol patch targets."""
     patched: Set[str] = set()
     has_patch = False
+    call_func_ids: Set[int] = set()
     stack: List[ast.AST] = [tree]
     while stack:
         node = stack.pop()
+        if isinstance(node, ast.Call):
+            call_func_ids.add(id(node.func))
         stack.extend(ast.iter_child_nodes(node))
         target: Optional[ast.AST] = None
         if (
@@ -103,10 +132,30 @@ def _scan_exit_protocol_patches_uncached(tree: ast.AST) -> ExitProtocolPatchScan
         ):
             target = node.value
         elif isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name) and node.func.id in _DYNAMIC_CODE_BUILTINS:
+            func = node.func
+            if (
+                (isinstance(func, ast.Name) and func.id in _DYNAMIC_CODE_BUILTINS)
+                or (
+                    isinstance(func, ast.Attribute)
+                    and func.attr in _DYNAMIC_CODE_BUILTINS
+                )
+                or _is_getattr_of_mutation_builtin(node)
+            ):
                 has_patch = True
                 continue
             target = _attr_mutation_call_target(node)
+        elif id(node) not in call_func_ids:
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id in _REF_TRIGGER_NAMES
+            ) or (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.ctx, ast.Load)
+                and node.attr in _REF_TRIGGER_ATTRS
+            ):
+                has_patch = True
+                continue
         if target is None:
             continue
         has_patch = True

@@ -11,22 +11,25 @@ import logging
 import os
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
 from pydoppelgangerhunt.config import (
+    APP_VERSION,
     heuristic_ctx_manager_session,
     normalize_path_string,
     resolve_pair_closure_flags,
 )
 from pydoppelgangerhunt.source_lines import (
-    SourceLinesOrigin,
-    extract_notebook_code_cell_text,
-    is_sliced_unit_source_lines,
+    _extract_notebook_cell_lines,
+    extract_unit_source_code,
     parse_unit_coord,
     resolve_safe_unit_file_path,
     resolve_unit_line_bounds,
-    split_source_lines,
+    with_unit_source_text,
+)
+from pydoppelgangerhunt.source_lines import (  # pylint: disable=unused-import
+    extract_unit_source_lines_with_state,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,35 +77,6 @@ def _unit_line_bounds(unit: Dict[str, Any]) -> Tuple[int, int]:
     return resolve_unit_line_bounds(unit)
 
 
-def _ensure_trailing_lf(line: str) -> str:
-    """Ensures line ends with '\\n', converting lone trailing '\\r' to '\\n' while preserving '\\r\\n'."""
-    if line.endswith("\n"):
-        return line
-    if line.endswith("\r"):
-        return line[:-1] + "\n"
-    return line + "\n"
-
-
-def _extract_notebook_cell_lines(nb_data: Any, cell_idx: int) -> Optional[List[str]]:
-    """Extracts LF-terminated physical source lines for a 0-indexed notebook code cell, or None if invalid.
-
-    Source fragments are joined per nbformat semantics before splitting on physical
-    newlines (``\\r\\n``, ``\\r``, ``\\n``), and every line terminator is normalized to
-    ``\\n`` to match universal-newline disk reads. Malformed cells (non-code cells,
-    missing or non-string source fragments) return None so callers fall back to a
-    placeholder rather than treating coerced values as real source.
-    """
-    if not isinstance(nb_data, dict):
-        return None
-    cells = nb_data.get("cells")
-    if not isinstance(cells, list) or cell_idx < 0 or cell_idx >= len(cells):
-        return None
-    cell_text = extract_notebook_code_cell_text(cells[cell_idx])
-    if cell_text is None:
-        return None
-    return [ln.rstrip("\r\n") + "\n" for ln in split_source_lines(cell_text)]
-
-
 def _read_notebook_cell_lines(resolved_file: Path, cell_idx: int) -> Optional[List[str]]:
     """Reads and extracts newline-terminated source lines for a 0-indexed Jupyter notebook cell on disk."""
     try:
@@ -111,116 +85,6 @@ def _read_notebook_cell_lines(resolved_file: Path, cell_idx: int) -> Optional[Li
     except (OSError, json.JSONDecodeError, ValueError, TypeError):
         return None
     return _extract_notebook_cell_lines(nb_data, cell_idx)
-
-
-def extract_unit_source_lines_with_state(
-    unit: Dict[str, Any], repo_root: Optional[str] = None
-) -> Tuple[List[str], SourceLinesOrigin]:
-    """Reads raw source code lines for a unit and returns ``(lines, origin)``.
-
-    ``origin`` is a :class:`SourceLinesOrigin` indicating whether the returned lines
-    came from a pre-sliced ``source_lines`` excerpt (``PRE_SLICED``), a full-file
-    in-memory buffer (``FULL_BUFFER``), disk (``DISK``), or a synthetic missing-source
-    comment (``PLACEHOLDER``). Callers should query ``origin.is_pre_sliced``,
-    ``origin.is_placeholder``, or ``origin.has_real_source`` explicitly.
-    """
-    s_d, e_d = _unit_line_bounds(unit)
-    n_d = str(unit.get("name") or "unit")
-    placeholder = [f"# Source for {n_d} lines {s_d}-{e_d}\n"]
-
-    source_lines = unit.get("source_lines")
-    from_source_text = False
-    raw_src_text = unit.get("source_text")
-    if raw_src_text is None or not str(raw_src_text).strip():
-        file_src = unit.get("file_source")
-        if file_src is not None and str(file_src).strip():
-            raw_src_text = file_src
-    if (
-        not source_lines
-        and raw_src_text is not None
-        and str(raw_src_text).strip()
-    ):
-        source_lines = split_source_lines(str(raw_src_text))
-        from_source_text = True
-
-    if source_lines is not None and isinstance(source_lines, (list, tuple)):
-        if not source_lines:
-            return placeholder, SourceLinesOrigin.PLACEHOLDER
-        # Sliced lines fast-path:
-        # If 'source_lines_is_sliced' is explicitly set, honor caller intent.
-        # Otherwise, heuristic: if len(source_lines) == (e_d - s_d + 1),
-        # the list is treated as already sliced to unit boundaries (unless from full source_text).
-        if not from_source_text and is_sliced_unit_source_lines(unit, source_lines):
-            return (
-                [_ensure_trailing_lf(str(ln)) for ln in source_lines],
-                SourceLinesOrigin.PRE_SLICED,
-            )
-        start = max(1, s_d)
-        end = min(len(source_lines), e_d)
-        sliced_buf = source_lines[start - 1 : end]
-        return (
-            [_ensure_trailing_lf(str(ln)) for ln in sliced_buf],
-            SourceLinesOrigin.FULL_BUFFER,
-        )
-
-    resolved_file = resolve_safe_unit_file_path(unit, repo_root=repo_root)
-    if resolved_file is None:
-        return placeholder, SourceLinesOrigin.PLACEHOLDER
-
-    try:
-        is_cell_anchor = False
-        cell_idx = -1
-        u_file = str(unit.get("file") or "")
-        if resolved_file.suffix.lower() == ".ipynb" and "#" in u_file:
-            parsed_nb = parse_notebook_cell_anchor(u_file)
-            if parsed_nb is not None:
-                cell_idx = parsed_nb[1]
-                is_cell_anchor = True
-
-        if resolved_file.suffix.lower() == ".ipynb":
-            nb_fallback: List[str] = [] if is_cell_anchor else placeholder
-            raw_nb_text = resolved_file.read_text(encoding="utf-8", errors="replace")
-            try:
-                nb_data = json.loads(raw_nb_text)
-            except (json.JSONDecodeError, ValueError, TypeError):
-                return nb_fallback, SourceLinesOrigin.PLACEHOLDER
-            if not isinstance(nb_data, dict):
-                return nb_fallback, SourceLinesOrigin.PLACEHOLDER
-            if is_cell_anchor:
-                cell_lines = _extract_notebook_cell_lines(nb_data, cell_idx)
-                if cell_lines is None:
-                    return [], SourceLinesOrigin.PLACEHOLDER
-                all_lines = cell_lines
-            else:
-                with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
-                    all_lines = fh.readlines()
-        else:
-            with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
-                all_lines = fh.readlines()
-        start = max(1, s_d)
-        end = min(len(all_lines), e_d)
-        return all_lines[start - 1 : end], SourceLinesOrigin.DISK
-    except OSError:
-        return (
-            [f"# Unable to read {str(unit.get('file') or '')}\n"],
-            SourceLinesOrigin.PLACEHOLDER,
-        )
-
-
-def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:
-    """Reads raw source code lines for a given unit from provided lines or disk.
-
-    Supports pre-sliced unit lines, full-file line lists, in-memory source_text,
-    or disk-based source reading. Callers can explicitly specify
-    'source_lines_is_sliced': True (or False) to disambiguate whether 'source_lines'
-    represents a pre-sliced excerpt or the complete file.
-
-    Note:
-        When the 'end' coordinate is omitted in the unit dictionary, it defaults
-        to end = start (a single line), consistent with resolve_unit_line_bounds,
-        rather than extending to end-of-file.
-    """
-    return extract_unit_source_lines_with_state(unit, repo_root=repo_root)[0]
 
 
 def generate_clone_diff(
@@ -322,8 +186,9 @@ def _collect_suggestion_rejection_reasons(
     if (
         sc1.get("is_async") is None
         or sc2.get("is_async") is None
-        or bool(sc1.get("is_async")) != bool(sc2.get("is_async"))
     ):
+        _add_unique(structural_reasons, "unknown async status")
+    elif bool(sc1.get("is_async")) != bool(sc2.get("is_async")):
         _add_unique(structural_reasons, "async mismatch")
     if bool(sc1.get("has_yield")) != bool(sc2.get("has_yield")):
         _add_unique(structural_reasons, "generator mismatch")
@@ -763,7 +628,7 @@ def format_sarif_report(
                 "tool": {
                     "driver": {
                         "name": "pyDoppelgangerHunt",
-                        "version": "2.0.0",
+                        "version": APP_VERSION,
                         "informationUri": "https://github.com/jonathanschaab/pyDoppelgangerHunt",
                         "rules": [
                             {
@@ -819,7 +684,7 @@ def format_json_report(
     """Generates structured JSON representation of clone matches."""
     data: Dict[str, Any] = {
         "tool": "pyDoppelgangerHunt",
-        "version": "2.0.0",
+        "version": APP_VERSION,
         "target": target,
         "threshold": threshold,
         "clone_count": len(clones),
@@ -965,6 +830,7 @@ def generate_html_report(
     closure_strictness: Optional[str] = None,
     skip_pre_unit_closures: Optional[bool] = None,
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    on_diagnostic_error: Optional[Callable[[], None]] = None,
 ) -> str:
     """Generates a standalone, self-contained interactive HTML audit report."""
     effective_repo_root = (
@@ -982,13 +848,9 @@ def generate_html_report(
     circumference = 282.74  # 2 * pi * 45
     dashoffset = circumference * (1.0 - (dry_score / 100.0))
 
-    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
-        _suppress_syntax_warnings,
-    )
-
     cards_html: List[str] = []
     file_cache: OrderedDict[str, Tuple[Optional[str], Optional[ast.AST]]] = OrderedDict()
-    with heuristic_ctx_manager_session(), _suppress_syntax_warnings():
+    with heuristic_ctx_manager_session():
         for idx, (sim, u1, u2) in enumerate(clones, 1):
             try:
                 src1, tree1 = resolve_cached_unit_source_and_tree(
@@ -997,20 +859,8 @@ def generate_html_report(
                 src2, tree2 = resolve_cached_unit_source_and_tree(
                     u2, repo_root=effective_repo_root, file_cache=file_cache
                 )
-                u1_diff = (
-                    {**u1, "source_text": src1}
-                    if src1 is not None
-                    and "source_text" not in u1
-                    and "source_lines" not in u1
-                    else u1
-                )
-                u2_diff = (
-                    {**u2, "source_text": src2}
-                    if src2 is not None
-                    and "source_text" not in u2
-                    and "source_lines" not in u2
-                    else u2
-                )
+                u1_diff = with_unit_source_text(u1, src1)
+                u2_diff = with_unit_source_text(u2, src2)
                 diff_txt = generate_clone_diff(
                     u1_diff, u2_diff, repo_root=effective_repo_root
                 )
@@ -1037,6 +887,8 @@ def generate_html_report(
                 n1 = str(u1.get("name") or "unit1")
                 n2 = str(u2.get("name") or "unit2")
             except Exception as exc:  # pylint: disable=broad-exception-caught
+                if on_diagnostic_error is not None:
+                    on_diagnostic_error()
                 logger.warning(
                     "Failed to render HTML card for clone pair #%d",
                     idx,
@@ -1276,7 +1128,7 @@ def generate_html_report(
     <div class="container">
         <header>
             <h1>pyDoppelgangerHunt Audit Report</h1>
-            <div class="meta">Target: <code>{target_esc}</code> | Similarity Threshold: {threshold:.0%} | Generated by pyDoppelgangerHunt v2.0.0</div>
+            <div class="meta">Target: <code>{target_esc}</code> | Similarity Threshold: {threshold:.0%} | Generated by pyDoppelgangerHunt v{APP_VERSION}</div>
         </header>
 
         <div class="grid-stats">

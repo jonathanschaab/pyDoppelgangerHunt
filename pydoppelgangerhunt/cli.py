@@ -10,7 +10,7 @@ import logging
 import os
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.baseline import (
     BaselineFingerprints,
@@ -37,7 +37,6 @@ from pydoppelgangerhunt.config import (
 from pydoppelgangerhunt.canonical_path import CanonicalPathResolver
 from pydoppelgangerhunt.coverage import check_asymmetric_coverage, read_coverage_data
 from pydoppelgangerhunt.fixer import generate_refactoring_patch
-from pydoppelgangerhunt.fixer._df_cache import _suppress_syntax_warnings
 from pydoppelgangerhunt.git_diff import (
     DiffRangeMap,
     check_temporal_divergence,
@@ -68,7 +67,10 @@ from pydoppelgangerhunt.reporters import (
     supports_color,
     synthesize_refactoring_suggestion,
 )
-from pydoppelgangerhunt.source_lines import resolve_unit_line_bounds
+from pydoppelgangerhunt.source_lines import (
+    resolve_unit_line_bounds,
+    with_unit_source_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -413,6 +415,7 @@ def _render_pair_diff_and_suggestions(
     file_cache: Optional[
         OrderedDict[str, Tuple[Optional[str], Optional[ast.AST]]]
     ] = None,
+    on_diagnostic_error: Optional[Callable[[], None]] = None,
 ) -> List[str]:
     """Renders optional refactoring suggestion and unified diff for a pair of clone units."""
     effective_root = repo_root or target_repo_root
@@ -430,6 +433,8 @@ def _render_pair_diff_and_suggestions(
                 u2, repo_root=effective_root, file_cache=file_cache
             )
         except Exception:  # pylint: disable=broad-exception-caught
+            if on_diagnostic_error is not None:
+                on_diagnostic_error()
             logger.warning(
                 "Failed to preload cached source/AST for clone pair (%r, %r)",
                 u1.get("name") if isinstance(u1, dict) else u1,
@@ -456,6 +461,8 @@ def _render_pair_diff_and_suggestions(
                 )
             sug = synthesize_refactoring_suggestion(u1, u2, **sug_kwargs)
         except Exception as exc:  # pylint: disable=broad-exception-caught
+            if on_diagnostic_error is not None:
+                on_diagnostic_error()
             logger.warning(
                 "Failed to synthesize refactoring suggestion for clone pair (%r, %r)",
                 u1.get("name") if isinstance(u1, dict) else u1,
@@ -471,24 +478,14 @@ def _render_pair_diff_and_suggestions(
         lines.append(indent + sug.replace("\n", "\n" + indent))
     if args.diff:
         try:
-            u1_diff = (
-                {**u1, "source_text": src1}
-                if src1 is not None
-                and "source_text" not in u1
-                and "source_lines" not in u1
-                else u1
-            )
-            u2_diff = (
-                {**u2, "source_text": src2}
-                if src2 is not None
-                and "source_text" not in u2
-                and "source_lines" not in u2
-                else u2
-            )
+            u1_diff = with_unit_source_text(u1, src1)
+            u2_diff = with_unit_source_text(u2, src2)
             diff_out = generate_clone_diff(
                 u1_diff, u2_diff, repo_root=effective_root, color=use_color
             )
         except Exception as exc:  # pylint: disable=broad-exception-caught
+            if on_diagnostic_error is not None:
+                on_diagnostic_error()
             logger.warning(
                 "Failed to render unified diff for clone pair (%r, %r)",
                 u1.get("name") if isinstance(u1, dict) else u1,
@@ -735,6 +732,7 @@ def _render_text_violations(
     closure_strictness: Optional[str] = None,
     skip_pre_unit_closures: Optional[bool] = None,
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    on_diagnostic_error: Optional[Callable[[], None]] = None,
 ) -> List[str]:
     """Renders human-readable text output for clone violations (either clustered families or pairwise)."""
     effective_root = repo_root or target_repo_root
@@ -794,6 +792,7 @@ def _render_text_violations(
                         skip_pre_unit_closures=skip_pre_unit_closures,
                         non_suppressing_ctx_managers=non_suppressing_ctx_managers,
                         file_cache=file_cache,
+                        on_diagnostic_error=on_diagnostic_error,
                     )
                 )
     else:
@@ -843,6 +842,7 @@ def _render_text_violations(
                     skip_pre_unit_closures=skip_pre_unit_closures,
                     non_suppressing_ctx_managers=non_suppressing_ctx_managers,
                     file_cache=file_cache,
+                    on_diagnostic_error=on_diagnostic_error,
                 )
             )
 
@@ -1630,10 +1630,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.coverage:
         cov_data = read_coverage_data(args.coverage)
 
-    with (
-        heuristic_ctx_manager_session(warn=replace_clones),
-        _suppress_syntax_warnings(),
-    ):
+    with heuristic_ctx_manager_session(warn=replace_clones):
         return _emit_scan_artifacts_and_report(
             args=args,
             clones=clones,
@@ -1680,6 +1677,12 @@ def _emit_scan_artifacts_and_report(
     non_suppressing_ctx_managers: Tuple[str, ...],
 ) -> int:
     """Emits HTML/patch/annotation artifacts and structured or text scan reports."""
+    diagnostic_errors = 0
+
+    def _record_diagnostic_error() -> None:
+        nonlocal diagnostic_errors
+        diagnostic_errors += 1
+
     if args.html:
         html_report = generate_html_report(
             clones,
@@ -1691,6 +1694,7 @@ def _emit_scan_artifacts_and_report(
             closure_strictness=closure_strictness,
             skip_pre_unit_closures=skip_pre_unit_closures,
             non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+            on_diagnostic_error=_record_diagnostic_error,
         )
         _write_artifact_file(args.html, html_report, "HTML", args.format == "text")
 
@@ -1769,6 +1773,7 @@ def _emit_scan_artifacts_and_report(
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
         non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        on_diagnostic_error=_record_diagnostic_error,
     )
 
     if args.output:
@@ -1776,6 +1781,13 @@ def _emit_scan_artifacts_and_report(
         out_p.parent.mkdir(parents=True, exist_ok=True)
         with open(out_p, "w", encoding="utf-8") as fh:
             fh.write("\n".join(report_lines) + "\n")
+
+    if diagnostic_errors > 0:
+        print(
+            f"Warning: {diagnostic_errors} internal diagnostic error(s) occurred while "
+            f"rendering clone pair suggestions, diffs, or HTML cards; see logs for details.",
+            file=sys.stderr,
+        )
 
     return 1
 

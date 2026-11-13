@@ -50,7 +50,7 @@ from pydoppelgangerhunt.fixer.binding import (
 )
 from pydoppelgangerhunt.fixer._df_cache import (
     _get_or_parse_tree,
-    _suppress_syntax_warnings,
+    _parse_ast_no_syntax_warnings,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
     _extract_comprehension_walrus_names,
@@ -104,10 +104,8 @@ from pydoppelgangerhunt.fixer.source import (
     resolve_unit_replacement,
     split_source_lines,
 )
-from pydoppelgangerhunt.reporters import (
-    extract_unit_source_lines_with_state,
-)
 from pydoppelgangerhunt.source_lines import (
+    extract_unit_source_lines_with_state,
     normalize_unit_coordinates,
     resolve_unit_line_bounds,
 )
@@ -607,7 +605,7 @@ def _build_whole_method_delegation(
     base_u_name = raw_u_name.rsplit(":", maxsplit=1)[-1] if raw_u_name else ""
 
     try:
-        tree = ast.parse(source_text)
+        tree = _parse_ast_no_syntax_warnings(source_text)
         cand_nodes: List[Tuple[int, Union[ast.FunctionDef, ast.AsyncFunctionDef]]] = []
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1636,7 +1634,7 @@ def _has_future_annotations(source_text: str) -> bool:
     if not source_text or "__future__" not in source_text:
         return False
     try:
-        tree = ast.parse(source_text)
+        tree = _parse_ast_no_syntax_warnings(source_text)
     except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         return False
     for node in ast.walk(tree):
@@ -1652,7 +1650,7 @@ def _helper_requires_future_annotations(helper_code: str) -> bool:
     if not helper_code or "|" not in helper_code:
         return False
     try:
-        tree = ast.parse(helper_code)
+        tree = _parse_ast_no_syntax_warnings(helper_code)
     except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         return False
     for node in ast.walk(tree):
@@ -1773,7 +1771,7 @@ def _extract_module_import_statements(
     if not source_text.strip():
         return _ModuleImportsResult(stmts, wildcards)
     try:
-        tree = ast.parse(source_text)
+        tree = _parse_ast_no_syntax_warnings(source_text)
         for stmt in tree.body:
             if isinstance(stmt, (ast.Import, ast.ImportFrom)):
                 name_stmts, wilds = _parse_import_node_statements(
@@ -1831,7 +1829,7 @@ def _canonicalize_helper_relative_imports(
     if not valid_mods:
         return helper_code
     try:
-        tree = ast.parse(helper_code)
+        tree = _parse_ast_no_syntax_warnings(helper_code)
     except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         return helper_code
 
@@ -1926,7 +1924,7 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
     if not source_text.strip():
         return set()
     try:
-        tree = ast.parse(source_text)
+        tree = _parse_ast_no_syntax_warnings(source_text)
     except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         return set()
     names: Set[str] = set()
@@ -2434,7 +2432,7 @@ def _parse_local_import_statements(
         if not s_loc:
             continue
         try:
-            loc_tree = ast.parse(s_loc)
+            loc_tree = _parse_ast_no_syntax_warnings(s_loc)
         except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
             continue
 
@@ -2586,7 +2584,7 @@ def _collect_host_missing_imports(
 
     # 3. Source dependencies referenced in helper_code
     try:
-        helper_tree = ast.parse(helper_code)
+        helper_tree = _parse_ast_no_syntax_warnings(helper_code)
     except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         helper_tree = None
 
@@ -3192,18 +3190,35 @@ def _unit_start(u: Dict[str, Any]) -> int:
 _PatchCallableT = TypeVar("_PatchCallableT", bound=Callable[..., str])
 
 
+def _apply_replace_clones_default_policy(
+    unit: Dict[str, Any],
+    *,
+    replace_clones: bool,
+    closure_strictness: Optional[str],
+    skip_pre_unit_closures: Optional[bool],
+) -> Dict[str, Any]:
+    """Defaults unset unit closure policy to 'pedantic' when replace_clones=True."""
+    if (
+        replace_clones
+        and closure_strictness is None
+        and skip_pre_unit_closures is None
+        and unit.get("closure_strictness") is None
+        and unit.get("skip_pre_unit_closures") is None
+        and unit.get("strict_with_suppression") is None
+    ):
+        return {**unit, "closure_strictness": "pedantic"}
+    return unit
+
+
 def _with_patch_session(fn: _PatchCallableT) -> _PatchCallableT:
-    """Enters heuristic session (escalating to WARNING on replace_clones) and syntax-warning guard."""
+    """Enters heuristic session (escalating to WARNING on replace_clones)."""
 
     @functools.wraps(fn)
     def _wrapped(*args: Any, **kwargs: Any) -> str:
         warn_mode = bool(
             kwargs.get("replace_clones", args[3] if len(args) > 3 else False)
         )
-        with (
-            heuristic_ctx_manager_session(warn=warn_mode),
-            _suppress_syntax_warnings(),
-        ):
+        with heuristic_ctx_manager_session(warn=warn_mode):
             return fn(*args, **kwargs)
 
     return cast(_PatchCallableT, _wrapped)
@@ -3534,29 +3549,17 @@ def generate_refactoring_patch(
             # replace_clones=True and no explicit policy is set on the call or unit,
             # default to pedantic so automated call-site rewrites fail closed on
             # unproven context managers.
-            u1_policy = (
-                {**u1, "closure_strictness": "pedantic"}
-                if (
-                    replace_clones
-                    and closure_strictness is None
-                    and skip_pre_unit_closures is None
-                    and u1.get("closure_strictness") is None
-                    and u1.get("skip_pre_unit_closures") is None
-                    and u1.get("strict_with_suppression") is None
-                )
-                else u1
+            u1_policy = _apply_replace_clones_default_policy(
+                u1,
+                replace_clones=replace_clones,
+                closure_strictness=closure_strictness,
+                skip_pre_unit_closures=skip_pre_unit_closures,
             )
-            u2_policy = (
-                {**u2, "closure_strictness": "pedantic"}
-                if (
-                    replace_clones
-                    and closure_strictness is None
-                    and skip_pre_unit_closures is None
-                    and u2.get("closure_strictness") is None
-                    and u2.get("skip_pre_unit_closures") is None
-                    and u2.get("strict_with_suppression") is None
-                )
-                else u2
+            u2_policy = _apply_replace_clones_default_policy(
+                u2,
+                replace_clones=replace_clones,
+                closure_strictness=closure_strictness,
+                skip_pre_unit_closures=skip_pre_unit_closures,
             )
             pair_flags = resolve_pair_closure_flags(
                 u1_policy,
@@ -3593,10 +3596,10 @@ def generate_refactoring_patch(
             if u1_eff.get("kind") in ("comprehension", "complex_expr") or u2_eff.get(
                 "kind"
             ) in ("comprehension", "complex_expr"):
-                raw_l1, origin1 = extract_unit_source_lines_with_state(
+                raw_l1, _ = extract_unit_source_lines_with_state(
                     u1_eff, repo_root=str(root)
                 )
-                raw_l2, origin2 = extract_unit_source_lines_with_state(
+                raw_l2, _ = extract_unit_source_lines_with_state(
                     u2_eff, repo_root=str(root)
                 )
                 stmt_lines1 = _slice_unit_token_lines(
@@ -3605,7 +3608,6 @@ def generate_refactoring_patch(
                         u1_eff,
                         [ln.rstrip("\r\n") for ln in raw_l1],
                     ),
-                    is_pre_sliced=origin1.is_pre_sliced,
                 )
                 stmt_lines2 = _slice_unit_token_lines(
                     u2_eff,
@@ -3613,7 +3615,6 @@ def generate_refactoring_patch(
                         u2_eff,
                         [ln.rstrip("\r\n") for ln in raw_l2],
                     ),
-                    is_pre_sliced=origin2.is_pre_sliced,
                 )
                 if not _prune_pair_lhs_and_augassign_scopes(
                     u1_eff, u2_eff, s1, s2, stmt_lines1, stmt_lines2

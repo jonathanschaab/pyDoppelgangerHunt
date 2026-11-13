@@ -2816,3 +2816,30 @@ def test_suggestion_and_html_report_record_strict_heuristic_ctx_manager_assumpti
         any("'Transaction'" in msg and "non-suppressing via name heuristic" in msg for msg in html_msgs)
         is expect_heuristic
     )
+
+
+def test_cli_surfaces_internal_diagnostic_error_count_to_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verifies internal suggestion/HTML rendering exceptions are counted and surfaced on stderr."""
+    from pydoppelgangerhunt.cli import main
+
+    target = tmp_path / "dup.py"
+    target.write_text(
+        "def alpha(x):\n    a = x + 1\n    b = a * 2\n    return b + 3\n\n"
+        "def beta(x):\n    a = x + 1\n    b = a * 2\n    return b + 3\n",
+        encoding="utf-8",
+    )
+
+    def _boom(*_args: Any, **_kwargs: Any) -> str:
+        raise RuntimeError("synthetic synthesis boom")
+
+    monkeypatch.setattr("pydoppelgangerhunt.cli.synthesize_refactoring_suggestion", _boom)
+    monkeypatch.setattr("pydoppelgangerhunt.reporters.synthesize_refactoring_suggestion", _boom)
+    html_out = tmp_path / "report.html"
+    exit_code = main([str(target), "--min-lines", "3", "--suggest", "--html", str(html_out)])
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "2 internal diagnostic error(s) occurred" in captured.err

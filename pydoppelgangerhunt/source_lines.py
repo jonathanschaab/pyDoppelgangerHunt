@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import enum
+import json
 import logging
 import math
 from pathlib import Path
 import re
 from typing import Any, Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence, Tuple, Union, overload
 
+from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
 from pydoppelgangerhunt.config import normalize_path_string
 
 logger = logging.getLogger(__name__)
@@ -20,12 +22,15 @@ __all__ = [
     "count_physical_newlines",
     "detect_line_ending",
     "extract_notebook_code_cell_text",
+    "extract_unit_source_code",
+    "extract_unit_source_lines_with_state",
     "is_sliced_unit_source_lines",
     "normalize_unit_coordinates",
     "parse_unit_coord",
     "resolve_safe_unit_file_path",
     "resolve_unit_line_bounds",
     "split_source_lines",
+    "with_unit_source_text",
 ]
 
 
@@ -41,8 +46,7 @@ class SourceLinesOrigin(enum.Enum):
     FULL_BUFFER = ("FULL_BUFFER", False, False)
     DISK = ("DISK", False, False)
 
-    def __init__(self, label: str, is_pre_sliced: bool, is_placeholder: bool) -> None:
-        self._label = label
+    def __init__(self, _label: str, is_pre_sliced: bool, is_placeholder: bool) -> None:
         self._is_pre_sliced = is_pre_sliced
         self._is_placeholder = is_placeholder
 
@@ -469,3 +473,142 @@ def resolve_safe_unit_file_path(
 
 
 _resolve_safe_unit_file_path = resolve_safe_unit_file_path
+
+
+def _ensure_trailing_lf(line: str) -> str:
+    """Ensures line ends with '\\n', converting lone trailing '\\r' to '\\n' while preserving '\\r\\n'."""
+    if line.endswith("\n"):
+        return line
+    if line.endswith("\r"):
+        return line[:-1] + "\n"
+    return line + "\n"
+
+
+def _extract_notebook_cell_lines(nb_data: Any, cell_idx: int) -> Optional[List[str]]:
+    """Extracts LF-terminated physical source lines for a 0-indexed notebook code cell, or None if invalid.
+
+    Source fragments are joined per nbformat semantics before splitting on physical
+    newlines (``\\r\\n``, ``\\r``, ``\\n``), and every line terminator is normalized to
+    ``\\n`` to match universal-newline disk reads. Malformed cells (non-code cells,
+    missing or non-string source fragments) return None so callers fall back to a
+    placeholder rather than treating coerced values as real source.
+    """
+    if not isinstance(nb_data, dict):
+        return None
+    cells = nb_data.get("cells")
+    if not isinstance(cells, list) or cell_idx < 0 or cell_idx >= len(cells):
+        return None
+    cell_text = extract_notebook_code_cell_text(cells[cell_idx])
+    if cell_text is None:
+        return None
+    return [ln.rstrip("\r\n") + "\n" for ln in split_source_lines(cell_text)]
+
+
+def extract_unit_source_lines_with_state(
+    unit: Dict[str, Any], repo_root: Optional[str] = None
+) -> Tuple[List[str], SourceLinesOrigin]:
+    """Reads raw source code lines for a unit and returns ``(lines, origin)``.
+
+    ``origin`` is a :class:`SourceLinesOrigin` indicating whether the returned lines
+    came from a pre-sliced ``source_lines`` excerpt (``PRE_SLICED``), a full-file
+    in-memory buffer (``FULL_BUFFER``), disk (``DISK``), or missing/unreadable source
+    (``PLACEHOLDER``). Under ``PLACEHOLDER``, unavailable notebook cell anchors return
+    ``[]`` while other missing-source paths return a single synthetic comment line;
+    callers should query ``origin.is_pre_sliced``, ``origin.is_placeholder``, or
+    ``origin.has_real_source`` explicitly.
+    """
+    s_d, e_d = resolve_unit_line_bounds(unit)
+    n_d = str(unit.get("name") or "unit")
+    placeholder = [f"# Source for {n_d} lines {s_d}-{e_d}\n"]
+
+    source_lines = unit.get("source_lines")
+    from_source_text = False
+    raw_src_text = unit.get("source_text")
+    if raw_src_text is None or not str(raw_src_text).strip():
+        file_src = unit.get("file_source")
+        if file_src is not None and str(file_src).strip():
+            raw_src_text = file_src
+    if (
+        not source_lines
+        and raw_src_text is not None
+        and str(raw_src_text).strip()
+    ):
+        source_lines = split_source_lines(str(raw_src_text))
+        from_source_text = True
+
+    if source_lines is not None and isinstance(source_lines, (list, tuple)):
+        if not source_lines:
+            return placeholder, SourceLinesOrigin.PLACEHOLDER
+        if not from_source_text and is_sliced_unit_source_lines(unit, source_lines):
+            return (
+                [_ensure_trailing_lf(str(ln)) for ln in source_lines],
+                SourceLinesOrigin.PRE_SLICED,
+            )
+        start = max(1, s_d)
+        end = min(len(source_lines), e_d)
+        sliced_buf = source_lines[start - 1 : end]
+        return (
+            [_ensure_trailing_lf(str(ln)) for ln in sliced_buf],
+            SourceLinesOrigin.FULL_BUFFER,
+        )
+
+    resolved_file = resolve_safe_unit_file_path(unit, repo_root=repo_root)
+    if resolved_file is None:
+        return placeholder, SourceLinesOrigin.PLACEHOLDER
+
+    try:
+        is_cell_anchor = False
+        cell_idx = -1
+        u_file = str(unit.get("file") or "")
+        if resolved_file.suffix.lower() == ".ipynb" and "#" in u_file:
+            parsed_nb = parse_notebook_cell_anchor(u_file)
+            if parsed_nb is not None:
+                cell_idx = parsed_nb[1]
+                is_cell_anchor = True
+
+        if resolved_file.suffix.lower() == ".ipynb":
+            nb_fallback: List[str] = [] if is_cell_anchor else placeholder
+            raw_nb_text = resolved_file.read_text(encoding="utf-8", errors="replace")
+            try:
+                nb_data = json.loads(raw_nb_text)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                return nb_fallback, SourceLinesOrigin.PLACEHOLDER
+            if not isinstance(nb_data, dict):
+                return nb_fallback, SourceLinesOrigin.PLACEHOLDER
+            if is_cell_anchor:
+                cell_lines = _extract_notebook_cell_lines(nb_data, cell_idx)
+                if cell_lines is None:
+                    return [], SourceLinesOrigin.PLACEHOLDER
+                all_lines = cell_lines
+            else:
+                with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
+                    all_lines = fh.readlines()
+        else:
+            with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
+                all_lines = fh.readlines()
+        start = max(1, s_d)
+        end = min(len(all_lines), e_d)
+        return all_lines[start - 1 : end], SourceLinesOrigin.DISK
+    except OSError:
+        return (
+            [f"# Unable to read {str(unit.get('file') or '')}\n"],
+            SourceLinesOrigin.PLACEHOLDER,
+        )
+
+
+def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:
+    """Reads raw source code lines for a given unit from provided lines or disk."""
+    return extract_unit_source_lines_with_state(unit, repo_root=repo_root)[0]
+
+
+def with_unit_source_text(
+    unit: Dict[str, Any], source_text: Optional[str]
+) -> Dict[str, Any]:
+    """Returns unit with ``source_text`` attached when neither ``source_text`` nor ``source_lines`` is set."""
+    if (
+        source_text is not None
+        and "source_text" not in unit
+        and "source_lines" not in unit
+    ):
+        return {**unit, "source_text": source_text}
+    return unit

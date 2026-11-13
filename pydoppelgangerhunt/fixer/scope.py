@@ -94,7 +94,7 @@ from pydoppelgangerhunt.fixer._df_visitors import (
     _UnitLiveInVisitor,
     _is_ast_node_within_unit_bounds,
 )
-from pydoppelgangerhunt.reporters import (
+from pydoppelgangerhunt.source_lines import (
     extract_unit_source_lines_with_state,
 )
 from pydoppelgangerhunt.fixer.source import (
@@ -3191,7 +3191,6 @@ def _inspect_unit_scope(
         }
 
 
-@_suppress_syntax_warnings()
 def inspect_single_unit_scope(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,

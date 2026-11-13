@@ -135,7 +135,7 @@ from pydoppelgangerhunt.fixer.synthesis import (
     _merge_types,
     synthesize_shared_helper_code,
 )
-from pydoppelgangerhunt.reporters import extract_unit_source_lines_with_state
+from pydoppelgangerhunt.source_lines import extract_unit_source_lines_with_state
 from pydoppelgangerhunt.source_lines import SourceLinesOrigin
 
 __all__ = [
