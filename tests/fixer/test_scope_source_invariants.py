@@ -2451,3 +2451,155 @@ def test_notebook_harvest_and_metrics_skip_malformed_cells_without_crashing(tmp_
 
     stats = compute_repository_dry_stats(str(tmp_path), [], include_notebooks=True)
     assert stats["sloc"] == 3
+
+
+def test_generator_yield_structural_rejection_not_classified_as_safety_hazard() -> None:
+    """Verifies non-blocking generator_yield in control_flow_hazards is not treated as a safety hazard."""
+    from pydoppelgangerhunt.reporters import (
+        _collect_suggestion_rejection_reasons,
+        synthesize_refactoring_suggestion,
+    )
+
+    sc_gen1: dict[str, Any] = {
+        "control_flow_hazards": ["generator_yield"],
+        "closure_hazard_reasons": [],
+        "is_async": False,
+        "has_yield": True,
+        "nonlocals": [],
+        "globals": [],
+        "attrs_read": [],
+        "attrs_written": [],
+    }
+    sc_gen2 = dict(sc_gen1)
+    u1_stub: dict[str, Any] = {"file": "a.py", "start": 1, "end": 4, "kind": "function"}
+    u2_stub: dict[str, Any] = {"file": "a.py", "start": 6, "end": 9, "kind": "function"}
+
+    info = _collect_suggestion_rejection_reasons(
+        u1_stub,
+        u2_stub,
+        sc_gen1,
+        sc_gen2,
+        pair_skip_reason="output arity mismatch",
+        has_async_gen_hazard=False,
+    )
+    assert info.has_safety_hazard is False
+    assert "generator yield" not in info.reasons
+    assert "output arity mismatch" in info.reasons
+
+    # Negative control: blocking control-flow hazard still sets has_safety_hazard=True.
+    sc_blocking = dict(sc_gen1, control_flow_hazards=["generator_yield", "naked_break"])
+    info_blocking = _collect_suggestion_rejection_reasons(
+        u1_stub,
+        u2_stub,
+        sc_blocking,
+        sc_gen2,
+        pair_skip_reason="",
+        has_async_gen_hazard=False,
+    )
+    assert info_blocking.has_safety_hazard is True
+    assert "naked break" in info_blocking.reasons
+
+    gen_src_a = [
+        "def gen_a(xs):\n",
+        "    a = 1\n",
+        "    yield xs\n",
+        "    return a\n",
+    ]
+    gen_src_b = [
+        "def gen_b(xs):\n",
+        "    a = 1\n",
+        "    b = 2\n",
+        "    yield xs\n",
+        "    return a, b\n",
+    ]
+    sug = synthesize_refactoring_suggestion(
+        {"file": "gen.py", "start": 1, "end": 4, "kind": "function", "source_lines": gen_src_a},
+        {"file": "gen.py", "start": 1, "end": 5, "kind": "function", "source_lines": gen_src_b},
+    )
+    assert "skipped as structurally incompatible" in sug
+    assert "rejected as unsafe" not in sug
+
+
+def test_multiline_end_col_zero_allowed_while_single_line_rejected() -> None:
+    """Verifies multiline spans with end_col=0 are valid while single-line end_col=0 is rejected."""
+    from pydoppelgangerhunt.fixer.scope import _has_out_of_bounds_unit_cols
+
+    multi_unit: dict[str, Any] = {
+        "start": 1,
+        "end": 2,
+        "start_col": 4,
+        "end_col": 0,
+        "kind": "block",
+        "source_lines": ["    x = 1\n", "y = 2\n"],
+    }
+    assert (
+        _has_out_of_bounds_unit_cols(
+            multi_unit,
+            multi_unit["source_lines"],
+            is_pre_sliced=False,
+            is_placeholder_origin=False,
+            explicit_col_sliced=False,
+        )
+        is False
+    )
+    sc_multi = inspect_single_unit_scope(multi_unit)
+    assert "invalid_unit_columns" not in sc_multi["control_flow_hazards"]
+
+    single_unit: dict[str, Any] = {
+        "start": 1,
+        "end": 1,
+        "start_col": 0,
+        "end_col": 0,
+        "kind": "complex_expr",
+        "source_lines": ["x + 1\n"],
+    }
+    assert (
+        _has_out_of_bounds_unit_cols(
+            single_unit,
+            single_unit["source_lines"],
+            is_pre_sliced=False,
+            is_placeholder_origin=False,
+            explicit_col_sliced=False,
+        )
+        is True
+    )
+    sc_single = inspect_single_unit_scope(single_unit)
+    assert "invalid_unit_columns" in sc_single["control_flow_hazards"]
+
+
+@pytest.mark.parametrize(
+    ("unit_dict", "expect_valid"),
+    [
+        ({"start": 5, "end": 5, "start_col": 10, "end_col": 5}, False),
+        ({"lineno": 5, "end_lineno": 5, "col_offset": 10, "end_col_offset": 5}, False),
+        ({"start": 5, "end": 6, "start_col": 10, "end_col": 5}, True),
+        ({"start": 5, "end": 5, "start_col": 5, "end_col": 10}, True),
+    ],
+)
+def test_validate_unit_schema_rejects_inverted_single_line_columns(
+    unit_dict: dict[str, Any], expect_valid: bool
+) -> None:
+    """Verifies validate_unit_schema rejects inverted single-line columns while allowing multiline/valid spans."""
+    from pydoppelgangerhunt.fixer.source import validate_unit_schema
+
+    if expect_valid:
+        assert validate_unit_schema(unit_dict, strict=True) == set()
+    else:
+        with pytest.raises(ValueError, match="Inverted column coordinates"):
+            validate_unit_schema(unit_dict, strict=True)
+
+
+def test_weak_parent_map_len_excludes_collected_parents() -> None:
+    """Verifies _WeakParentMap.__len__ matches live iterated entries after parent garbage collection."""
+    import gc
+    from pydoppelgangerhunt.fixer._df_cache import _WeakParentMap
+
+    parent = ast.Module(body=[], type_ignores=[])
+    child = ast.Expr(value=ast.Constant(value=1))
+    pmap = _WeakParentMap({child: parent})
+    assert len(pmap) == 1
+    assert len(list(pmap)) == 1
+    del parent
+    gc.collect()
+    assert len(pmap) == 0
+    assert len(list(pmap)) == 0

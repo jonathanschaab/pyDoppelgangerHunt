@@ -424,6 +424,15 @@ def _validate_coordinate_alias_agreement(unit: Mapping[str, Any]) -> None:
             )
 
 
+def _parse_first_unit_coord(
+    unit: Mapping[str, Any], keys: Tuple[str, ...]
+) -> Optional[int]:
+    for key in keys:
+        if unit.get(key) is not None:
+            return parse_unit_coord({key: unit[key]}, key, default=None, strict=True)
+    return None
+
+
 def validate_unit_schema(
     unit: Mapping[str, Any], *, strict: bool = False
 ) -> Set[str]:
@@ -460,10 +469,21 @@ def validate_unit_schema(
     if start_raw is not None and end_raw is not None:
         s_val = parse_unit_coord({"start": start_raw}, "start", default=None, strict=True)
         e_val = parse_unit_coord({"end": end_raw}, "end", default=None, strict=True)
-        if s_val is not None and e_val is not None and e_val < s_val:
-            raise ValueError(
-                f"Inverted line coordinates in unit dictionary: start={s_val} > end={e_val}"
-            )
+        if s_val is not None and e_val is not None:
+            if e_val < s_val:
+                raise ValueError(
+                    f"Inverted line coordinates in unit dictionary: start={s_val} > end={e_val}"
+                )
+            if s_val == e_val:
+                s_col = _parse_first_unit_coord(
+                    unit, ("start_col", "col_offset", "start_col_offset")
+                )
+                e_col = _parse_first_unit_coord(unit, ("end_col", "end_col_offset"))
+                if s_col is not None and e_col is not None and e_col < s_col:
+                    raise ValueError(
+                        f"Inverted column coordinates on line {s_val}: "
+                        f"start_col={s_col} > end_col={e_col}"
+                    )
     return unknown
 
 _parse_unit_coord = parse_unit_coord

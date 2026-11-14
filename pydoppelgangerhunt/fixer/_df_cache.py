@@ -197,7 +197,7 @@ class _WeakParentMap(_AbcMapping[ast.AST, ast.AST]):
                 yield child
 
     def __len__(self) -> int:
-        return len(self._refs)
+        return sum(1 for ref in list(self._refs.values()) if ref() is not None)
 
 
 class _OversizedParentEntry(NamedTuple):

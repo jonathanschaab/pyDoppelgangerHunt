@@ -20,6 +20,7 @@ from pydoppelgangerhunt.config import (
     normalize_path_string,
     resolve_pair_closure_flags,
 )
+from pydoppelgangerhunt.fixer.scope import BLOCKING_CONTROL_FLOW_HAZARDS
 from pydoppelgangerhunt.source_lines import (
     _extract_notebook_cell_lines,
     extract_unit_source_code,
@@ -168,7 +169,8 @@ def _collect_suggestion_rejection_reasons(
 
     for sc_cand in (sc1, sc2):
         for h in sc_cand.get("control_flow_hazards", ()):
-            _add_unique(safety_reasons, str(h).replace("_", " "))
+            if h in BLOCKING_CONTROL_FLOW_HAZARDS:
+                _add_unique(safety_reasons, str(h).replace("_", " "))
         for cr in sc_cand.get("closure_hazard_reasons", ()):
             _add_unique(safety_reasons, str(cr).replace("_", " "))
 

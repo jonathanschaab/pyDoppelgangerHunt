@@ -13,6 +13,7 @@ import tokenize
 from typing import (
     Any,
     Dict,
+    FrozenSet,
     List,
     Optional,
     Sequence,
@@ -28,6 +29,21 @@ from pydoppelgangerhunt.config import (
     resolve_pair_closure_flags,
     resolve_unit_closure_flags,
     should_warn_closure_event,
+)
+
+BLOCKING_CONTROL_FLOW_HAZARDS: FrozenSet[str] = frozenset(
+    {
+        "naked_break",
+        "naked_continue",
+        "embedded_return",
+        "type_param_closure_capture",
+        "pathological_ast",
+        "deleted_output",
+        "severed_closure_cell",
+        "unavailable_source_for_closure_mode",
+        "unavailable_source_placeholder",
+        "invalid_unit_columns",
+    }
 )
 from pydoppelgangerhunt.fixer._ast_compat import (
     is_match_as_node,
@@ -1981,7 +1997,7 @@ def _has_out_of_bounds_unit_cols(
     first_b = len(unit_code_lines[0].rstrip("\r\n").encode("utf-8"))
     last_b = len(unit_code_lines[-1].rstrip("\r\n").encode("utf-8"))
     s_in_bounds = raw_s_col is None or (0 <= raw_s_col < first_b)
-    e_in_bounds = raw_e_col is None or (0 < raw_e_col <= last_b)
+    e_in_bounds = raw_e_col is None or (0 <= raw_e_col <= last_b)
     order_ok = (
         len(unit_code_lines) > 1
         or raw_s_col is None
@@ -3070,20 +3086,7 @@ def _inspect_unit_scope(
                         )
 
         is_control_flow_safe = not any(
-            h
-            in (
-                "naked_break",
-                "naked_continue",
-                "embedded_return",
-                "type_param_closure_capture",
-                "pathological_ast",
-                "deleted_output",
-                "severed_closure_cell",
-                "unavailable_source_for_closure_mode",
-                "unavailable_source_placeholder",
-                "invalid_unit_columns",
-            )
-            for h in hazards
+            h in BLOCKING_CONTROL_FLOW_HAZARDS for h in hazards
         )
 
         has_receiver_access = bool(
