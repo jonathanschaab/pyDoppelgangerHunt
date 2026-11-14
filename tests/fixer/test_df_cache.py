@@ -2953,10 +2953,13 @@ def test_suppress_syntax_warnings_concurrency_lock_and_already_ignored_fast_path
             for action, _msg, category, _mod, _ln in warnings.filters
         )
 
-    # 2. Fast path (SyntaxWarning already ignored): concurrent callers do NOT block on lock
+    # 2. Fast path (SyntaxWarning, plus DeprecationWarning on <3.12, already ignored):
+    # concurrent callers do NOT block on lock
     with warnings.catch_warnings():
         warnings.resetwarnings()
         warnings.simplefilter("ignore", SyntaxWarning)
+        if sys.version_info < (3, 12):
+            warnings.simplefilter("ignore", DeprecationWarning)
         barrier = threading.Barrier(2, timeout=3.0)
 
         def _fast_worker() -> int:
@@ -2968,6 +2971,36 @@ def test_suppress_syntax_warnings_concurrency_lock_and_already_ignored_fast_path
             fb = pool.submit(_fast_worker)
             results = sorted((fa.result(timeout=5.0), fb.result(timeout=5.0)))
         assert results == [0, 1]
+
+
+@pytest.mark.parametrize(
+    ("version_info", "ignore_deprecation", "expected"),
+    [
+        ((3, 11, 9), False, False),
+        ((3, 11, 9), True, True),
+        ((3, 12, 0), False, True),
+        ((3, 12, 0), True, True),
+    ],
+)
+def test_filters_already_ignore_syntax_warnings_version_requirements(
+    monkeypatch: pytest.MonkeyPatch,
+    version_info: tuple[int, int, int],
+    ignore_deprecation: bool,
+    expected: bool,
+) -> None:
+    """Verifies Python <3.12 requires DeprecationWarning ignored alongside SyntaxWarning."""
+    import sys
+    import warnings
+
+    from pydoppelgangerhunt.fixer import _df_cache as df_cache_mod
+
+    monkeypatch.setattr(sys, "version_info", version_info)
+    with warnings.catch_warnings():
+        warnings.resetwarnings()
+        warnings.simplefilter("ignore", SyntaxWarning)
+        if ignore_deprecation:
+            warnings.simplefilter("ignore", DeprecationWarning)
+        assert df_cache_mod._filters_already_ignore_syntax_warnings() is expected
 
 
 def test_evict_tree_scopes_evicts_oversized_ast_from_interior_stmt(
