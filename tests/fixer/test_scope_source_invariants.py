@@ -2993,3 +2993,97 @@ def test_resolve_cached_unit_source_and_tree_populates_cache_for_presliced_unit(
     )
     assert (t2, tr2) == (None, None)
     assert not empty_cache
+
+
+@pytest.mark.parametrize(
+    ("setup_stmt", "run_stmt", "expect_safe"),
+    [
+        pytest.param(
+            "self.callbacks.append(lambda: total)",
+            "out.append(self.callbacks[0]())",
+            False,
+            id="append_mutation_links_sibling_closure",
+        ),
+        pytest.param(
+            "self.callbacks[0] = lambda: total",
+            "out.append(self.callbacks[0]())",
+            False,
+            id="subscript_store_mutation_links_sibling_closure",
+        ),
+        pytest.param(
+            "self.state.cb = lambda: total",
+            "out.append(self.state.cb())",
+            False,
+            id="nested_attr_store_links_sibling_closure",
+        ),
+        pytest.param(
+            "self.callbacks = [lambda: total]",
+            "self.callbacks += [lambda: 1]",
+            False,
+            id="augassign_on_unit_attr_links_sibling_store",
+        ),
+        pytest.param(
+            "self.callbacks += [lambda: total]",
+            "out.append(self.callbacks[0]())",
+            False,
+            id="augassign_in_sibling_links_unit_load",
+        ),
+        pytest.param(
+            "return self.callbacks.copy(), total",
+            "out.append(self.callbacks[0]())",
+            True,
+            id="negative_readonly_method_does_not_link_sibling_closure",
+        ),
+        pytest.param(
+            "self.other.append(lambda: total)",
+            "out.append(self.callbacks[0]())",
+            True,
+            id="negative_unrelated_attr_mutation_does_not_link",
+        ),
+    ],
+)
+def test_local_class_receiver_in_place_container_and_subattr_mutations(
+    setup_stmt: str, run_stmt: str, expect_safe: bool
+) -> None:
+    """Verifies in-place container, subscript, nested-attribute, and augmented receiver mutations link sibling closures."""
+    setup_body = "\n".join(f"            {line}" for line in setup_stmt.splitlines())
+    run_lines = [f"                {line}" for line in run_stmt.splitlines()]
+    src = (
+        "def outer(items):\n"
+        "    total = 0\n"
+        "    class Worker:\n"
+        "        def __init__(self):\n"
+        "            self.callbacks = []\n"
+        "            self.other = []\n"
+        "            self.state = type('S', (), {})()\n"
+        "        def setup(self):\n"
+        f"{setup_body}\n"
+        "        def run(self):\n"
+        "            nonlocal total\n"
+        "            out = []\n"
+        "            for x in items:\n"
+        "                total += x\n"
+        + "\n".join(run_lines)
+        + "\n"
+        "            return out\n"
+        "    return Worker(), total\n"
+    )
+    lines = src.splitlines()
+    start_idx = next(i + 1 for i, ln in enumerate(lines) if "out = []" in ln)
+    end_idx = next(i + 1 for i, ln in enumerate(lines) if "return out" in ln) - 1
+    tree = ast.parse(src)
+    sc = inspect_single_unit_scope(
+        {
+            "start": start_idx,
+            "end": end_idx,
+            "kind": "block",
+            "source_text": src,
+            "source_lines": src.splitlines(keepends=True),
+        },
+        tree=tree,
+    )
+    assert sc["is_control_flow_safe"] is expect_safe
+    if not expect_safe:
+        assert "nonlocal_closure_hazard" in sc["control_flow_hazards"] or bool(
+            sc["closure_hazard_reasons"]
+        )

@@ -401,6 +401,32 @@ def _render_dry_scorecard(stats: Dict[str, Any], use_color: bool) -> None:
     print("=" * 55)
 
 
+def _append_preload_failure_lines(
+    lines: List[str],
+    exc: Exception,
+    args: argparse.Namespace,
+    *,
+    use_color: bool,
+    indent: str,
+) -> None:
+    """Emits diagnostic fallback lines for enabled render options when pair preload fails."""
+    if args.suggest:
+        sug = (
+            f"[REFACTOR SUGGESTION] Diagnostic: suggestion skipped due to "
+            f"{type(exc).__name__}: {exc}"
+        )
+        sug_colored = colorize(sug, COLOR_YELLOW, use_color)
+        print(indent + sug_colored.replace("\n", "\n" + indent))
+        lines.append(indent + sug.replace("\n", "\n" + indent))
+    if args.diff:
+        diff_out = f"# Diagnostic: diff skipped due to {type(exc).__name__}: {exc}"
+        print(f"{indent}--- Diff ---")
+        print(indent + diff_out.replace("\n", "\n" + indent))
+        lines.append(
+            f"{indent}--- Diff ---\n{indent}" + diff_out.replace("\n", "\n" + indent)
+        )
+
+
 def _render_pair_diff_and_suggestions(
     u1: Dict[str, Any],
     u2: Dict[str, Any],
@@ -433,7 +459,7 @@ def _render_pair_diff_and_suggestions(
             src2, tree2 = resolve_cached_unit_source_and_tree(
                 u2, repo_root=effective_root, file_cache=file_cache
             )
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception as exc:  # pylint: disable=broad-exception-caught
             if on_diagnostic_error is not None:
                 on_diagnostic_error()
             logger.warning(
@@ -442,6 +468,10 @@ def _render_pair_diff_and_suggestions(
                 u2.get("name") if isinstance(u2, dict) else u2,
                 exc_info=True,
             )
+            _append_preload_failure_lines(
+                lines, exc, args, use_color=use_color, indent=indent
+            )
+            return lines
     if args.suggest:
         try:
             sug_kwargs: Dict[str, Any] = {"repo_root": effective_root}

@@ -1891,6 +1891,90 @@ def _find_enclosing_method_class_names(
     )
 
 
+_RECEIVER_MUTATING_METHODS: frozenset[str] = frozenset(
+    {
+        "add",
+        "append",
+        "appendleft",
+        "clear",
+        "discard",
+        "extend",
+        "extendleft",
+        "insert",
+        "pop",
+        "popitem",
+        "popleft",
+        "remove",
+        "reverse",
+        "rotate",
+        "setdefault",
+        "sort",
+        "update",
+        "__delattr__",
+        "__delitem__",
+        "__iadd__",
+        "__imul__",
+        "__isub__",
+        "__setattr__",
+        "__setitem__",
+    }
+)
+
+
+def _extract_receiver_root_attr(expr: ast.AST, rec_param: str) -> Optional[str]:
+    """Returns the attribute name on rec_param when expr is rooted at ``rec_param.<attr>``."""
+    curr_expr: ast.AST = expr
+    root_attr: Optional[str] = None
+    while isinstance(curr_expr, (ast.Attribute, ast.Subscript)):
+        if isinstance(curr_expr, ast.Attribute):
+            root_attr = curr_expr.attr
+        curr_expr = curr_expr.value
+    if isinstance(curr_expr, ast.Name) and curr_expr.id == rec_param:
+        return root_attr
+    return None
+
+
+def _record_receiver_container_mutations(
+    curr: ast.AST,
+    rec_param: str,
+    loaded_attrs: Set[str],
+    stored_attrs: Set[str],
+) -> None:
+    """Records rec_param root attribute mutations across AugAssign, nested targets, and mutating calls."""
+    if isinstance(curr, ast.AugAssign) and isinstance(
+        curr.target, (ast.Attribute, ast.Subscript)
+    ):
+        aug_attr = _extract_receiver_root_attr(curr.target, rec_param)
+        if aug_attr is not None:
+            loaded_attrs.add(aug_attr)
+            stored_attrs.add(aug_attr)
+        return
+    if isinstance(curr, (ast.Attribute, ast.Subscript)) and isinstance(
+        curr.ctx, (ast.Store, ast.Del)
+    ):
+        mut_attr = _extract_receiver_root_attr(curr, rec_param)
+        if mut_attr is not None:
+            stored_attrs.add(mut_attr)
+        return
+    if isinstance(curr, ast.Call):
+        mut_target: Optional[ast.AST] = None
+        if (
+            isinstance(curr.func, ast.Attribute)
+            and curr.func.attr in _RECEIVER_MUTATING_METHODS
+        ):
+            mut_target = curr.func.value
+        elif (
+            isinstance(curr.func, ast.Name)
+            and curr.func.id in ("setattr", "delattr")
+            and curr.args
+        ):
+            mut_target = curr.args[0]
+        if mut_target is not None:
+            call_attr = _extract_receiver_root_attr(mut_target, rec_param)
+            if call_attr is not None:
+                stored_attrs.add(call_attr)
+
+
 def _extract_receiver_usage_in_method(
     method_node: ast.AST,
     rec_param: str,
@@ -1929,6 +2013,7 @@ def _extract_receiver_usage_in_method(
                 if curr.generators:
                     stack.append(curr.generators[0].iter)
                 continue
+        _record_receiver_container_mutations(curr, rec_param, loaded_attrs, stored_attrs)
         if (
             isinstance(curr, ast.Attribute)
             and isinstance(curr.value, ast.Name)

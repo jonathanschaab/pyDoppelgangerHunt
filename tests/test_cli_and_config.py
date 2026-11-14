@@ -3344,3 +3344,68 @@ def test_nested_heuristic_ctx_manager_session_does_not_escalate_empty_warn(
     assert warn_records[0].levelno == logging.WARNING
     assert "OuterSafeMgr" in warn_records[0].message
     assert "InnerSafeMgr" in warn_records[0].message
+
+
+def test_render_pair_diff_and_suggestions_preload_failure_counts_once(
+    tmp_path: Any,
+) -> None:
+    """Verifies preload errors increment on_diagnostic_error once while rendering diagnostics for active flags."""
+    # pylint: disable=import-outside-toplevel
+    import argparse
+    from collections import OrderedDict
+    from unittest import mock
+
+    from pydoppelgangerhunt.cli import _render_pair_diff_and_suggestions
+
+    dummy_u1 = {"file": "mod1.py", "start": 1, "end": 3, "name": "fn1", "source": "def fn1(): pass\n"}
+    dummy_u2 = {"file": "mod2.py", "start": 1, "end": 3, "name": "fn2", "source": "def fn2(): pass\n"}
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--suggest", action="store_true")
+    parser.add_argument("--diff", action="store_true")
+    both_args = parser.parse_args(["--suggest", "--diff"])
+    suggest_only_args = parser.parse_args(["--suggest"])
+
+    errors = 0
+
+    def _inc_error() -> None:
+        nonlocal errors
+        errors += 1
+
+    cache: OrderedDict[str, Any] = OrderedDict()
+    with mock.patch(
+        "pydoppelgangerhunt.cli.resolve_cached_unit_source_and_tree",
+        side_effect=SyntaxError("invalid syntax"),
+    ), mock.patch(
+        "pydoppelgangerhunt.cli.synthesize_refactoring_suggestion"
+    ) as mock_sug, mock.patch(
+        "pydoppelgangerhunt.cli.generate_clone_diff"
+    ) as mock_diff:
+        lines = _render_pair_diff_and_suggestions(
+            dummy_u1,
+            dummy_u2,
+            args=both_args,
+            target_repo_root=str(tmp_path),
+            use_color=False,
+            file_cache=cache,
+            on_diagnostic_error=_inc_error,
+        )
+        assert errors == 1
+        assert len(lines) == 2
+        assert "[REFACTOR SUGGESTION] Diagnostic: suggestion skipped due to SyntaxError" in lines[0]
+        assert "# Diagnostic: diff skipped due to SyntaxError" in lines[1]
+        mock_sug.assert_not_called()
+        mock_diff.assert_not_called()
+
+        errors = 0
+        lines_sug = _render_pair_diff_and_suggestions(
+            dummy_u1,
+            dummy_u2,
+            args=suggest_only_args,
+            target_repo_root=str(tmp_path),
+            use_color=False,
+            file_cache=cache,
+            on_diagnostic_error=_inc_error,
+        )
+        assert errors == 1
+        assert len(lines_sug) == 1
+        assert "[REFACTOR SUGGESTION] Diagnostic: suggestion skipped due to SyntaxError" in lines_sug[0]

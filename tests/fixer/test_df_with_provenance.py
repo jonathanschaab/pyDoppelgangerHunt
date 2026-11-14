@@ -4590,3 +4590,222 @@ def test_seed_scope_suppress_aliases_stops_before_u_start_and_post_unit() -> Non
     assert "cm" in prov_direct.non_suppressors
     prov_direct_late = _seed_scope_suppress_aliases(direct_fn, direct_mod, u_start=7)
     assert "cm" not in prov_direct_late.non_suppressors
+
+
+@pytest.mark.parametrize(
+    ("src", "expect_has_patch"),
+    [
+        pytest.param(
+            "def f(eval: bool = False):\n    return 1 if eval else 0\n",
+            False,
+            id="param_shadows_eval",
+        ),
+        pytest.param(
+            "def f():\n    setattr = object()\n    return setattr\n",
+            False,
+            id="local_shadows_setattr",
+        ),
+        pytest.param(
+            "def f(flags):\n    return [eval for eval in flags]\n",
+            False,
+            id="comp_target_shadows_eval",
+        ),
+        pytest.param(
+            "def outer():\n    eval = False\n    class Inner:\n        def m(self):\n            return eval\n",
+            False,
+            id="enclosing_fn_shadows_eval_inside_class_method",
+        ),
+        pytest.param(
+            "s = setattr\ns(obj, 'normal_label', 1)\n",
+            False,
+            id="benign_setattr_alias_safe_attr",
+        ),
+        pytest.param(
+            "import builtins\ns = builtins.setattr\ns(obj, 'normal_label', 1)\n",
+            False,
+            id="benign_builtins_setattr_alias_safe_attr",
+        ),
+        pytest.param(
+            "s1 = setattr\ns2 = s1\ns2(obj, 'normal_label', 1)\n",
+            False,
+            id="chained_benign_setattr_aliases",
+        ),
+        pytest.param(
+            "(s := setattr)(obj, 'normal_label', 1)\n",
+            False,
+            id="benign_walrus_setattr_call",
+        ),
+        pytest.param(
+            "s = setattr\ndef unrelated(s):\n    return s\ns(obj, 'normal_label', 1)\n",
+            False,
+            id="unrelated_param_with_same_alias_name",
+        ),
+        pytest.param(
+            "def f(x=eval):\n    return x\n",
+            True,
+            id="negative_default_eval_in_enclosing_scope",
+        ),
+        pytest.param(
+            "class Config:\n    eval = False\n    def m(self):\n        return eval\n",
+            True,
+            id="negative_pep227_class_attr_does_not_shadow_method_eval",
+        ),
+        pytest.param(
+            "def outer():\n    eval = False\n    def inner():\n        global eval\n        return eval\n",
+            True,
+            id="negative_global_eval_bypasses_outer_shadow",
+        ),
+        pytest.param(
+            "cb(setattr)\n",
+            True,
+            id="negative_uncalled_setattr_arg_escapes",
+        ),
+        pytest.param(
+            "s = setattr\ncb(s)\n",
+            True,
+            id="negative_alias_escapes_in_arg",
+        ),
+        pytest.param(
+            "s1 = setattr\ns2 = s1\ncb(s2)\n",
+            True,
+            id="negative_chained_alias_escapes",
+        ),
+        pytest.param(
+            "class Box:\n    s = setattr\n",
+            True,
+            id="negative_class_body_alias_exposes_attr",
+        ),
+        pytest.param(
+            "f((s := setattr))\n",
+            True,
+            id="negative_walrus_alias_escapes_as_arg",
+        ),
+        pytest.param(
+            "def f(cond):\n    s = setattr\n    if cond:\n        s = other_fn\n    s(obj, 'normal_label', 1)\n",
+            True,
+            id="negative_local_alias_rebound",
+        ),
+        pytest.param(
+            "s = eval\n",
+            True,
+            id="negative_exec_eval_alias_not_exempt",
+        ),
+    ],
+)
+def test_exit_protocol_shadowed_names_and_benign_setattr_aliases(
+    src: str, expect_has_patch: bool
+) -> None:
+    """Verifies shadowed local non-builtins and call-only safe setattr aliases avoid false patch alarms while preserving escape detection."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    clear_dataflow_cache()
+    scan = scan_exit_protocol_patches(ast.parse(src))
+    assert scan.has_patch is expect_has_patch
+
+
+def test_exit_protocol_shadowed_eval_and_benign_alias_keep_proven_ctx_manager() -> None:
+    """Verifies shadowed local builtins and benign setattr calls do not withdraw proven class non-suppression in pedantic mode."""
+    src = (
+        _PROVEN_EXIT_CLASS
+        + "def configure(eval: bool = False):\n"
+        "    if eval:\n"
+        "        return 1\n"
+        "    return 0\n"
+        "def label_item(item):\n"
+        "    s = setattr\n"
+        "    s(item, 'tag', 'ok')\n"
+        + _WITH_MGR_RUN
+    )
+    safety = _late_bound_capture_safety_by_mode(src, "        v = compute()")
+    assert safety["pedantic"] is True
+
+
+@pytest.mark.parametrize(
+    ("patch_stmt", "expected_names", "expected_strict_safe"),
+    [
+        pytest.param(
+            "getattr(builtins, 'setattr')(Mgr, '__exit__', lambda *a: True)",
+            {"Mgr"},
+            False,
+            id="getattr_builtins_setattr",
+        ),
+        pytest.param(
+            "vars(builtins)['setattr'](Mgr, '__exit__', lambda *a: True)",
+            {"Mgr"},
+            False,
+            id="vars_builtins_subscript_setattr",
+        ),
+        pytest.param(
+            "vars(builtins).get('setattr')(Mgr, '__exit__', lambda *a: True)",
+            {"Mgr"},
+            False,
+            id="vars_builtins_get_setattr",
+        ),
+        pytest.param(
+            "__builtins__['setattr'](Mgr, '__exit__', lambda *a: True)",
+            {"Mgr"},
+            False,
+            id="dunder_builtins_subscript_setattr",
+        ),
+        pytest.param(
+            "importlib.import_module('builtins').setattr(Mgr, '__exit__', lambda *a: True)",
+            {"Mgr"},
+            False,
+            id="importlib_builtins_attr_setattr",
+        ),
+        pytest.param(
+            "(s := setattr)(Mgr, '__exit__', lambda *a: True)",
+            {"Mgr"},
+            False,
+            id="walrus_setattr_call",
+        ),
+        pytest.param(
+            "s = getattr(builtins, 'setattr')\ns(Mgr, '__exit__', lambda *a: True)",
+            {"Mgr"},
+            False,
+            id="alias_from_getattr_builtins_setattr",
+        ),
+        pytest.param(
+            "getattr(builtins, 'setattr')(Mgr, 'normal_label', 1)",
+            set(),
+            True,
+            id="control_getattr_builtins_safe_attr",
+        ),
+        pytest.param(
+            "vars(builtins)['setattr'](Other, '__exit__', lambda *a: True)",
+            {"Other"},
+            True,
+            id="control_unrelated_target_keeps_mgr_unpatched_in_strict",
+        ),
+    ],
+)
+def test_exit_protocol_indirect_and_walrus_setattr_record_patched_names(
+    patch_stmt: str, expected_names: set[str], expected_strict_safe: bool
+) -> None:
+    """Verifies indirect and walrus setattr calls targeting exit protocols populate patched_names for strict mode."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    clear_dataflow_cache()
+    patch_indented = "\n".join(f"    {line}" for line in patch_stmt.splitlines())
+    src = (
+        "import builtins\n"
+        "import importlib\n"
+        "class Other:\n"
+        "    pass\n"
+        "class Mgr:\n"
+        "    def __enter__(self): return self\n"
+        "    def __exit__(self, *a): return False\n"
+        "def run(compute):\n"
+        "    cm = Mgr()\n"
+        f"{patch_indented}\n"
+        "    with cm:\n"
+        "        v = compute()\n"
+        "    cb = lambda: v\n"
+        "    return cb()\n"
+    )
+    scan = scan_exit_protocol_patches(ast.parse(src))
+    assert expected_names.issubset(scan.patched_names)
+    if not expected_names:
+        assert "Mgr" not in scan.patched_names
+    safety = _late_bound_capture_safety_by_mode(src, "    cb = lambda: v")
+    assert safety["strict"] is expected_strict_safe
