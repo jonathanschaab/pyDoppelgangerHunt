@@ -2643,3 +2643,114 @@ def test_full_buffer_out_of_range_slice_returns_placeholder() -> None:
         }
     )
     assert origin is SourceLinesOrigin.PLACEHOLDER
+
+
+@pytest.mark.parametrize(
+    ("call_expr", "lambda_body", "expect_safe"),
+    [
+        ("self.cb()", "total", False),
+        ("Worker.cb(self)", "total", False),
+        ("self.cb()", "1", True),
+    ],
+)
+def test_local_class_body_lambda_attr_closure_captured_in_method_unit(
+    call_expr: str, lambda_body: str, expect_safe: bool
+) -> None:
+    """Verifies class-body lambda closures on an enclosing local class are tracked across self.<attr>() and ClassName.<attr>() calls."""
+    src = (
+        "def outer(items):\n"
+        "    total = 0\n"
+        "    class Worker:\n"
+        f"        cb = lambda self: {lambda_body}\n"
+        "        def run(self):\n"
+        "            nonlocal total\n"
+        "            out = []\n"
+        "            for x in items:\n"
+        "                total += x\n"
+        f"                out.append({call_expr})\n"
+        "            return out\n"
+        "    return Worker().run(), total\n"
+    )
+    tree = ast.parse(src)
+    sc = inspect_single_unit_scope(
+        {
+            "start": 8,
+            "end": 10,
+            "kind": "block",
+            "source_text": src,
+            "source_lines": src.splitlines(keepends=True),
+        },
+        tree=tree,
+    )
+    assert sc["is_control_flow_safe"] is expect_safe
+    if not expect_safe:
+        assert "nonlocal_closure_hazard" in sc["control_flow_hazards"] or bool(
+            sc["closure_hazard_reasons"]
+        )
+
+
+def test_tree_only_except_handler_unit_does_not_trigger_stale_source_code() -> None:
+    """Verifies tree-only except clause units match ExceptHandler nodes without false stale_source_code."""
+    src = (
+        "def f(x):\n"
+        "    try:\n"
+        "        a = int(x)\n"
+        "    except ValueError:\n"
+        "        a = 2\n"
+        "    except RuntimeError:\n"
+        "        a = 3\n"
+        "    return a\n"
+    )
+    tree = ast.parse(src)
+    unit: dict[str, Any] = {
+        "file": "missing_disk_tree_only.py",
+        "start": 4,
+        "end": 5,
+        "kind": "block",
+        "source_code": "    except ValueError:\n        a = 2\n",
+    }
+    sc = inspect_single_unit_scope(unit, tree=tree)
+    assert "stale_source_code" not in sc["control_flow_hazards"]
+
+
+def test_stale_source_code_classified_as_safety_hazard_on_expression_units() -> None:
+    """Verifies stale_source_code on complex_expr units is reported as a blocking safety hazard."""
+    from pydoppelgangerhunt.fixer.scope import BLOCKING_CONTROL_FLOW_HAZARDS
+    from pydoppelgangerhunt.reporters import (
+        _collect_suggestion_rejection_reasons,
+        synthesize_refactoring_suggestion,
+    )
+
+    assert "stale_source_code" in BLOCKING_CONTROL_FLOW_HAZARDS
+    sc_stale: dict[str, Any] = {
+        "control_flow_hazards": ["stale_source_code"],
+        "closure_hazard_reasons": [],
+        "is_async": False,
+        "has_yield": False,
+        "nonlocals": [],
+        "globals": [],
+        "attrs_read": [],
+        "attrs_written": [],
+    }
+    info = _collect_suggestion_rejection_reasons(
+        {"file": "a.py", "start": 1, "end": 1, "kind": "complex_expr"},
+        {"file": "a.py", "start": 2, "end": 2, "kind": "complex_expr"},
+        sc_stale,
+        sc_stale,
+        pair_skip_reason=None,
+        has_async_gen_hazard=False,
+    )
+    assert info.has_safety_hazard is True
+    assert "stale source code" in info.reasons
+
+    u_stale: dict[str, Any] = {
+        "file": "stale_expr.py",
+        "start": 1,
+        "end": 1,
+        "kind": "complex_expr",
+        "source_text": "z = b + 2\nx = c + 3\n",
+        "source_code": "y = a + 1",
+    }
+    sug = synthesize_refactoring_suggestion(u_stale, dict(u_stale, start=2, end=2))
+    assert "rejected as unsafe" in sug
+    assert "stale source code" in sug

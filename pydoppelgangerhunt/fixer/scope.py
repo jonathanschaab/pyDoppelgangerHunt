@@ -40,6 +40,7 @@ BLOCKING_CONTROL_FLOW_HAZARDS: FrozenSet[str] = frozenset(
         "pathological_ast",
         "deleted_output",
         "severed_closure_cell",
+        "stale_source_code",
         "unavailable_source_for_closure_mode",
         "unavailable_source_placeholder",
         "invalid_unit_columns",

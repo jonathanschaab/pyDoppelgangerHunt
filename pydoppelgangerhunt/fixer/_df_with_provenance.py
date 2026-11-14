@@ -1402,6 +1402,8 @@ def _is_dynamic_namespace_call(node: ast.AST, call_names: frozenset[str]) -> boo
 
 def _class_def_has_dynamic_exit_mutation(cls_node: ast.ClassDef) -> bool:
     """Returns True if a ClassDef contains dynamic namespace reflection or runtime __exit__/__aexit__ mutation."""
+    if scan_exit_protocol_patches(cls_node).has_patch:
+        return True
     if any(
         _is_dynamic_namespace_call(sub, _DYNAMIC_CLASS_NAMESPACE_CALLS)
         for sub in _iter_shallow_scope_body_nodes(cls_node)

@@ -4318,22 +4318,98 @@ def test_exit_protocol_scanner_avoids_non_builtin_eval_and_nested_attr_stores(
 @pytest.mark.parametrize(
     ("src", "expect_has_patch"),
     [
-        ("class C:\n    def m(self, k, v):\n        setattr(self, k, v)\n", False),
+        ("class C:\n    def m(self, k, v):\n        setattr(self, k, v)\n", True),
+        ("class C:\n    def m(self, v):\n        setattr(self, 'safe_field', v)\n", False),
+        ("import builtins\nclass C:\n    def m(self, k, v):\n        builtins.setattr(self, k, v)\n", True),
         ("class C:\n    def m(self, v):\n        setattr(self, '__class__', v)\n", True),
         ("class C:\n    @classmethod\n    def m(cls, k, v):\n        setattr(cls, k, v)\n", True),
         ("__import__('builtins').setattr(M, '__exit__', f)\n", True),
+        ("imp = __import__\nimp('builtins').setattr(M, '__exit__', f)\n", True),
         ("import importlib\nimportlib.import_module('builtins').setattr(M, '__exit__', f)\n", True),
         ("import builtins\nvars(builtins)['setattr'](M, '__exit__', f)\n", True),
-        ("import sys\nsys.modules['builtins'].setattr(M, '__exit__', f)\n", True),
+        ("import builtins\nbuiltins.__dict__['setattr'](M, '__exit__', f)\n", True),
+        ("__builtins__['setattr'](M, '__exit__', f)\n", True),
+        ("import builtins\nname = 'setattr'\ngetattr(builtins, name)(M, '__exit__', f)\n", True),
+        ("import sys\ns = sys\ns.modules['builtins'].setattr(M, '__exit__', f)\n", True),
     ],
 )
 def test_exit_protocol_scanner_self_setattr_and_dynamic_builtins_lookup(
     src: str, expect_has_patch: bool
 ) -> None:
-    """Verifies instance setattr(self, k, v) does not false-positive while dynamic builtins lookups are flagged."""
+    """Verifies dynamic setattr on self/builtins and dynamic builtins namespace lookups invalidate proofs."""
     import ast
 
     from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
 
     scan = scan_exit_protocol_patches(ast.parse(src))
     assert scan.has_patch is expect_has_patch
+
+
+@pytest.mark.parametrize(
+    ("include_self_setattr", "patch_stmt", "expected_pedantic_safe", "expected_strict_safe"),
+    [
+        pytest.param(False, "    pass", True, True, id="clean_control"),
+        pytest.param(
+            True,
+            "    cm.change('__class__', Suppressing)",
+            False,
+            False,
+            id="builtins_setattr_self_dynamic_attr_swap",
+        ),
+        pytest.param(
+            False,
+            "    name = 'setattr'\n    getattr(builtins, name)(Mgr, '__exit__', lambda *a: True)",
+            False,
+            None,
+            id="dynamic_getattr_builtins_setattr",
+        ),
+        pytest.param(
+            False,
+            "    builtins.__dict__['setattr'](Mgr, '__exit__', lambda *a: True)",
+            False,
+            None,
+            id="builtins_dunder_dict_setattr",
+        ),
+        pytest.param(
+            False,
+            "    __builtins__['setattr'](Mgr, '__exit__', lambda *a: True)",
+            False,
+            None,
+            id="dunder_builtins_subscript_setattr",
+        ),
+    ],
+)
+def test_exit_protocol_dynamic_lookup_and_self_setattr_withdraws_provenance_proof(
+    include_self_setattr: bool,
+    patch_stmt: str,
+    expected_pedantic_safe: bool,
+    expected_strict_safe: bool | None,
+) -> None:
+    """Verifies builtins.setattr(self, name, cls) and dynamic builtins lookups withdraw class non-suppression proofs."""
+    change_method = (
+        "    def change(self, name, cls):\n"
+        "        builtins.setattr(self, name, cls)\n"
+        if include_self_setattr
+        else ""
+    )
+    src = (
+        "import builtins\n"
+        "class Suppressing:\n"
+        "    def __enter__(self): return self\n"
+        "    def __exit__(self, *a): return True\n"
+        "class Mgr:\n"
+        "    def __enter__(self): return self\n"
+        "    def __exit__(self, *a): return False\n"
+        f"{change_method}"
+        "def run(compute):\n"
+        "    cm = Mgr()\n"
+        f"{patch_stmt}\n"
+        "    with cm:\n"
+        "        v = compute()\n"
+        "    cb = lambda: v\n"
+        "    return cb()\n"
+    )
+    safety = _late_bound_capture_safety_by_mode(src, "    cb = lambda: v")
+    assert safety["pedantic"] is expected_pedantic_safe
+    if expected_strict_safe is not None:
+        assert safety["strict"] is expected_strict_safe

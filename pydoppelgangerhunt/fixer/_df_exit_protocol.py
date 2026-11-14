@@ -13,7 +13,7 @@ non-suppression proofs instead of trusting a stale class body.
 from __future__ import annotations
 
 import ast
-from typing import AbstractSet, List, NamedTuple, Optional, Set, Tuple, cast
+from typing import AbstractSet, List, NamedTuple, Optional, Sequence, Set, Tuple, cast
 
 from pydoppelgangerhunt.fixer._df_cache import (
     _get_or_compute_scope_cached,
@@ -120,40 +120,111 @@ def is_factory_rebound_target(
 _NO_PATCH_SCAN = ExitProtocolPatchScan(frozenset(), False, frozenset())
 
 
-def _collect_builtin_aliases(
-    tree: ast.AST,
-) -> Tuple[Set[str], Set[str], Set[str], Set[str], bool]:
-    """Collects imported and assigned aliases for exec/eval, setattr/delattr, getattr, and builtins module.
+class _BuiltinAliasTable(NamedTuple):
+    exec_eval: Set[str]
+    setattr_delattr: Set[str]
+    getattr_fns: Set[str]
+    builtins_mods: Set[str]
+    import_fns: Set[str]
+    importlib_mods: Set[str]
+    sys_mods: Set[str]
+    has_wildcard: bool
 
-    Returns ``(exec_eval_aliases, setattr_delattr_aliases, getattr_aliases, builtins_mod_aliases, has_wildcard)``.
-    """
-    exec_eval_aliases: Set[str] = set(_DYNAMIC_CODE_BUILTINS)
-    setattr_delattr_aliases: Set[str] = set(_ATTR_MUTATION_BUILTINS)
-    getattr_aliases: Set[str] = {"getattr"}
-    builtins_mod_aliases: Set[str] = {"builtins", "__builtins__"}
+
+def _propagate_alias_step(
+    assign_pairs: Sequence[Tuple[str, ast.AST]],
+    table: _BuiltinAliasTable,
+) -> bool:
+    """Propagates one fixed-point iteration across assignment pairs; returns True if changed."""
+    changed = False
+    attr_targets: Tuple[Tuple[AbstractSet[str], str, Set[str]], ...] = (
+        (table.builtins_mods, "__import__", table.import_fns),
+        (table.builtins_mods, "getattr", table.getattr_fns),
+        (table.importlib_mods, "import_module", table.import_fns),
+    )
+    name_sets: Tuple[Set[str], ...] = (
+        table.exec_eval,
+        table.setattr_delattr,
+        table.getattr_fns,
+        table.builtins_mods,
+        table.import_fns,
+        table.importlib_mods,
+        table.sys_mods,
+    )
+    for tgt_name, val in assign_pairs:
+        if isinstance(val, ast.Name):
+            for alias_set in name_sets:
+                if val.id in alias_set and tgt_name not in alias_set:
+                    alias_set.add(tgt_name)
+                    changed = True
+        elif isinstance(val, ast.Attribute) and isinstance(val.value, ast.Name):
+            if val.value.id in table.builtins_mods:
+                if val.attr in _DYNAMIC_CODE_BUILTINS and tgt_name not in table.exec_eval:
+                    table.exec_eval.add(tgt_name)
+                    changed = True
+                elif (
+                    val.attr in _ATTR_MUTATION_BUILTINS
+                    and tgt_name not in table.setattr_delattr
+                ):
+                    table.setattr_delattr.add(tgt_name)
+                    changed = True
+            for mod_set, attr_name, dest_set in attr_targets:
+                if (
+                    val.value.id in mod_set
+                    and val.attr == attr_name
+                    and tgt_name not in dest_set
+                ):
+                    dest_set.add(tgt_name)
+                    changed = True
+    return changed
+
+
+def _collect_builtin_aliases(tree: ast.AST) -> _BuiltinAliasTable:
+    """Collects imported and assigned aliases for builtins, dynamic import helpers, and sys."""
+    table = _BuiltinAliasTable(
+        exec_eval=set(_DYNAMIC_CODE_BUILTINS),
+        setattr_delattr=set(_ATTR_MUTATION_BUILTINS),
+        getattr_fns={"getattr"},
+        builtins_mods={"builtins", "__builtins__"},
+        import_fns={"__import__"},
+        importlib_mods={"importlib"},
+        sys_mods={"sys"},
+        has_wildcard=False,
+    )
     has_wildcard = False
     assign_pairs: List[Tuple[str, ast.AST]] = []
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
+                bound = alias.asname or alias.name
                 if alias.name in ("builtins", "__builtins__"):
-                    builtins_mod_aliases.add(alias.asname or alias.name)
+                    table.builtins_mods.add(bound)
+                elif alias.name == "importlib":
+                    table.importlib_mods.add(bound)
+                elif alias.name == "sys":
+                    table.sys_mods.add(bound)
         elif isinstance(node, ast.ImportFrom) and node.module in (
             "builtins",
             "__builtins__",
+            "importlib",
         ):
             for alias in node.names:
                 if alias.name == "*":
                     has_wildcard = True
                     continue
                 bound = alias.asname or alias.name
-                if alias.name in _DYNAMIC_CODE_BUILTINS:
-                    exec_eval_aliases.add(bound)
+                if node.module == "importlib":
+                    if alias.name == "import_module":
+                        table.import_fns.add(bound)
+                elif alias.name in _DYNAMIC_CODE_BUILTINS:
+                    table.exec_eval.add(bound)
                 elif alias.name in _ATTR_MUTATION_BUILTINS:
-                    setattr_delattr_aliases.add(bound)
+                    table.setattr_delattr.add(bound)
                 elif alias.name == "getattr":
-                    getattr_aliases.add(bound)
+                    table.getattr_fns.add(bound)
+                elif alias.name == "__import__":
+                    table.import_fns.add(bound)
         elif isinstance(node, ast.Assign) and node.value is not None:
             for tgt in node.targets:
                 if isinstance(tgt, ast.Name):
@@ -162,45 +233,10 @@ def _collect_builtin_aliases(
             if isinstance(node.target, ast.Name):
                 assign_pairs.append((node.target.id, node.value))
 
-    changed = True
-    while changed:
-        changed = False
-        for tgt_name, val in assign_pairs:
-            if isinstance(val, ast.Name):
-                ref_name = val.id
-                if ref_name in builtins_mod_aliases and tgt_name not in builtins_mod_aliases:
-                    builtins_mod_aliases.add(tgt_name)
-                    changed = True
-            elif (
-                isinstance(val, ast.Attribute)
-                and isinstance(val.value, ast.Name)
-                and val.value.id in builtins_mod_aliases
-                and val.attr
-                in (_DYNAMIC_CODE_BUILTINS | _ATTR_MUTATION_BUILTINS | frozenset({"getattr"}))
-            ):
-                ref_name = val.attr
-            else:
-                continue
-            if ref_name in exec_eval_aliases and tgt_name not in exec_eval_aliases:
-                exec_eval_aliases.add(tgt_name)
-                changed = True
-            if (
-                ref_name in setattr_delattr_aliases
-                and tgt_name not in setattr_delattr_aliases
-            ):
-                setattr_delattr_aliases.add(tgt_name)
-                changed = True
-            if ref_name in getattr_aliases and tgt_name not in getattr_aliases:
-                getattr_aliases.add(tgt_name)
-                changed = True
+    while _propagate_alias_step(assign_pairs, table):
+        pass
 
-    return (
-        exec_eval_aliases,
-        setattr_delattr_aliases,
-        getattr_aliases,
-        builtins_mod_aliases,
-        has_wildcard,
-    )
+    return table._replace(has_wildcard=has_wildcard)
 
 
 def _is_builtins_attr(
@@ -266,37 +302,35 @@ _REF_TRIGGER_ATTRS: frozenset[str] = (
 
 def _is_getattr_of_mutation_builtin(
     node: ast.Call,
-    getattr_aliases: AbstractSet[str],
-    builtins_mod_aliases: AbstractSet[str],
+    aliases: _BuiltinAliasTable,
 ) -> bool:
-    """Returns True when node is getattr(..., '<attr_mutation_or_exec_builtin>')."""
+    """Returns True when node is getattr(..., '<mutation>') or getattr(<builtins>, dynamic_attr)."""
     func = node.func
-    is_getattr = (isinstance(func, ast.Name) and func.id in getattr_aliases) or _is_builtins_attr(
-        func, builtins_mod_aliases, frozenset({"getattr"})
+    is_getattr = (isinstance(func, ast.Name) and func.id in aliases.getattr_fns) or _is_builtins_attr(
+        func, aliases.builtins_mods, frozenset({"getattr"})
     )
     if not is_getattr or len(node.args) < 2:
         return False
     attr_arg = node.args[1]
-    return (
-        isinstance(attr_arg, ast.Constant)
-        and isinstance(attr_arg.value, str)
-        and attr_arg.value in _REF_TRIGGER_ATTRS
-    )
+    if isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):
+        return attr_arg.value in _REF_TRIGGER_ATTRS
+    return isinstance(node.args[0], ast.Name) and node.args[0].id in aliases.builtins_mods
 
 
 def _is_dynamic_builtins_lookup(
-    node: ast.AST, builtins_mod_aliases: AbstractSet[str]
+    node: ast.AST,
+    aliases: _BuiltinAliasTable,
 ) -> bool:
-    """Returns True for __import__('builtins'), import_module('builtins'), vars(builtins), or sys.modules['builtins']."""
+    """Returns True for __import__('builtins'), vars(builtins), builtins.__dict__, sys.modules['builtins'], or __builtins__[...] mutation lookups."""
     if isinstance(node, ast.Call):
         func = node.func
-        is_import_call = (
-            isinstance(func, ast.Name) and func.id in ("__import__", "import_module")
-        ) or (
+        is_import_call = (isinstance(func, ast.Name) and func.id in aliases.import_fns) or (
             isinstance(func, ast.Attribute)
             and isinstance(func.value, ast.Name)
-            and func.value.id == "importlib"
-            and func.attr == "import_module"
+            and (
+                (func.value.id in aliases.importlib_mods and func.attr == "import_module")
+                or (func.value.id in aliases.builtins_mods and func.attr == "__import__")
+            )
         )
         if (
             is_import_call
@@ -310,69 +344,50 @@ def _is_dynamic_builtins_lookup(
             and func.id == "vars"
             and node.args
             and isinstance(node.args[0], ast.Name)
-            and node.args[0].id in builtins_mod_aliases
+            and node.args[0].id in aliases.builtins_mods
         ):
             return True
     elif isinstance(node, ast.Subscript):
         if (
             isinstance(node.value, ast.Attribute)
             and isinstance(node.value.value, ast.Name)
-            and node.value.value.id == "sys"
+            and node.value.value.id in aliases.sys_mods
             and node.value.attr == "modules"
             and isinstance(node.slice, ast.Constant)
             and node.slice.value == "builtins"
         ):
             return True
+        if isinstance(node.value, ast.Name) and node.value.id in aliases.builtins_mods:
+            return not isinstance(node.slice, ast.Constant) or (
+                node.slice.value in _REF_TRIGGER_ATTRS
+            )
+    elif (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in aliases.builtins_mods
+        and node.attr == "__dict__"
+    ):
+        return True
     return False
-
-
-def _instance_self_param(fn: ast.AST) -> Optional[str]:
-    """Returns the first parameter name of an instance method (excluding classmethod/staticmethod)."""
-    if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        return None
-    for dec in fn.decorator_list:
-        if isinstance(dec, ast.Name) and dec.id in ("classmethod", "staticmethod"):
-            return None
-    pos_args = fn.args.posonlyargs or fn.args.args
-    return pos_args[0].arg if pos_args else None
 
 
 def _scan_exit_protocol_patches_uncached(tree: ast.AST) -> ExitProtocolPatchScan:
     """Walks every scope of tree collecting exit-protocol and stdlib-factory patch targets."""
-    (
-        exec_eval_aliases,
-        setattr_delattr_aliases,
-        getattr_aliases,
-        builtins_mod_aliases,
-        has_wildcard,
-    ) = _collect_builtin_aliases(tree)
-    ref_trigger_names = exec_eval_aliases | setattr_delattr_aliases
+    aliases = _collect_builtin_aliases(tree)
+    ref_trigger_names = aliases.exec_eval | aliases.setattr_delattr
     patched: Set[str] = set()
     rebound_attrs: Set[Tuple[Optional[str], Optional[str]]] = set()
-    has_patch = has_wildcard
-    if has_wildcard:
+    has_patch = aliases.has_wildcard
+    if aliases.has_wildcard:
         rebound_attrs.add((None, None))
     call_func_ids: Set[int] = set()
-    stack: List[Tuple[ast.AST, Optional[str]]] = [(tree, None)]
+    stack: List[ast.AST] = [tree]
     while stack:
-        node, instance_self = stack.pop()
+        node = stack.pop()
         if isinstance(node, ast.Call):
             call_func_ids.add(id(node.func))
-        if isinstance(node, ast.ClassDef):
-            for cls_stmt in node.body:
-                stack.append((cls_stmt, _instance_self_param(cls_stmt)))
-            for cls_hdr in (*node.bases, *node.keywords, *node.decorator_list):
-                stack.append((cls_hdr, None))
-            continue
-        child_self = (
-            None
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and not instance_self
-            else instance_self
-        )
-        for sub_node in ast.iter_child_nodes(node):
-            stack.append((sub_node, child_self))
-        if _is_dynamic_builtins_lookup(node, builtins_mod_aliases):
+        stack.extend(ast.iter_child_nodes(node))
+        if _is_dynamic_builtins_lookup(node, aliases):
             has_patch = True
             rebound_attrs.add((None, None))
             continue
@@ -388,28 +403,19 @@ def _scan_exit_protocol_patches_uncached(tree: ast.AST) -> ExitProtocolPatchScan
         elif isinstance(node, ast.Call):
             func = node.func
             if (
-                (isinstance(func, ast.Name) and func.id in exec_eval_aliases)
-                or _is_builtins_attr(func, builtins_mod_aliases, _DYNAMIC_CODE_BUILTINS)
-                or _is_getattr_of_mutation_builtin(
-                    node, getattr_aliases, builtins_mod_aliases
-                )
+                (isinstance(func, ast.Name) and func.id in aliases.exec_eval)
+                or _is_builtins_attr(func, aliases.builtins_mods, _DYNAMIC_CODE_BUILTINS)
+                or _is_getattr_of_mutation_builtin(node, aliases)
             ):
                 has_patch = True
                 rebound_attrs.add((None, None))
                 continue
             mut_info = _attr_mutation_call_info(
-                node, setattr_delattr_aliases, builtins_mod_aliases
+                node, aliases.setattr_delattr, aliases.builtins_mods
             )
             if mut_info is None:
                 continue
             target_expr, literal_attr = mut_info
-            if (
-                literal_attr is None
-                and instance_self is not None
-                and isinstance(target_expr, ast.Name)
-                and target_expr.id == instance_self
-            ):
-                continue
             if literal_attr is not None and literal_attr in _STDLIB_FACTORY_ATTRS:
                 rebound_attrs.add(
                     (
@@ -434,7 +440,7 @@ def _scan_exit_protocol_patches_uncached(tree: ast.AST) -> ExitProtocolPatchScan
                 isinstance(node, ast.Attribute)
                 and isinstance(node.ctx, ast.Load)
                 and (
-                    _is_builtins_attr(node, builtins_mod_aliases, _REF_TRIGGER_ATTRS)
+                    _is_builtins_attr(node, aliases.builtins_mods, _REF_TRIGGER_ATTRS)
                     or (
                         isinstance(node.value, ast.Name)
                         and node.value.id in ("type", "object")
@@ -455,7 +461,7 @@ def scan_exit_protocol_patches(tree: Optional[ast.AST]) -> ExitProtocolPatchScan
     """Returns the cached exit-protocol patch scan for tree (empty scan when tree is None)."""
     if tree is None:
         return _NO_PATCH_SCAN
-    if _is_ephemeral_unit_ast(tree):
+    if not isinstance(tree, ast.Module) or _is_ephemeral_unit_ast(tree):
         return _scan_exit_protocol_patches_uncached(tree)
     return cast(
         ExitProtocolPatchScan,

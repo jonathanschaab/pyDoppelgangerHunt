@@ -330,7 +330,7 @@ class _SpanLineIndex:
                 ),
             ):
                 closure_nodes.append(node)
-            is_stmt_or_expr = isinstance(node, (ast.stmt, ast.expr))
+            is_stmt_or_expr = isinstance(node, (ast.stmt, ast.expr, ast.ExceptHandler))
             if is_stmt_or_expr:
                 n_start, n_col = _node_earliest_start_pos(
                     node, source_lines=source_lines

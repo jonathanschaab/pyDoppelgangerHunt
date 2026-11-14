@@ -60,6 +60,7 @@ from pydoppelgangerhunt.fixer._df_cell_carriers import (
     _is_pos_before_span,
     _iter_carrier_target_entries,
     _iter_class_body_methods,
+    _iter_class_body_non_method_stmts,
     _iter_comprehension_body_exprs_and_targets,
     _node_contains_or_encloses_span,
     _propagate_sibling_closures,
@@ -760,6 +761,28 @@ def _handle_nested_scope_node(
                         sibling_closures.append((curr.name, set(s_reads), set(s_muts)))
                         for oc_name in s_carriers:
                             sibling_closures.append((oc_name, set(s_reads), set(s_muts)))
+            for attr_stmt in _iter_class_body_non_method_stmts(curr):
+                if _is_node_inside_span(attr_stmt, span) or _strictly_encloses_span(
+                    attr_stmt, span
+                ):
+                    continue
+                for _is_reb, _c_targets, c_values in _iter_carrier_target_entries(
+                    attr_stmt
+                ):
+                    c_calls: Set[str] = set()
+                    c_reads, c_muts, c_loads = (
+                        _extract_carrier_value_closure_and_load_info(
+                            c_values, scope_ctx, called_names_out=c_calls
+                        )
+                    )
+                    if c_reads or c_muts:
+                        sibling_closures.append(
+                            (curr.name, set(c_reads), set(c_muts))
+                        )
+                    if c_loads and alias_edges is not None:
+                        alias_edges.append((curr.name, set(c_loads)))
+                    if c_calls and call_edges is not None:
+                        call_edges.append((curr.name, set(c_calls)))
         elif not enclosing_cls:
             free_r = (
                 _extract_nested_scope_free_reads(curr, include_header=False)
@@ -1878,9 +1901,12 @@ def _extract_receiver_usage_in_method(
     bare_escape = False
     attr_val_ids: Set[int] = set()
     raw_body = getattr(method_node, "body", ())
-    stack: List[ast.AST] = list(
-        raw_body if isinstance(raw_body, (list, tuple)) else ()
-    )
+    if isinstance(raw_body, ast.AST):
+        stack: List[ast.AST] = [raw_body]
+    elif isinstance(raw_body, (list, tuple)):
+        stack = list(raw_body)
+    else:
+        stack = []
     while stack:
         curr = stack.pop()
         if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
@@ -1924,6 +1950,64 @@ def _extract_receiver_usage_in_method(
     return frozenset(loaded_attrs), frozenset(stored_attrs), bare_escape
 
 
+class _ClassAttrClosureEntry(NamedTuple):
+    attr_names: frozenset[str]
+    reads: frozenset[str]
+    muts: frozenset[str]
+    rec_loaded_attrs: frozenset[str]
+    rec_stored_attrs: frozenset[str]
+    rec_bare_escape: bool
+
+
+def _collect_class_attr_closure_entries(
+    cls_node: ast.ClassDef,
+    info_sibling_closures: Sequence[Tuple[Optional[str], frozenset[str], frozenset[str]]],
+) -> List[_ClassAttrClosureEntry]:
+    """Collects non-method class-attribute closure entries and lambda receiver usages."""
+    info_by_name: Dict[str, Tuple[Set[str], Set[str]]] = {}
+    for s_name, s_reads, s_muts in info_sibling_closures:
+        if s_name is not None:
+            r_set, m_set = info_by_name.setdefault(s_name, (set(), set()))
+            r_set.update(s_reads)
+            m_set.update(s_muts)
+    entries: List[_ClassAttrClosureEntry] = []
+    for attr_stmt in _iter_class_body_non_method_stmts(cls_node):
+        for _is_reb, c_targets, c_values in _iter_carrier_target_entries(attr_stmt):
+            c_calls: Set[str] = set()
+            c_reads, c_muts, c_loads = _extract_carrier_value_closure_and_load_info(
+                c_values, called_names_out=c_calls
+            )
+            for ref in c_loads | c_calls:
+                if ref in info_by_name:
+                    c_reads.update(info_by_name[ref][0])
+                    c_muts.update(info_by_name[ref][1])
+            l_load: Set[str] = set()
+            l_store: Set[str] = set()
+            l_bare = False
+            for val in c_values:
+                for sub in ast.walk(val):
+                    if isinstance(sub, ast.Lambda):
+                        l_pos = sub.args.posonlyargs + sub.args.args
+                        if l_pos:
+                            ll, ls, lb = _extract_receiver_usage_in_method(
+                                sub, l_pos[0].arg
+                            )
+                            l_load.update(ll)
+                            l_store.update(ls)
+                            l_bare = l_bare or lb
+            entries.append(
+                _ClassAttrClosureEntry(
+                    frozenset(c_targets),
+                    frozenset(c_reads),
+                    frozenset(c_muts),
+                    frozenset(l_load),
+                    frozenset(l_store),
+                    l_bare,
+                )
+            )
+    return entries
+
+
 def _collect_method_receiver_sibling_closures(
     fn_node: ast.AST,
     enc_child: ast.AST,
@@ -1963,8 +2047,10 @@ def _collect_method_receiver_sibling_closures(
             method_usages[id(m)] = _extract_receiver_usage_in_method(m, m_pos[0].arg)
         else:
             method_usages[id(m)] = (frozenset(), frozenset(), False)
+    attr_entries = _collect_class_attr_closure_entries(cls_node, info_sibling_closures)
     reachable_attrs: Set[str] = set(loaded_attrs)
     reachable_method_ids: Set[int] = set()
+    reachable_attr_idxs: Set[int] = set()
     if not bare_escape:
         changed = True
         while changed:
@@ -1984,10 +2070,30 @@ def _collect_method_receiver_sibling_closures(
                         reachable_attrs.update(m_load)
             if bare_escape:
                 break
+            for idx, entry in enumerate(attr_entries):
+                if idx in reachable_attr_idxs:
+                    continue
+                if bool(entry.attr_names & reachable_attrs) or bool(
+                    entry.rec_stored_attrs & reachable_attrs
+                ):
+                    reachable_attr_idxs.add(idx)
+                    changed = True
+                    if entry.rec_bare_escape:
+                        bare_escape = True
+                        break
+                    if not entry.rec_loaded_attrs.issubset(reachable_attrs):
+                        reachable_attrs.update(entry.rec_loaded_attrs)
+            if bare_escape:
+                break
     active_methods = (
         sib_methods
         if bare_escape
         else [m for m in sib_methods if id(m) in reachable_method_ids]
+    )
+    active_attrs = (
+        attr_entries
+        if bare_escape
+        else [attr_entries[i] for i in reachable_attr_idxs]
     )
     reads: Set[str] = set()
     muts: Set[str] = set()
@@ -1995,6 +2101,9 @@ def _collect_method_receiver_sibling_closures(
         reads.update(_extract_cached_scope_free_reads(m))
         m_muts, m_dels = _extract_closure_nonlocal_mutations_and_deletions(m)
         muts.update(m_muts | m_dels)
+    for entry in active_attrs:
+        reads.update(entry.reads)
+        muts.update(entry.muts)
     if not reads and not muts:
         return ()
     return ((rec_param, frozenset(reads), frozenset(muts)),)

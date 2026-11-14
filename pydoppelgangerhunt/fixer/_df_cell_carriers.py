@@ -2452,11 +2452,12 @@ def _extract_fn_outer_carrier_targets(
     )
 
 
-def _iter_class_body_methods(
+def _partition_class_body_shallow_stmts(
     cls_node: ast.ClassDef,
-) -> List[Union[ast.FunctionDef, ast.AsyncFunctionDef]]:
-    """Collects method definitions in cls_node.body without descending into nested scopes."""
+) -> Tuple[List[Union[ast.FunctionDef, ast.AsyncFunctionDef]], List[ast.stmt]]:
+    """Partitions cls_node.body shallow statements into (methods, non_method_stmts)."""
     methods: List[Union[ast.FunctionDef, ast.AsyncFunctionDef]] = []
+    non_methods: List[ast.stmt] = []
     stack: List[ast.AST] = list(reversed(cls_node.body))
     while stack:
         curr = stack.pop()
@@ -2465,5 +2466,19 @@ def _iter_class_body_methods(
             continue
         if isinstance(curr, _INNER_SCOPE_TYPES):
             continue
+        if isinstance(curr, ast.stmt):
+            non_methods.append(curr)
         stack.extend(reversed(list(ast.iter_child_nodes(curr))))
-    return methods
+    return methods, non_methods
+
+
+def _iter_class_body_methods(
+    cls_node: ast.ClassDef,
+) -> List[Union[ast.FunctionDef, ast.AsyncFunctionDef]]:
+    """Collects method definitions in cls_node.body without descending into nested scopes."""
+    return _partition_class_body_shallow_stmts(cls_node)[0]
+
+
+def _iter_class_body_non_method_stmts(cls_node: ast.ClassDef) -> List[ast.stmt]:
+    """Collects non-method shallow statements in cls_node.body (e.g. class-attribute assignments)."""
+    return _partition_class_body_shallow_stmts(cls_node)[1]

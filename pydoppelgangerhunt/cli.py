@@ -1279,16 +1279,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             closure_strictness = cfg_fallback_mode
             skip_pre_unit_closures = cfg_fallback_skip
     else:
-        cfg_resolved_strictness: Optional[str] = None
-        cfg_resolved_skip: bool = False
-        if cfg_strictness is not None or has_cfg_skip or cfg_strict_with is not None:
-            cfg_resolved_strictness, cfg_resolved_skip = (
-                resolve_closure_strictness_mode(
-                    closure_strictness=cfg_strictness,
-                    skip_pre_unit_closures=cfg_skip,
-                    strict_with_suppression=cfg_strict_with,
-                )
-            )
         if args.closure_strictness is not None:
             cli_strictness_str = str(args.closure_strictness)
             cli_skip = _safe_bool(args.skip_pre_unit_closures)
@@ -1305,31 +1295,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "skip_pre_unit_closures=True (--skip-pre-unit-closures)",
                     cli_strictness_str,
                 )
-        elif args.skip_pre_unit_closures:
-            if cfg_resolved_strictness in ("strict", "pedantic"):
-                if cfg_strictness is not None and str(cfg_strictness).strip().lower() in (
-                    "strict",
-                    "pedantic",
-                ):
-                    logger.warning(
-                        "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
-                        "configured closure_strictness='%s'",
-                        cfg_strictness,
-                    )
-                elif cfg_strict_with:
-                    logger.warning(
-                        "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
-                        "configured strict_with_suppression=True"
-                    )
-            closure_strictness, skip_pre_unit_closures = (
-                resolve_closure_strictness_mode(
-                    closure_strictness="lenient",
-                    skip_pre_unit_closures=True,
-                )
-            )
         else:
-            closure_strictness = cfg_resolved_strictness
-            skip_pre_unit_closures = cfg_resolved_skip
+            cfg_resolved_strictness: Optional[str] = None
+            cfg_resolved_skip: bool = False
+            if cfg_strictness is not None or has_cfg_skip or cfg_strict_with is not None:
+                cfg_resolved_strictness, cfg_resolved_skip = (
+                    resolve_closure_strictness_mode(
+                        closure_strictness=cfg_strictness,
+                        skip_pre_unit_closures=cfg_skip,
+                        strict_with_suppression=cfg_strict_with,
+                    )
+                )
+            if args.skip_pre_unit_closures:
+                if cfg_resolved_strictness in ("strict", "pedantic"):
+                    if cfg_strictness is not None and str(cfg_strictness).strip().lower() in (
+                        "strict",
+                        "pedantic",
+                    ):
+                        logger.warning(
+                            "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
+                            "configured closure_strictness='%s'",
+                            cfg_strictness,
+                        )
+                    elif cfg_strict_with:
+                        logger.warning(
+                            "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
+                            "configured strict_with_suppression=True"
+                        )
+                closure_strictness, skip_pre_unit_closures = (
+                    resolve_closure_strictness_mode(
+                        closure_strictness="lenient",
+                        skip_pre_unit_closures=True,
+                    )
+                )
+            else:
+                closure_strictness = cfg_resolved_strictness
+                skip_pre_unit_closures = cfg_resolved_skip
     non_suppressing_ctx_managers = normalize_non_suppressing_ctx_managers(
         tool_cfg.get("non_suppressing_ctx_managers"),
         getattr(args, "non_suppressing_ctx_managers", ()),
