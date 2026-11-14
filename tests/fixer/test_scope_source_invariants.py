@@ -2616,12 +2616,15 @@ def test_normalize_non_suppressing_ctx_managers_handles_cyclic_input() -> None:
 
 def test_app_version_matches_pyproject_toml() -> None:
     """Verifies APP_VERSION stays synchronized with pyproject.toml."""
-    import tomllib
+    import re
     from pydoppelgangerhunt.config import APP_VERSION
 
     repo_root = Path(__file__).resolve().parents[2]
-    pyproject_data = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
-    assert APP_VERSION == pyproject_data["project"]["version"]
+    pyproject_text = (repo_root / "pyproject.toml").read_text(encoding="utf-8")
+    project_section = pyproject_text.split("[project]", 1)[1].split("\n[", 1)[0]
+    match = re.search(r'(?m)^version\s*=\s*"([^"]+)"\s*$', project_section)
+    assert match is not None
+    assert APP_VERSION == match.group(1)
 
 
 def test_full_buffer_out_of_range_slice_returns_placeholder() -> None:
