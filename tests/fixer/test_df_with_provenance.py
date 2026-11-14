@@ -585,7 +585,7 @@ def test_suppress_provenance_set_algebra_and_with_classification_modes() -> None
     assert "m" not in bound_prov
 
     custom_safe_stmts = ast.parse(
-        "with SafeTransaction():\n" "    committed = compute_value()\n"
+        "with CustomTransaction():\n" "    committed = compute_value()\n"
     ).body
     # Default heuristic mode treats non-suppress-named managers as non-suppressing
     def_heur, cond_heur = _analyze_block_assignment(
@@ -600,7 +600,7 @@ def test_suppress_provenance_set_algebra_and_with_classification_modes() -> None
     )
     def_ped_with, cond_ped_with = _analyze_block_assignment(
         custom_safe_stmts,
-        extra_non_suppressing_ctx_managers=frozenset({"SafeTransaction"}),
+        extra_non_suppressing_ctx_managers=frozenset({"CustomTransaction"}),
         strict_with_suppression=True,
     )
     assert "committed" not in def_ped_without
@@ -4256,3 +4256,60 @@ def test_exit_protocol_scanner_resolves_imported_builtin_aliases(
     scan = scan_exit_protocol_patches(ast.parse(src))
     assert scan.has_patch is expect_has_patch
     assert ("Mgr" in scan.patched_names) is expect_patched_mgr
+
+
+@pytest.mark.parametrize(
+    ("mgr_expr", "expect_definite"),
+    [
+        ("handle_errors()", False),
+        ("ErrorHandler()", False),
+        ("safe_run()", False),
+        ("failsafe()", False),
+        ("Rescue()", False),
+        ("recover()", False),
+        ("allow_failure()", False),
+        ("ContinueOnError()", False),
+        ("Masker()", False),
+        ("Muter()", False),
+        ("CustomTransaction()", True),
+        ("masked_array()", True),
+        ("tolerance_ctx()", True),
+    ],
+)
+def test_suspicious_suppress_name_stems_and_neutral_controls(
+    mgr_expr: str, expect_definite: bool
+) -> None:
+    """Verifies suppression-idiom stems match common error-handling managers while preserving neutral controls."""
+    import ast
+
+    from pydoppelgangerhunt.fixer._df_with_provenance import _analyze_block_assignment
+
+    stmts = ast.parse(f"with {mgr_expr}:\n    committed = compute_value()\n").body
+    definite, conditional = _analyze_block_assignment(
+        stmts, strict_with_suppression=False
+    )
+    assert ("committed" in definite) is expect_definite
+    assert ("committed" in conditional) is (not expect_definite)
+
+
+@pytest.mark.parametrize(
+    ("stmt", "expect_has_patch", "expect_rebound_attrs"),
+    [
+        ("model.eval()", False, False),
+        ('df.eval("a + b")', False, False),
+        ("self.conn.connect = fn", False, False),
+        ("import builtins as b\nb.eval('1')", True, True),
+        ("import contextlib\ncontextlib.nullcontext = fn", False, True),
+    ],
+)
+def test_exit_protocol_scanner_avoids_non_builtin_eval_and_nested_attr_stores(
+    stmt: str, expect_has_patch: bool, expect_rebound_attrs: bool
+) -> None:
+    """Verifies non-builtin .eval() calls and nested attribute stores do not trigger exit-protocol invalidation."""
+    import ast
+
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    scan = scan_exit_protocol_patches(ast.parse(stmt))
+    assert scan.has_patch is expect_has_patch
+    assert bool(scan.rebound_attrs) is expect_rebound_attrs

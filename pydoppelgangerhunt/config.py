@@ -256,7 +256,10 @@ def heuristic_ctx_manager_session(*, warn: bool = False) -> Iterator[None]:
             if should_flush:
                 log_heuristic_ctx_manager_summary(force=True, warn=emit_warn)
         finally:
-            _heuristic_session_stack.reset(token)
+            try:
+                _heuristic_session_stack.reset(token)
+            except ValueError:
+                _heuristic_session_stack.set(prev_stack)
             if is_outermost:
                 with _warned_closure_lock:
                     _active_heuristic_sessions.pop(sid, None)
@@ -310,6 +313,22 @@ def _maybe_warn_skip_conflict(
         _warn_closure_event_once(f"{event_prefix}:{mode_label}", message, mode_label)
 
 
+_CANONICAL_CLOSURE_MODES: frozenset[str] = frozenset({"strict", "pedantic", "lenient"})
+_LEGACY_CLOSURE_STRICTNESS_ALIASES: Dict[str, str] = {
+    "fail_closed": "pedantic",
+    "fast": "lenient",
+    "skip": "lenient",
+}
+
+
+def is_recognized_closure_strictness(value: Any) -> bool:
+    """Returns True when value is a canonical or legacy closure_strictness mode name."""
+    if value is None:
+        return False
+    c_mode = str(value).strip().lower()
+    return c_mode in _CANONICAL_CLOSURE_MODES or c_mode in _LEGACY_CLOSURE_STRICTNESS_ALIASES
+
+
 def resolve_closure_strictness_mode(
     closure_strictness: Optional[str] = None,
     skip_pre_unit_closures: Optional[bool] = False,
@@ -348,7 +367,16 @@ def resolve_closure_strictness_mode(
     """
     if closure_strictness is not None:
         c_mode = str(closure_strictness).strip().lower()
-        if c_mode in ("strict", "pedantic", "lenient"):
+        if c_mode in _LEGACY_CLOSURE_STRICTNESS_ALIASES:
+            mapped_mode = _LEGACY_CLOSURE_STRICTNESS_ALIASES[c_mode]
+            _warn_closure_event_once(
+                f"legacy_strictness:{c_mode}",
+                "Deprecated closure_strictness '%s'; mapping to '%s' mode",
+                closure_strictness,
+                mapped_mode,
+            )
+            c_mode = mapped_mode
+        if c_mode in _CANONICAL_CLOSURE_MODES:
             is_lenient_mode = c_mode == "lenient"
             _maybe_warn_skip_conflict(
                 is_lenient_mode,

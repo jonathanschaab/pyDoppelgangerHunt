@@ -435,6 +435,11 @@ def synthesize_refactoring_suggestion(
         h in ("naked_break", "naked_continue")
         for h in (*sc1.get("control_flow_hazards", ()), *sc2.get("control_flow_hazards", ()))
     )
+    effective_pair_strictness = (
+        "lenient"
+        if pair_flags.effective_skip_pre_unit_closures
+        else ("pedantic" if pair_flags.effective_strict_with_suppression else "strict")
+    )
     pair_out_raw = resolve_clone_pair_outputs(
         u1=p1.unit,
         u2=p2.unit,
@@ -446,7 +451,7 @@ def synthesize_refactoring_suggestion(
         tree2=p2.tree,
         repo_root=repo_root,
         skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
-        closure_strictness=closure_strictness,
+        closure_strictness=effective_pair_strictness,
         non_suppressing_ctx_managers=non_suppressing_ctx_managers,
         return_details=True,
     )
@@ -474,8 +479,8 @@ def synthesize_refactoring_suggestion(
                 source_text2=p2.source_text,
                 tree1=p1.tree,
                 tree2=p2.tree,
-                closure_strictness=closure_strictness,
-                skip_pre_unit_closures=skip_pre_unit_closures,
+                closure_strictness=effective_pair_strictness,
+                skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
                 non_suppressing_ctx_managers=non_suppressing_ctx_managers,
                 outputs=None if is_expr_unit or pair_outputs is None else pair_outputs[0],
                 outputs2=None if is_expr_unit or pair_outputs is None else pair_outputs[1],

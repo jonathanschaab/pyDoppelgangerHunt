@@ -29,6 +29,7 @@ from pydoppelgangerhunt.config import (
     DEFAULT_EXCLUDES,
     heuristic_ctx_manager_session,
     init_tool_configuration,
+    is_recognized_closure_strictness,
     load_tool_config,
     normalize_non_suppressing_ctx_managers,
     normalize_path_string,
@@ -1252,7 +1253,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else None
     )
     has_cfg_closure = (
-        cfg_strictness is not None or has_cfg_skip or cfg_strict_with is not None
+        is_recognized_closure_strictness(cfg_strictness)
+        or has_cfg_skip
+        or bool(cfg_strict_with)
     )
     has_cli_closure = args.closure_strictness is not None or bool(
         args.skip_pre_unit_closures
@@ -1261,16 +1264,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     closure_strictness: Optional[str]
     skip_pre_unit_closures: Optional[bool]
     if not has_explicit_closure_cfg:
+        cfg_fallback_mode: Optional[str] = None
+        cfg_fallback_skip: Optional[bool] = None
+        if cfg_strictness is not None:
+            cfg_fallback_mode, cfg_fallback_skip = resolve_closure_strictness_mode(
+                closure_strictness=cfg_strictness,
+                skip_pre_unit_closures=cfg_skip,
+                strict_with_suppression=cfg_strict_with,
+            )
         if replace_clones:
             closure_strictness = "pedantic"
             skip_pre_unit_closures = False
         else:
-            closure_strictness = None
-            skip_pre_unit_closures = None
+            closure_strictness = cfg_fallback_mode
+            skip_pre_unit_closures = cfg_fallback_skip
     else:
         cfg_resolved_strictness: Optional[str] = None
         cfg_resolved_skip: bool = False
-        if has_cfg_closure:
+        if cfg_strictness is not None or has_cfg_skip or cfg_strict_with is not None:
             cfg_resolved_strictness, cfg_resolved_skip = (
                 resolve_closure_strictness_mode(
                     closure_strictness=cfg_strictness,
@@ -1285,6 +1296,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 resolve_closure_strictness_mode(
                     closure_strictness=cli_strictness_str,
                     skip_pre_unit_closures=False,
+                    strict_with_suppression=True if cfg_strict_with is True else None,
                 )
             )
             if cli_skip and not skip_pre_unit_closures:
@@ -1730,6 +1742,14 @@ def _emit_scan_artifacts_and_report(
         if annotations:
             print("\n".join(annotations))
 
+    def _emit_diagnostic_error_summary() -> None:
+        if diagnostic_errors > 0:
+            print(
+                f"Warning: {diagnostic_errors} internal diagnostic error(s) occurred while "
+                f"rendering clone pair suggestions, diffs, or HTML cards; see logs for details.",
+                file=sys.stderr,
+            )
+
     if args.format in ("sarif", "json"):
         report_data = (
             format_sarif_report(clones, target, threshold)
@@ -1739,7 +1759,8 @@ def _emit_scan_artifacts_and_report(
         emit_structured_report(
             report_data, "SARIF 2.1.0" if args.format == "sarif" else "JSON", args.output
         )
-        return 0 if not clones else 1
+        _emit_diagnostic_error_summary()
+        return 0 if (not clones and diagnostic_errors == 0) else 1
 
     if stats and args.stats:
         _render_dry_scorecard(stats, use_color)
@@ -1782,12 +1803,7 @@ def _emit_scan_artifacts_and_report(
         with open(out_p, "w", encoding="utf-8") as fh:
             fh.write("\n".join(report_lines) + "\n")
 
-    if diagnostic_errors > 0:
-        print(
-            f"Warning: {diagnostic_errors} internal diagnostic error(s) occurred while "
-            f"rendering clone pair suggestions, diffs, or HTML cards; see logs for details.",
-            file=sys.stderr,
-        )
+    _emit_diagnostic_error_summary()
 
     return 1
 

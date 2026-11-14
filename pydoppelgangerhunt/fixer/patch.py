@@ -8,6 +8,7 @@ from collections import defaultdict
 import difflib
 import functools
 import hashlib
+import inspect
 import logging
 import os
 import re
@@ -3212,12 +3213,13 @@ def _apply_replace_clones_default_policy(
 
 def _with_patch_session(fn: _PatchCallableT) -> _PatchCallableT:
     """Enters heuristic session (escalating to WARNING on replace_clones)."""
+    sig = inspect.signature(fn)
 
     @functools.wraps(fn)
     def _wrapped(*args: Any, **kwargs: Any) -> str:
-        warn_mode = bool(
-            kwargs.get("replace_clones", args[3] if len(args) > 3 else False)
-        )
+        bound = sig.bind_partial(*args, **kwargs)
+        bound.apply_defaults()
+        warn_mode = bool(bound.arguments.get("replace_clones", False))
         with heuristic_ctx_manager_session(warn=warn_mode):
             return fn(*args, **kwargs)
 
@@ -3982,8 +3984,8 @@ def generate_refactoring_patch(
                 source_text2=f2_text,
                 tree1=tree1,
                 tree2=tree2,
-                skip_pre_unit_closures=skip_pre_unit_closures,
-                closure_strictness=closure_strictness,
+                skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
+                closure_strictness=effective_pair_strictness,
                 non_suppressing_ctx_managers=eff_non_sup or None,
                 outputs=outputs,
                 outputs2=target_outs2,

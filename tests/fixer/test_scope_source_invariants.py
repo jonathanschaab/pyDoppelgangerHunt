@@ -1522,23 +1522,39 @@ def test_col_sliced_flag_separation_and_unrecognized_strictness_rejection(
     sc_col_sliced = inspect_single_unit_scope(unit_col_sliced)
     assert set(sc_col_sliced["inputs"]) == {"items", "offset"}
 
-    for removed_mode in ("fail_closed", "fast", "skip"):
+    for deprecated_mode, expected_resolved in (
+        ("fail_closed", ("pedantic", False)),
+        ("fast", ("lenient", True)),
+        ("skip", ("lenient", True)),
+    ):
         clear_closure_warning_cache()
         caplog.clear()
         with caplog.at_level(logging.WARNING):
             res_mode, res_skip = resolve_closure_strictness_mode(
-                closure_strictness=removed_mode
+                closure_strictness=deprecated_mode
             )
-        assert (res_mode, res_skip) == ("strict", False)
+        assert (res_mode, res_skip) == expected_resolved
         assert any(
-            "Unrecognized closure_strictness" in rec.message
+            "Deprecated closure_strictness" in rec.message
             for rec in caplog.records
         )
         with pytest.raises(ValueError, match="closure_strictness"):
             validate_unit_schema(
-                {"start": 1, "end": 2, "closure_strictness": removed_mode},
+                {"start": 1, "end": 2, "closure_strictness": deprecated_mode},
                 strict=True,
             )
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        bogus_mode, bogus_skip = resolve_closure_strictness_mode(
+            closure_strictness="bogus_mode"
+        )
+    assert (bogus_mode, bogus_skip) == ("strict", False)
+    assert any(
+        "Unrecognized closure_strictness" in rec.message
+        for rec in caplog.records
+    )
 
 
 @pytest.mark.parametrize(

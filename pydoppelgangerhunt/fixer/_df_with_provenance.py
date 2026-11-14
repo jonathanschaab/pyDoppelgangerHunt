@@ -273,6 +273,13 @@ _SUSPICIOUS_SUPPRESS_SUBSTRINGS: Tuple[str, ...] = (
     "squelch",
     "quench",
     "mask",
+    "handl",
+    "safe",
+    "failsafe",
+    "rescue",
+    "recover",
+    "allow",
+    "continue_on",
 )
 
 _IDENT_WORD_TOKEN_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[^A-Za-z]|$)|[A-Z]?[a-z]+")
@@ -287,6 +294,7 @@ _SUSPICIOUS_PREFIX_STEMS: Tuple[str, ...] = (
     "forgiv",
     "squelch",
     "quench",
+    "handl",
 )
 
 _SUSPICIOUS_COMPOUND_TOKEN_SPLITS: Mapping[str, Tuple[str, ...]] = MappingProxyType(
@@ -296,6 +304,7 @@ _SUSPICIOUS_COMPOUND_TOKEN_SPLITS: Mapping[str, Tuple[str, ...]] = MappingProxyT
         "cancelscope": ("cancel", "scope"),
         "fallback": ("fall", "back"),
         "noop": ("no", "op"),
+        "failsafe": ("fail", "safe"),
     }
 )
 
@@ -308,10 +317,15 @@ _SUSPICIOUS_EXACT_INFLECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType(
         "retry": ("retries", "retrying", "retried", "retrier"),
         "attempt": ("attempts", "attempted", "attempting"),
         "skip": ("skips", "skipped", "skipping", "skipper"),
-        "mute": ("mutes", "muted"),
+        "mute": ("mutes", "muted", "muter", "muters"),
         "hush": ("hushes", "hushed", "hushing"),
         "discard": ("discards", "discarded", "discarding"),
-        "mask": ("masks", "masking"),
+        "mask": ("masks", "masking", "masker", "maskers"),
+        "safe": ("safely", "safeguard"),
+        "failsafe": ("failsafes",),
+        "rescue": ("rescues", "rescued", "rescuing", "rescuer", "rescuers"),
+        "recover": ("recovers", "recovered", "recovering", "recovery", "recoverer"),
+        "allow": ("allows", "allowed", "allowing"),
         "fallback": ("fallbacks",),
         "noop": ("noops",),
         "subtest": ("subtests",),

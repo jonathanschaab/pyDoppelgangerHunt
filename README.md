@@ -319,12 +319,13 @@ escaping callbacks across lexical scopes.
     `pathlib.Path(...)` are never treated as non-suppressing context managers). Unproven context
     managers use a name-and-provenance heuristic:
     managers are treated as non-suppressing unless their terminal identifier/callee attribute
-    matches—at `snake_case` or `CamelCase` token boundaries—one of the 34 case-insensitive
+    matches—at `snake_case` or `CamelCase` token boundaries—one of the 41 case-insensitive
     suppression-idiom stems (`suppress`, `raises`, `ignor`, `subtest`, `exitstack`,
     `enter_context`, `enter_async_context`, `cancelscope`, `move_on_after`, `fail_after`, `catch`,
     `swallow`, `silen`, `quiet`, `toler`, `best_effort`, `absorb`, `trap`, `fallback`, `noop`,
     `no_op`, `shield`, `retry`, `attempt`, `skip`, `mute`, `muting`, `maybe`, `hush`, `discard`,
-    `forgiv`, `squelch`, `quench`, `mask`, avoiding unrelated names such as `masked_array`,
+    `forgiv`, `squelch`, `quench`, `mask`, `handl`, `safe`, `failsafe`, `rescue`, `recover`,
+    `allow`, `continue_on`, avoiding unrelated names such as `masked_array`,
     `commute`, `Mutex`, `bootstrap`, or `tolerance_ctx`) or their root
     receiver/class is proven suppressing via local/function/class `__exit__` provenance (intermediate
     attribute names on receiver chains such as `self.retry_budget.acquire()` are not scanned).

@@ -2951,20 +2951,28 @@ def test_resolve_closure_strictness_rejects_unshipped_and_unknown_modes(
     clear_closure_warning_cache()
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        assert resolve_closure_strictness_mode("fail_closed") == ("strict", False)
-        assert resolve_closure_strictness_mode("fail_closed") == ("strict", False)
-        assert resolve_closure_strictness_mode("fast") == ("strict", False)
-        assert resolve_closure_strictness_mode("skip") == ("strict", False)
+        assert resolve_closure_strictness_mode("fail_closed") == ("pedantic", False)
+        assert resolve_closure_strictness_mode("fail_closed") == ("pedantic", False)
+        assert resolve_closure_strictness_mode("fast") == ("lenient", True)
+        assert resolve_closure_strictness_mode("skip") == ("lenient", True)
         assert resolve_closure_strictness_mode("strict_with") == ("strict", False)
+
+    dep_msgs = [
+        r.message
+        for r in caplog.records
+        if "Deprecated closure_strictness" in r.message
+    ]
+    assert len(dep_msgs) == 3
+    for dep_val in ("fail_closed", "fast", "skip"):
+        assert any(f"Deprecated closure_strictness '{dep_val}'" in m for m in dep_msgs)
 
     warn_msgs = [
         r.message
         for r in caplog.records
         if "Unrecognized closure_strictness" in r.message
     ]
-    assert len(warn_msgs) == 4
-    for bad_val in ("fail_closed", "fast", "skip", "strict_with"):
-        assert any(f"Unrecognized closure_strictness '{bad_val}'" in m for m in warn_msgs)
+    assert len(warn_msgs) == 1
+    assert "Unrecognized closure_strictness 'strict_with'" in warn_msgs[0]
 
 
 def test_resolve_closure_strictness_mode_config_conflict_warning(

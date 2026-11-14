@@ -122,19 +122,24 @@ _NO_PATCH_SCAN = ExitProtocolPatchScan(frozenset(), False, frozenset())
 
 def _collect_builtin_aliases(
     tree: ast.AST,
-) -> Tuple[Set[str], Set[str], Set[str], bool]:
-    """Collects imported and assigned aliases for exec/eval, setattr/delattr, and getattr.
+) -> Tuple[Set[str], Set[str], Set[str], Set[str], bool]:
+    """Collects imported and assigned aliases for exec/eval, setattr/delattr, getattr, and builtins module.
 
-    Returns ``(exec_eval_aliases, setattr_delattr_aliases, getattr_aliases, has_wildcard)``.
+    Returns ``(exec_eval_aliases, setattr_delattr_aliases, getattr_aliases, builtins_mod_aliases, has_wildcard)``.
     """
     exec_eval_aliases: Set[str] = set(_DYNAMIC_CODE_BUILTINS)
     setattr_delattr_aliases: Set[str] = set(_ATTR_MUTATION_BUILTINS)
     getattr_aliases: Set[str] = {"getattr"}
+    builtins_mod_aliases: Set[str] = {"builtins", "__builtins__"}
     has_wildcard = False
     assign_pairs: List[Tuple[str, ast.AST]] = []
 
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module in (
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in ("builtins", "__builtins__"):
+                    builtins_mod_aliases.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module in (
             "builtins",
             "__builtins__",
         ):
@@ -163,8 +168,15 @@ def _collect_builtin_aliases(
         for tgt_name, val in assign_pairs:
             if isinstance(val, ast.Name):
                 ref_name = val.id
-            elif isinstance(val, ast.Attribute) and val.attr in (
-                _DYNAMIC_CODE_BUILTINS | _ATTR_MUTATION_BUILTINS | frozenset({"getattr"})
+                if ref_name in builtins_mod_aliases and tgt_name not in builtins_mod_aliases:
+                    builtins_mod_aliases.add(tgt_name)
+                    changed = True
+            elif (
+                isinstance(val, ast.Attribute)
+                and isinstance(val.value, ast.Name)
+                and val.value.id in builtins_mod_aliases
+                and val.attr
+                in (_DYNAMIC_CODE_BUILTINS | _ATTR_MUTATION_BUILTINS | frozenset({"getattr"}))
             ):
                 ref_name = val.attr
             else:
@@ -182,12 +194,31 @@ def _collect_builtin_aliases(
                 getattr_aliases.add(tgt_name)
                 changed = True
 
-    return exec_eval_aliases, setattr_delattr_aliases, getattr_aliases, has_wildcard
+    return (
+        exec_eval_aliases,
+        setattr_delattr_aliases,
+        getattr_aliases,
+        builtins_mod_aliases,
+        has_wildcard,
+    )
+
+
+def _is_builtins_attr(
+    node: ast.AST, builtins_mod_aliases: AbstractSet[str], allowed_attrs: AbstractSet[str]
+) -> bool:
+    """Returns True when node is ``<builtins_or_alias>.<attr>`` for an attr in allowed_attrs."""
+    return (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in builtins_mod_aliases
+        and node.attr in allowed_attrs
+    )
 
 
 def _attr_mutation_call_info(
     node: ast.Call,
     setattr_delattr_aliases: AbstractSet[str],
+    builtins_mod_aliases: AbstractSet[str],
 ) -> Optional[Tuple[ast.AST, Optional[str]]]:
     """Returns ``(target_expr, literal_attr_name_or_None)`` for a setattr/delattr call, else None.
 
@@ -198,7 +229,7 @@ def _attr_mutation_call_info(
     func = node.func
     if isinstance(func, ast.Name) and func.id in setattr_delattr_aliases:
         target_idx = 0
-    elif isinstance(func, ast.Attribute) and func.attr in _ATTR_MUTATION_BUILTINS:
+    elif _is_builtins_attr(func, builtins_mod_aliases, _ATTR_MUTATION_BUILTINS):
         target_idx = 0
     elif isinstance(func, ast.Attribute) and func.attr in _ATTR_MUTATION_DUNDERS:
         target_idx = (
@@ -234,12 +265,14 @@ _REF_TRIGGER_ATTRS: frozenset[str] = (
 
 
 def _is_getattr_of_mutation_builtin(
-    node: ast.Call, getattr_aliases: AbstractSet[str]
+    node: ast.Call,
+    getattr_aliases: AbstractSet[str],
+    builtins_mod_aliases: AbstractSet[str],
 ) -> bool:
     """Returns True when node is getattr(..., '<attr_mutation_or_exec_builtin>')."""
     func = node.func
-    is_getattr = (isinstance(func, ast.Name) and func.id in getattr_aliases) or (
-        isinstance(func, ast.Attribute) and func.attr == "getattr"
+    is_getattr = (isinstance(func, ast.Name) and func.id in getattr_aliases) or _is_builtins_attr(
+        func, builtins_mod_aliases, frozenset({"getattr"})
     )
     if not is_getattr or len(node.args) < 2:
         return False
@@ -253,9 +286,13 @@ def _is_getattr_of_mutation_builtin(
 
 def _scan_exit_protocol_patches_uncached(tree: ast.AST) -> ExitProtocolPatchScan:
     """Walks every scope of tree collecting exit-protocol and stdlib-factory patch targets."""
-    exec_eval_aliases, setattr_delattr_aliases, getattr_aliases, has_wildcard = (
-        _collect_builtin_aliases(tree)
-    )
+    (
+        exec_eval_aliases,
+        setattr_delattr_aliases,
+        getattr_aliases,
+        builtins_mod_aliases,
+        has_wildcard,
+    ) = _collect_builtin_aliases(tree)
     ref_trigger_names = exec_eval_aliases | setattr_delattr_aliases
     patched: Set[str] = set()
     rebound_attrs: Set[Tuple[Optional[str], Optional[str]]] = set()
@@ -276,27 +313,23 @@ def _scan_exit_protocol_patches_uncached(tree: ast.AST) -> ExitProtocolPatchScan
                 has_patch = True
                 if isinstance(node.value, ast.Name):
                     patched.add(node.value.id)
-            elif node.attr in _STDLIB_FACTORY_ATTRS:
-                rebound_attrs.add(
-                    (
-                        node.value.id if isinstance(node.value, ast.Name) else None,
-                        node.attr,
-                    )
-                )
+            elif node.attr in _STDLIB_FACTORY_ATTRS and isinstance(node.value, ast.Name):
+                rebound_attrs.add((node.value.id, node.attr))
         elif isinstance(node, ast.Call):
             func = node.func
             if (
                 (isinstance(func, ast.Name) and func.id in exec_eval_aliases)
-                or (
-                    isinstance(func, ast.Attribute)
-                    and func.attr in _DYNAMIC_CODE_BUILTINS
+                or _is_builtins_attr(func, builtins_mod_aliases, _DYNAMIC_CODE_BUILTINS)
+                or _is_getattr_of_mutation_builtin(
+                    node, getattr_aliases, builtins_mod_aliases
                 )
-                or _is_getattr_of_mutation_builtin(node, getattr_aliases)
             ):
                 has_patch = True
                 rebound_attrs.add((None, None))
                 continue
-            mut_info = _attr_mutation_call_info(node, setattr_delattr_aliases)
+            mut_info = _attr_mutation_call_info(
+                node, setattr_delattr_aliases, builtins_mod_aliases
+            )
             if mut_info is None:
                 continue
             target_expr, literal_attr = mut_info
@@ -323,7 +356,14 @@ def _scan_exit_protocol_patches_uncached(tree: ast.AST) -> ExitProtocolPatchScan
             ) or (
                 isinstance(node, ast.Attribute)
                 and isinstance(node.ctx, ast.Load)
-                and node.attr in _REF_TRIGGER_ATTRS
+                and (
+                    _is_builtins_attr(node, builtins_mod_aliases, _REF_TRIGGER_ATTRS)
+                    or (
+                        isinstance(node.value, ast.Name)
+                        and node.value.id in ("type", "object")
+                        and node.attr in _ATTR_MUTATION_DUNDERS
+                    )
+                )
             ):
                 has_patch = True
                 rebound_attrs.add((None, None))

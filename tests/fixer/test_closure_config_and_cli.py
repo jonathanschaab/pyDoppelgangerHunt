@@ -1475,7 +1475,7 @@ def test_docs_sync_with_suspicious_suppress_substrings_and_local_accumulator_str
     repo_root = Path(__file__).resolve().parents[2]
     readme_text = (repo_root / "README.md").read_text(encoding="utf-8")
     changelog_text = (repo_root / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert len(_SUSPICIOUS_SUPPRESS_SUBSTRINGS) == 34
+    assert len(_SUSPICIOUS_SUPPRESS_SUBSTRINGS) == 41
     for sub in _SUSPICIOUS_SUPPRESS_SUBSTRINGS:
         assert f"`{sub}`" in readme_text, sub
     for mod_name, attrs in _STDLIB_NON_SUPPRESSING_MODULES.items():
@@ -2843,3 +2843,172 @@ def test_cli_surfaces_internal_diagnostic_error_count_to_stderr(
     assert exit_code == 1
     captured = capsys.readouterr()
     assert "2 internal diagnostic error(s) occurred" in captured.err
+
+
+def test_cli_replace_clones_config_opt_out_and_strict_conflict_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies invalid/false config keys do not opt out of --replace-clones pedantic default and CLI strict warns on strict_with_suppression=true."""
+    import logging
+    from pydoppelgangerhunt.cli import main
+    from pydoppelgangerhunt.config import clear_closure_warning_cache
+
+    target = tmp_path / "dup_ctx.py"
+    target.write_text(
+        "def alpha():\n"
+        "    with CustomCtx():\n"
+        "        val = 1\n"
+        "    return lambda: val\n\n"
+        "def beta():\n"
+        "    with CustomCtx():\n"
+        "        val = 1\n"
+        "    return lambda: val\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.chdir(tmp_path)
+
+    for toml_body in (
+        '[tool.pydoppelgangerhunt]\nclosure_strictness = "bogus"\n',
+        "[tool.pydoppelgangerhunt]\nstrict_with_suppression = false\n",
+    ):
+        (tmp_path / "pyproject.toml").write_text(toml_body, encoding="utf-8")
+        clear_closure_warning_cache()
+        caplog.clear()
+        recorded_strictness: list[str] = []
+
+        def _capture_patch(*_args: Any, **kwargs: Any) -> str:
+            recorded_strictness.append(str(kwargs.get("closure_strictness")))
+            return ""
+
+        monkeypatch.setattr(
+            "pydoppelgangerhunt.cli.generate_refactoring_patch", _capture_patch
+        )
+        with caplog.at_level(logging.WARNING):
+            exit_code = main(
+                [
+                    str(target),
+                    "--min-lines",
+                    "3",
+                    "--replace-clones",
+                    "--patch",
+                    str(tmp_path / "out.patch"),
+                ]
+            )
+        assert exit_code == 1
+        assert recorded_strictness == ["pedantic"]
+
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.pydoppelgangerhunt]\nstrict_with_suppression = true\n",
+        encoding="utf-8",
+    )
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        exit_code = main(
+            [str(target), "--min-lines", "3", "--closure-strictness", "strict"]
+        )
+    assert exit_code in (0, 1)
+    assert any(
+        "strict_with_suppression" in rec.message and "conflict" in rec.message.lower()
+        for rec in caplog.records
+    )
+
+
+def test_generate_refactoring_patch_replace_clones_no_discarded_scope_warning(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies replace_clones=True passes effective_pair_strictness consistently without discarding precomputed scopes."""
+    import logging
+    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch
+
+    src = (
+        "def alpha(x):\n"
+        "    a = x + 1\n"
+        "    b = a * 2\n"
+        "    return b + 3\n\n"
+        "def beta(x):\n"
+        "    a = x + 1\n"
+        "    b = a * 2\n"
+        "    return b + 3\n"
+    )
+    f_path = tmp_path / "dup.py"
+    f_path.write_text(src, encoding="utf-8")
+    unit_a = {"file": str(f_path), "start": 2, "end": 4, "kind": "block"}
+    unit_b = {"file": str(f_path), "start": 7, "end": 9, "kind": "block"}
+    with caplog.at_level(logging.WARNING):
+        patch_text = generate_refactoring_patch(
+            [(1.0, unit_a, unit_b)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+        )
+    assert patch_text != ""
+    assert not any(
+        "Discarding caller-supplied precomputed scope" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_cli_json_format_surfaces_internal_diagnostic_error_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verifies --format json still surfaces internal diagnostic errors on stderr and exits 1."""
+    from pydoppelgangerhunt.cli import main
+
+    target = tmp_path / "dup.py"
+    target.write_text(
+        "def alpha(x):\n    a = x + 1\n    b = a * 2\n    return b + 3\n\n"
+        "def beta(x):\n    a = x + 1\n    b = a * 2\n    return b + 3\n",
+        encoding="utf-8",
+    )
+
+    def _boom(*_args: Any, **_kwargs: Any) -> str:
+        raise RuntimeError("synthetic html boom")
+
+    monkeypatch.setattr("pydoppelgangerhunt.reporters.synthesize_refactoring_suggestion", _boom)
+    html_out = tmp_path / "report.html"
+    exit_code = main(
+        [str(target), "--min-lines", "3", "--format", "json", "--html", str(html_out)]
+    )
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "1 internal diagnostic error(s) occurred" in captured.err
+
+
+def test_scope_cache_production_fingerprint_without_debug_mode() -> None:
+    """Verifies production 512-node BFS scope-cache fingerprinting works with debug AST immutability disabled."""
+    from pydoppelgangerhunt.fixer import clear_dataflow_cache, inspect_single_unit_scope
+    from pydoppelgangerhunt.fixer._df_cache import _debug_ast_immutability
+
+    prev_debug = _debug_ast_immutability[0]
+    _debug_ast_immutability[0] = False
+    clear_dataflow_cache()
+    try:
+        src1 = "def f(x):\n    y = x + 1\n    return y\n"
+        src2 = "def f(x):\n    z = x + 2\n    return z\n"
+        unit1 = {
+            "start": 2,
+            "end": 3,
+            "kind": "block",
+            "source_lines": src1.splitlines(keepends=True),
+        }
+        unit2 = {
+            "start": 2,
+            "end": 3,
+            "kind": "block",
+            "source_lines": src2.splitlines(keepends=True),
+        }
+        sc1_first = inspect_single_unit_scope(unit1)
+        sc1_second = inspect_single_unit_scope(unit1)
+        sc2 = inspect_single_unit_scope(unit2)
+        assert sc1_first == sc1_second
+        assert set(sc1_first["outputs"]) == {"y"}
+        assert set(sc2["outputs"]) == {"z"}
+    finally:
+        clear_dataflow_cache()
+        _debug_ast_immutability[0] = prev_debug
