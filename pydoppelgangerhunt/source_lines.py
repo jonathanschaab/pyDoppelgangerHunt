@@ -2,16 +2,33 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence as _AbcSequence
 import enum
 import json
 import logging
 import math
 from pathlib import Path
 import re
-from typing import Any, Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence, Tuple, Union, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    NoReturn,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    overload,
+)
 
 from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
 from pydoppelgangerhunt.config import normalize_path_string
+
+if TYPE_CHECKING:
+    from typing import TypeGuard
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +41,7 @@ __all__ = [
     "extract_notebook_code_cell_text",
     "extract_unit_source_code",
     "extract_unit_source_lines_with_state",
+    "is_non_string_sequence",
     "is_sliced_unit_source_lines",
     "normalize_unit_coordinates",
     "parse_unit_coord",
@@ -32,6 +50,13 @@ __all__ = [
     "split_source_lines",
     "with_unit_source_text",
 ]
+
+
+def is_non_string_sequence(val: Any) -> TypeGuard[Sequence[Any]]:
+    """Returns True if val is a Sequence other than str, bytes, or bytearray."""
+    return isinstance(val, _AbcSequence) and not isinstance(
+        val, (str, bytes, bytearray)
+    )
 
 
 class SourceLinesOrigin(enum.Enum):
@@ -231,7 +256,7 @@ def is_sliced_unit_source_lines(
     if is_sliced is not None:
         return bool(is_sliced)
     lines = source_lines if source_lines is not None else unit.get("source_lines")
-    if not lines or not isinstance(lines, (list, tuple)):
+    if not lines or not is_non_string_sequence(lines):
         return False
     try:
         raw_s = parse_unit_coord(unit, "start", default=None)
@@ -536,7 +561,7 @@ def extract_unit_source_lines_with_state(
         source_lines = split_source_lines(str(raw_src_text))
         from_source_text = True
 
-    if source_lines is not None and isinstance(source_lines, (list, tuple)):
+    if source_lines is not None and is_non_string_sequence(source_lines):
         if not source_lines:
             return placeholder, SourceLinesOrigin.PLACEHOLDER
         if not from_source_text and is_sliced_unit_source_lines(unit, source_lines):
@@ -546,7 +571,7 @@ def extract_unit_source_lines_with_state(
             )
         start = max(1, s_d)
         end = min(len(source_lines), e_d)
-        sliced_buf = source_lines[start - 1 : end]
+        sliced_buf = [source_lines[idx] for idx in range(start - 1, end)] if start - 1 < end else []
         if not sliced_buf:
             return placeholder, SourceLinesOrigin.PLACEHOLDER
         return (
@@ -590,7 +615,13 @@ def extract_unit_source_lines_with_state(
                 all_lines = fh.readlines()
         start = max(1, s_d)
         end = min(len(all_lines), e_d)
-        return all_lines[start - 1 : end], SourceLinesOrigin.DISK
+        sliced_disk = all_lines[start - 1 : end]
+        if not sliced_disk:
+            return ([] if is_cell_anchor else placeholder), SourceLinesOrigin.PLACEHOLDER
+        return (
+            [_ensure_trailing_lf(str(ln)) for ln in sliced_disk],
+            SourceLinesOrigin.DISK,
+        )
     except OSError:
         return (
             [f"# Unable to read {str(unit.get('file') or '')}\n"],

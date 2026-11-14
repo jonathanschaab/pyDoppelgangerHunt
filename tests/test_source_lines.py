@@ -2388,3 +2388,84 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     assert "self" in super_scope["inputs"]
     assert super_scope["has_instance_binding"] is True
     assert super_scope["binding_kind"] == "instance"
+
+
+def test_sequence_source_lines_without_slice_support_and_string_controls(
+    tmp_path: Path,
+) -> None:
+    """Verifies arbitrary Sequence[str] objects work without slice support and strings are rejected."""
+    from collections import UserList
+    from collections.abc import Sequence
+
+    from pydoppelgangerhunt.fixer.source import is_subroutine_unit, validate_unit_schema
+    from pydoppelgangerhunt.source_lines import (
+        SourceLinesOrigin,
+        extract_unit_source_lines_with_state,
+        is_non_string_sequence,
+    )
+
+    class _IndexOnlyLines(Sequence[str]):
+        def __init__(self, items: list[str]) -> None:
+            self._items = items
+
+        def __len__(self) -> int:
+            return len(self._items)
+
+        def __getitem__(self, index: int | slice) -> Any:
+            if isinstance(index, slice):
+                raise TypeError("slicing is intentionally unsupported")
+            return self._items[index]
+
+    sample_lines = ["def add(a, b):\n", "    return a + b\n"]
+    seq_variants: tuple[Sequence[str], ...] = (
+        tuple(sample_lines),
+        UserList(sample_lines),
+        _IndexOnlyLines(sample_lines),
+    )
+    for seq in seq_variants:
+        assert is_non_string_sequence(seq) is True
+        unit: dict[str, Any] = {
+            "file": str(tmp_path / "mod.py"),
+            "start": 2,
+            "end": 2,
+            "source_lines": seq,
+        }
+        validate_unit_schema(unit)
+        assert is_subroutine_unit(unit) is True
+        lines, origin = extract_unit_source_lines_with_state(unit)
+        assert origin == SourceLinesOrigin.FULL_BUFFER
+        assert lines == [sample_lines[1]]
+
+    for bad_seq in ("def f(): pass\n", b"def f(): pass\n", bytearray(b"abc")):
+        assert is_non_string_sequence(bad_seq) is False
+        with pytest.raises(ValueError, match="ordered sequence of str"):
+            validate_unit_schema(
+                {"file": "a.py", "start": 1, "end": 1, "source_lines": bad_seq}
+            )
+
+
+def test_extract_unit_source_lines_disk_out_of_range_and_lf_normalization(
+    tmp_path: Path,
+) -> None:
+    """Verifies disk out-of-range slices return PLACEHOLDER origin and in-range slices normalize LF."""
+    from pydoppelgangerhunt.source_lines import (
+        SourceLinesOrigin,
+        extract_unit_source_lines_with_state,
+    )
+
+    target = tmp_path / "no_trailing_nl.py"
+    target.write_text("a = 1\nb = 2", encoding="utf-8")
+
+    valid_lines, valid_origin = extract_unit_source_lines_with_state(
+        {"file": str(target), "start": 1, "end": 2, "kind": "block"},
+        repo_root=str(tmp_path),
+    )
+    assert valid_origin == SourceLinesOrigin.DISK
+    assert valid_lines == ["a = 1\n", "b = 2\n"]
+
+    oob_lines, oob_origin = extract_unit_source_lines_with_state(
+        {"file": str(target), "start": 10, "end": 12, "kind": "block"},
+        repo_root=str(tmp_path),
+    )
+    assert oob_origin == SourceLinesOrigin.PLACEHOLDER
+    assert oob_lines == ["# Source for unit lines 10-12\n"]

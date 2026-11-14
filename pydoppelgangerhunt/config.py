@@ -222,24 +222,12 @@ def heuristic_ctx_manager_session(*, warn: bool = False) -> Iterator[None]:
     """
     prev_stack = _heuristic_session_stack.get()
     with _warned_closure_lock:
-        existing_sid = prev_stack[-1] if prev_stack else None
-        existing_bucket = (
-            _active_heuristic_sessions.get(existing_sid)
-            if existing_sid is not None
-            else None
+        sid = next(_next_heuristic_session_id)
+        bucket = _HeuristicSessionBucket(defer_depth=1, warn_on_summary=warn)
+        _active_heuristic_sessions[sid] = bucket
+        is_outermost = not prev_stack or (
+            _active_heuristic_sessions.get(prev_stack[-1]) is None
         )
-        if existing_bucket is None or existing_sid is None:
-            is_outermost = True
-            sid = next(_next_heuristic_session_id)
-            bucket = _HeuristicSessionBucket(defer_depth=1, warn_on_summary=warn)
-            _active_heuristic_sessions[sid] = bucket
-        else:
-            is_outermost = False
-            sid = existing_sid
-            bucket = existing_bucket
-            bucket.defer_depth += 1
-            if warn:
-                bucket.warn_on_summary = True
     token = _heuristic_session_stack.set((*prev_stack, sid))
     try:
         yield
@@ -251,6 +239,17 @@ def heuristic_ctx_manager_session(*, warn: bool = False) -> Iterator[None]:
             if is_outermost:
                 should_flush = True
                 emit_warn = bucket.warn_on_summary
+            else:
+                _active_heuristic_sessions.pop(sid, None)
+                parent_bucket = _active_heuristic_sessions.get(prev_stack[-1])
+                if parent_bucket is not None and (
+                    bucket.names or bucket.overflow_count > 0
+                ):
+                    for mgr_name in bucket.names:
+                        parent_bucket.add(mgr_name)
+                    parent_bucket.overflow_count += bucket.overflow_count
+                    if bucket.warn_on_summary:
+                        parent_bucket.warn_on_summary = True
         try:
             if should_flush:
                 log_heuristic_ctx_manager_summary(force=True, warn=emit_warn)
@@ -481,7 +480,7 @@ def resolve_unit_closure_flags(
         return UnitClosureFlags(eff_skip, resolved_mode == "pedantic")
 
     has_explicit_unit_mode = (
-        unit.get("closure_strictness") is not None
+        is_recognized_closure_strictness(unit.get("closure_strictness"))
         or unit.get("strict_with_suppression") is True
         or unit.get("skip_pre_unit_closures") is False
     )
@@ -520,6 +519,14 @@ def resolve_unit_closure_flags(
             "to override explicitly",
             unit_mode,
         )
+        if unit_strict_with and strict_with_suppression is False:
+            _warn_closure_event_once(
+                f"conflict_unit_strictness_vs_caller_strict_with:{unit_mode}",
+                "Conflicting configuration: unit closure strictness '%s' cannot be "
+                "weakened by strict_with_suppression=False; pass closure_strictness='strict' "
+                "to override explicitly",
+                unit_mode,
+            )
         eff_skip = bool(unit_skip and caller_skip)
         eff_strict_with = bool(
             not eff_skip and (unit_strict_with or caller_strict_with)

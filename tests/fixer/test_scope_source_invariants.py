@@ -2754,3 +2754,242 @@ def test_stale_source_code_classified_as_safety_hazard_on_expression_units() -> 
     sug = synthesize_refactoring_suggestion(u_stale, dict(u_stale, start=2, end=2))
     assert "rejected as unsafe" in sug
     assert "stale source code" in sug
+
+
+def test_enclosing_lambda_and_comprehension_nonlocal_and_outer_global_hazards(
+    tmp_path: Path,
+) -> None:
+    """Verifies shared enclosing_chain helper extracts outer nonlocal/global hazards through enclosing lambda."""
+    from pydoppelgangerhunt.fixer._df_closures import (
+        _extract_chain_nonlocals_and_outer_globals,
+    )
+    from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope
+
+    # Unit sits on a comprehension inside outer()'s lambda while outer() binds nonlocal & outer_global
+    src = (
+        "EXTERN_FLAG = 0\n"
+        "def make_ops():\n"
+        "    shared = 0\n"
+        "    def outer(cond):\n"
+        "        nonlocal shared\n"
+        "        global EXTERN_FLAG\n"
+        "        if cond:\n"
+        "            res = (lambda items: [shared + EXTERN_FLAG + x for x in items])([1])\n"
+        "        return res\n"
+        "    return outer\n"
+    )
+    tree = ast.parse(src)
+    make_ops_fn = tree.body[1]
+    assert isinstance(make_ops_fn, ast.FunctionDef)
+    outer_fn = make_ops_fn.body[1]
+    assert isinstance(outer_fn, ast.FunctionDef)
+    if_stmt = outer_fn.body[2]
+    assert isinstance(if_stmt, ast.If)
+    assign_stmt = if_stmt.body[0]
+    assert isinstance(assign_stmt, ast.Assign)
+    call_expr = assign_stmt.value
+    assert isinstance(call_expr, ast.Call)
+    lam_node = call_expr.func
+    assert isinstance(lam_node, ast.Lambda)
+
+    chain: list[tuple[int, int, ast.AST]] = [
+        (2, 10, make_ops_fn),
+        (4, 9, outer_fn),
+        (8, 8, lam_node),
+    ]
+    inner_stmt_fn, enc_nl, enc_og = _extract_chain_nonlocals_and_outer_globals(
+        chain, 8, 8
+    )
+    assert inner_stmt_fn is outer_fn
+    assert "shared" in enc_nl
+    assert "EXTERN_FLAG" in enc_og
+
+    mod_file = tmp_path / "enclosing_lambda.py"
+    mod_file.write_text(src, encoding="utf-8")
+    line8 = src.splitlines()[7]
+    comp_text = "[shared + EXTERN_FLAG + x for x in items]"
+    comp_start_col = line8.index(comp_text)
+    comp_end_col = comp_start_col + len(comp_text)
+    comp_unit: dict[str, Any] = {
+        "file": str(mod_file),
+        "start": 8,
+        "end": 8,
+        "start_col": comp_start_col,
+        "end_col": comp_end_col,
+        "kind": "comprehension",
+        "source_code": comp_text,
+    }
+    sc = inspect_single_unit_scope(comp_unit, repo_root=str(tmp_path), tree=tree)
+    assert "shared" in sc["inputs"]
+    assert "EXTERN_FLAG" in sc["inputs"]
+
+    # Negative control: outer function without nonlocal/global reports empty sets
+    clean_src = (
+        "def make_clean():\n"
+        "    def outer():\n"
+        "        return lambda items: [x + 1 for x in items]\n"
+        "    return outer\n"
+    )
+    clean_tree = ast.parse(clean_src)
+    clean_outer = clean_tree.body[0].body[0]  # type: ignore[attr-defined]
+    clean_lam = clean_outer.body[0].value
+    clean_stmt_fn, clean_nl, clean_og = _extract_chain_nonlocals_and_outer_globals(
+        [(1, 4, clean_tree.body[0]), (2, 3, clean_outer), (3, 3, clean_lam)],
+        3,
+        3,
+    )
+    assert clean_stmt_fn is clean_outer
+    assert clean_nl == set()
+    assert clean_og == set()
+
+
+def test_validate_unit_schema_and_oob_column_edge_cases() -> None:
+    """Verifies omitted-end single-line column inversion check and _has_out_of_bounds_unit_cols edge cases."""
+    from pydoppelgangerhunt.fixer.scope import _has_out_of_bounds_unit_cols
+    from pydoppelgangerhunt.fixer.source import validate_unit_schema
+
+    with pytest.raises(ValueError, match="Inverted column coordinates"):
+        validate_unit_schema({"file": "a.py", "start": 2, "start_col": 10, "end_col": 4})
+
+    # Control: valid single-line columns with omitted end
+    validate_unit_schema({"file": "a.py", "start": 2, "start_col": 2, "end_col": 8})
+
+    # 1. Multi-line starting on empty line with start_col=0 is in bounds; start_col=1 is OOB
+    assert (
+        _has_out_of_bounds_unit_cols(
+            {"file": "a.py", "start": 1, "end": 2, "start_col": 0},
+            ["\n", "x = 1\n"],
+            is_pre_sliced=False,
+            is_placeholder_origin=False,
+            explicit_col_sliced=False,
+        )
+        is False
+    )
+    assert (
+        _has_out_of_bounds_unit_cols(
+            {"file": "a.py", "start": 1, "end": 2, "start_col": 1},
+            ["\n", "x = 1\n"],
+            is_pre_sliced=False,
+            is_placeholder_origin=False,
+            explicit_col_sliced=False,
+        )
+        is True
+    )
+    # 2. Single-line zero-width end_col=0 with omitted start_col is OOB
+    assert (
+        _has_out_of_bounds_unit_cols(
+            {"file": "a.py", "start": 1, "end": 1, "end_col": 0},
+            ["x = 1\n"],
+            is_pre_sliced=False,
+            is_placeholder_origin=False,
+            explicit_col_sliced=False,
+        )
+        is True
+    )
+    # 3. explicit_col_sliced=True still flags inverted single-line columns
+    assert (
+        _has_out_of_bounds_unit_cols(
+            {"file": "a.py", "start": 1, "end": 1, "start_col": 5, "end_col": 2},
+            ["abc\n"],
+            is_pre_sliced=True,
+            is_placeholder_origin=False,
+            explicit_col_sliced=True,
+        )
+        is True
+    )
+
+
+def test_synthesize_refactoring_suggestion_and_align_pair_handles_none_kind(
+    tmp_path: Path,
+) -> None:
+    """Verifies None/empty unit kinds adopt partner expression kind during suggestion synthesis."""
+    from pydoppelgangerhunt.fixer.synthesis import _align_pair_expr_kinds
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    p1: dict[str, Any] = {"kind": None, "file": "a.py", "start": 1, "end": 1}
+    p2: dict[str, Any] = {"kind": "comprehension", "file": "b.py", "start": 1, "end": 1}
+    assert _align_pair_expr_kinds(p1, p2) is True
+    assert p1["kind"] == "comprehension"
+    assert p2["kind"] == "comprehension"
+
+    b1: dict[str, Any] = {"kind": "block", "file": "a.py", "start": 1, "end": 1}
+    b2: dict[str, Any] = {"kind": "comprehension", "file": "b.py", "start": 1, "end": 1}
+    assert _align_pair_expr_kinds(b1, b2) is False
+    assert b1["kind"] == "block"
+    assert b2["kind"] == "comprehension"
+
+    src_a = "def fa(items):\n    vals = [x + 1 for x in items]\n    return vals\n"
+    src_b = "def fb(items):\n    out = [y + 1 for y in items]\n    return out\n"
+    fa = tmp_path / "a.py"
+    fb = tmp_path / "b.py"
+    fa.write_text(src_a, encoding="utf-8")
+    fb.write_text(src_b, encoding="utf-8")
+    line_a2 = src_a.splitlines()[1]
+    expr_a = "[x + 1 for x in items]"
+    col_a = line_a2.index(expr_a)
+    line_b2 = src_b.splitlines()[1]
+    expr_b = "[y + 1 for y in items]"
+    col_b = line_b2.index(expr_b)
+    u1: dict[str, Any] = {
+        "file": str(fa),
+        "start": 2,
+        "end": 2,
+        "start_col": col_a,
+        "end_col": col_a + len(expr_a),
+        "kind": None,
+        "source_code": expr_a,
+    }
+    u2: dict[str, Any] = {
+        "file": str(fb),
+        "start": 2,
+        "end": 2,
+        "start_col": col_b,
+        "end_col": col_b + len(expr_b),
+        "kind": "comprehension",
+        "source_code": expr_b,
+    }
+    sug = synthesize_refactoring_suggestion(u1, u2, repo_root=str(tmp_path))
+    assert "rejected as unsafe" not in sug
+    assert "def _shared" in sug
+
+
+def test_resolve_cached_unit_source_and_tree_populates_cache_for_presliced_unit(
+    tmp_path: Path,
+) -> None:
+    """Verifies pre-sliced unit source_lines loads and caches disk module instead of returning (None, None)."""
+    from collections import OrderedDict
+
+    from pydoppelgangerhunt.reporters import resolve_cached_unit_source_and_tree
+
+    mod_file = tmp_path / "sliced.py"
+    full_src = "def alpha(x):\n    y = x + 1\n    return y\n"
+    mod_file.write_text(full_src, encoding="utf-8")
+
+    # Start=2, end=3 with only the 2 sliced lines (NOT full 3-line buffer)
+    sliced_unit: dict[str, Any] = {
+        "file": str(mod_file),
+        "start": 2,
+        "end": 3,
+        "source_lines": ["    y = x + 1\n", "    return y\n"],
+    }
+    cache: OrderedDict[str, tuple[str | None, ast.AST | None]] = OrderedDict()
+    text, tree = resolve_cached_unit_source_and_tree(
+        sliced_unit, repo_root=str(tmp_path), file_cache=cache
+    )
+    assert text == full_src
+    assert tree is not None
+    assert str(mod_file.resolve()) in cache
+
+    # Control: full-file buffer in source_lines keeps in-memory bypass without populating disk cache
+    full_buf_unit: dict[str, Any] = {
+        "file": str(mod_file),
+        "start": 2,
+        "end": 3,
+        "source_lines": full_src.splitlines(keepends=True),
+    }
+    empty_cache: OrderedDict[str, tuple[str | None, ast.AST | None]] = OrderedDict()
+    t2, tr2 = resolve_cached_unit_source_and_tree(
+        full_buf_unit, repo_root=str(tmp_path), file_cache=empty_cache
+    )
+    assert (t2, tr2) == (None, None)
+    assert not empty_cache

@@ -138,8 +138,8 @@ from pydoppelgangerhunt.fixer._df_cell_traversal import (
 from pydoppelgangerhunt.fixer._df_closures import (
     _COMPREHENSION_TYPES,
     _collect_scope_closures_uncached,
+    _extract_chain_nonlocals_and_outer_globals,
     _extract_comprehension_walrus_names,
-    _extract_scope_nonlocals_and_outer_globals,
     _extract_single_node_local_names,
     _has_escaped_intra_unit_global_declarations,
     _has_wildcard_star_import,
@@ -1522,13 +1522,14 @@ def _evaluate_severed_closure_cell_hazard(
             _append_hazard_reason(reasons, "cell_severing")
             return _ClosureHazardResult(True, tuple(reasons))
 
-        innermost_stmt_fn: ast.AST = next(
-            (
-                fn_n
-                for _, _, fn_n in reversed(enclosing_chain)
-                if isinstance(fn_n, (ast.FunctionDef, ast.AsyncFunctionDef))
-            ),
-            enclosing_chain[-1][2],
+        innermost_stmt_fn, enc_nonlocals, enc_outer_globals = (
+            _extract_chain_nonlocals_and_outer_globals(
+                enclosing_chain,
+                ctx.u_start,
+                ctx.u_end,
+                u_start_col=u_start_col,
+                u_end_col=u_end_col,
+            )
         )
         if _has_escaped_intra_unit_global_declarations(
             innermost_stmt_fn,
@@ -1540,36 +1541,6 @@ def _evaluate_severed_closure_cell_hazard(
         ):
             _append_hazard_reason(reasons, "global_escape")
             return _ClosureHazardResult(True, tuple(reasons))
-        enc_nonlocals, enc_outer_globals = _extract_scope_nonlocals_and_outer_globals(
-            innermost_stmt_fn,
-            ctx.u_start,
-            ctx.u_end,
-            u_start_col=u_start_col,
-            u_end_col=u_end_col,
-        )
-        fn_scopes_in_chain = [
-            fn_n
-            for _, _, fn_n in enclosing_chain
-            if isinstance(fn_n, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ]
-        if len(fn_scopes_in_chain) > 1:
-            for idx_fn, outer_fn in enumerate(fn_scopes_in_chain[:-1]):
-                _, outer_og = _extract_scope_nonlocals_and_outer_globals(
-                    outer_fn,
-                    ctx.u_start,
-                    ctx.u_end,
-                    u_start_col=u_start_col,
-                    u_end_col=u_end_col,
-                )
-                if outer_og:
-                    inner_locals: Set[str] = set()
-                    for inner_fn in fn_scopes_in_chain[idx_fn + 1 :]:
-                        inner_locals.update(
-                            _extract_single_node_local_names(
-                                inner_fn, include_globals=False
-                            )
-                        )
-                    enc_outer_globals.update((outer_og - inner_locals) - enc_nonlocals)
         enc_escaping = enc_nonlocals | enc_outer_globals
         if unit_stores_affect_enclosing and bool(
             escaping_unit_mutations

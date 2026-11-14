@@ -1763,7 +1763,11 @@ def test_seed_scope_suppress_aliases_clears_function_locals_at_entry() -> None:
 
     prov_mid = _seed_scope_suppress_aliases(fn_node, mod_tree, u_start=3)
     assert "nullcontext" not in prov_mid.non_suppressors
-    assert "late_sup" in prov_mid.suppressors
+    assert "late_sup" not in prov_mid.suppressors
+
+    prov_after_sup = _seed_scope_suppress_aliases(fn_node, mod_tree, u_start=7)
+    assert "nullcontext" not in prov_after_sup.non_suppressors
+    assert "late_sup" in prov_after_sup.suppressors
 
     bound, _ = _extract_block_definite_bindings_and_term(
         fn_node.body[:2],
@@ -4413,3 +4417,175 @@ def test_exit_protocol_dynamic_lookup_and_self_setattr_withdraws_provenance_proo
     assert safety["pedantic"] is expected_pedantic_safe
     if expected_strict_safe is not None:
         assert safety["strict"] is expected_strict_safe
+
+
+@pytest.mark.parametrize(
+    ("src", "expect_has_patch"),
+    [
+        pytest.param(
+            "import builtins\nbuiltins.vars(builtins)['setattr'](M, '__exit__', f)\n",
+            True,
+            id="builtins_dot_vars",
+        ),
+        pytest.param(
+            "import builtins\nget_vars = vars\nget_vars(builtins)['setattr'](M, '__exit__', f)\n",
+            True,
+            id="aliased_vars",
+        ),
+        pytest.param(
+            "import importlib\nimportlib.import_module(name='builtins').setattr(M, '__exit__', f)\n",
+            True,
+            id="importlib_kwarg_name",
+        ),
+        pytest.param(
+            "b = globals()['__builtins__']\nb['setattr'](M, '__exit__', f)\n",
+            True,
+            id="globals_subscript_builtins",
+        ),
+        pytest.param(
+            "b = globals().get('__builtins__')\nb.setattr(M, '__exit__', f)\n",
+            True,
+            id="globals_get_builtins",
+        ),
+        pytest.param(
+            "__import__(name='builtins').setattr(M, '__exit__', f)\n",
+            True,
+            id="dunder_import_kwarg_name",
+        ),
+        pytest.param(
+            "import builtins\ngetattr(builtins, 'vars')(builtins)['setattr'](M, '__exit__', f)\n",
+            True,
+            id="getattr_builtins_vars",
+        ),
+        pytest.param(
+            "import importlib\nimportlib.import_module(name='math').sin(1)\n",
+            False,
+            id="negative_importlib_kwarg_math",
+        ),
+        pytest.param(
+            "g = globals()\ng['helper'](1)\n",
+            False,
+            id="negative_globals_regular_key",
+        ),
+        pytest.param(
+            "v = vars(obj)\nv['x'] = 1\n",
+            False,
+            id="negative_vars_regular_obj",
+        ),
+    ],
+)
+def test_exit_protocol_scanner_extended_vars_importlib_and_globals(
+    src: str, expect_has_patch: bool
+) -> None:
+    """Verifies extended vars/importlib/globals builtins lookups are recognized uniformly."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    scan = scan_exit_protocol_patches(ast.parse(src))
+    assert scan.has_patch is expect_has_patch
+
+
+@pytest.mark.parametrize(
+    ("patch_stmt", "expected_pedantic_safe"),
+    [
+        pytest.param("    pass", True, id="clean_control"),
+        pytest.param(
+            "    builtins.vars(builtins)['setattr'](Mgr, '__exit__', lambda *a: True)",
+            False,
+            id="builtins_vars_setattr",
+        ),
+        pytest.param(
+            "    get_vars = vars\n    get_vars(builtins)['setattr'](Mgr, '__exit__', lambda *a: True)",
+            False,
+            id="vars_alias_setattr",
+        ),
+        pytest.param(
+            "    importlib.import_module(name='builtins').setattr(Mgr, '__exit__', lambda *a: True)",
+            False,
+            id="import_module_kwarg_builtins_setattr",
+        ),
+        pytest.param(
+            "    globals()['__builtins__']['setattr'](Mgr, '__exit__', lambda *a: True)",
+            False,
+            id="globals_builtins_setattr",
+        ),
+    ],
+)
+def test_exit_protocol_extended_builtins_lookup_withdraws_provenance_proof(
+    patch_stmt: str, expected_pedantic_safe: bool
+) -> None:
+    """Verifies extended dynamic builtins lookups withdraw class non-suppression proofs."""
+    src = (
+        "import builtins\n"
+        "import importlib\n"
+        "class Mgr:\n"
+        "    def __enter__(self): return self\n"
+        "    def __exit__(self, *a): return False\n"
+        "def run(compute):\n"
+        "    cm = Mgr()\n"
+        f"{patch_stmt}\n"
+        "    with cm:\n"
+        "        v = compute()\n"
+        "    cb = lambda: v\n"
+        "    return cb()\n"
+    )
+    safety = _late_bound_capture_safety_by_mode(src, "    cb = lambda: v")
+    assert safety["pedantic"] is expected_pedantic_safe
+
+
+def test_seed_scope_suppress_aliases_stops_before_u_start_and_post_unit() -> None:
+    """Verifies pre-unit provenance seeding stops before u_start in linear/if blocks while remaining sound across loops."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import _seed_scope_suppress_aliases
+
+    # 1. Loop body can re-enter after post-unit rebind, so loop body invalidates cm conservatively
+    loop_src = (
+        "import contextlib\n"
+        "def run_loop(compute, custom_unknown):\n"
+        "    cm = contextlib.nullcontext\n"
+        "    for _ in range(1):\n"
+        "        with cm():\n"
+        "            val = compute()\n"
+        "        cm = custom_unknown\n"
+        "    return val\n"
+    )
+    loop_mod = ast.parse(loop_src)
+    loop_fn = loop_mod.body[1]
+    assert isinstance(loop_fn, ast.FunctionDef)
+    prov_loop = _seed_scope_suppress_aliases(loop_fn, loop_mod, u_start=5)
+    assert "cm" not in prov_loop.non_suppressors
+
+    # 2. Single-pass `if` branch: post-unit `cm = custom_unknown` does not pre-invalidate u_start=5
+    if_src = (
+        "import contextlib\n"
+        "def run_if(cond, compute, custom_unknown):\n"
+        "    cm = contextlib.nullcontext\n"
+        "    if cond:\n"
+        "        with cm() as cm:\n"
+        "            val = compute()\n"
+        "        cm = custom_unknown\n"
+        "    return val\n"
+    )
+    if_mod = ast.parse(if_src)
+    if_fn = if_mod.body[1]
+    assert isinstance(if_fn, ast.FunctionDef)
+    prov_if_before = _seed_scope_suppress_aliases(if_fn, if_mod, u_start=5)
+    assert "cm" in prov_if_before.non_suppressors
+    prov_if_after = _seed_scope_suppress_aliases(if_fn, if_mod, u_start=8)
+    assert "cm" not in prov_if_after.non_suppressors
+
+    # 3. Direct sequential statements: `with cm() as cm:` and post-unit rebind must not pre-invalidate u_start=4
+    direct_src = (
+        "import contextlib\n"
+        "def run_direct(compute, custom_unknown):\n"
+        "    cm = contextlib.nullcontext\n"
+        "    with cm() as cm:\n"
+        "        val = compute()\n"
+        "    cm = custom_unknown\n"
+        "    return val\n"
+    )
+    direct_mod = ast.parse(direct_src)
+    direct_fn = direct_mod.body[1]
+    assert isinstance(direct_fn, ast.FunctionDef)
+    prov_direct = _seed_scope_suppress_aliases(direct_fn, direct_mod, u_start=4)
+    assert "cm" in prov_direct.non_suppressors
+    prov_direct_late = _seed_scope_suppress_aliases(direct_fn, direct_mod, u_start=7)
+    assert "cm" not in prov_direct_late.non_suppressors

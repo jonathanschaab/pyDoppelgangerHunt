@@ -76,6 +76,7 @@ from pydoppelgangerhunt.fixer._df_cell_traversal import (
 )
 from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=unused-import
     _COMPREHENSION_TYPES,
+    _extract_chain_nonlocals_and_outer_globals,
     _extract_comprehension_walrus_names,
     _extract_scope_nonlocals_and_outer_globals,
     _extract_single_node_local_names,
@@ -113,6 +114,7 @@ from pydoppelgangerhunt.fixer._df_visitors import (
 )
 from pydoppelgangerhunt.source_lines import (
     extract_unit_source_lines_with_state,
+    is_non_string_sequence,
 )
 from pydoppelgangerhunt.fixer.source import (
     _SUBROUTINE_KINDS,
@@ -1990,20 +1992,31 @@ def _has_out_of_bounds_unit_cols(
         return True
     if (
         is_placeholder_origin
-        or explicit_col_sliced
         or not unit_code_lines
         or (raw_s_col is None and raw_e_col is None)
     ):
         return False
+    is_single_line = len(unit_code_lines) == 1
+    if explicit_col_sliced:
+        return bool(
+            is_single_line
+            and raw_s_col is not None
+            and raw_e_col is not None
+            and raw_s_col >= raw_e_col
+        )
     first_b = len(unit_code_lines[0].rstrip("\r\n").encode("utf-8"))
     last_b = len(unit_code_lines[-1].rstrip("\r\n").encode("utf-8"))
-    s_in_bounds = raw_s_col is None or (0 <= raw_s_col < first_b)
+    s_in_bounds = raw_s_col is None or (
+        0 <= raw_s_col < first_b
+        if (is_single_line or first_b > 0)
+        else raw_s_col == 0
+    )
     e_in_bounds = raw_e_col is None or (0 <= raw_e_col <= last_b)
+    eff_s_col = 0 if raw_s_col is None else raw_s_col
     order_ok = (
-        len(unit_code_lines) > 1
-        or raw_s_col is None
+        not is_single_line
         or raw_e_col is None
-        or raw_s_col < raw_e_col
+        or eff_s_col < raw_e_col
     )
     if s_in_bounds and e_in_bounds and order_ok:
         return False
@@ -2708,24 +2721,24 @@ def _inspect_unit_scope(
                         u_end_col=u_end_col,
                     )
                     if enclosing_chain:
+                        innermost_stmt_fn, enc_nonlocals, enc_outer_globals = (
+                            _extract_chain_nonlocals_and_outer_globals(
+                                enclosing_chain,
+                                u_start,
+                                u_end,
+                                u_start_col=u_start_col,
+                                u_end_col=u_end_col,
+                            )
+                        )
                         in_enclosing_class_body = isinstance(
                             _resolve_immediate_scope_in_fn(
-                                enclosing_chain[-1][2],
+                                innermost_stmt_fn,
                                 u_start,
                                 u_end,
                                 u_start_col=u_start_col,
                                 u_end_col=u_end_col,
                             ),
                             ast.ClassDef,
-                        )
-                        enc_nonlocals, enc_outer_globals = (
-                            _extract_scope_nonlocals_and_outer_globals(
-                                enclosing_chain[-1][2],
-                                u_start,
-                                u_end,
-                                u_start_col=u_start_col,
-                                u_end_col=u_end_col,
-                            )
                         )
                         enc_escaping = enc_nonlocals | enc_outer_globals
                         with collect_heuristic_ctx_managers() as pre_heur_mgrs:
@@ -2946,7 +2959,7 @@ def _inspect_unit_scope(
         all_deleted = _extract_deleted_names(candidate_stmts) | visitor.deleted_names
         uncond_deleted = all_deleted - (def_assigned | cond_assigned)
 
-        if is_subroutine and isinstance(pre_outs, (list, tuple)):
+        if is_subroutine and is_non_string_sequence(pre_outs):
             outputs = list(dict.fromkeys(pre_outs))
         elif is_subroutine and isinstance(pre_outs, (set, frozenset)):
             if len(pre_outs) > 1:
@@ -3434,7 +3447,7 @@ def ensure_unit_scope_closure_mode(
             or (isinstance(src_text_val, str) and bool(src_text_val.strip()))
             or (isinstance(file_src_val, str) and bool(file_src_val.strip()))
             or (
-                isinstance(src_lines_val, (list, tuple))
+                is_non_string_sequence(src_lines_val)
                 and not is_sliced_unit_source_lines(u_copy, src_lines_val)
                 and any(
                     isinstance(ln, str) and bool(ln.strip())
@@ -3446,7 +3459,7 @@ def ensure_unit_scope_closure_mode(
         has_snippet_source = (
             isinstance(src_code_val, str) and bool(src_code_val.strip())
         ) or (
-            isinstance(src_lines_val, (list, tuple))
+            is_non_string_sequence(src_lines_val)
             and any(
                 isinstance(ln, str) and bool(ln.strip())
                 for ln in src_lines_val

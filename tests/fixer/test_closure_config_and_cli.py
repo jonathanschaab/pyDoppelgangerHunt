@@ -2007,11 +2007,13 @@ def test_pyproject_skip_pre_unit_closures_false_treated_as_unset(tmp_path: Path)
         ) as mock_patch:
             main([str(repo), "--patch", str(patch_out), "--replace-clones"])
             _, kwargs_rc = mock_patch.call_args
-            assert kwargs_rc.get("closure_strictness") == "pedantic"
-            assert kwargs_rc.get("skip_pre_unit_closures") is False
+            assert kwargs_rc.get("replace_clones") is True
+            assert kwargs_rc.get("closure_strictness") is None
+            assert kwargs_rc.get("skip_pre_unit_closures") is None
 
             main([str(repo), "--patch", str(patch_out)])
             _, kwargs_preview = mock_patch.call_args
+            assert kwargs_preview.get("replace_clones") is False
             assert kwargs_preview.get("closure_strictness") is None
             assert kwargs_preview.get("skip_pre_unit_closures") is None
 
@@ -2193,7 +2195,9 @@ def test_strict_with_suppression_precedence_identical_across_cli_and_api(
         ) as mock_patch_rc:
             main([str(repo), "--patch", str(patch_out), "--replace-clones"])
             _, rc_kwargs = mock_patch_rc.call_args
-            assert rc_kwargs.get("closure_strictness") == "pedantic"
+            assert rc_kwargs.get("replace_clones") is True
+            assert rc_kwargs.get("closure_strictness") is None
+            assert rc_kwargs.get("skip_pre_unit_closures") is None
 
 
 def test_report_boundary_isolates_malformed_clone_pair_without_aborting_run(
@@ -2877,28 +2881,32 @@ def test_cli_replace_clones_config_opt_out_and_strict_conflict_warning(
         (tmp_path / "pyproject.toml").write_text(toml_body, encoding="utf-8")
         clear_closure_warning_cache()
         caplog.clear()
-        recorded_strictness: list[str] = []
+        from unittest import mock
+
+        recorded_calls: list[tuple[Any, Any]] = []
 
         def _capture_patch(*_args: Any, **kwargs: Any) -> str:
-            recorded_strictness.append(str(kwargs.get("closure_strictness")))
+            recorded_calls.append(
+                (kwargs.get("replace_clones"), kwargs.get("closure_strictness"))
+            )
             return ""
 
-        monkeypatch.setattr(
+        with mock.patch(
             "pydoppelgangerhunt.cli.generate_refactoring_patch", _capture_patch
-        )
-        with caplog.at_level(logging.WARNING):
-            exit_code = main(
-                [
-                    str(target),
-                    "--min-lines",
-                    "3",
-                    "--replace-clones",
-                    "--patch",
-                    str(tmp_path / "out.patch"),
-                ]
-            )
+        ):
+            with caplog.at_level(logging.WARNING):
+                exit_code = main(
+                    [
+                        str(target),
+                        "--min-lines",
+                        "3",
+                        "--replace-clones",
+                        "--patch",
+                        str(tmp_path / "out.patch"),
+                    ]
+                )
         assert exit_code == 1
-        assert recorded_strictness == ["pedantic"]
+        assert recorded_calls == [(True, None)]
 
     (tmp_path / "pyproject.toml").write_text(
         "[tool.pydoppelgangerhunt]\nstrict_with_suppression = true\n",

@@ -3205,3 +3205,142 @@ def test_cli_suggest_plumbing_and_strict_with_vs_skip_config_conflict(
                 in r.message
                 for r in caplog.records
             )
+
+
+def test_cli_replace_clones_keeps_reports_strict_and_preserves_unit_policy(
+    tmp_path: Path,
+) -> None:
+    """Verifies --replace-clones keeps --suggest/--html strict and lets --patch apply pedantic only to unset units."""
+    from pydoppelgangerhunt.cli import main
+
+    repo = tmp_path / "replace_clones_cli"
+    repo.mkdir()
+    (repo / "m.py").write_text("x = 1\n", encoding="utf-8")
+    html_out = repo / "report.html"
+    patch_out = repo / "refactor.patch"
+    dummy_clone = (
+        0.95,
+        {"name": "u1", "file": "m.py", "start": 1, "end": 1},
+        {"name": "u2", "file": "m.py", "start": 1, "end": 1},
+    )
+
+    with (
+        mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[dummy_clone]),
+        mock.patch("pydoppelgangerhunt.cli.generate_html_report", return_value="<html/>") as mock_html,
+        mock.patch("pydoppelgangerhunt.cli.generate_refactoring_patch", return_value="# patch\n") as mock_patch,
+        mock.patch("pydoppelgangerhunt.cli.synthesize_refactoring_suggestion", return_value="sug") as mock_sug,
+    ):
+        code = main([
+            str(repo),
+            "--suggest",
+            "--html",
+            str(html_out),
+            "--patch",
+            str(patch_out),
+            "--replace-clones",
+        ])
+        assert code == 1
+        assert mock_html.call_args.kwargs.get("closure_strictness") is None
+        assert mock_sug.call_args.kwargs.get("closure_strictness") is None
+        assert mock_patch.call_args.kwargs.get("replace_clones") is True
+        assert mock_patch.call_args.kwargs.get("closure_strictness") is None
+        assert mock_patch.call_args.kwargs.get("skip_pre_unit_closures") is None
+
+        # Even with an unrecognized config closure_strictness, --replace-clones --patch keeps None
+        (repo / "pyproject.toml").write_text(
+            '[tool.pydoppelgangerhunt]\nclosure_strictness = "bogus_cfg"\n',
+            encoding="utf-8",
+        )
+        code2 = main([
+            str(repo),
+            "--html",
+            str(html_out),
+            "--patch",
+            str(patch_out),
+            "--replace-clones",
+        ])
+        assert code2 == 1
+        assert mock_html.call_args.kwargs.get("closure_strictness") == "strict"
+        assert mock_patch.call_args.kwargs.get("closure_strictness") is None
+        assert mock_patch.call_args.kwargs.get("skip_pre_unit_closures") is None
+
+
+def test_resolve_unit_closure_flags_unrecognized_mode_and_strict_with_conflict(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies unrecognized unit closure_strictness yields to caller flags and pedantic warns on strict_with_suppression=False."""
+    import logging  # pylint: disable=import-outside-toplevel
+
+    from pydoppelgangerhunt.config import UnitClosureFlags, resolve_unit_closure_flags
+
+    with caplog.at_level(logging.WARNING):
+        res_bogus = resolve_unit_closure_flags(
+            {"closure_strictness": "unrecognized_unit_val"},
+            skip_pre_unit_closures=True,
+        )
+        assert res_bogus == UnitClosureFlags(True, False)
+        assert any(
+            "Unrecognized closure_strictness 'unrecognized_unit_val'" in r.message
+            for r in caplog.records
+        )
+
+        caplog.clear()
+        res_conflict = resolve_unit_closure_flags(
+            {"closure_strictness": "pedantic"},
+            strict_with_suppression=False,
+        )
+        assert res_conflict == UnitClosureFlags(False, True)
+        assert any(
+            "cannot be weakened by strict_with_suppression=False" in r.message
+            for r in caplog.records
+        )
+
+        caplog.clear()
+        res_ok = resolve_unit_closure_flags(
+            {"closure_strictness": "strict"},
+            strict_with_suppression=False,
+        )
+        assert res_ok == UnitClosureFlags(False, False)
+        assert not any(
+            "cannot be weakened by strict_with_suppression=False" in r.message
+            for r in caplog.records
+        )
+
+
+def test_nested_heuristic_ctx_manager_session_does_not_escalate_empty_warn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies an empty nested warn=True session does not escalate an outer warn=False session."""
+    import logging  # pylint: disable=import-outside-toplevel
+
+    from pydoppelgangerhunt.config import (
+        heuristic_ctx_manager_session,
+        record_heuristic_non_suppressing_ctx_manager,
+    )
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="pydoppelgangerhunt.config"):
+        with heuristic_ctx_manager_session(warn=False):
+            record_heuristic_non_suppressing_ctx_manager("OuterSafeMgr")
+            with heuristic_ctx_manager_session(warn=True):
+                pass
+    summary_records = [
+        r for r in caplog.records if "unproven context manager(s)" in r.message
+    ]
+    assert len(summary_records) == 1
+    assert summary_records[0].levelno == logging.INFO
+    assert "OuterSafeMgr" in summary_records[0].message
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="pydoppelgangerhunt.config"):
+        with heuristic_ctx_manager_session(warn=False):
+            record_heuristic_non_suppressing_ctx_manager("OuterSafeMgr")
+            with heuristic_ctx_manager_session(warn=True):
+                record_heuristic_non_suppressing_ctx_manager("InnerSafeMgr")
+    warn_records = [
+        r for r in caplog.records if "unproven context manager(s)" in r.message
+    ]
+    assert len(warn_records) == 1
+    assert warn_records[0].levelno == logging.WARNING
+    assert "OuterSafeMgr" in warn_records[0].message
+    assert "InnerSafeMgr" in warn_records[0].message

@@ -124,11 +124,104 @@ class _BuiltinAliasTable(NamedTuple):
     exec_eval: Set[str]
     setattr_delattr: Set[str]
     getattr_fns: Set[str]
+    vars_fns: Set[str]
+    globals_fns: Set[str]
+    namespace_dicts: Set[str]
     builtins_mods: Set[str]
     import_fns: Set[str]
     importlib_mods: Set[str]
     sys_mods: Set[str]
     has_wildcard: bool
+
+
+def _extract_call_arg(node: ast.Call, pos: int, kw_name: str) -> Optional[ast.AST]:
+    """Returns the AST expression passed at positional index pos or keyword kw_name."""
+    if len(node.args) > pos and not any(
+        isinstance(arg, ast.Starred) for arg in node.args[: pos + 1]
+    ):
+        return node.args[pos]
+    for kw in node.keywords:
+        if kw.arg == kw_name:
+            return kw.value
+    return None
+
+
+def _is_namespace_dict_call(node: ast.AST, aliases: _BuiltinAliasTable) -> bool:
+    """Returns True if node calls globals() (or alias) or 0-arg vars() (or alias)."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    is_glob = (isinstance(func, ast.Name) and func.id in aliases.globals_fns) or _is_builtins_attr(
+        func, aliases.builtins_mods, frozenset({"globals"})
+    )
+    if is_glob:
+        return True
+    is_zero_arg_vars = not node.args and not node.keywords and (
+        (isinstance(func, ast.Name) and func.id in aliases.vars_fns)
+        or _is_builtins_attr(func, aliases.builtins_mods, frozenset({"vars"}))
+    )
+    return is_zero_arg_vars
+
+
+def _is_builtins_namespace_expr(node: ast.AST, table: _BuiltinAliasTable) -> bool:
+    """Returns True when node dynamically evaluates to the builtins module or its __dict__."""
+    if isinstance(node, ast.Call):
+        func = node.func
+        is_import_call = (isinstance(func, ast.Name) and func.id in table.import_fns) or (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and (
+                (func.value.id in table.importlib_mods and func.attr == "import_module")
+                or (func.value.id in table.builtins_mods and func.attr == "__import__")
+            )
+        )
+        if is_import_call:
+            mod_arg = _extract_call_arg(node, 0, "name")
+            if isinstance(mod_arg, ast.Constant) and mod_arg.value in (
+                "builtins",
+                "__builtins__",
+            ):
+                return True
+        is_vars_call = (
+            isinstance(func, ast.Name) and func.id in table.vars_fns
+        ) or _is_builtins_attr(func, table.builtins_mods, frozenset({"vars"}))
+        if (
+            is_vars_call
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in table.builtins_mods
+        ):
+            return True
+    elif isinstance(node, ast.Attribute):
+        return (
+            isinstance(node.value, ast.Name)
+            and node.value.id in table.builtins_mods
+            and node.attr == "__dict__"
+        )
+    elif isinstance(node, ast.Subscript):
+        if (
+            isinstance(node.value, ast.Attribute)
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id in table.sys_mods
+            and node.value.attr == "modules"
+            and isinstance(node.slice, ast.Constant)
+            and node.slice.value in ("builtins", "__builtins__")
+        ):
+            return True
+        if _is_namespace_dict_expr(node.value, table):
+            if isinstance(node.slice, ast.Constant) and node.slice.value in (
+                "__builtins__",
+                *table.builtins_mods,
+            ):
+                return True
+    return False
+
+
+def _is_namespace_dict_expr(node: ast.AST, aliases: _BuiltinAliasTable) -> bool:
+    """Returns True for globals() / 0-arg vars() calls or variables aliasing them."""
+    return (
+        isinstance(node, ast.Name) and node.id in aliases.namespace_dicts
+    ) or _is_namespace_dict_call(node, aliases)
 
 
 def _propagate_alias_step(
@@ -140,12 +233,17 @@ def _propagate_alias_step(
     attr_targets: Tuple[Tuple[AbstractSet[str], str, Set[str]], ...] = (
         (table.builtins_mods, "__import__", table.import_fns),
         (table.builtins_mods, "getattr", table.getattr_fns),
+        (table.builtins_mods, "vars", table.vars_fns),
+        (table.builtins_mods, "globals", table.globals_fns),
         (table.importlib_mods, "import_module", table.import_fns),
     )
     name_sets: Tuple[Set[str], ...] = (
         table.exec_eval,
         table.setattr_delattr,
         table.getattr_fns,
+        table.vars_fns,
+        table.globals_fns,
+        table.namespace_dicts,
         table.builtins_mods,
         table.import_fns,
         table.importlib_mods,
@@ -176,6 +274,12 @@ def _propagate_alias_step(
                 ):
                     dest_set.add(tgt_name)
                     changed = True
+        if _is_namespace_dict_expr(val, table) and tgt_name not in table.namespace_dicts:
+            table.namespace_dicts.add(tgt_name)
+            changed = True
+        if _is_builtins_namespace_expr(val, table) and tgt_name not in table.builtins_mods:
+            table.builtins_mods.add(tgt_name)
+            changed = True
     return changed
 
 
@@ -185,6 +289,9 @@ def _collect_builtin_aliases(tree: ast.AST) -> _BuiltinAliasTable:
         exec_eval=set(_DYNAMIC_CODE_BUILTINS),
         setattr_delattr=set(_ATTR_MUTATION_BUILTINS),
         getattr_fns={"getattr"},
+        vars_fns={"vars"},
+        globals_fns={"globals"},
+        namespace_dicts=set(),
         builtins_mods={"builtins", "__builtins__"},
         import_fns={"__import__"},
         importlib_mods={"importlib"},
@@ -223,6 +330,10 @@ def _collect_builtin_aliases(tree: ast.AST) -> _BuiltinAliasTable:
                     table.setattr_delattr.add(bound)
                 elif alias.name == "getattr":
                     table.getattr_fns.add(bound)
+                elif alias.name == "vars":
+                    table.vars_fns.add(bound)
+                elif alias.name == "globals":
+                    table.globals_fns.add(bound)
                 elif alias.name == "__import__":
                     table.import_fns.add(bound)
         elif isinstance(node, ast.Assign) and node.value is not None:
@@ -300,6 +411,9 @@ _REF_TRIGGER_ATTRS: frozenset[str] = (
 )
 
 
+_BUILTIN_NAMESPACE_ATTRS: frozenset[str] = frozenset({"vars", "globals", "__import__"})
+
+
 def _is_getattr_of_mutation_builtin(
     node: ast.Call,
     aliases: _BuiltinAliasTable,
@@ -311,63 +425,51 @@ def _is_getattr_of_mutation_builtin(
     )
     if not is_getattr or len(node.args) < 2:
         return False
+    target_is_builtins = (
+        isinstance(node.args[0], ast.Name) and node.args[0].id in aliases.builtins_mods
+    )
     attr_arg = node.args[1]
     if isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):
-        return attr_arg.value in _REF_TRIGGER_ATTRS
-    return isinstance(node.args[0], ast.Name) and node.args[0].id in aliases.builtins_mods
+        return attr_arg.value in _REF_TRIGGER_ATTRS or (
+            target_is_builtins and attr_arg.value in _BUILTIN_NAMESPACE_ATTRS
+        )
+    return target_is_builtins
 
 
 def _is_dynamic_builtins_lookup(
     node: ast.AST,
     aliases: _BuiltinAliasTable,
 ) -> bool:
-    """Returns True for __import__('builtins'), vars(builtins), builtins.__dict__, sys.modules['builtins'], or __builtins__[...] mutation lookups."""
+    """Returns True for dynamic builtins, vars(builtins), globals()['__builtins__'], sys.modules['builtins'], or __builtins__[...] mutation lookups."""
+    if _is_builtins_namespace_expr(node, aliases):
+        return True
     if isinstance(node, ast.Call):
         func = node.func
-        is_import_call = (isinstance(func, ast.Name) and func.id in aliases.import_fns) or (
+        if (
             isinstance(func, ast.Attribute)
-            and isinstance(func.value, ast.Name)
-            and (
-                (func.value.id in aliases.importlib_mods and func.attr == "import_module")
-                or (func.value.id in aliases.builtins_mods and func.attr == "__import__")
+            and func.attr == "get"
+            and _is_namespace_dict_expr(func.value, aliases)
+        ):
+            key_arg = _extract_call_arg(node, 0, "key")
+            return key_arg is not None and (
+                not isinstance(key_arg, ast.Constant)
+                or key_arg.value in _REF_TRIGGER_ATTRS
+                or key_arg.value in _BUILTIN_NAMESPACE_ATTRS
+                or key_arg.value in aliases.builtins_mods
             )
-        )
-        if (
-            is_import_call
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and node.args[0].value == "builtins"
-        ):
-            return True
-        if (
-            isinstance(func, ast.Name)
-            and func.id == "vars"
-            and node.args
-            and isinstance(node.args[0], ast.Name)
-            and node.args[0].id in aliases.builtins_mods
-        ):
-            return True
     elif isinstance(node, ast.Subscript):
-        if (
-            isinstance(node.value, ast.Attribute)
-            and isinstance(node.value.value, ast.Name)
-            and node.value.value.id in aliases.sys_mods
-            and node.value.attr == "modules"
-            and isinstance(node.slice, ast.Constant)
-            and node.slice.value == "builtins"
-        ):
-            return True
         if isinstance(node.value, ast.Name) and node.value.id in aliases.builtins_mods:
-            return not isinstance(node.slice, ast.Constant) or (
-                node.slice.value in _REF_TRIGGER_ATTRS
+            return (
+                not isinstance(node.slice, ast.Constant)
+                or node.slice.value in _REF_TRIGGER_ATTRS
+                or node.slice.value in _BUILTIN_NAMESPACE_ATTRS
             )
-    elif (
-        isinstance(node, ast.Attribute)
-        and isinstance(node.value, ast.Name)
-        and node.value.id in aliases.builtins_mods
-        and node.attr == "__dict__"
-    ):
-        return True
+        if _is_namespace_dict_expr(node.value, aliases):
+            return (
+                not isinstance(node.slice, ast.Constant)
+                or node.slice.value in _REF_TRIGGER_ATTRS
+                or node.slice.value in _BUILTIN_NAMESPACE_ATTRS
+            )
     return False
 
 

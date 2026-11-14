@@ -3277,19 +3277,22 @@ def _advance_prov_across_stmts_until_target(
         s_end = int(getattr(sub_stmt, "end_lineno", s_start) or s_start)
         if not reached and target_lineno > 0 and s_start <= target_lineno <= s_end:
             if target_node is None and s_start >= target_lineno:
-                reached = True
-            else:
-                prov = _advance_enclosing_compound_stmt_seed(
-                    sub_stmt,
-                    prov,
-                    target_node,
-                    target_lineno,
-                    extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-                    strict_with_suppression=strict_with_suppression,
-                )
-                reached = True
-                continue
+                return prov
+            prov = _advance_enclosing_compound_stmt_seed(
+                sub_stmt,
+                prov,
+                target_node,
+                target_lineno,
+                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                strict_with_suppression=strict_with_suppression,
+            )
+            if target_node is None:
+                return prov
+            reached = True
+            continue
         if not reached and 0 < target_lineno <= s_start:
+            if target_node is None:
+                return prov
             reached = True
         next_sub = _update_suppress_provenance_from_stmt(
             sub_stmt,

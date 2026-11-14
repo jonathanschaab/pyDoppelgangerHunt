@@ -28,6 +28,7 @@ from pydoppelgangerhunt.fixer._ast_compat import is_trystar_node
 from pydoppelgangerhunt.fixer._df_cache import (
     _get_cached_tree_source_lines,
     _get_or_parse_tree,
+    _get_valid_unit_bounds,
     _register_tree_source_lines,
     _suppress_syntax_warnings,
 )
@@ -39,6 +40,7 @@ from pydoppelgangerhunt.source_lines import (
     SourceLinesOrigin,
     count_physical_newlines,
     detect_line_ending,
+    is_non_string_sequence,
     is_sliced_unit_source_lines,
     normalize_unit_coordinates,
     parse_unit_coord,
@@ -311,7 +313,7 @@ _VALID_CLOSURE_STRICTNESS_VALUES: frozenset[str] = frozenset(
 
 def _is_valid_ordered_str_sequence(val: Any) -> bool:
     """Returns True if val is an ordered non-string sequence of strings (sets are rejected)."""
-    if isinstance(val, (str, bytes, bytearray)) or not isinstance(val, Sequence):
+    if not is_non_string_sequence(val):
         return False
     return all(isinstance(item, str) for item in val)
 
@@ -466,9 +468,13 @@ def validate_unit_schema(
     _validate_coordinate_alias_agreement(unit)
     start_raw = unit.get("start") if unit.get("start") is not None else unit.get("lineno")
     end_raw = unit.get("end") if unit.get("end") is not None else unit.get("end_lineno")
-    if start_raw is not None and end_raw is not None:
+    if start_raw is not None:
         s_val = parse_unit_coord({"start": start_raw}, "start", default=None, strict=True)
-        e_val = parse_unit_coord({"end": end_raw}, "end", default=None, strict=True)
+        e_val = (
+            parse_unit_coord({"end": end_raw}, "end", default=None, strict=True)
+            if end_raw is not None
+            else s_val
+        )
         if s_val is not None and e_val is not None:
             if e_val < s_val:
                 raise ValueError(
@@ -625,11 +631,11 @@ def is_subroutine_unit(
         return False
 
     src = source_text or unit.get("source_text") or unit.get("file_source")
-    if not src and isinstance(unit.get("source_lines"), (list, tuple)):
+    if not src and is_non_string_sequence(unit.get("source_lines")):
         u_lines = unit["source_lines"]
         if not _is_sliced_excerpt_for_file(unit, u_lines):
             src = "".join(u_lines)
-    if isinstance(src, (list, tuple)):
+    if is_non_string_sequence(src):
         src = "".join(src)
     if (src and isinstance(src, str)) or tree is not None:
         try:
@@ -691,7 +697,7 @@ def _load_unit_file_text(
 
     # In-memory full lines take precedence over disk (vital for IDE/LSP unsaved buffers)
     unit_lines = unit.get("source_lines")
-    if unit_lines is not None and isinstance(unit_lines, (list, tuple)):
+    if unit_lines is not None and is_non_string_sequence(unit_lines):
         if not _is_sliced_excerpt_for_file(unit, unit_lines):
             return "".join(
                 ln if ln.endswith(("\n", "\r")) else ln + "\n"
@@ -1941,17 +1947,12 @@ def _find_innermost_enclosing_node(
     tree: Optional[ast.AST] = None,
 ) -> Optional[Tuple[ast.AST, int, int]]:
     """Locates the innermost AST node of matching types enclosing the given unit."""
-    if not isinstance(unit, dict):
+    bounds = _get_valid_unit_bounds(unit)
+    if bounds is None:
         return None
-    try:
-        u_start = parse_unit_coord(unit, "start", default=0)
-        u_end = parse_unit_coord(unit, "end", default=u_start)
-    except (ValueError, TypeError):
-        return None
-    if u_start <= 0 or u_end <= 0 or u_start > u_end:
-        return None
+    u_start, u_end = bounds
 
-    if isinstance(source_text, (list, tuple)):
+    if is_non_string_sequence(source_text):
         source_text = "".join(source_text)
     elif not isinstance(source_text, str):
         return None

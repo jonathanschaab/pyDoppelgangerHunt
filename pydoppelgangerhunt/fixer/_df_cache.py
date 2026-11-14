@@ -107,16 +107,23 @@ def _suppress_syntax_warnings() -> Iterator[None]:
     brief ``ast.parse`` / ``symtable.symtable`` / ``compile`` call across cooperating
     threads.
     """
-    if getattr(_syntax_warning_tls, "depth", 0) == 0:
-        if bool(getattr(sys.flags, "context_aware_warnings", 0)):
-            with _catch_and_ignore_syntax_warnings():
-                yield
-            return
-        if _filters_already_ignore_syntax_warnings():
+    if bool(getattr(sys.flags, "context_aware_warnings", 0)):
+        with _catch_and_ignore_syntax_warnings():
+            yield
+        return
+    prev_depth = int(getattr(_syntax_warning_tls, "depth", 0))
+    _syntax_warning_lock.acquire()
+    locked = True
+    try:
+        if (
+            prev_depth == 0
+            and _syntax_warning_active_count[0] == 0
+            and _filters_already_ignore_syntax_warnings()
+        ):
+            _syntax_warning_lock.release()
+            locked = False
             yield
             return
-    with _syntax_warning_lock:
-        prev_depth = int(getattr(_syntax_warning_tls, "depth", 0))
         _syntax_warning_tls.depth = prev_depth + 1
         try:
             if _syntax_warning_active_count[0] > 0:
@@ -134,6 +141,9 @@ def _suppress_syntax_warnings() -> Iterator[None]:
                 _syntax_warning_active_count[0] = 0
         finally:
             _syntax_warning_tls.depth = prev_depth
+    finally:
+        if locked:
+            _syntax_warning_lock.release()
 
 
 def _parse_ast_no_syntax_warnings(source: str) -> ast.Module:
@@ -1566,6 +1576,7 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
             for r_node, pmap in _scope_parent_maps.items():
                 if r_node not in candidate_roots and (r_node is tree or tree in pmap):
                     candidate_roots.add(r_node)
+        oversized_pmaps: Dict[ast.AST, Mapping[ast.AST, ast.AST]] = {}
         for o_root in list(_oversized_scope_parent_maps.keys()):
             o_entry = _oversized_scope_parent_maps.get(o_root)
             if o_entry is None:
@@ -1582,6 +1593,7 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
                     tree_nodes,
                     scope_nodes,
                 )
+                oversized_pmaps[o_root] = o_entry.weak_parent_map
                 _oversized_scope_parent_maps.pop(o_root, None)
                 scope_nodes.add(o_root)
                 candidate_roots.add(o_root)
@@ -1596,7 +1608,9 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
                     tree_nodes,
                     scope_nodes,
                 )
-            pmap_opt = _scope_parent_maps.get(root_node)
+            pmap_opt = _scope_parent_maps.get(root_node) or oversized_pmaps.get(
+                root_node
+            )
             if pmap_opt is None:
                 continue
             matched_child: Optional[ast.AST] = None

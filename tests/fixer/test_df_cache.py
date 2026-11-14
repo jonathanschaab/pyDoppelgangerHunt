@@ -2898,3 +2898,130 @@ def test_evict_tree_scopes_purges_all_eight_cache_categories_selectively() -> No
     )
     assert not any(n in df_cache_mod._cached_scope_fingerprints for n in nodes_a)
     assert all(post_b.values()), post_b
+
+
+def test_suppress_syntax_warnings_concurrency_lock_and_already_ignored_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies _suppress_syntax_warnings serializes active mutations and runs concurrently when already ignored."""
+    from concurrent.futures import ThreadPoolExecutor
+    import sys
+    from types import SimpleNamespace
+    import warnings
+
+    from pydoppelgangerhunt.fixer import _df_cache as df_cache_mod
+
+    flags_attrs = {
+        name: getattr(sys.flags, name)
+        for name in dir(sys.flags)
+        if not name.startswith("_") and isinstance(getattr(sys.flags, name), int)
+    }
+    flags_attrs["context_aware_warnings"] = 0
+    monkeypatch.setattr(sys, "flags", SimpleNamespace(**flags_attrs))
+
+    # 1. Slow path (SyntaxWarning not yet ignored): lock prevents overlapping filter mutations
+    with warnings.catch_warnings():
+        warnings.resetwarnings()
+        inside_count = 0
+        max_inside = 0
+        count_lock = threading.Lock()
+        first_entered = threading.Event()
+
+        def _slow_worker(wait_for_first: bool) -> bool:
+            nonlocal inside_count, max_inside
+            if wait_for_first:
+                assert first_entered.wait(timeout=5.0)
+            with df_cache_mod._suppress_syntax_warnings():
+                first_entered.set()
+                with count_lock:
+                    inside_count += 1
+                    max_inside = max(max_inside, inside_count)
+                threading.Event().wait(0.05)
+                with count_lock:
+                    inside_count -= 1
+                return True
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_a = pool.submit(_slow_worker, False)
+            fut_b = pool.submit(_slow_worker, True)
+            assert fut_a.result(timeout=5.0) is True
+            assert fut_b.result(timeout=5.0) is True
+
+        assert max_inside == 1
+        assert not any(
+            action == "ignore" and category is SyntaxWarning
+            for action, _msg, category, _mod, _ln in warnings.filters
+        )
+
+    # 2. Fast path (SyntaxWarning already ignored): concurrent callers do NOT block on lock
+    with warnings.catch_warnings():
+        warnings.resetwarnings()
+        warnings.simplefilter("ignore", SyntaxWarning)
+        barrier = threading.Barrier(2, timeout=3.0)
+
+        def _fast_worker() -> int:
+            with df_cache_mod._suppress_syntax_warnings():
+                return barrier.wait()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fa = pool.submit(_fast_worker)
+            fb = pool.submit(_fast_worker)
+            results = sorted((fa.result(timeout=5.0), fb.result(timeout=5.0)))
+        assert results == [0, 1]
+
+
+def test_evict_tree_scopes_evicts_oversized_ast_from_interior_stmt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies evict_tree_scopes(interior_stmt) evicts enclosing scopes for oversized ASTs."""
+    from pydoppelgangerhunt.fixer import _df_cache as df_cache_mod
+
+    from pydoppelgangerhunt.fixer._df_closures import _collect_scope_closures
+    from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
+
+    clear_dataflow_cache()
+    monkeypatch.setattr(df_cache_mod, "_MAX_PARENT_MAP_TOTAL_NODES", 20)
+    body_stmts = "\n".join(f"    v_{i} = {i}" for i in range(15))
+    oversized_src = f"def huge(x):\n{body_stmts}\n    return v_0 + x\n"
+    oversized_tree = df_cache_mod._get_or_parse_tree(oversized_src)
+    assert isinstance(oversized_tree, ast.Module)
+    fn_node = oversized_tree.body[0]
+    assert isinstance(fn_node, ast.FunctionDef)
+    interior_stmt = fn_node.body[5]
+
+    other_src = "def small(y):\n    return y + 1\n"
+    other_tree = df_cache_mod._get_or_parse_tree(other_src)
+    assert isinstance(other_tree, ast.Module)
+    other_fn = other_tree.body[0]
+    assert isinstance(other_fn, ast.FunctionDef)
+
+    # Populate oversized parent map and enclosing scope caches through real analyzers
+    pmap = df_cache_mod._get_scope_ancestor_map(oversized_tree)
+    assert pmap.get(fn_node) is oversized_tree
+    assert oversized_tree in df_cache_mod._oversized_scope_parent_maps
+    assert oversized_tree not in df_cache_mod._scope_parent_maps
+
+    _collect_scope_closures(oversized_tree, oversized_tree)
+    _collect_scope_closures(other_tree, other_tree)
+    collect_downstream_read_names(
+        oversized_src, {"start": 6, "end": 6}, candidates={"v_0"}, tree=oversized_tree
+    )
+    collect_downstream_read_names(
+        other_src, {"start": 2, "end": 2}, candidates={"y"}, tree=other_tree
+    )
+
+    df_cache_mod.evict_tree_scopes(interior_stmt)
+
+    assert oversized_tree not in df_cache_mod._oversized_scope_parent_maps
+    assert not any(
+        df_cache_mod._key_references_scope_nodes(k, {oversized_tree, fn_node, interior_stmt})
+        for k in df_cache_mod._scope_cell_info_cache
+    )
+    assert not any(
+        df_cache_mod._key_references_scope_nodes(k, {oversized_tree, fn_node})
+        for k in df_cache_mod._scope_closures_cache
+    )
+    assert any(
+        df_cache_mod._key_references_scope_nodes(k, {other_tree, other_fn})
+        for k in df_cache_mod._scope_closures_cache
+    )

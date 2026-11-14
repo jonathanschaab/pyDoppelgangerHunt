@@ -24,6 +24,8 @@ from pydoppelgangerhunt.fixer.scope import BLOCKING_CONTROL_FLOW_HAZARDS
 from pydoppelgangerhunt.source_lines import (
     _extract_notebook_cell_lines,
     extract_unit_source_code,
+    is_non_string_sequence,
+    is_sliced_unit_source_lines,
     parse_unit_coord,
     resolve_safe_unit_file_path,
     resolve_unit_line_bounds,
@@ -254,7 +256,13 @@ def resolve_cached_unit_source_and_tree(
         except (SyntaxError, ValueError, RecursionError, MemoryError):
             return inline_src, None
 
-    if "source_lines" in unit and unit.get("source_lines") is not None:
+    raw_src_lines = unit.get("source_lines")
+    if (
+        raw_src_lines is not None
+        and is_non_string_sequence(raw_src_lines)
+        and bool(raw_src_lines)
+        and not is_sliced_unit_source_lines(unit, raw_src_lines)
+    ):
         return None, None
 
     raw_file = str(unit.get("file") or "")
@@ -393,15 +401,11 @@ def synthesize_refactoring_suggestion(
         ensure_unit_scope_closure_mode,
     )
     from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _align_pair_expr_kinds,
         synthesize_shared_helper_code,
     )
 
-    k1_expr = p1.unit.get("kind") in ("comprehension", "complex_expr")
-    k2_expr = p2.unit.get("kind") in ("comprehension", "complex_expr")
-    if k1_expr != k2_expr and not (p1.unit.get("kind") and p2.unit.get("kind")):
-        eff_expr_kind = p1.unit.get("kind") if k1_expr else p2.unit.get("kind")
-        p1.unit.setdefault("kind", eff_expr_kind)
-        p2.unit.setdefault("kind", eff_expr_kind)
+    _align_pair_expr_kinds(p1.unit, p2.unit)
     is_expr_unit = p1.unit.get("kind") in ("comprehension", "complex_expr")
 
     pair_flags = resolve_pair_closure_flags(

@@ -49,6 +49,7 @@ from pydoppelgangerhunt.fixer._df_visitors import (
     _extract_pattern_bound_name,
 )
 from pydoppelgangerhunt.parser import iter_nested_scope_header_nodes
+from pydoppelgangerhunt.source_lines import is_non_string_sequence
 
 
 class _TreeEnclosingScopeIndex:
@@ -945,13 +946,13 @@ def _compute_scope_invalid_lexical_declarations(
     """Checks whether root_scope has invalid lexical declarations using symtable fast-path for Module."""
     eff_lines = (
         source_lines
-        if isinstance(source_lines, (list, tuple)) and source_lines
+        if is_non_string_sequence(source_lines) and source_lines
         else _get_cached_tree_source_lines(root_scope)
     )
     if (
         is_module_rooted
         and isinstance(root_scope, ast.Module)
-        and isinstance(eff_lines, (list, tuple))
+        and is_non_string_sequence(eff_lines)
         and eff_lines
     ):
         try:
@@ -971,7 +972,7 @@ def _scope_has_invalid_lexical_declarations(
     source_lines: Optional[Sequence[str]] = None,
 ) -> bool:
     """Checks (and caches per AST root scope) whether root_scope has invalid lexical declarations."""
-    if isinstance(source_lines, (list, tuple)) and source_lines:
+    if is_non_string_sequence(source_lines) and source_lines:
         _register_tree_source_lines(root_scope, source_lines)
     return bool(
         _get_or_compute_scope_cached(

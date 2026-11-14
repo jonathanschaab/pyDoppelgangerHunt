@@ -164,8 +164,10 @@ def _align_pair_expr_kinds(u1: Dict[str, Any], u2: Dict[str, Any]) -> bool:
         if u1.get("kind") and u2.get("kind"):
             return False
         eff_expr_kind = u1.get("kind") if k1_expr else u2.get("kind")
-        u1.setdefault("kind", eff_expr_kind)
-        u2.setdefault("kind", eff_expr_kind)
+        if not u1.get("kind"):
+            u1["kind"] = eff_expr_kind
+        if not u2.get("kind"):
+            u2["kind"] = eff_expr_kind
     return True
 
 

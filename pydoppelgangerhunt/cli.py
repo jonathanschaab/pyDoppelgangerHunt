@@ -1272,12 +1272,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 skip_pre_unit_closures=cfg_skip,
                 strict_with_suppression=cfg_strict_with,
             )
-        if replace_clones:
-            closure_strictness = "pedantic"
-            skip_pre_unit_closures = False
-        else:
-            closure_strictness = cfg_fallback_mode
-            skip_pre_unit_closures = cfg_fallback_skip
+        closure_strictness = cfg_fallback_mode
+        skip_pre_unit_closures = cfg_fallback_skip
     else:
         if args.closure_strictness is not None:
             cli_strictness_str = str(args.closure_strictness)
@@ -1663,6 +1659,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             shared_module_name=shared_module_name,
             skip_pre_unit_closures=skip_pre_unit_closures,
             closure_strictness=closure_strictness,
+            has_explicit_closure_cfg=has_explicit_closure_cfg,
             non_suppressing_ctx_managers=non_suppressing_ctx_managers,
         )
 
@@ -1688,6 +1685,7 @@ def _emit_scan_artifacts_and_report(
     skip_pre_unit_closures: Optional[bool],
     closure_strictness: Optional[str],
     non_suppressing_ctx_managers: Tuple[str, ...],
+    has_explicit_closure_cfg: bool = False,
 ) -> int:
     """Emits HTML/patch/annotation artifacts and structured or text scan reports."""
     diagnostic_errors = 0
@@ -1712,6 +1710,16 @@ def _emit_scan_artifacts_and_report(
         _write_artifact_file(args.html, html_report, "HTML", args.format == "text")
 
     if args.patch:
+        patch_closure_strictness = (
+            None
+            if (replace_clones and not has_explicit_closure_cfg)
+            else closure_strictness
+        )
+        patch_skip_pre_unit_closures = (
+            None
+            if (replace_clones and not has_explicit_closure_cfg)
+            else skip_pre_unit_closures
+        )
         patch_text = (
             generate_refactoring_patch(
                 clones,
@@ -1721,8 +1729,8 @@ def _emit_scan_artifacts_and_report(
                 method_binding=method_binding,
                 cross_file_strategy=cross_file_strategy,
                 shared_module_name=shared_module_name,
-                skip_pre_unit_closures=skip_pre_unit_closures,
-                closure_strictness=closure_strictness,
+                skip_pre_unit_closures=patch_skip_pre_unit_closures,
+                closure_strictness=patch_closure_strictness,
                 non_suppressing_ctx_managers=non_suppressing_ctx_managers,
             )
             if clones

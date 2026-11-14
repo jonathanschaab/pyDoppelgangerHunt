@@ -1532,6 +1532,52 @@ def _extract_scope_nonlocals_and_outer_globals(
     return nonlocal_names, outer_globals
 
 
+def _extract_chain_nonlocals_and_outer_globals(
+    enclosing_chain: Sequence[Tuple[int, int, ast.AST]],
+    u_start: int,
+    u_end: int,
+    *,
+    u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
+) -> Tuple[ast.AST, Set[str], Set[str]]:
+    """Resolves innermost statement function and (nonlocals, outer_globals) across enclosing_chain."""
+    innermost_stmt_fn: ast.AST = next(
+        (
+            fn_n
+            for _, _, fn_n in reversed(enclosing_chain)
+            if isinstance(fn_n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ),
+        enclosing_chain[-1][2],
+    )
+    enc_nonlocals, enc_outer_globals = _extract_scope_nonlocals_and_outer_globals(
+        innermost_stmt_fn,
+        u_start,
+        u_end,
+        u_start_col=u_start_col,
+        u_end_col=u_end_col,
+    )
+    fn_scopes_in_chain = [
+        fn_n
+        for _, _, fn_n in enclosing_chain
+        if isinstance(fn_n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    if len(fn_scopes_in_chain) > 1:
+        for idx_fn, outer_fn in enumerate(fn_scopes_in_chain[:-1]):
+            _, outer_og = _extract_scope_nonlocals_and_outer_globals(
+                outer_fn,
+                u_start,
+                u_end,
+                u_start_col=u_start_col,
+                u_end_col=u_end_col,
+            )
+            if outer_og:
+                inner_locals: Set[str] = set()
+                for inner_fn in fn_scopes_in_chain[idx_fn + 1 :]:
+                    inner_locals.update(_extract_strict_fn_local_names(inner_fn))
+                enc_outer_globals.update((outer_og - inner_locals) - enc_nonlocals)
+    return innermost_stmt_fn, enc_nonlocals, enc_outer_globals
+
+
 def _has_escaped_intra_unit_global_declarations(
     scope_node: ast.AST,
     u_start: int,
