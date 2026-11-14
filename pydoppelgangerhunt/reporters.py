@@ -2,23 +2,38 @@
 
 from __future__ import annotations
 
+import ast
+from collections import OrderedDict
 import difflib
 import html
 import json
+import logging
 import os
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
-from pydoppelgangerhunt.config import normalize_path_string
+from pydoppelgangerhunt.config import (
+    APP_VERSION,
+    heuristic_ctx_manager_session,
+    normalize_path_string,
+    resolve_pair_closure_flags,
+)
+from pydoppelgangerhunt.fixer.scope import BLOCKING_CONTROL_FLOW_HAZARDS
 from pydoppelgangerhunt.source_lines import (
-    is_sliced_unit_source_lines,
+    _extract_notebook_cell_lines,
+    extract_unit_source_code,
     parse_unit_coord,
     resolve_safe_unit_file_path,
     resolve_unit_line_bounds,
-    split_source_lines,
+    with_unit_source_text,
 )
+from pydoppelgangerhunt.source_lines import (  # pylint: disable=unused-import
+    extract_unit_source_lines_with_state,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_unit_coord(unit: Dict[str, Any], key: str) -> Optional[int]:
@@ -63,87 +78,14 @@ def _unit_line_bounds(unit: Dict[str, Any]) -> Tuple[int, int]:
     return resolve_unit_line_bounds(unit)
 
 
-def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:
-    """Reads raw source code lines for a given unit from provided lines or disk.
-
-    Supports pre-sliced unit lines, full-file line lists, in-memory source_text,
-    or disk-based source reading. Callers can explicitly specify
-    'source_lines_is_sliced': True (or False) to disambiguate whether 'source_lines'
-    represents a pre-sliced excerpt or the complete file.
-
-    Note:
-        When the 'end' coordinate is omitted in the unit dictionary, it defaults
-        to end = start (a single line), consistent with resolve_unit_line_bounds,
-        rather than extending to end-of-file.
-    """
-    s_d, e_d = _unit_line_bounds(unit)
-    n_d = str(unit.get("name") or "unit")
-    placeholder = [f"# Source for {n_d} lines {s_d}-{e_d}\n"]
-
-    source_lines = unit.get("source_lines")
-    from_source_text = False
-    if source_lines is None and unit.get("source_text") is not None:
-        source_lines = split_source_lines(str(unit["source_text"]))
-        from_source_text = True
-
-    if source_lines is not None and isinstance(source_lines, (list, tuple)):
-        if not source_lines:
-            return placeholder
-        # Sliced lines fast-path:
-        # If 'source_lines_is_sliced' is explicitly set, honor caller intent.
-        # Otherwise, heuristic: if len(source_lines) == (e_d - s_d + 1),
-        # the list is treated as already sliced to unit boundaries (unless from full source_text).
-        if not from_source_text and is_sliced_unit_source_lines(unit, source_lines):
-            return [
-                ln if ln.endswith("\n") else ln + "\n"
-                for ln in source_lines
-            ]
-        start = max(1, s_d)
-        end = min(len(source_lines), e_d)
-        return [
-            ln if ln.endswith("\n") else ln + "\n"
-            for ln in source_lines[start - 1 : end]
-        ]
-
-    resolved_file = resolve_safe_unit_file_path(unit, repo_root=repo_root)
-    if resolved_file is None:
-        return placeholder
-
+def _read_notebook_cell_lines(resolved_file: Path, cell_idx: int) -> Optional[List[str]]:
+    """Reads and extracts newline-terminated source lines for a 0-indexed Jupyter notebook cell on disk."""
     try:
-        is_cell_anchor = False
-        cell_idx = -1
-        u_file = str(unit.get("file") or "")
-        if resolved_file.suffix.lower() == ".ipynb" and "#" in u_file:
-            parsed_nb = parse_notebook_cell_anchor(u_file)
-            if parsed_nb is not None:
-                cell_idx = parsed_nb[1]
-                is_cell_anchor = True
-
-        if is_cell_anchor:
-            try:
-                nb_data = json.loads(resolved_file.read_text(encoding="utf-8", errors="replace"))
-                cells = nb_data.get("cells", [])
-                if 0 <= cell_idx < len(cells):
-                    cell = cells[cell_idx]
-                    src = cell.get("source", [])
-                    raw_lines = (
-                        src
-                        if isinstance(src, list)
-                        else split_source_lines(str(src))
-                    )
-                    all_lines = [l if l.endswith("\n") else l + "\n" for l in raw_lines]
-                else:
-                    all_lines = []
-            except (json.JSONDecodeError, ValueError):
-                all_lines = []
-        else:
-            with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
-                all_lines = fh.readlines()
-        start = max(1, s_d)
-        end = min(len(all_lines), e_d)
-        return all_lines[start - 1 : end]
-    except OSError:
-        return [f"# Unable to read {str(unit.get('file') or '')}\n"]
+        raw_nb_text = resolved_file.read_text(encoding="utf-8", errors="replace")
+        nb_data = json.loads(raw_nb_text)
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return None
+    return _extract_notebook_cell_lines(nb_data, cell_idx)
 
 
 def generate_clone_diff(
@@ -185,12 +127,224 @@ def generate_clone_diff(
     return "\n".join(colored_diff)
 
 
+class _SuggestionRejectionInfo(NamedTuple):
+    """Classified reasons explaining why automatic helper synthesis was skipped."""
+
+    reasons: Tuple[str, ...]
+    has_safety_hazard: bool
+
+
+_PAIR_SAFETY_HAZARD_REASONS = frozenset(
+    {
+        "enclosing try/with cleanup hazard",
+        "deleted output hazard",
+        "generator cleanup hazard",
+        "severed closure cell",
+        "stale source code",
+        "invalid unit columns",
+        "pathological ast",
+        "unavailable source for closure mode",
+        "unavailable source placeholder",
+    }
+)
+
+
+def _collect_suggestion_rejection_reasons(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    sc1: Dict[str, Any],
+    sc2: Dict[str, Any],
+    *,
+    pair_skip_reason: Optional[str],
+    has_async_gen_hazard: bool,
+    synthesis_failed_with_error: bool = False,
+) -> _SuggestionRejectionInfo:
+    """Classifies per-unit safety hazards and pair-level structural incompatibilities."""
+    safety_reasons: List[str] = []
+    structural_reasons: List[str] = []
+
+    def _add_unique(dest: List[str], item: str) -> None:
+        if item and item not in dest:
+            dest.append(item)
+
+    for sc_cand in (sc1, sc2):
+        for h in sc_cand.get("control_flow_hazards", ()):
+            if h in BLOCKING_CONTROL_FLOW_HAZARDS:
+                _add_unique(safety_reasons, str(h).replace("_", " "))
+        for cr in sc_cand.get("closure_hazard_reasons", ()):
+            _add_unique(safety_reasons, str(cr).replace("_", " "))
+
+    if pair_skip_reason:
+        if pair_skip_reason in _PAIR_SAFETY_HAZARD_REASONS or "hazard" in pair_skip_reason:
+            _add_unique(safety_reasons, pair_skip_reason)
+        elif pair_skip_reason not in safety_reasons:
+            _add_unique(structural_reasons, pair_skip_reason)
+
+    if has_async_gen_hazard:
+        _add_unique(safety_reasons, "async generator delegation hazard")
+    if sc1.get("nonlocals") or sc2.get("nonlocals"):
+        _add_unique(safety_reasons, "nonlocal binding")
+
+    if (
+        sc1.get("is_async") is None
+        or sc2.get("is_async") is None
+    ):
+        _add_unique(structural_reasons, "unknown async status")
+    elif bool(sc1.get("is_async")) != bool(sc2.get("is_async")):
+        _add_unique(structural_reasons, "async mismatch")
+    if bool(sc1.get("has_yield")) != bool(sc2.get("has_yield")):
+        _add_unique(structural_reasons, "generator mismatch")
+    if (u1.get("kind") in ("comprehension", "complex_expr")) != (
+        u2.get("kind") in ("comprehension", "complex_expr")
+    ):
+        _add_unique(structural_reasons, "mismatched expression kinds")
+    f1 = normalize_path_string(str(u1.get("file") or ""))
+    f2 = normalize_path_string(str(u2.get("file") or ""))
+    if f1 and f2 and f1 != f2 and (sc1.get("globals") or sc2.get("globals")):
+        _add_unique(structural_reasons, "cross-file global access")
+    if not safety_reasons and not structural_reasons:
+        if (
+            sc1.get("attrs_read") != sc2.get("attrs_read")
+            or sc1.get("attrs_written") != sc2.get("attrs_written")
+        ):
+            _add_unique(structural_reasons, "mismatched attribute access")
+        elif (
+            sc1.get("has_super")
+            or sc2.get("has_super")
+            or sc1.get("has_mangled_names")
+            or sc2.get("has_mangled_names")
+            or sc1.get("has_class_scoped_type_params")
+            or sc2.get("has_class_scoped_type_params")
+        ):
+            _add_unique(structural_reasons, "incompatible class binding")
+        elif synthesis_failed_with_error:
+            _add_unique(structural_reasons, "unparseable or invalid syntax")
+
+    combined = tuple(dict.fromkeys([*safety_reasons, *structural_reasons]))
+    return _SuggestionRejectionInfo(
+        reasons=combined,
+        has_safety_hazard=bool(safety_reasons),
+    )
+
+
+_MAX_REPORT_FILE_CACHE_ENTRIES = 256
+
+
+def resolve_cached_unit_source_and_tree(
+    unit: Dict[str, Any],
+    repo_root: Optional[str] = None,
+    file_cache: Optional[
+        OrderedDict[str, Tuple[Optional[str], Optional[ast.AST]]]
+    ] = None,
+) -> Tuple[Optional[str], Optional[ast.AST]]:
+    """Loads and caches (source_text, parsed_ast) for a unit across multi-pair reporting passes."""
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
+        _get_or_parse_tree,
+    )
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        _load_unit_file_text,
+    )
+
+    inline_src = unit.get("source_text")
+    if not isinstance(inline_src, str) or not inline_src:
+        inline_src = unit.get("file_source")
+    if isinstance(inline_src, str) and inline_src:
+        try:
+            return inline_src, _get_or_parse_tree(inline_src)
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            return inline_src, None
+
+    if "source_lines" in unit and unit.get("source_lines") is not None:
+        return None, None
+
+    raw_file = str(unit.get("file") or "")
+    if not raw_file:
+        return None, None
+
+    cache_key: Optional[str] = None
+    resolved_p = resolve_safe_unit_file_path(unit, repo_root=repo_root)
+    if file_cache is not None and resolved_p is not None:
+        anchor = raw_file.split("#", 1)[1] if "#" in raw_file else ""
+        cache_key = f"{resolved_p}#{anchor}" if anchor else str(resolved_p)
+        if cache_key in file_cache:
+            file_cache.move_to_end(cache_key)
+            return file_cache[cache_key]
+
+    src_text: Optional[str]
+    if resolved_p is not None and resolved_p.suffix.lower() == ".ipynb" and "#" in raw_file:
+        parsed_nb = parse_notebook_cell_anchor(raw_file)
+        if parsed_nb is not None:
+            cell_lines = _read_notebook_cell_lines(resolved_p, parsed_nb[1])
+            src_text = "".join(cell_lines) if cell_lines else None
+        else:
+            src_text = None
+    else:
+        src_text = _load_unit_file_text(unit, repo_root=repo_root)
+    parsed_tree: Optional[ast.AST] = None
+    if isinstance(src_text, str) and src_text:
+        try:
+            parsed_tree = _get_or_parse_tree(src_text)
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            parsed_tree = None
+    entry = (src_text, parsed_tree)
+    if file_cache is not None and cache_key is not None:
+        file_cache[cache_key] = entry
+        if len(file_cache) > _MAX_REPORT_FILE_CACHE_ENTRIES:
+            file_cache.popitem(last=False)
+    return entry
+
+
+class _PreparedSuggestionUnit(NamedTuple):
+    """Resolved unit dictionary, backing module source/AST, and sliced lines for suggestion synthesis."""
+
+    unit: Dict[str, Any]
+    source_text: Optional[str]
+    tree: Optional[ast.AST]
+    lines: List[str]
+
+
+def _prepare_effective_suggestion_unit(
+    unit: Dict[str, Any],
+    *,
+    repo_root: Optional[str],
+    source_text: Optional[str],
+    tree: Optional[ast.AST],
+) -> _PreparedSuggestionUnit:
+    """Copies unit, attaches resolved full-module source_text when not inline, and slices unit lines."""
+    u_eff = dict(unit)
+    eff_src, eff_tree = (
+        (source_text, tree)
+        if source_text is not None or tree is not None
+        else resolve_cached_unit_source_and_tree(u_eff, repo_root=repo_root)
+    )
+    if (
+        eff_src is not None
+        and "source_text" not in u_eff
+        and "source_lines" not in u_eff
+    ):
+        u_eff["source_text"] = eff_src
+    return _PreparedSuggestionUnit(
+        unit=u_eff,
+        source_text=eff_src,
+        tree=eff_tree,
+        lines=extract_unit_source_code(u_eff, repo_root),
+    )
+
+
 def synthesize_refactoring_suggestion(
-    u1: Dict[str, Any], u2: Dict[str, Any], repo_root: Optional[str] = None
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    repo_root: Optional[str] = None,
+    *,
+    closure_strictness: Optional[str] = None,
+    skip_pre_unit_closures: Optional[bool] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    source_text1: Optional[str] = None,
+    source_text2: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
 ) -> str:
     """Synthesizes actionable refactoring recommendation and shared helper template."""
-    lines1 = extract_unit_source_code(u1, repo_root)
-    lines2 = extract_unit_source_code(u2, repo_root)
     n1 = str(u1.get("name") or "unit1").rsplit(":", maxsplit=1)[-1]
     n2 = str(u2.get("name") or "unit2").rsplit(":", maxsplit=1)[-1]
 
@@ -205,6 +359,16 @@ def synthesize_refactoring_suggestion(
             f"        ..."
         )
 
+    p1, p2 = (
+        _prepare_effective_suggestion_unit(
+            u_item, repo_root=repo_root, source_text=s_item, tree=t_item
+        )
+        for u_item, s_item, t_item in (
+            (u1, source_text1, tree1),
+            (u2, source_text2, tree2),
+        )
+    )
+
     shared_prefix = ""
     for c1, c2 in zip(n1, n2):
         if c1 == c2:
@@ -215,17 +379,173 @@ def synthesize_refactoring_suggestion(
     helper_name = f"_shared_{clean_prefix}" if clean_prefix else "_shared_helper"
 
     diff_lines = [
-        line for line in difflib.ndiff(lines1, lines2)
+        line for line in difflib.ndiff(p1.lines, p2.lines)
         if line.startswith("- ") or line.startswith("+ ")
     ]
     diff_summary = f"{len(diff_lines)} varying line(s) detected between clone blocks."
 
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        CloneOutputResolution,
+        has_async_generator_delegation_hazard,
+        resolve_clone_pair_outputs,
+    )
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        ensure_unit_scope_closure_mode,
+    )
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        synthesize_shared_helper_code,
+    )
+
+    k1_expr = p1.unit.get("kind") in ("comprehension", "complex_expr")
+    k2_expr = p2.unit.get("kind") in ("comprehension", "complex_expr")
+    if k1_expr != k2_expr and not (p1.unit.get("kind") and p2.unit.get("kind")):
+        eff_expr_kind = p1.unit.get("kind") if k1_expr else p2.unit.get("kind")
+        p1.unit.setdefault("kind", eff_expr_kind)
+        p2.unit.setdefault("kind", eff_expr_kind)
+    is_expr_unit = p1.unit.get("kind") in ("comprehension", "complex_expr")
+
+    pair_flags = resolve_pair_closure_flags(
+        p1.unit,
+        p2.unit,
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+    )
+    pre_sc1 = p1.unit.get("scope") if isinstance(p1.unit.get("scope"), dict) else None
+    pre_sc2 = p2.unit.get("scope") if isinstance(p2.unit.get("scope"), dict) else None
+    sc1 = ensure_unit_scope_closure_mode(
+        p1.unit,
+        pre_sc1,
+        pair_flags.effective_skip_pre_unit_closures,
+        strict_with_suppression=pair_flags.effective_strict_with_suppression,
+        non_suppressing_ctx_managers=pair_flags.unit1.non_suppressing_ctx_managers,
+        source_text=p1.source_text,
+        tree=p1.tree,
+        repo_root=repo_root,
+    )
+    sc2 = ensure_unit_scope_closure_mode(
+        p2.unit,
+        pre_sc2,
+        pair_flags.effective_skip_pre_unit_closures,
+        strict_with_suppression=pair_flags.effective_strict_with_suppression,
+        non_suppressing_ctx_managers=pair_flags.unit2.non_suppressing_ctx_managers,
+        source_text=p2.source_text,
+        tree=p2.tree,
+        repo_root=repo_root,
+    )
+    has_naked_loop_jump = any(
+        h in ("naked_break", "naked_continue")
+        for h in (*sc1.get("control_flow_hazards", ()), *sc2.get("control_flow_hazards", ()))
+    )
+    effective_pair_strictness = (
+        "lenient"
+        if pair_flags.effective_skip_pre_unit_closures
+        else ("pedantic" if pair_flags.effective_strict_with_suppression else "strict")
+    )
+    pair_out_raw = resolve_clone_pair_outputs(
+        u1=p1.unit,
+        u2=p2.unit,
+        scope1=sc1,
+        scope2=sc2,
+        source_text1=p1.source_text,
+        source_text2=p2.source_text,
+        tree1=p1.tree,
+        tree2=p2.tree,
+        repo_root=repo_root,
+        skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
+        closure_strictness=effective_pair_strictness,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        return_details=True,
+    )
+    pair_outputs: Optional[Tuple[List[str], List[str]]] = (
+        pair_out_raw.outputs
+        if isinstance(pair_out_raw, CloneOutputResolution)
+        else pair_out_raw
+    )
+    pair_skip_reason: Optional[str] = (
+        pair_out_raw.skip_reason
+        if isinstance(pair_out_raw, CloneOutputResolution)
+        else None
+    )
+
+    helper_code = ""
+    synthesis_failed_with_error = False
+    if not has_naked_loop_jump and (pair_outputs is not None or is_expr_unit):
+        try:
+            helper_code = synthesize_shared_helper_code(
+                p1.unit,
+                p2.unit,
+                helper_name=helper_name,
+                repo_root=repo_root,
+                source_text1=p1.source_text,
+                source_text2=p2.source_text,
+                tree1=p1.tree,
+                tree2=p2.tree,
+                closure_strictness=effective_pair_strictness,
+                skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
+                non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+                outputs=None if is_expr_unit or pair_outputs is None else pair_outputs[0],
+                outputs2=None if is_expr_unit or pair_outputs is None else pair_outputs[1],
+                scope1=sc1,
+                scope2=sc2,
+            )
+        except (
+            SyntaxError,
+            OSError,
+            UnicodeDecodeError,
+            RecursionError,
+            MemoryError,
+        ) as exc:
+            logger.debug(
+                "Failed to synthesize refactoring suggestion for (%s, %s): %s",
+                n1,
+                n2,
+                exc,
+                exc_info=True,
+            )
+            helper_code = ""
+            synthesis_failed_with_error = True
+    if helper_code:
+        indented_helper = "\n".join(
+            f"    {ln}" if ln.strip() else ""
+            for ln in helper_code.rstrip("\n").splitlines()
+        )
+        return (
+            f"[REFACTOR SUGGESTION] Extract duplicated logic into common helper '{helper_name}':\n"
+            f"    # {diff_summary}\n"
+            f"{indented_helper}"
+        )
+
+    has_async_gen_hazard = has_async_generator_delegation_hazard(
+        sc1,
+        sc2,
+        has_outputs=bool(pair_outputs and (pair_outputs[0] or pair_outputs[1])),
+    )
+    rejection = _collect_suggestion_rejection_reasons(
+        p1.unit,
+        p2.unit,
+        sc1,
+        sc2,
+        pair_skip_reason=pair_skip_reason,
+        has_async_gen_hazard=has_async_gen_hazard,
+        synthesis_failed_with_error=synthesis_failed_with_error,
+    )
+    reason_suffix = (
+        f" [{', '.join(rejection.reasons)}]" if rejection.reasons else ""
+    )
+    if rejection.has_safety_hazard:
+        return (
+            f"[REFACTOR SUGGESTION] Automatic extraction into '{helper_name}' rejected as unsafe "
+            f"(safety hazard detected for {n1} and {n2}{reason_suffix}); manual review required:\n"
+            f"    # {diff_summary}\n"
+            f"    # WARNING: Automatic helper synthesis was skipped due to a safety hazard{reason_suffix}."
+        )
     return (
-        f"[REFACTOR SUGGESTION] Extract duplicated logic into common helper '{helper_name}':\n"
+        f"[REFACTOR SUGGESTION] Automatic extraction into '{helper_name}' skipped as structurally "
+        f"incompatible (incompatible pair structure or outputs for {n1} and {n2}{reason_suffix}); "
+        f"manual review required:\n"
         f"    # {diff_summary}\n"
-        f"    def {helper_name}(*args, **kwargs):\n"
-        f"        \"\"\"Extracted common implementation for {n1} and {n2}.\"\"\"\n"
-        f"        # Place common block here and parameterize differing inputs."
+        f"    # WARNING: Automatic helper synthesis was skipped due to structural incompatibility{reason_suffix}."
     )
 
 
@@ -315,7 +635,7 @@ def format_sarif_report(
                 "tool": {
                     "driver": {
                         "name": "pyDoppelgangerHunt",
-                        "version": "1.0.0",
+                        "version": APP_VERSION,
                         "informationUri": "https://github.com/jonathanschaab/pyDoppelgangerHunt",
                         "rules": [
                             {
@@ -371,7 +691,7 @@ def format_json_report(
     """Generates structured JSON representation of clone matches."""
     data: Dict[str, Any] = {
         "tool": "pyDoppelgangerHunt",
-        "version": "1.0.0",
+        "version": APP_VERSION,
         "target": target,
         "threshold": threshold,
         "clone_count": len(clones),
@@ -513,6 +833,11 @@ def generate_html_report(
     families: Optional[List[Dict[str, Any]]] = None,
     stats: Optional[Dict[str, Any]] = None,
     repo_root: Optional[str] = None,
+    *,
+    closure_strictness: Optional[str] = None,
+    skip_pre_unit_closures: Optional[bool] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    on_diagnostic_error: Optional[Callable[[], None]] = None,
 ) -> str:
     """Generates a standalone, self-contained interactive HTML audit report."""
     effective_repo_root = (
@@ -531,32 +856,97 @@ def generate_html_report(
     dashoffset = circumference * (1.0 - (dry_score / 100.0))
 
     cards_html: List[str] = []
-    for idx, (sim, u1, u2) in enumerate(clones, 1):
-        diff_txt = generate_clone_diff(u1, u2, repo_root=effective_repo_root)
-        sug_txt = synthesize_refactoring_suggestion(u1, u2, repo_root=effective_repo_root)
-        diff_block = (
-            f"<pre class='diff'><code>{html.escape(diff_txt)}</code></pre>" if diff_txt else "<em>No textual diff</em>"
-        )
-        sug_block = (
-            f"<div class='sug'><strong>Refactoring Suggestion:</strong><pre><code>{html.escape(sug_txt)}</code></pre></div>"
-            if sug_txt
-            else ""
-        )
+    file_cache: OrderedDict[str, Tuple[Optional[str], Optional[ast.AST]]] = OrderedDict()
+    with heuristic_ctx_manager_session():
+        for idx, (sim, u1, u2) in enumerate(clones, 1):
+            try:
+                src1, tree1 = resolve_cached_unit_source_and_tree(
+                    u1, repo_root=effective_repo_root, file_cache=file_cache
+                )
+                src2, tree2 = resolve_cached_unit_source_and_tree(
+                    u2, repo_root=effective_repo_root, file_cache=file_cache
+                )
+                u1_diff = with_unit_source_text(u1, src1)
+                u2_diff = with_unit_source_text(u2, src2)
+                diff_txt = generate_clone_diff(
+                    u1_diff, u2_diff, repo_root=effective_repo_root
+                )
+                sug_txt = synthesize_refactoring_suggestion(
+                    u1,
+                    u2,
+                    repo_root=effective_repo_root,
+                    closure_strictness=closure_strictness,
+                    skip_pre_unit_closures=skip_pre_unit_closures,
+                    non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+                    source_text1=src1,
+                    source_text2=src2,
+                    tree1=tree1,
+                    tree2=tree2,
+                )
+                f1_norm = normalize_path_string(
+                    str(u1.get("file") or ""), strip_anchor=False
+                )
+                f2_norm = normalize_path_string(
+                    str(u2.get("file") or ""), strip_anchor=False
+                )
+                s1, e1 = _unit_line_bounds(u1)
+                s2, e2 = _unit_line_bounds(u2)
+                n1 = str(u1.get("name") or "unit1")
+                n2 = str(u2.get("name") or "unit2")
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                if on_diagnostic_error is not None:
+                    on_diagnostic_error()
+                logger.warning(
+                    "Failed to render HTML card for clone pair #%d",
+                    idx,
+                    exc_info=True,
+                )
+                n1 = (
+                    str(u1.get("name") or "unit1")
+                    if isinstance(u1, dict)
+                    else "unit1"
+                )
+                n2 = (
+                    str(u2.get("name") or "unit2")
+                    if isinstance(u2, dict)
+                    else "unit2"
+                )
+                f1_norm = (
+                    normalize_path_string(
+                        str(u1.get("file") or ""), strip_anchor=False
+                    )
+                    if isinstance(u1, dict)
+                    else ""
+                )
+                f2_norm = (
+                    normalize_path_string(
+                        str(u2.get("file") or ""), strip_anchor=False
+                    )
+                    if isinstance(u2, dict)
+                    else ""
+                )
+                s1, e1, s2, e2 = 1, 1, 1, 1
+                diag = f"Diagnostic: pair rendering failed ({type(exc).__name__}: {exc})"
+                diff_txt = f"# {diag}"
+                sug_txt = f"[REFACTOR SUGGESTION] {diag}"
+            diff_block = (
+                f"<pre class='diff'><code>{html.escape(diff_txt)}</code></pre>"
+                if diff_txt
+                else "<em>No textual diff</em>"
+            )
+            sug_block = (
+                f"<div class='sug'><strong>Refactoring Suggestion:</strong><pre><code>{html.escape(sug_txt)}</code></pre></div>"
+                if sug_txt
+                else ""
+            )
 
-        f1_norm = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
-        f2_norm = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
-        s1, e1 = _unit_line_bounds(u1)
-        s2, e2 = _unit_line_bounds(u2)
-        n1 = str(u1.get("name") or "unit1")
-        n2 = str(u2.get("name") or "unit2")
+            f1_esc = html.escape(f1_norm)
+            f2_esc = html.escape(f2_norm)
+            n1_esc = html.escape(n1)
+            n2_esc = html.escape(n2)
+            search_attr = html.escape(f"{f1_norm} {n1} {f2_norm} {n2}", quote=True)
 
-        f1_esc = html.escape(f1_norm)
-        f2_esc = html.escape(f2_norm)
-        n1_esc = html.escape(n1)
-        n2_esc = html.escape(n2)
-        search_attr = html.escape(f"{f1_norm} {n1} {f2_norm} {n2}", quote=True)
-
-        card = f"""
+            card = f"""
         <div class="clone-card" data-search="{search_attr}">
             <div class="card-header">
                 <span class="sim-badge" style="background: {'#ef4444' if sim >= 0.85 else '#f59e0b'};">
@@ -578,7 +968,7 @@ def generate_html_report(
             </div>
         </div>
         """
-        cards_html.append(card)
+            cards_html.append(card)
 
     families_html: List[str] = []
     if families:
@@ -745,7 +1135,7 @@ def generate_html_report(
     <div class="container">
         <header>
             <h1>pyDoppelgangerHunt Audit Report</h1>
-            <div class="meta">Target: <code>{target_esc}</code> | Similarity Threshold: {threshold:.0%} | Generated by pyDoppelgangerHunt v1.0.0</div>
+            <div class="meta">Target: <code>{target_esc}</code> | Similarity Threshold: {threshold:.0%} | Generated by pyDoppelgangerHunt v{APP_VERSION}</div>
         </header>
 
         <div class="grid-stats">

@@ -8886,13 +8886,14 @@ def test_generate_refactoring_patch_closure_strictness_knob(tmp_path: Path) -> N
     [
         ("lenient", None, ("lenient", True)),
         ("strict", None, ("strict", False)),
-        ("fast", None, ("lenient", True)),
-        ("skip", None, ("lenient", True)),
-        ("fail_closed", None, ("strict", False)),
+        ("pedantic", None, ("pedantic", False)),
         (None, True, ("lenient", True)),
         (None, False, ("strict", False)),
         ("strict", True, ("strict", False)),
         ("lenient", False, ("lenient", True)),
+        ("fast", None, ("lenient", True)),
+        ("skip", None, ("lenient", True)),
+        ("fail_closed", None, ("pedantic", False)),
         ("unknown_mode", True, ("lenient", True)),
         ("unknown_mode", False, ("strict", False)),
     ],
@@ -8902,7 +8903,7 @@ def test_resolve_closure_strictness_mode_aliases(
     skip_flag: Optional[bool],
     expected: Tuple[str, bool],
 ) -> None:
-    """Verifies resolve_closure_strictness_mode maps all aliases and honors precedence."""
+    """Verifies resolve_closure_strictness_mode maps canonical modes, rejects unknown values, and honors precedence."""
     assert resolve_closure_strictness_mode(
         mode_arg,
         skip_pre_unit_closures=skip_flag if skip_flag is not None else False,

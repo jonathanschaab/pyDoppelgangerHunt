@@ -4,48 +4,148 @@ from __future__ import annotations
 
 import ast
 import builtins
+import hashlib
+import io
 import logging
 import re
 import textwrap
+import tokenize
 from typing import (
     Any,
     Dict,
-    Iterable,
+    FrozenSet,
     List,
     Optional,
     Sequence,
     Set,
     Tuple,
     Union,
+    cast,
 )
 
-from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
-from pydoppelgangerhunt.fixer._df_closures import (
+from pydoppelgangerhunt.config import (
+    collect_heuristic_ctx_managers,
+    normalize_non_suppressing_ctx_managers,
+    resolve_pair_closure_flags,
+    resolve_unit_closure_flags,
+    should_warn_closure_event,
+)
+
+BLOCKING_CONTROL_FLOW_HAZARDS: FrozenSet[str] = frozenset(
+    {
+        "naked_break",
+        "naked_continue",
+        "embedded_return",
+        "type_param_closure_capture",
+        "pathological_ast",
+        "deleted_output",
+        "severed_closure_cell",
+        "stale_source_code",
+        "unavailable_source_for_closure_mode",
+        "unavailable_source_placeholder",
+        "invalid_unit_columns",
+    }
+)
+from pydoppelgangerhunt.fixer._ast_compat import (
+    is_match_as_node,
+    is_match_mapping_node,
+    is_match_node,
+    is_match_star_node,
+    is_trystar_node,
+    is_type_alias_node,
+)
+from pydoppelgangerhunt.fixer._df_cache import (
+    _ScopeCacheKey,
+    _get_cached_tree_source_lines,
+    _get_or_compute_scope_cached,
+    _get_or_parse_tree,
+    _get_scope_parent_map,
+    _is_ephemeral_unit_ast,
+    _register_tree_source_lines,
+    _scope_cell_info_cache,
+    _split_source_lines_stripped,
+    _suppress_syntax_warnings,
+)
+from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context
+from pydoppelgangerhunt.fixer._df_cell_hazards import (
+    _UnitClosureHazardContext,
+    _evaluate_severed_closure_cell_hazard,
+)
+from pydoppelgangerhunt.fixer._df_cell_traversal import (
+    _find_enclosing_chain_definite_pre_bound,
+)
+from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=unused-import
+    _COMPREHENSION_TYPES,
     _extract_comprehension_walrus_names,
+    _extract_scope_nonlocals_and_outer_globals,
     _extract_single_node_local_names,
+    _extract_strict_fn_local_names,
+    _get_tree_scope_intervals,
+    _is_irrefutable_case,
+    _is_irrefutable_pattern,
+    _is_span_in_scope_header,
+    _node_earliest_start_pos,
+    _node_strictly_encloses_bounds,
+    _resolve_immediate_scope_in_fn,
     iter_nested_scope_header_nodes,
 )
+from pydoppelgangerhunt.fixer._df_span_index import (
+    _find_enclosing_function_chain,
+    _get_span_line_index,
+    _has_invalid_lexical_scope_declarations,
+    _resolve_unit_col_bounds,
+)
+from pydoppelgangerhunt.fixer._df_with_provenance import (  # pylint: disable=unused-import
+    _EMPTY_SUPPRESS_PROVENANCE,
+    _SuppressProvenance,
+    _analyze_block_assignment,
+    _block_terminates,
+    _extract_deleted_names,
+    _seed_scope_suppress_aliases,
+    _walrus_assignment_in_expr,
+    _walrus_in_sequence,
+)
 from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
-from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor, _UnitLiveInVisitor
-from pydoppelgangerhunt.reporters import extract_unit_source_code
+from pydoppelgangerhunt.fixer._df_visitors import (
+    _OuterExprVisitor,
+    _UnitLiveInVisitor,
+    _is_ast_node_within_unit_bounds,
+)
+from pydoppelgangerhunt.source_lines import (
+    extract_unit_source_lines_with_state,
+)
 from pydoppelgangerhunt.fixer.source import (
     _SUBROUTINE_KINDS,
     _WHOLE_UNIT_KINDS,
-    _get_tree_scope_intervals,
+    _extract_slice_col_offset,
+    _is_valid_eval_expr,
     _load_unit_file_text,
     _slice_unit_token_lines,
+    _slice_utf8_line,
     dedent_source_text,
     find_enclosing_function_is_async,
+    is_sliced_unit_source_lines,
     is_subroutine_unit,
     parse_unit_coord,
     resolve_unit_declared_outputs,
     split_source_lines,
 )
 
+__all__ = [
+    "BUILTIN_NAMES",
+    "SCOPE_SCHEMA_VERSION",
+    "analyze_unit_variable_scope",
+    "ensure_unit_scope_closure_mode",
+    "inspect_single_unit_scope",
+    "is_subroutine_unit",
+    "scope_matches_closure_mode",
+]
+
 logger = logging.getLogger(__name__)
 
 BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
+SCOPE_SCHEMA_VERSION: int = 2
 
 _SYNTHETIC_WRAPPER_NAME: str = "__pdh_wrapper__"
 
@@ -182,17 +282,11 @@ class _ScopeVisitor(ast.NodeVisitor):
             if receiver_names is not None
             else ("self", "cls")
         )
-        self._unit_top_locals: Set[str] = set()
+        self.unit_top_locals: Set[str] = set()
         self._unit_top_stored_locals: Set[str] = set()
 
     def _init_unit_top_locals(self, target_node: ast.AST) -> None:
-        self._unit_top_locals = _extract_single_node_local_names(
-            target_node,
-            include_globals=False,
-            include_nonlocals=False,
-            include_self_name=False,
-            include_bare_annotations=True,
-        )
+        self.unit_top_locals = _extract_strict_fn_local_names(target_node)
         self._unit_top_stored_locals = _extract_single_node_local_names(
             target_node,
             include_globals=False,
@@ -202,7 +296,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         )
 
     def visit_Module(self, node: ast.Module) -> None:
-        if self.is_subroutine and not self._unit_top_locals:
+        if self.is_subroutine and not self.unit_top_locals:
             if (
                 len(node.body) == 1
                 and isinstance(node.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -349,7 +443,7 @@ class _ScopeVisitor(ast.NodeVisitor):
             ):
                 body = body[0].body
                 self.loop_offset = 0
-            if not self._unit_top_locals:
+            if not self.unit_top_locals:
                 self._init_unit_top_locals(ast.Module(body=body, type_ignores=[]))
             if isinstance(node, ast.AsyncFunctionDef):
                 self.is_async = True
@@ -396,7 +490,7 @@ class _ScopeVisitor(ast.NodeVisitor):
             if is_top:
                 self._init_unit_top_locals(node)
                 self._scope_stack.append(
-                    set(self.params) | tp_names | self._unit_top_locals
+                    set(self.params) | tp_names | self.unit_top_locals
                 )
             else:
                 for tp in getattr(node, "type_params", []):
@@ -414,7 +508,7 @@ class _ScopeVisitor(ast.NodeVisitor):
                     self.visit(node.returns)
                 self._record_store_name(node.name)
                 if not self._scope_stack:
-                    self._scope_stack.append(set(self._unit_top_locals))
+                    self._scope_stack.append(set(self.unit_top_locals))
                     created_outer = True
                 nested_locals = _extract_single_node_local_names(
                     node,
@@ -444,9 +538,15 @@ class _ScopeVisitor(ast.NodeVisitor):
                 self.visit(kw_default)
         created_outer = False
         if not self._scope_stack:
-            self._scope_stack.append(set(self._unit_top_locals))
+            self._scope_stack.append(set(self.unit_top_locals))
             created_outer = True
-        self._scope_stack.append(self._extract_arg_names(node.args))
+        lambda_locals = _extract_single_node_local_names(
+            node,
+            include_globals=False,
+            include_nonlocals=False,
+            include_self_name=False,
+        )
+        self._scope_stack.append(self._extract_arg_names(node.args) | lambda_locals)
         saved_comp_depth = self._comprehension_depth
         self._comprehension_depth = 0
         try:
@@ -486,7 +586,7 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._record_store_name(node.name)
             created_outer = False
             if not self._scope_stack:
-                self._scope_stack.append(set(self._unit_top_locals))
+                self._scope_stack.append(set(self.unit_top_locals))
                 created_outer = True
             self._scope_stack.append({":class_scope:", *tp_names})
             self.class_depth += 1
@@ -692,7 +792,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self._comprehension_depth += 1
         created_outer = False
         if not self._scope_stack:
-            self._scope_stack.append(set(self._unit_top_locals))
+            self._scope_stack.append(set(self.unit_top_locals))
             created_outer = True
         inner_vars: Set[str] = set()
         self._scope_stack.append(inner_vars)
@@ -741,7 +841,7 @@ class _ScopeVisitor(ast.NodeVisitor):
                 )
                 or name in self.stores
                 or name in self.params
-                or name in self._unit_top_locals
+                or name in self.unit_top_locals
             )
             if (eff_len <= 1 or not is_unit_bound) and name not in self.nonlocals:
                 self.nonlocals.append(name)
@@ -926,610 +1026,6 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def _walrus_in_sequence(
-    items: Sequence[Optional[ast.AST]],
-    is_conditional: bool = False,
-) -> Tuple[Set[str], Set[str]]:
-    """Evaluates walrus assignments sequentially across expressions with short-circuiting tail conditions."""
-    definite: Set[str] = set()
-    conditional: Set[str] = set()
-    for idx, item in enumerate(items):
-        if item is not None:
-            d, c = _walrus_assignment_in_expr(item, is_conditional if idx == 0 else True)
-            definite.update(d)
-            conditional.update(c)
-    return definite, conditional
-
-
-def _walrus_assignment_in_expr(
-    expr: Optional[ast.AST],
-    is_conditional: bool = False,
-) -> Tuple[Set[str], Set[str]]:
-    """Analyzes walrus assignments in an expression to distinguish definite from conditional stores."""
-    definite: Set[str] = set()
-    conditional: Set[str] = set()
-    if expr is None:
-        return definite, conditional
-
-    if isinstance(expr, ast.NamedExpr) and isinstance(expr.target, ast.Name):
-        if is_conditional:
-            conditional.add(expr.target.id)
-        else:
-            definite.add(expr.target.id)
-
-    if isinstance(expr, ast.BoolOp):
-        d_seq, c_seq = _walrus_in_sequence(expr.values, is_conditional)
-        definite.update(d_seq)
-        conditional.update(c_seq)
-        return definite, conditional - definite
-
-    if isinstance(expr, ast.IfExp):
-        d_t, c_t = _walrus_assignment_in_expr(expr.test, is_conditional)
-        d_b, c_b = _walrus_assignment_in_expr(expr.body, True)
-        d_o, c_o = _walrus_assignment_in_expr(expr.orelse, True)
-        definite.update(d_t)
-        conditional.update(c_t | d_b | c_b | d_o | c_o)
-        return definite, conditional - definite
-
-    if isinstance(expr, ast.Compare):
-        d_l, c_l = _walrus_assignment_in_expr(expr.left, is_conditional)
-        definite.update(d_l)
-        conditional.update(c_l)
-        d_seq, c_seq = _walrus_in_sequence(expr.comparators, is_conditional)
-        definite.update(d_seq)
-        conditional.update(c_seq)
-        return definite, conditional - definite
-
-    if isinstance(expr, ast.Lambda):
-        d_l, c_l = _walrus_assignment_in_expr(expr.body, True)
-        conditional.update(d_l | c_l)
-        return definite, conditional - definite
-
-    if isinstance(expr, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
-        d_seq, c_seq = _walrus_in_sequence([g.iter for g in expr.generators], is_conditional)
-        definite.update(d_seq)
-        conditional.update(c_seq)
-        for child in ast.iter_child_nodes(expr):
-            if isinstance(expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp)) and child is expr.elt:
-                d_c, c_c = _walrus_assignment_in_expr(child, True)
-                conditional.update(d_c | c_c)
-            elif isinstance(expr, ast.DictComp) and child in (expr.key, expr.value):
-                d_c, c_c = _walrus_assignment_in_expr(child, True)
-                conditional.update(d_c | c_c)
-            elif isinstance(child, ast.comprehension):
-                for if_expr in child.ifs:
-                    d_c, c_c = _walrus_assignment_in_expr(if_expr, True)
-                    conditional.update(d_c | c_c)
-        return definite, conditional - definite
-
-    for child in ast.iter_child_nodes(expr):
-        target_child = child.value if isinstance(child, ast.keyword) else child
-        if isinstance(target_child, ast.AST):
-            d_ch, c_ch = _walrus_assignment_in_expr(target_child, is_conditional)
-            definite.update(d_ch)
-            conditional.update(c_ch)
-
-    return definite, conditional - definite
-
-
-def _is_irrefutable_pattern(pattern: Optional[ast.AST]) -> bool:  # pragma: no cover (py310+)
-    """Recursively determines if a pattern matching AST node unconditionally matches any subject."""
-    if pattern is None:
-        return True
-    if type(pattern).__name__ == "MatchAs":
-        sub_pat = getattr(pattern, "pattern", None)
-        return sub_pat is None or _is_irrefutable_pattern(sub_pat)
-    if type(pattern).__name__ == "MatchOr":
-        patterns = getattr(pattern, "patterns", [])
-        return any(_is_irrefutable_pattern(p) for p in patterns)
-    return False
-
-
-def _is_irrefutable_case(case: ast.AST) -> bool:  # pragma: no cover (py310+)
-    """Returns True if the match case has no guard and an irrefutable pattern."""
-    guard = getattr(case, "guard", None)
-    pattern = getattr(case, "pattern", None)
-    if guard is not None or pattern is None:
-        return False
-    return _is_irrefutable_pattern(pattern)
-
-
-def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
-    """Returns True if the statement sequence unconditionally terminates via return or raise."""
-    for stmt in statements:
-        if isinstance(stmt, (ast.Return, ast.Raise)):
-            return True
-        if isinstance(stmt, ast.If):
-            if (
-                stmt.orelse
-                and _block_terminates(stmt.body)
-                and _block_terminates(stmt.orelse)
-            ):
-                return True
-        elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-            if _block_terminates(stmt.body):
-                return True
-        elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
-            cases = getattr(stmt, "cases", [])
-            has_irrefutable = any(_is_irrefutable_case(c) for c in cases)
-            if has_irrefutable and cases and all(_block_terminates(c.body) for c in cases):
-                return True
-        elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
-            f_body = getattr(stmt, "finalbody", [])
-            if f_body and _block_terminates(f_body):
-                return True
-            handlers = getattr(stmt, "handlers", [])
-            o_stmts = getattr(stmt, "orelse", [])
-            body_terminates = _block_terminates(getattr(stmt, "body", [])) or (
-                bool(o_stmts) and _block_terminates(o_stmts)
-            )
-            if (
-                handlers
-                and body_terminates
-                and all(_block_terminates(getattr(h, "body", [])) for h in handlers)
-            ):
-                return True
-    return False
-
-
-def _extract_deleted_names(statements: Sequence[ast.AST]) -> Set[str]:
-    """Finds all variable names deleted within a statement sequence without recursing into nested functions."""
-    deleted: Set[str] = set()
-    for stmt in statements:
-        if isinstance(stmt, ast.Delete):
-            for target in stmt.targets:
-                for node in ast.walk(target):
-                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del):
-                        deleted.add(node.id)
-        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            continue
-        elif isinstance(stmt, ast.ExceptHandler):
-            deleted.update(_extract_deleted_names(stmt.body))
-        elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
-            for case in getattr(stmt, "cases", []):
-                deleted.update(_extract_deleted_names(getattr(case, "body", [])))
-        else:
-            for child in ast.iter_child_nodes(stmt):
-                if isinstance(child, (ast.stmt, ast.ExceptHandler)):
-                    deleted.update(_extract_deleted_names([child]))
-    return deleted
-
-
-def _demote_deletions_to_conditional(
-    deleted_names: Iterable[str],
-    definite: Set[str],
-    conditional: Set[str],
-) -> None:
-    """Discards deleted variables from definite and promotes previously definite variables to conditional."""
-    for v_del in deleted_names:
-        if v_del in definite:
-            definite.discard(v_del)
-            conditional.add(v_del)
-
-
-def _analyze_block_assignment(
-    statements: Sequence[ast.stmt],
-    definite: Optional[Set[str]] = None,
-    conditional: Optional[Set[str]] = None,
-    *,
-    may_deleted: Optional[Set[str]] = None,
-    live_in_deleted: Optional[Set[str]] = None,
-) -> Tuple[Set[str], Set[str]]:
-    """Analyzes a sequence of statements to determine unconditionally and conditionally assigned variables.
-
-    Returns:
-        A tuple of (definitely_assigned, conditionally_assigned) variable name sets.
-    """
-    if definite is None:
-        definite = set()
-    if conditional is None:
-        conditional = set()
-    may_del = may_deleted if may_deleted is not None else set()
-    live_in_del = live_in_deleted if live_in_deleted is not None else set()
-
-    for stmt in statements:
-        before_def = set(definite)
-        if isinstance(stmt, ast.Assign):
-            for target in stmt.targets:
-                for node in ast.walk(target):
-                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-                        definite.add(node.id)
-                        may_del.discard(node.id)
-                d_t, c_t = _walrus_assignment_in_expr(target)
-                definite.update(d_t)
-                may_del.difference_update(d_t)
-                conditional.update(c_t)
-            d_val, c_val = _walrus_assignment_in_expr(stmt.value)
-            definite.update(d_val)
-            may_del.difference_update(d_val)
-            conditional.update(c_val)
-        elif isinstance(stmt, ast.AnnAssign):
-            if stmt.value is not None:
-                if isinstance(stmt.target, ast.Name):
-                    definite.add(stmt.target.id)
-                    may_del.discard(stmt.target.id)
-                d_val, c_val = _walrus_assignment_in_expr(stmt.value)
-                definite.update(d_val)
-                may_del.difference_update(d_val)
-                conditional.update(c_val)
-        elif isinstance(stmt, ast.AugAssign):
-            if isinstance(stmt.target, ast.Name):
-                definite.add(stmt.target.id)
-                may_del.discard(stmt.target.id)
-            d_t, c_t = _walrus_assignment_in_expr(stmt.target)
-            definite.update(d_t)
-            may_del.difference_update(d_t)
-            conditional.update(c_t)
-            d_val, c_val = _walrus_assignment_in_expr(stmt.value)
-            definite.update(d_val)
-            may_del.difference_update(d_val)
-            conditional.update(c_val)
-        elif isinstance(stmt, ast.Expr):
-            d_val, c_val = _walrus_assignment_in_expr(stmt.value)
-            definite.update(d_val)
-            may_del.difference_update(d_val)
-            conditional.update(c_val)
-        elif isinstance(stmt, ast.Delete):
-            for target in stmt.targets:
-                d_del, c_del = _walrus_assignment_in_expr(target)
-                definite.update(d_del)
-                may_del.difference_update(d_del)
-                conditional.update(c_del)
-                for node in ast.walk(target):
-                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del):
-                        if node.id not in definite:
-                            live_in_del.add(node.id)
-                        definite.discard(node.id)
-                        conditional.discard(node.id)
-                        may_del.add(node.id)
-        elif isinstance(stmt, ast.Raise):
-            if stmt.exc is not None:
-                d_exc, c_exc = _walrus_assignment_in_expr(stmt.exc)
-                definite.update(d_exc)
-                may_del.difference_update(d_exc)
-                conditional.update(c_exc)
-            if stmt.cause is not None:
-                d_cause, c_cause = _walrus_assignment_in_expr(stmt.cause)
-                definite.update(d_cause)
-                may_del.difference_update(d_cause)
-                conditional.update(c_cause)
-        elif isinstance(stmt, ast.Return):
-            if stmt.value is not None:
-                d_val, c_val = _walrus_assignment_in_expr(stmt.value)
-                definite.update(d_val)
-                may_del.difference_update(d_val)
-                conditional.update(c_val)
-        elif isinstance(stmt, ast.If):
-            d_test, c_test = _walrus_assignment_in_expr(stmt.test)
-            definite.update(d_test)
-            may_del.difference_update(d_test)
-            conditional.update(c_test)
-            b_may: Set[str] = set()
-            b_live: Set[str] = set()
-            o_may: Set[str] = set()
-            o_live: Set[str] = set()
-            b_def, b_cond = _analyze_block_assignment(
-                stmt.body, may_deleted=b_may, live_in_deleted=b_live
-            )
-            o_def, o_cond = (
-                _analyze_block_assignment(
-                    stmt.orelse, may_deleted=o_may, live_in_deleted=o_live
-                )
-                if stmt.orelse
-                else (set(), set())
-            )
-            live_in_del.update((b_live | o_live) - definite)
-            b_term = _block_terminates(stmt.body)
-            o_term = _block_terminates(stmt.orelse) if stmt.orelse else False
-            if stmt.orelse:
-                if o_term and not b_term:
-                    definite.update(b_def)
-                    conditional.update((b_def | b_cond) - definite)
-                    may_del.difference_update(b_def)
-                    may_del.update(b_may)
-                elif b_term and not o_term:
-                    definite.update(o_def)
-                    conditional.update((o_def | o_cond) - definite)
-                    may_del.difference_update(o_def)
-                    may_del.update(o_may)
-                elif not b_term and not o_term:
-                    both = b_def & o_def
-                    definite.update(both)
-                    conditional.update((b_def | b_cond | o_def | o_cond) - definite)
-                    may_del.difference_update(both)
-                    may_del.update(b_may | o_may)
-                eff_b_del = _extract_deleted_names(stmt.body) - b_def
-                eff_o_del = _extract_deleted_names(stmt.orelse) - o_def
-                for v_del in eff_b_del & eff_o_del:
-                    definite.discard(v_del)
-                    conditional.discard(v_del)
-                _demote_deletions_to_conditional(eff_b_del ^ eff_o_del, definite, conditional)
-            else:
-                if not b_term:
-                    conditional.update((b_def | b_cond) - definite)
-                    may_del.update(b_may)
-                    eff_b_del = _extract_deleted_names(stmt.body) - b_def
-                    _demote_deletions_to_conditional(eff_b_del, definite, conditional)
-        elif isinstance(stmt, ast.While):
-            d_test, c_test = _walrus_assignment_in_expr(stmt.test)
-            definite.update(d_test)
-            may_del.difference_update(d_test)
-            conditional.update(c_test)
-            sub_stmts = list(stmt.body)
-            if hasattr(stmt, "orelse") and stmt.orelse:
-                sub_stmts.extend(stmt.orelse)
-            sub_may: Set[str] = set()
-            sub_live: Set[str] = set()
-            sub_def, sub_cond = _analyze_block_assignment(
-                sub_stmts, may_deleted=sub_may, live_in_deleted=sub_live
-            )
-            live_in_del.update(sub_live - definite)
-            may_del.update(sub_may)
-            conditional.update((sub_def | sub_cond) - definite)
-            _demote_deletions_to_conditional(_extract_deleted_names(sub_stmts), definite, conditional)
-        elif isinstance(stmt, (ast.For, ast.AsyncFor)):
-            d_iter, c_iter = _walrus_assignment_in_expr(stmt.iter)
-            definite.update(d_iter)
-            may_del.difference_update(d_iter)
-            conditional.update(c_iter)
-            t_names: Set[str] = set()
-            for p_node in ast.walk(stmt.target):
-                if isinstance(p_node, ast.Name) and isinstance(p_node.ctx, ast.Store):
-                    conditional.add(p_node.id)
-                    t_names.add(p_node.id)
-            sub_stmts = list(stmt.body)
-            if hasattr(stmt, "orelse") and stmt.orelse:
-                sub_stmts.extend(stmt.orelse)
-            for_may: Set[str] = set()
-            for_live: Set[str] = set()
-            sub_def, sub_cond = _analyze_block_assignment(
-                sub_stmts, may_deleted=for_may, live_in_deleted=for_live
-            )
-            live_in_del.update((for_live - t_names) - definite)
-            may_del.update(for_may)
-            conditional.update((sub_def | sub_cond) - definite)
-            _demote_deletions_to_conditional(_extract_deleted_names(sub_stmts), definite, conditional)
-        elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-            for item in stmt.items:
-                d_ctx, c_ctx = _walrus_assignment_in_expr(item.context_expr)
-                definite.update(d_ctx)
-                may_del.difference_update(d_ctx)
-                conditional.update(c_ctx)
-                if item.optional_vars is not None:
-                    for p_node in ast.walk(item.optional_vars):
-                        if isinstance(p_node, ast.Name) and isinstance(p_node.ctx, ast.Store):
-                            definite.add(p_node.id)
-                            may_del.discard(p_node.id)
-            _analyze_block_assignment(
-                stmt.body,
-                definite,
-                conditional,
-                may_deleted=may_del,
-                live_in_deleted=live_in_del,
-            )
-        elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
-            t_body = list(getattr(stmt, "body", []))
-            t_may: Set[str] = set()
-            t_live: Set[str] = set()
-            t_def, t_cond = _analyze_block_assignment(
-                t_body, may_deleted=t_may, live_in_deleted=t_live
-            )
-            live_in_del.update(t_live - definite)
-            t_term = _block_terminates(t_body)
-            o_stmts = list(getattr(stmt, "orelse", []))
-            o_try_may: Set[str] = set()
-            if o_stmts:
-                o_try_live: Set[str] = set()
-                o_def, o_cond = _analyze_block_assignment(
-                    o_stmts, may_deleted=o_try_may, live_in_deleted=o_try_live
-                )
-                if not t_term:
-                    live_in_del.update(o_try_live - (definite | t_def))
-                o_term = _block_terminates(o_stmts)
-                if not o_term:
-                    try_def = t_def | o_def
-                    try_cond = (t_cond | o_cond) - try_def
-                    succ_may = (t_may - o_def) | o_try_may
-                else:
-                    try_def = set()
-                    try_cond = set()
-                    succ_may = set()
-                    t_term = True
-            else:
-                try_def = t_def
-                try_cond = t_cond
-                succ_may = t_may
-
-            handlers = list(getattr(stmt, "handlers", []))
-            h_defs: List[Set[str]] = []
-            h_dels: List[Tuple[Set[str], bool]] = []
-            h_mays: List[Set[str]] = []
-            all_handlers_terminate = bool(
-                handlers and all(_block_terminates(getattr(h, "body", [])) for h in handlers)
-            )
-
-            for h in handlers:
-                h_body = list(getattr(h, "body", []))
-                if getattr(h, "type", None) is not None:
-                    d_ht, c_ht = _walrus_assignment_in_expr(h.type, is_conditional=True)
-                    conditional.update(d_ht | c_ht)
-                h_may: Set[str] = set()
-                h_live: Set[str] = set()
-                h_d, h_c = _analyze_block_assignment(
-                    h_body, may_deleted=h_may, live_in_deleted=h_live
-                )
-                h_bound = {h.name} if isinstance(getattr(h, "name", None), str) else set()
-                h_may.difference_update(h_bound)
-                live_in_del.update((h_live - h_bound) - definite)
-                h_term = _block_terminates(h_body)
-                eff_h_del = _extract_deleted_names(h_body) - h_d
-                h_dels.append((eff_h_del, h_term))
-                if not h_term:
-                    h_defs.append(h_d)
-                    h_mays.append(h_may)
-                conditional.update((h_d | h_c) - definite)
-
-            if not t_term:
-                if all_handlers_terminate:
-                    definite.update(try_def)
-                    conditional.update(try_cond - definite)
-                    may_del.difference_update(try_def)
-                    may_del.update(succ_may)
-                elif handlers and h_defs:
-                    common = try_def.intersection(*h_defs)
-                    definite.update(common)
-                    conditional.update((try_def | try_cond) - definite)
-                    may_del.difference_update(common)
-                    may_del.update(succ_may)
-                    for hm in h_mays:
-                        may_del.update(hm)
-                elif not handlers:
-                    definite.update(try_def)
-                    conditional.update(try_cond - definite)
-                    may_del.difference_update(try_def)
-                    may_del.update(succ_may)
-            elif h_defs:
-                common = set.intersection(*h_defs)
-                definite.update(common)
-                conditional.update(try_cond - definite)
-                may_del.difference_update(common)
-                for hm in h_mays:
-                    may_del.update(hm)
-
-            eff_try_del = _extract_deleted_names(t_body) - t_def
-            eff_o_del = _extract_deleted_names(o_stmts) - o_def if o_stmts else set()
-            succ_del = eff_try_del | eff_o_del
-
-            surviving_dels: List[Set[str]] = []
-            all_try_dels = succ_del.copy()
-            if not t_term:
-                surviving_dels.append(succ_del)
-
-            for eff_h_del, h_term in h_dels:
-                all_try_dels.update(eff_h_del)
-                if not h_term:
-                    surviving_dels.append(eff_h_del)
-
-            if surviving_dels:
-                uncond_dels = set.intersection(*surviving_dels)
-                for v_del in uncond_dels:
-                    definite.discard(v_del)
-                    conditional.discard(v_del)
-                _demote_deletions_to_conditional(all_try_dels - uncond_dels, definite, conditional)
-            else:
-                _demote_deletions_to_conditional(all_try_dels, definite, conditional)
-
-            f_body = list(getattr(stmt, "finalbody", []))
-            if f_body:
-                _analyze_block_assignment(
-                    f_body,
-                    definite,
-                    conditional,
-                    may_deleted=may_del,
-                    live_in_deleted=live_in_del,
-                )
-        elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
-            d_sub, c_sub = _walrus_assignment_in_expr(getattr(stmt, "subject", None))
-            definite.update(d_sub)
-            may_del.difference_update(d_sub)
-            conditional.update(c_sub)
-            case_defs: List[Set[str]] = []
-            non_term_case_defs: List[Set[str]] = []
-            case_conds: Set[str] = set()
-            case_dels: Set[str] = set()
-            non_term_case_dels: List[Set[str]] = []
-            has_irrefutable_default = False
-            for case in getattr(stmt, "cases", []):
-                pattern_stores: Set[str] = set()
-                pattern = getattr(case, "pattern", None)
-                if pattern is not None:
-                    for p_node in ast.walk(pattern):
-                        if type(p_node).__name__ in ("MatchAs", "MatchStar"):
-                            p_name = getattr(p_node, "name", None)
-                            if p_name and isinstance(p_name, str) and p_name != "_":
-                                pattern_stores.add(p_name)
-                        elif type(p_node).__name__ == "MatchMapping":
-                            p_rest = getattr(p_node, "rest", None)
-                            if p_rest and isinstance(p_rest, str) and p_rest != "_":
-                                pattern_stores.add(p_rest)
-                guard = getattr(case, "guard", None)
-                d_g: Set[str] = set()
-                c_g: Set[str] = set()
-                if guard is not None:
-                    d_g, c_g = _walrus_assignment_in_expr(guard, is_conditional=False)
-                case_init_def = pattern_stores | d_g
-                c_may: Set[str] = set()
-                c_live: Set[str] = set()
-                c_def, c_cond = _analyze_block_assignment(
-                    case.body,
-                    definite=case_init_def.copy(),
-                    conditional=c_g.copy() if c_g else None,
-                    may_deleted=c_may,
-                    live_in_deleted=c_live,
-                )
-                live_in_del.update((c_live - case_init_def) - definite)
-                case_defs.append(c_def)
-                case_conds.update(c_def | c_cond)
-                c_del = _extract_deleted_names(case.body) - c_def
-                case_dels.update(c_del)
-                if not _block_terminates(case.body):
-                    non_term_case_defs.append(c_def)
-                    non_term_case_dels.append(c_del)
-                    may_del.update(c_may - pattern_stores)
-                if _is_irrefutable_case(case):
-                    has_irrefutable_default = True
-            if case_defs and has_irrefutable_default:
-                if non_term_case_defs:
-                    common = set.intersection(*non_term_case_defs)
-                    definite.update(common)
-                    may_del.difference_update(common)
-                conditional.update(case_conds - definite)
-            else:
-                conditional.update(case_conds - definite)
-            all_del = (
-                {v for v in case_dels if all(v in d for d in non_term_case_dels)}
-                if (has_irrefutable_default and non_term_case_dels)
-                else set()
-            )
-            for v_del in all_del:
-                definite.discard(v_del)
-                conditional.discard(v_del)
-            _demote_deletions_to_conditional(case_dels - all_del, definite, conditional)
-        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            definite.add(stmt.name)
-            may_del.discard(stmt.name)
-        elif type(stmt).__name__ == "TypeAlias":  # pragma: no cover (py312+)
-            name_node = getattr(stmt, "name", None)
-            if isinstance(name_node, ast.Name):
-                definite.add(name_node.id)
-                may_del.discard(name_node.id)
-        elif isinstance(stmt, ast.Import):
-            for alias in stmt.names:
-                bound_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
-                definite.add(bound_name)
-                may_del.discard(bound_name)
-        elif isinstance(stmt, ast.ImportFrom):
-            for alias in stmt.names:
-                if alias.name != "*":
-                    bound_name = alias.asname or alias.name
-                    definite.add(bound_name)
-                    may_del.discard(bound_name)
-        elif isinstance(stmt, ast.Assert):
-            d_ast, c_ast = _walrus_assignment_in_expr(stmt.test)
-            definite.update(d_ast)
-            may_del.difference_update(d_ast)
-            conditional.update(c_ast)
-            if stmt.msg is not None:
-                d_m, c_m = _walrus_assignment_in_expr(stmt.msg, is_conditional=True)
-                conditional.update(d_m | c_m)
-
-        may_del.difference_update(definite - before_def)
-        if _block_terminates([stmt]):
-            break
-
-    return definite, conditional - definite
-
-
 def _determine_binding_kind(
     has_instance_binding: bool,
     has_class_binding: bool,
@@ -1593,15 +1089,81 @@ def _rank_param_kind(
 
 
 def _find_enclosing_pre_bound_names(
-    mod_tree: ast.AST, s_line: int, e_line: int
+    mod_tree: ast.AST,
+    s_line: int,
+    e_line: int,
+    u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
 ) -> Tuple[Set[str], bool]:
-    """Finds names bound before s_line in scopes enclosing [s_line, e_line] and loop containment."""
+    """Finds names may-bound before s_line in enclosing module/class/function scopes.
+
+    Unlike ``_find_enclosing_chain_definite_pre_bound`` (which computes must-bound
+    definite assignment across every control-flow path in enclosing functions), this
+    function collects all names that have a lexical binding on at least one path prior
+    to the unit across module, class, and function scopes, and reports whether the unit
+    is enclosed inside a loop. Comparing the may-bound set against the must-bound set
+    identifies variables that are only conditionally initialized before the unit.
+    """
     bound_before: Set[str] = set()
     in_loop = False
+
+    def _is_before_unit(c_line: Optional[int], c_col: Optional[int]) -> bool:
+        if not isinstance(c_line, int):
+            return False
+        if c_line < s_line:
+            return True
+        return (
+            c_line == s_line
+            and u_start_col is not None
+            and isinstance(c_col, int)
+            and c_col < u_start_col
+        )
+
+    def _node_contains_or_encloses_unit(node: ast.AST) -> bool:
+        return _is_ast_node_within_unit_bounds(
+            node,
+            s_line,
+            e_line,
+            u_end_col=u_end_col,
+            u_start_col=u_start_col,
+        ) or _node_strictly_encloses_bounds(
+            node,
+            s_line,
+            e_line,
+            u_start_col=u_start_col,
+            u_end_col=u_end_col,
+        )
+
     intervals = [
         (earliest_start, n_end, span, node)
         for earliest_start, n_end, span, node in _get_tree_scope_intervals(mod_tree)
-        if earliest_start <= s_line and e_line <= n_end
+        if earliest_start <= s_line
+        and e_line <= n_end
+        and (
+            _node_strictly_encloses_bounds(
+                node,
+                s_line,
+                e_line,
+                u_start_col=u_start_col,
+                u_end_col=u_end_col,
+            )
+            or (
+                u_start_col is None
+                and u_end_col is None
+                and (
+                    earliest_start < s_line
+                    or n_end > e_line
+                    or earliest_start == n_end
+                )
+            )
+        )
+        and not _is_span_in_scope_header(
+            node,
+            s_line,
+            e_line,
+            u_start_col=u_start_col,
+            u_end_col=u_end_col,
+        )
     ]
     intervals.sort(key=lambda item: (item[0], -item[1], -item[2]))
     innermost_scope = intervals[-1][3] if intervals else mod_tree
@@ -1617,6 +1179,9 @@ def _find_enclosing_pre_bound_names(
     for scope_node in active_scopes:
         is_class_scope = isinstance(scope_node, ast.ClassDef)
         if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bound_before.difference_update(
+                _extract_strict_fn_local_names(scope_node)
+            )
             for arg in (
                 scope_node.args.posonlyargs
                 + scope_node.args.args
@@ -1631,9 +1196,18 @@ def _find_enclosing_pre_bound_names(
         while stack:
             curr, is_branched = stack.pop()
             c_start = getattr(curr, "lineno", None)
+            c_col = getattr(curr, "col_offset", None)
             c_end = getattr(curr, "end_lineno", c_start)
+            c_end_col = getattr(curr, "end_col_offset", c_col)
             if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if isinstance(c_start, int) and c_start < s_line:
+                estart, ecol = _node_earliest_start_pos(curr)
+                if _is_before_unit(estart, ecol) and (
+                    (
+                        curr in active_scopes
+                        and not isinstance(curr, ast.ClassDef)
+                    )
+                    or _is_before_unit(c_end, c_end_col)
+                ):
                     bound_before.add(curr.name)
                 if not is_class_scope:
                     stack.extend(
@@ -1651,11 +1225,11 @@ def _find_enclosing_pre_bound_names(
             if isinstance(
                 curr, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
             ):
-                if isinstance(c_start, int) and c_start < s_line and not is_class_scope:
+                if _is_before_unit(c_start, c_col) and not is_class_scope:
                     bound_before.update(_extract_comprehension_walrus_names(curr))
                 continue
-            if type(curr).__name__ == "TypeAlias":
-                if isinstance(c_start, int) and c_start < s_line:
+            if is_type_alias_node(curr):
+                if _is_before_unit(c_start, c_col):
                     alias_name = getattr(curr, "name", None)
                     if isinstance(alias_name, ast.Name):
                         bound_before.add(alias_name.id)
@@ -1667,16 +1241,37 @@ def _find_enclosing_pre_bound_names(
             ):
                 stack.append((curr.annotation, is_branched))
                 continue
+            if isinstance(
+                curr,
+                (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr),
+            ):
+                rhs_val = curr.value
+                if rhs_val is not None and _node_contains_or_encloses_unit(
+                    rhs_val
+                ):
+                    stack.append((rhs_val, is_branched))
+                    if isinstance(curr, ast.AnnAssign):
+                        stack.append((curr.annotation, is_branched))
+                    elif isinstance(curr, ast.AugAssign) and not isinstance(
+                        curr.target, ast.Name
+                    ):
+                        stack.append((curr.target, is_branched))
+                    continue
             if isinstance(curr, (ast.For, ast.AsyncFor, ast.While)):
-                if (
-                    isinstance(c_start, int)
-                    and isinstance(c_end, int)
-                    and c_start <= s_line
-                    and e_line <= c_end
-                    and (c_start < s_line or c_end > e_line)
+                if isinstance(
+                    curr, (ast.For, ast.AsyncFor)
+                ) and _node_contains_or_encloses_unit(curr.iter):
+                    stack.append((curr.iter, is_branched))
+                    continue
+                if _node_strictly_encloses_bounds(
+                    curr,
+                    s_line,
+                    e_line,
+                    u_start_col=u_start_col,
+                    u_end_col=u_end_col,
                 ):
                     in_loop = True
-            if isinstance(c_start, int) and c_start < s_line:
+            if _is_before_unit(c_start, c_col):
                 if isinstance(curr, ast.Name) and isinstance(curr.ctx, ast.Store):
                     bound_before.add(curr.id)
                 elif (
@@ -1693,12 +1288,20 @@ def _find_enclosing_pre_bound_names(
                 elif (
                     isinstance(curr, ast.ExceptHandler)
                     and isinstance(curr.name, str)
-                    and isinstance(c_end, int)
-                    and c_start <= s_line
-                    and e_line <= c_end
+                    and _node_strictly_encloses_bounds(
+                        curr,
+                        s_line,
+                        e_line,
+                        u_start_col=u_start_col,
+                        u_end_col=u_end_col,
+                    )
                 ):
                     bound_before.add(curr.name)
-                elif type(curr).__name__ in ("MatchAs", "MatchStar", "MatchMapping"):
+                elif (
+                    is_match_as_node(curr)
+                    or is_match_star_node(curr)
+                    or is_match_mapping_node(curr)
+                ):
                     m_name = getattr(curr, "name", None) or getattr(curr, "rest", None)
                     if isinstance(m_name, str) and m_name != "_":
                         bound_before.add(m_name)
@@ -1714,13 +1317,698 @@ def _find_enclosing_pre_bound_names(
                         ast.ExceptHandler,
                     ),
                 )
-                or type(curr).__name__ in ("TryStar", "Match")
+                or is_trystar_node(curr)
+                or is_match_node(curr)
             )
             stack.extend(
                 (ch, child_branched)
                 for ch in reversed(list(ast.iter_child_nodes(curr)))
             )
     return bound_before, in_loop
+
+
+def _infer_missing_col_from_line_ast(
+    lines: Union[str, Sequence[str]],
+    s_col: Optional[int],
+    e_col: Optional[int],
+    unit_kind: Optional[str] = None,
+    *,
+    allow_expr_fallback: bool = False,
+) -> Tuple[Optional[int], Optional[int]]:
+    """Infers a missing start_col or end_col from single-line or multiline AST nodes."""
+    line_seq: Sequence[str] = (lines,) if isinstance(lines, str) else lines
+    if not line_seq:
+        return s_col, e_col
+    n_lines = len(line_seq)
+    if n_lines == 1:
+        line0 = line_seq[0]
+        stripped = line0.lstrip()
+        if not stripped:
+            return s_col, e_col
+        pad_first = len(line0[: len(line0) - len(stripped)].encode("utf-8"))
+        pad_last = pad_first
+        parse_src = stripped
+    else:
+        raw_block = "".join(
+            ln if ln.endswith("\n") else ln + "\n" for ln in line_seq
+        )
+        dedented = dedent_source_text(raw_block)
+        d_lines = split_source_lines(dedented)
+        if len(d_lines) != n_lines:
+            return s_col, e_col
+        pad_first = len(line_seq[0].rstrip("\r\n").encode("utf-8")) - len(
+            d_lines[0].rstrip("\r\n").encode("utf-8")
+        )
+        pad_last = len(line_seq[-1].rstrip("\r\n").encode("utf-8")) - len(
+            d_lines[-1].rstrip("\r\n").encode("utf-8")
+        )
+        parse_src = dedented
+    try:
+        with _suppress_syntax_warnings():
+            mod = ast.parse(parse_src)
+    except SyntaxError:
+        return s_col, e_col
+    if unit_kind == "comprehension":
+        candidate_groups: Tuple[Tuple[type, ...], ...] = (_COMPREHENSION_TYPES,)
+    elif unit_kind == "complex_expr":
+        candidate_groups = ((ast.expr,),)
+    elif allow_expr_fallback:
+        candidate_groups = ((ast.stmt,), (ast.expr,))
+    else:
+        candidate_groups = ((ast.stmt,),)
+    for target_types in candidate_groups:
+        matched_spans: Set[Tuple[int, int]] = set()
+        for node in ast.walk(mod):
+            if not isinstance(node, target_types) or isinstance(
+                node, (ast.Name, ast.Constant)
+            ):
+                continue
+            if (
+                getattr(node, "lineno", None) != 1
+                or getattr(node, "end_lineno", None) != n_lines
+            ):
+                continue
+            nc = getattr(node, "col_offset", None)
+            nec = getattr(node, "end_col_offset", None)
+            if not isinstance(nc, int) or not isinstance(nec, int):
+                continue
+            abs_s = pad_first + nc
+            abs_e = pad_last + nec
+            if (n_lines > 1 or abs_s < abs_e) and (
+                (s_col is not None and abs_s == s_col)
+                or (e_col is not None and abs_e == e_col)
+            ):
+                matched_spans.add((abs_s, abs_e))
+        if len(matched_spans) == 1:
+            return next(iter(matched_spans))
+        if len(matched_spans) > 1:
+            return s_col, e_col
+    return s_col, e_col
+
+
+def _unit_cols(
+    unit: Dict[str, Any],
+    unit_code_lines: Optional[Sequence[str]] = None,
+) -> Tuple[Optional[int], Optional[int]]:
+    """Extracts (start_col, end_col) coordinates from a unit dictionary."""
+    s_col = parse_unit_coord(unit, "start_col", default=None)
+    if s_col is None:
+        s_col = parse_unit_coord(unit, "col_offset", default=None)
+    e_col = parse_unit_coord(unit, "end_col", default=None)
+    if e_col is None:
+        e_col = parse_unit_coord(unit, "end_col_offset", default=None)
+    u_kind_str = str(unit.get("kind") or "")
+    is_inline_expr_kind = u_kind_str in (
+        "comprehension",
+        "complex_expr",
+        "closure",
+    )
+    if (
+        (s_col is None or e_col is None)
+        and unit_code_lines
+        and isinstance(unit.get("source_code"), str)
+    ):
+        snippet = unit["source_code"].strip()
+        if len(unit_code_lines) == 1 and snippet and "\n" not in snippet:
+            line0 = unit_code_lines[0]
+            if (
+                s_col is not None
+                or e_col is not None
+                or (
+                    snippet != line0.strip()
+                    and (";" in line0 or is_inline_expr_kind)
+                )
+            ):
+                start_id = snippet[0].isalnum() or snippet[0] == "_"
+                end_id = snippet[-1].isalnum() or snippet[-1] == "_"
+                search_idx = 0
+                exact_matches: List[Tuple[int, int]] = []
+                while True:
+                    pos = line0.find(snippet, search_idx)
+                    if pos < 0:
+                        break
+                    end_pos = pos + len(snippet)
+                    left_ok = not start_id or pos == 0 or not (
+                        line0[pos - 1].isalnum() or line0[pos - 1] == "_"
+                    )
+                    right_ok = not end_id or end_pos >= len(line0) or not (
+                        line0[end_pos].isalnum() or line0[end_pos] == "_"
+                    )
+                    if left_ok and right_ok:
+                        cand_s = len(line0[:pos].encode("utf-8"))
+                        cand_e = len(line0[:end_pos].encode("utf-8"))
+                        if (s_col is None or cand_s == s_col) and (
+                            e_col is None or cand_e == e_col
+                        ):
+                            exact_matches.append((cand_s, cand_e))
+                    search_idx = pos + 1
+                if len(exact_matches) == 1:
+                    best_pair = exact_matches[0]
+                    if s_col is None:
+                        s_col = best_pair[0]
+                    if e_col is None:
+                        e_col = best_pair[1]
+        elif len(unit_code_lines) > 1 and snippet and "\n" in snippet:
+            snip_lines = [
+                ln.rstrip("\r\n") for ln in split_source_lines(snippet)
+            ]
+            if (
+                len(snip_lines) == len(unit_code_lines)
+                and snip_lines[0]
+                and snip_lines[-1]
+                and all(
+                    snip_lines[i].strip() == unit_code_lines[i].strip()
+                    for i in range(1, len(snip_lines) - 1)
+                )
+            ):
+                had_explicit_col = s_col is not None or e_col is not None
+                line_first = unit_code_lines[0].rstrip("\r\n")
+                line_last = unit_code_lines[-1].rstrip("\r\n")
+                if (
+                    had_explicit_col
+                    or ";" in line_first
+                    or ";" in line_last
+                    or is_inline_expr_kind
+                ):
+                    ml_cand_s: Optional[int] = s_col
+                    ml_cand_e: Optional[int] = e_col
+                    snip_first = snip_lines[0]
+                    if ml_cand_s is None:
+                        start_id = (
+                            snip_first[0].isalnum() or snip_first[0] == "_"
+                        )
+                        s_matches: List[int] = []
+                        idx = 0
+                        while True:
+                            pos = line_first.find(snip_first, idx)
+                            if pos < 0:
+                                break
+                            tail = line_first[
+                                pos + len(snip_first) :
+                            ].strip()
+                            left_ok = not start_id or pos == 0 or not (
+                                line_first[pos - 1].isalnum()
+                                or line_first[pos - 1] == "_"
+                            )
+                            if left_ok and (not tail or tail.startswith("#")):
+                                s_matches.append(
+                                    len(line_first[:pos].encode("utf-8"))
+                                )
+                            idx = pos + 1
+                        if len(s_matches) == 1:
+                            ml_cand_s = s_matches[0]
+                    snip_last = snip_lines[-1].lstrip()
+                    if ml_cand_e is None and snip_last:
+                        end_id = (
+                            snip_last[-1].isalnum() or snip_last[-1] == "_"
+                        )
+                        l_stripped = line_last.lstrip()
+                        if l_stripped.startswith(snip_last):
+                            end_pos = (
+                                len(line_last)
+                                - len(l_stripped)
+                                + len(snip_last)
+                            )
+                            right_ok = (
+                                not end_id
+                                or end_pos >= len(line_last)
+                                or not (
+                                    line_last[end_pos].isalnum()
+                                    or line_last[end_pos] == "_"
+                                )
+                            )
+                            if right_ok:
+                                ml_cand_e = len(
+                                    line_last[:end_pos].encode("utf-8")
+                                )
+                    if had_explicit_col or (
+                        ml_cand_s is not None and ml_cand_e is not None
+                    ):
+                        s_col, e_col = ml_cand_s, ml_cand_e
+    if (s_col is None) != (e_col is None) and unit_code_lines:
+        s_col, e_col = _infer_missing_col_from_line_ast(
+            unit_code_lines,
+            s_col,
+            e_col,
+            unit_kind=u_kind_str,
+            allow_expr_fallback=is_inline_expr_kind,
+        )
+    return s_col, e_col
+
+
+def _is_word_or_attr_char(ch: str) -> bool:
+    """Returns True if ch is an identifier character or attribute dot."""
+    return ch.isalnum() or ch in ("_", ".")
+
+
+def _has_token_boundary_subslice(
+    sub: str,
+    line: str,
+    *,
+    anchor_start: bool = False,
+    anchor_end: bool = False,
+    require_stmt_delimiters: bool = False,
+) -> bool:
+    """Checks whether sub occurs in line at valid lexical token boundaries."""
+    if not sub:
+        return False
+    if sub == line:
+        return True
+    search_start = 0
+    while True:
+        pos = line.find(sub, search_start)
+        if pos == -1:
+            return False
+        search_start = pos + 1
+        end_pos = pos + len(sub)
+        if anchor_start and pos != 0:
+            continue
+        if anchor_end and end_pos != len(line):
+            continue
+        if pos > 0 and (sub[0].isalnum() or sub[0] == "_"):
+            if _is_word_or_attr_char(line[pos - 1]):
+                continue
+        if end_pos < len(line) and (sub[-1].isalnum() or sub[-1] == "_"):
+            if _is_word_or_attr_char(line[end_pos]):
+                continue
+        if require_stmt_delimiters:
+            prefix = line[:pos].rstrip()
+            suffix = line[end_pos:].lstrip()
+            if prefix and not prefix.endswith((";", ":")):
+                continue
+            if suffix and not suffix.startswith((";", "#")):
+                continue
+        return True
+
+
+def _is_ordered_contiguous_source_match(
+    src_code_lines: Sequence[str],
+    raw_lines: Sequence[str],
+    *,
+    allow_subwindow: bool = True,
+) -> bool:
+    """Checks whether src_code_lines matches raw_lines (with token-boundary boundary lines when allow_subwindow is True)."""
+    raw_nonempty = [ln.strip() for ln in raw_lines if ln.strip()]
+    k = len(src_code_lines)
+    if k == 0 or k != len(raw_nonempty):
+        return False
+    if not allow_subwindow:
+        return list(src_code_lines) == raw_nonempty
+    if k == 1:
+        target = src_code_lines[0]
+        is_stmt_like = not _is_valid_eval_expr(target)
+        return _has_token_boundary_subslice(
+            target,
+            raw_nonempty[0],
+            require_stmt_delimiters=is_stmt_like,
+        )
+    if not _has_token_boundary_subslice(
+        src_code_lines[0], raw_nonempty[0], anchor_end=True
+    ):
+        return False
+    if not _has_token_boundary_subslice(
+        src_code_lines[-1], raw_nonempty[-1], anchor_start=True
+    ):
+        return False
+    return all(
+        raw_nonempty[i] == src_code_lines[i] for i in range(1, k - 1)
+    )
+
+
+def _normalize_clause_header_snippet(dedented: str) -> str:
+    """Normalizes standalone elif/else/except/finally/case clause headers into parseable statements."""
+    stripped = dedented.lstrip(" \t")
+    if re.match(r"^elif(?:\s|\(|\[|:)", stripped):
+        return "if" + stripped[4:]
+    if re.match(r"^else\s*:", stripped):
+        return "if 1" + stripped[4:]
+    if re.match(r"^(?:except(?:\*|\s|\(|:)|finally\s*:)", stripped):
+        return f"try:\n    pass\n{stripped}"
+    if re.match(r"^case(?:\s|\(|\[)", stripped):
+        return f"match 0:\n{textwrap.indent(stripped, '    ')}"
+    return dedented
+
+
+def _parse_normalized_stmt_dumps(text: str) -> Optional[List[str]]:
+    """Parses a code snippet into position-independent AST statement dumps."""
+    raw_dedented = dedent_source_text(text).strip()
+    if not raw_dedented:
+        return None
+    dedented = _normalize_clause_header_snippet(raw_dedented)
+    for cand in (
+        dedented,
+        f"async def _norm_wrap():\n{textwrap.indent(dedented, '    ')}",
+    ):
+        try:
+            with _suppress_syntax_warnings():
+                parsed = ast.parse(cand)
+            stmts = (
+                parsed.body
+                if cand == dedented
+                else getattr(parsed.body[0], "body", [])
+            )
+            return (
+                [ast.dump(s, include_attributes=False) for s in stmts]
+                if stmts
+                else None
+            )
+        except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
+            continue
+    return None
+
+
+def _scan_line_unquoted_comment(
+    line: str,
+    in_quote: Optional[str] = None,
+) -> Tuple[str, Optional[str]]:
+    """Strips an unquoted trailing '#' comment while tracking triple-quote state across lines.
+
+    Note:
+        Used as a lightweight line-by-line fallback when ``tokenize.generate_tokens``
+        cannot tokenize an incomplete fragment; does not parse Python 3.12 nested
+        f-string quotes or raw-string trailing backslashes.
+    """
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if in_quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if line.startswith(in_quote, i):
+                i += len(in_quote)
+                in_quote = None
+                continue
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            triple = ch * 3
+            if line.startswith(triple, i):
+                in_quote = triple
+                i += 3
+            else:
+                in_quote = ch
+                i += 1
+            continue
+        if ch == "#":
+            return line[:i].strip(), None
+        i += 1
+    if in_quote in ("'", '"') and not line.rstrip("\r\n").endswith("\\"):
+        in_quote = None
+    return line.strip(), in_quote
+
+
+def _strip_unquoted_comment(line: str) -> str:
+    """Strips a trailing '#' comment outside of single, double, or triple-quoted strings."""
+    stripped, _ = _scan_line_unquoted_comment(line, None)
+    return stripped
+
+
+def _strip_inline_comment_line(line: str) -> str:
+    """Strips trailing Python comments and normalizes intra-line token spacing."""
+    toks: List[str] = []
+    try:
+        for tok in tokenize.generate_tokens(
+            io.StringIO(line.lstrip(" \t")).readline
+        ):
+            if tok.type in (
+                tokenize.COMMENT,
+                tokenize.NL,
+                tokenize.NEWLINE,
+                tokenize.INDENT,
+                tokenize.DEDENT,
+                tokenize.ENCODING,
+                tokenize.ENDMARKER,
+            ):
+                continue
+            toks.append(tok.string)
+        return " ".join(toks)
+    except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
+        if toks and "multi-line statement" in str(exc).lower():
+            return " ".join(toks)
+        return _strip_unquoted_comment(line)
+
+
+def _strip_comments_from_lines(lines: Sequence[str]) -> List[str]:
+    """Strips comments across a sequence of lines while preserving '#' inside multiline strings."""
+    result: List[str] = []
+    in_quote: Optional[str] = None
+    for ln in lines:
+        prev_quote = in_quote
+        stripped_ln, next_quote = _scan_line_unquoted_comment(ln, prev_quote)
+        in_quote = next_quote
+        if prev_quote is None and next_quote is None:
+            norm = _strip_inline_comment_line(ln)
+        else:
+            norm = stripped_ln
+        if norm:
+            result.append(norm)
+    return result
+
+
+def _is_normalized_source_equivalent(
+    src_code: str,
+    raw_lines: Sequence[str],
+    *,
+    allow_subwindow: bool = False,
+) -> bool:
+    """Checks whether normalized or comment-stripped src_code matches raw_lines."""
+    src_dumps = _parse_normalized_stmt_dumps(src_code)
+    raw_dumps = _parse_normalized_stmt_dumps("".join(raw_lines))
+    has_boundary_semicolon = bool(
+        raw_lines and (";" in raw_lines[0] or ";" in raw_lines[-1])
+    )
+    if src_dumps and raw_dumps:
+        if not (allow_subwindow and has_boundary_semicolon):
+            if src_dumps == raw_dumps:
+                return True
+        elif len(src_dumps) <= len(raw_dumps):
+            k = len(src_dumps)
+            if any(
+                raw_dumps[i : i + k] == src_dumps
+                for i in range(len(raw_dumps) - k + 1)
+            ):
+                return True
+    norm_src_lines = _strip_comments_from_lines(split_source_lines(src_code))
+    norm_raw_lines = _strip_comments_from_lines(raw_lines)
+    if norm_src_lines and norm_raw_lines:
+        return _is_ordered_contiguous_source_match(
+            norm_src_lines,
+            norm_raw_lines,
+            allow_subwindow=allow_subwindow,
+        )
+    return False
+
+
+def _get_tree_sha256_digest(mod_tree: ast.AST) -> str:
+    """Returns a cached SHA-256 hex digest of mod_tree for downstream cache keys when source_text is absent."""
+    def _compute() -> str:
+        cached_lines = _get_cached_tree_source_lines(mod_tree)
+        hasher = hashlib.sha256()
+        if cached_lines is not None:
+            for line in cached_lines:
+                hasher.update(line.encode("utf-8"))
+                hasher.update(b"\n")
+            return hasher.hexdigest()
+        hasher.update(
+            ast.dump(mod_tree, include_attributes=True).encode("utf-8")
+        )
+        return hasher.hexdigest()
+
+    if _is_ephemeral_unit_ast(mod_tree):
+        return _compute()
+    cache_key = _ScopeCacheKey(mod_tree, "tree_sha256_digest")
+    return cast(
+        str,
+        _get_or_compute_scope_cached(_scope_cell_info_cache, cache_key, _compute),
+    )
+
+
+def _unit_source_code_matches_tree(
+    unit: Dict[str, Any],
+    src_code: str,
+    file_tree: ast.AST,
+) -> bool:
+    """Checks whether unit['source_code'] matches the ordered AST nodes in file_tree spanning (start, end)."""
+    u_start = parse_unit_coord(unit, "start", default=1)
+    u_end = parse_unit_coord(unit, "end", default=u_start)
+    s_col = parse_unit_coord(
+        unit,
+        "start_col",
+        default=parse_unit_coord(unit, "col_offset", default=None),
+    )
+    e_col = parse_unit_coord(
+        unit,
+        "end_col",
+        default=parse_unit_coord(unit, "end_col_offset", default=None),
+    )
+    has_explicit_cols = s_col is not None or e_col is not None
+    u_kind_str = str(unit.get("kind") or "")
+    is_inline_expr_kind = u_kind_str in (
+        "comprehension",
+        "complex_expr",
+        "closure",
+    )
+    span_idx = _get_span_line_index(file_tree)
+    end_nodes: List[Tuple[ast.AST, int]] = []
+    for cand_node in (
+        *span_idx.by_start_line.get(u_end, ()),
+        *span_idx.by_end_line.get(u_end, ()),
+    ):
+        cand_start, cand_end, _c, _ec = span_idx.node_coords(cand_node)
+        if cand_end == u_end:
+            end_nodes.append((cand_node, cand_start))
+    src_dumps = _parse_normalized_stmt_dumps(src_code)
+    if src_dumps:
+        candidate_dump_seqs: List[List[str]] = [src_dumps]
+        raw_dedented = dedent_source_text(src_code).strip()
+        norm_dedented = _normalize_clause_header_snippet(raw_dedented)
+        if norm_dedented != raw_dedented:
+            try:
+                with _suppress_syntax_warnings():
+                    norm_mod = ast.parse(norm_dedented)
+                inner_nodes: List[ast.AST] = []
+                for top_s in norm_mod.body:
+                    if isinstance(top_s, ast.If):
+                        inner_nodes.extend(top_s.body)
+                    elif isinstance(top_s, ast.Try):
+                        inner_nodes.extend(top_s.handlers)
+                        inner_nodes.extend(top_s.finalbody)
+                    elif is_match_node(top_s):
+                        for c_node in getattr(top_s, "cases", ()):
+                            inner_nodes.extend(getattr(c_node, "body", ()))
+                if inner_nodes:
+                    candidate_dump_seqs.append(
+                        [
+                            ast.dump(n, include_attributes=False)
+                            for n in inner_nodes
+                        ]
+                    )
+            except (
+                SyntaxError,
+                ValueError,
+                UnicodeDecodeError,
+                RecursionError,
+                MemoryError,
+            ):
+                pass
+        parent_map = _get_scope_parent_map(file_tree)
+        candidate_parents: List[ast.AST] = []
+        seen_parent_ids: Set[int] = set()
+        for node, entry_start in end_nodes:
+            if isinstance(node, (ast.stmt, ast.ExceptHandler)):
+                n_s = getattr(node, "lineno", entry_start)
+                if u_start in (n_s, entry_start):
+                    single_dump = [span_idx.get_dump(node)]
+                    if single_dump in candidate_dump_seqs:
+                        return True
+                parent_node = parent_map.get(node)
+                if parent_node is not None and id(parent_node) not in seen_parent_ids:
+                    seen_parent_ids.add(id(parent_node))
+                    candidate_parents.append(parent_node)
+        for node in candidate_parents:
+            for attr_name in ("body", "orelse", "finalbody", "handlers"):
+                seq = getattr(node, attr_name, None)
+                if not isinstance(seq, list) or not seq:
+                    continue
+                in_span: List[ast.AST] = []
+                for s in seq:
+                    s_estart, _ = _node_earliest_start_pos(s)
+                    s_lineno = getattr(s, "lineno", s_estart)
+                    s_end = getattr(s, "end_lineno", s_lineno)
+                    if (
+                        isinstance(s_lineno, int)
+                        and isinstance(s_end, int)
+                        and (s_lineno >= u_start or (isinstance(s_estart, int) and s_estart >= u_start))
+                        and s_end <= u_end
+                    ):
+                        in_span.append(s)
+                if not in_span:
+                    continue
+                first_estart, _ = _node_earliest_start_pos(in_span[0])
+                first_lineno = getattr(in_span[0], "lineno", first_estart)
+                last_end = getattr(
+                    in_span[-1],
+                    "end_lineno",
+                    getattr(in_span[-1], "lineno", None),
+                )
+                starts_at_u_start = u_start in (first_lineno, first_estart) or (
+                    attr_name in ("body", "orelse", "finalbody")
+                    and first_lineno == u_start + 1
+                )
+                if not (starts_at_u_start and last_end == u_end):
+                    continue
+                span_dumps = [span_idx.get_dump(s) for s in in_span]
+                for target_dumps in candidate_dump_seqs:
+                    if span_dumps == target_dumps:
+                        return True
+                    if (
+                        (has_explicit_cols or (u_start == u_end and len(span_dumps) > 1))
+                        and len(target_dumps) <= len(span_dumps)
+                    ):
+                        k = len(target_dumps)
+                        if any(
+                            span_dumps[i : i + k] == target_dumps
+                            for i in range(len(span_dumps) - k + 1)
+                        ):
+                            return True
+    dedented = dedent_source_text(src_code).strip()
+    if dedented and (is_inline_expr_kind or has_explicit_cols or not src_dumps):
+        try:
+            with _suppress_syntax_warnings():
+                expr_node = ast.parse(dedented, mode="eval").body
+            expr_dump = ast.dump(expr_node, include_attributes=False)
+            for node, entry_start in end_nodes:
+                if (
+                    isinstance(node, ast.expr)
+                    and entry_start == u_start
+                    and span_idx.get_dump(node) == expr_dump
+                ):
+                    return True
+        except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
+            pass
+    return False
+
+
+def _has_out_of_bounds_unit_cols(
+    unit: Dict[str, Any],
+    unit_code_lines: Sequence[str],
+    *,
+    is_pre_sliced: bool,
+    is_placeholder_origin: bool,
+    explicit_col_sliced: bool,
+) -> bool:
+    """Returns True if explicit column coordinates on unit are invalid or out of bounds for unit_code_lines."""
+    raw_s_col = _extract_slice_col_offset(
+        unit, ("start_col", "start_col_offset", "col_offset"), default=None
+    )
+    raw_e_col = _extract_slice_col_offset(
+        unit, ("end_col", "end_col_offset"), default=None
+    )
+    if raw_s_col == -1 or raw_e_col == -1:
+        return True
+    if (
+        is_placeholder_origin
+        or explicit_col_sliced
+        or not unit_code_lines
+        or (raw_s_col is None and raw_e_col is None)
+    ):
+        return False
+    first_b = len(unit_code_lines[0].rstrip("\r\n").encode("utf-8"))
+    last_b = len(unit_code_lines[-1].rstrip("\r\n").encode("utf-8"))
+    s_in_bounds = raw_s_col is None or (0 <= raw_s_col < first_b)
+    e_in_bounds = raw_e_col is None or (0 <= raw_e_col <= last_b)
+    order_ok = (
+        len(unit_code_lines) > 1
+        or raw_s_col is None
+        or raw_e_col is None
+        or raw_s_col < raw_e_col
+    )
+    if s_in_bounds and e_in_bounds and order_ok:
+        return False
+    del is_pre_sliced
+    return True
 
 
 def _inspect_unit_scope(
@@ -1737,9 +2025,182 @@ def _inspect_unit_scope(
             full_source_loaded[0] = True
         return cached_full_source[0]
 
-    unit_code_lines = extract_unit_source_code(unit, repo_root=repo_root)
-    raw_lines = _slice_unit_token_lines(unit, unit_code_lines)
+    unit_code_lines, line_origin = extract_unit_source_lines_with_state(
+        unit, repo_root=repo_root
+    )
+    is_pre_sliced = line_origin.is_pre_sliced
+    is_placeholder_origin = line_origin.is_placeholder
+    explicit_col_sliced = bool(unit.get("source_lines_is_col_sliced"))
+    col_bounds_invalid = _has_out_of_bounds_unit_cols(
+        unit,
+        unit_code_lines,
+        is_pre_sliced=is_pre_sliced,
+        is_placeholder_origin=is_placeholder_origin,
+        explicit_col_sliced=explicit_col_sliced,
+    )
+    src_code_str = (
+        unit["source_code"].strip()
+        if isinstance(unit.get("source_code"), str)
+        else ""
+    )
+    is_placeholder_source = not src_code_str and (
+        is_placeholder_origin or not unit_code_lines
+    )
+    inferred_s_col, inferred_e_col = _unit_cols(
+        unit, None if is_placeholder_origin else unit_code_lines
+    )
+    slice_unit = (
+        {**unit, "start_col": inferred_s_col, "end_col": inferred_e_col}
+        if inferred_s_col is not None or inferred_e_col is not None
+        else unit
+    )
+    raw_lines = (
+        []
+        if col_bounds_invalid
+        else (
+            split_source_lines(str(unit["source_code"]))
+            if is_placeholder_origin and src_code_str
+            else _slice_unit_token_lines(
+                slice_unit,
+                unit_code_lines,
+                is_pre_sliced=is_pre_sliced,
+                explicit_col_sliced=explicit_col_sliced,
+            )
+        )
+    )
+    if not is_placeholder_origin and unit_code_lines and not raw_lines:
+        col_bounds_invalid = True
+    if (
+        not is_placeholder_origin
+        and raw_lines
+        and unit.get("kind") not in ("comprehension", "complex_expr")
+        and (not src_code_str or "".join(raw_lines).strip() != src_code_str)
+    ):
+        if (
+            len(raw_lines) == 1
+            and (";" in raw_lines[0] or unit.get("kind") == "closure")
+            and inferred_s_col is not None
+            and inferred_e_col is not None
+            and 0 <= inferred_s_col < inferred_e_col
+            <= len(raw_lines[0].rstrip("\r\n").encode("utf-8"))
+        ):
+            sliced_stmt = _slice_utf8_line(
+                raw_lines[0], inferred_s_col, inferred_e_col
+            )
+            if sliced_stmt.strip() and (
+                ";" in raw_lines[0]
+                or sliced_stmt.lstrip().startswith(("lambda", "(lambda"))
+            ):
+                raw_lines = [sliced_stmt]
+        elif len(raw_lines) > 1 and (
+            ";" in raw_lines[0] or ";" in raw_lines[-1]
+        ):
+            raw_lines = list(raw_lines)
+            if (
+                inferred_s_col is not None
+                and 0
+                < inferred_s_col
+                < len(raw_lines[0].rstrip("\r\n").encode("utf-8"))
+                and ";" in raw_lines[0]
+            ):
+                lead_ws = raw_lines[0][
+                    : len(raw_lines[0]) - len(raw_lines[0].lstrip(" \t"))
+                ]
+                raw_lines[0] = lead_ws + _slice_utf8_line(
+                    raw_lines[0], inferred_s_col, None
+                ).lstrip(" \t")
+            if (
+                inferred_e_col is not None
+                and 0
+                < inferred_e_col
+                <= len(raw_lines[-1].rstrip("\r\n").encode("utf-8"))
+                and ";" in raw_lines[-1]
+            ):
+                raw_lines[-1] = _slice_utf8_line(
+                    raw_lines[-1], 0, inferred_e_col
+                )
+    # Stale-source check: when both a backing module (file_tree or _get_full_source())
+    # and an embedded unit["source_code"] are present, verify that source_code matches
+    # the module lines at (start, end, start_col, end_col). When no backing module is
+    # available (e.g., an in-memory unit carrying only source_code), raw_lines falls
+    # back to unit["source_code"].
+    stale_source_code_mismatch = False
+    if col_bounds_invalid:
+        pass
+    elif is_placeholder_origin and src_code_str:
+        if file_tree is not None and not _unit_source_code_matches_tree(
+            unit, str(unit["source_code"]), file_tree
+        ):
+            stale_source_code_mismatch = True
+    elif (
+        src_code_str
+        and dedent_source_text("".join(raw_lines)).strip()
+        != dedent_source_text(str(unit["source_code"])).strip()
+    ):
+        src_code_lines = [
+            ln.strip()
+            for ln in split_source_lines(str(unit["source_code"]))
+            if ln.strip()
+        ]
+        has_boundary_semicolon = bool(
+            raw_lines and (";" in raw_lines[0] or ";" in raw_lines[-1])
+        )
+        allow_subwindow = (
+            inferred_s_col is not None
+            or inferred_e_col is not None
+            or has_boundary_semicolon
+            or str(unit.get("kind") or "")
+            in ("comprehension", "complex_expr", "closure")
+        )
+        candidate_line_windows: List[Sequence[str]] = [raw_lines]
+        if (
+            inferred_s_col is not None or inferred_e_col is not None
+        ) and raw_lines:
+            col_sliced = list(raw_lines)
+            first_b_len = len(col_sliced[0].rstrip("\r\n").encode("utf-8"))
+            if len(col_sliced) == 1:
+                s_c = inferred_s_col if inferred_s_col is not None and 0 <= inferred_s_col <= first_b_len else 0
+                e_c = (
+                    inferred_e_col
+                    if inferred_e_col is not None and s_c <= inferred_e_col <= first_b_len
+                    else None
+                )
+                col_sliced[0] = _slice_utf8_line(col_sliced[0], s_c, e_c)
+            else:
+                last_b_len = len(col_sliced[-1].rstrip("\r\n").encode("utf-8"))
+                if inferred_s_col is not None and 0 < inferred_s_col < first_b_len:
+                    col_sliced[0] = _slice_utf8_line(col_sliced[0], inferred_s_col, None)
+                if inferred_e_col is not None and 0 < inferred_e_col <= last_b_len:
+                    col_sliced[-1] = _slice_utf8_line(col_sliced[-1], 0, inferred_e_col)
+            candidate_line_windows.append(col_sliced)
+        matches_backing_source = any(
+            dedent_source_text("".join(win)).strip()
+            == dedent_source_text(str(unit["source_code"])).strip()
+            or _is_ordered_contiguous_source_match(
+                src_code_lines, win, allow_subwindow=allow_subwindow
+            )
+            or _is_normalized_source_equivalent(
+                str(unit["source_code"]), win, allow_subwindow=allow_subwindow
+            )
+            for win in candidate_line_windows
+        )
+        if (
+            (file_tree is not None or _get_full_source() is not None)
+            and src_code_lines
+            and not matches_backing_source
+        ):
+            stale_source_code_mismatch = True
+        elif not raw_lines or allow_subwindow:
+            raw_lines = split_source_lines(str(unit["source_code"]))
     dedented = dedent_source_text("".join(raw_lines))
+    skip_pre_unit_closures_flag, strict_with_flag = resolve_unit_closure_flags(
+        unit
+    )
+    extra_non_sup = frozenset(
+        normalize_non_suppressing_ctx_managers(
+            unit.get("non_suppressing_ctx_managers")
+        )
+    )
     empty_res: Dict[str, Any] = {
         "inputs": [],
         "outputs": [],
@@ -1752,6 +2213,7 @@ def _inspect_unit_scope(
         "param_details": [],
         "return_type": None,
         "control_flow_hazards": [],
+        "closure_hazard_reasons": [],
         "is_control_flow_safe": True,
         "has_yield": False,
         "has_yield_assignment": False,
@@ -1776,19 +2238,79 @@ def _inspect_unit_scope(
         "type_param_free_vars": [],
         "has_class_scoped_type_params": False,
         "deleted_names": [],
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
+        "skip_pre_unit_closures": skip_pre_unit_closures_flag,
+        "strict_with_suppression": strict_with_flag,
+        "non_suppressing_ctx_managers": sorted(extra_non_sup),
+        "heuristic_ctx_managers": [],
     }
+    if col_bounds_invalid:
+        return {
+            **empty_res,
+            "control_flow_hazards": ["invalid_unit_columns"],
+            "is_control_flow_safe": False,
+        }
+    if stale_source_code_mismatch:
+        return {
+            **empty_res,
+            "control_flow_hazards": ["stale_source_code"],
+            "is_control_flow_safe": False,
+        }
+    if is_placeholder_source:
+        unit_kind_str = str(unit.get("kind") or "")
+        placeholder_hazards = (
+            ["severed_closure_cell", "unavailable_source_placeholder"]
+            if (
+                bool(unit.get("is_subroutine"))
+                or unit_kind_str in _SUBROUTINE_KINDS
+                or unit_kind_str
+                in (
+                    "subroutine",
+                    "basic_block",
+                    "linear_block",
+                    "stmt_seq",
+                    "statement",
+                    "closure",
+                    "comprehension",
+                    "complex_expr",
+                )
+            )
+            else ["unavailable_source_placeholder"]
+        )
+        return {
+            **empty_res,
+            "control_flow_hazards": placeholder_hazards,
+            "closure_hazard_reasons": ["unavailable_source_placeholder"],
+            "is_control_flow_safe": False,
+        }
     if not dedented.strip():
         return empty_res
 
     tree: Optional[ast.AST] = None
     loop_offset = 0
     candidate_stmts: List[ast.stmt] = []
+    clause_dedented = _normalize_clause_header_snippet(dedented)
 
     parse_candidates = [
         (dedented, 0),
+        *([(clause_dedented, 0)] if clause_dedented != dedented else []),
         (f"if 1:\n{dedented}", 0),
         (f"def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
         (f"async def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
+        *(
+            [
+                (
+                    f"def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(clause_dedented, '    ')}",
+                    0,
+                ),
+                (
+                    f"async def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(clause_dedented, '    ')}",
+                    0,
+                ),
+            ]
+            if clause_dedented != dedented
+            else []
+        ),
         (
             f"def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
             f"{textwrap.indent(dedented, '        ')}",
@@ -1799,14 +2321,32 @@ def _inspect_unit_scope(
             f"{textwrap.indent(dedented, '        ')}",
             1,
         ),
+        *(
+            [
+                (
+                    f"def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
+                    f"{textwrap.indent(clause_dedented, '        ')}",
+                    1,
+                ),
+                (
+                    f"async def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
+                    f"{textwrap.indent(clause_dedented, '        ')}",
+                    1,
+                ),
+            ]
+            if clause_dedented != dedented
+            else []
+        ),
     ]
 
     had_resource_error = False
+    cand_text = dedented
     for cand_text, offset in parse_candidates:
         try:
-            tree = ast.parse(cand_text)
+            with _suppress_syntax_warnings():
+                tree = ast.parse(cand_text)
             loop_offset = offset
-            if cand_text == dedented:
+            if cand_text in (dedented, clause_dedented):
                 if isinstance(tree, ast.Module):
                     if len(tree.body) == 1 and isinstance(
                         tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -1828,14 +2368,14 @@ def _inspect_unit_scope(
                         candidate_stmts = inner_body[0].body
                     else:
                         candidate_stmts = inner_body
-            elif offset == 1:
-                wrapper_fn = tree.body[0]  # type: ignore[attr-defined]
+            elif offset == 1 and isinstance(tree, ast.Module):
+                wrapper_fn = tree.body[0]
                 if isinstance(wrapper_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     for_loop = wrapper_fn.body[0]
                     if isinstance(for_loop, (ast.For, ast.AsyncFor, ast.While)):
                         candidate_stmts = for_loop.body
-            else:
-                wrapper_fn = tree.body[0]  # type: ignore[attr-defined]
+            elif isinstance(tree, ast.Module):
+                wrapper_fn = tree.body[0]
                 if isinstance(wrapper_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     candidate_stmts = wrapper_fn.body
             break
@@ -1903,9 +2443,7 @@ def _inspect_unit_scope(
         if visitor.type_param_free_vars and not is_subroutine:
             s_line = parse_unit_coord(unit, "start", default=1)
             e_line = parse_unit_coord(unit, "end", default=s_line)
-            u_col = parse_unit_coord(unit, "start_col", default=None)
-            if u_col is None:
-                u_col = parse_unit_coord(unit, "col_offset", default=None)
+            u_col = inferred_s_col
             top_fn = (
                 tree.body[0]
                 if isinstance(tree, ast.Module)
@@ -1934,9 +2472,17 @@ def _inspect_unit_scope(
             has_enclosing_cls = False
             prev_enclosed_cls_name: Optional[str] = None
             if parsed_tree is not None:
+                full_src_for_lines = _get_full_source()
+                mod_src_lines: Optional[Tuple[str, ...]] = (
+                    _register_tree_source_lines(
+                        parsed_tree, source_text=full_src_for_lines
+                    )
+                    if full_src_for_lines
+                    else None
+                )
                 matched_self = False
                 for earliest_start, n_end, _span, scope_node in _get_tree_scope_intervals(
-                    parsed_tree
+                    parsed_tree, source_lines=mod_src_lines
                 ):
                     if earliest_start > s_line or e_line > n_end:
                         continue
@@ -2029,14 +2575,90 @@ def _inspect_unit_scope(
             ):
                 has_class_scoped_type_params = True
 
+        # Resolve module AST, unit column bounds, and enclosing function chain once per unit
+        closure_hazard_reasons: List[str] = []
+        u_start = parse_unit_coord(unit, "start", default=0)
+        u_end = parse_unit_coord(unit, "end", default=u_start)
+        mod_tree: Optional[ast.AST] = file_tree
+        if mod_tree is None and u_start > 0:
+            full_src = _get_full_source()
+            if full_src:
+                mod_tree = _get_or_parse_tree(full_src)
+        resolved_s_col, resolved_e_col = inferred_s_col, inferred_e_col
+        cols_resolved = False
+        enclosing_chain: List[Tuple[int, int, ast.AST]] = []
+        full_mod_src = _get_full_source()
+        if mod_tree is not None and full_mod_src:
+            full_mod_lines: Optional[Tuple[str, ...]] = _register_tree_source_lines(
+                mod_tree, source_text=full_mod_src
+            )
+        else:
+            full_mod_lines = (
+                _split_source_lines_stripped(full_mod_src)
+                if full_mod_src
+                else None
+            )
+        if mod_tree is not None and u_start > 0:
+            resolved_s_col, resolved_e_col = _resolve_unit_col_bounds(
+                candidate_stmts,
+                mod_tree,
+                u_start,
+                u_end,
+                resolved_s_col,
+                resolved_e_col,
+            )
+            cols_resolved = True
+            enclosing_chain = _find_enclosing_function_chain(
+                mod_tree,
+                u_start,
+                u_end,
+                resolved_s_col,
+                resolved_e_col,
+                source_lines=full_mod_lines,
+            )
+
         # Definite, conditional, and branch-aware deletion analysis across candidate statements
         may_deleted: Set[str] = set()
         live_in_deleted: Set[str] = set()
-        def_assigned, cond_assigned = _analyze_block_assignment(
-            candidate_stmts,
-            may_deleted=may_deleted,
-            live_in_deleted=live_in_deleted,
-        )
+        initial_sup_prov: _SuppressProvenance = _EMPTY_SUPPRESS_PROVENANCE
+        if mod_tree is not None and any(
+            isinstance(n, (ast.With, ast.AsyncWith))
+            for st in candidate_stmts
+            for n in ast.walk(st)
+        ):
+            sup_fn = enclosing_chain[-1][2] if enclosing_chain else mod_tree
+            sup_scope_ctx = (
+                _get_fn_scope_context(
+                    sup_fn,
+                    mod_tree=mod_tree,
+                    enclosing_scopes=[f for _, _, f in enclosing_chain[:-1]],
+                )
+                if isinstance(sup_fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                else None
+            )
+            initial_sup_prov = _seed_scope_suppress_aliases(
+                sup_fn,
+                mod_tree=mod_tree,
+                u_start=u_start,
+                scope_ctx=sup_scope_ctx,
+                extra_non_suppressing_ctx_managers=extra_non_sup,
+                strict_with_suppression=strict_with_flag,
+            )
+        if "open" in visitor.params:
+            initial_sup_prov = initial_sup_prov.with_shadowed_builtins(
+                ("open",)
+            )
+        unit_heuristic_mgrs: Set[str] = set()
+        with collect_heuristic_ctx_managers() as block_heur_mgrs:
+            def_assigned, cond_assigned = _analyze_block_assignment(
+                candidate_stmts,
+                may_deleted=may_deleted,
+                live_in_deleted=live_in_deleted,
+                suppress_aliases=initial_sup_prov,
+                extra_non_suppressing_ctx_managers=extra_non_sup,
+                strict_with_suppression=strict_with_flag,
+            )
+        unit_heuristic_mgrs.update(block_heur_mgrs)
         for del_name in sorted(live_in_deleted):
             if (
                 del_name not in visitor.params
@@ -2052,33 +2674,205 @@ def _inspect_unit_scope(
             live_in_visitor = _UnitLiveInVisitor(1, 10**9, include_annotations=False)
             for stmt in candidate_stmts:
                 live_in_visitor.visit(stmt)
+            excluded_cond_vars = (
+                set(visitor.params) | set(visitor.globals) | BUILTIN_NAMES
+            )
             cond_live_ins = [
                 v
                 for v in sorted(live_in_visitor.live_ins)
                 if v in visitor.loads
-                and v not in visitor.params
-                and v not in visitor.globals
-                and v not in BUILTIN_NAMES
+                and v not in excluded_cond_vars
                 and v not in visitor.read_before_write
             ]
-            if cond_live_ins:
+            cond_escaping_cands = [
+                v
+                for v in sorted(
+                    (cond_assigned - def_assigned)
+                    | set(cond_live_ins)
+                    | (live_in_visitor.live_ins & set(visitor.stores))
+                )
+                if v not in excluded_cond_vars
+            ]
+            if cond_live_ins or cond_escaping_cands:
                 pre_bound: Set[str] = set()
-                u_start = parse_unit_coord(unit, "start", default=0)
-                u_end = parse_unit_coord(unit, "end", default=u_start)
-                mod_tree = file_tree
-                if mod_tree is None and u_start > 0:
-                    full_src = _get_full_source()
-                    if full_src:
-                        mod_tree = _get_or_parse_tree(full_src)
+                rejected_escaping_vars: Set[str] = set()
+                if mod_tree is not None and full_mod_lines is not None:
+                    _register_tree_source_lines(mod_tree, full_mod_lines)
                 if mod_tree is not None and u_start > 0:
+                    u_start_col, u_end_col = resolved_s_col, resolved_e_col
                     pre_bound, _ = _find_enclosing_pre_bound_names(
-                        mod_tree, u_start, u_end
+                        mod_tree,
+                        u_start,
+                        u_end,
+                        u_start_col=u_start_col,
+                        u_end_col=u_end_col,
                     )
+                    if enclosing_chain:
+                        in_enclosing_class_body = isinstance(
+                            _resolve_immediate_scope_in_fn(
+                                enclosing_chain[-1][2],
+                                u_start,
+                                u_end,
+                                u_start_col=u_start_col,
+                                u_end_col=u_end_col,
+                            ),
+                            ast.ClassDef,
+                        )
+                        enc_nonlocals, enc_outer_globals = (
+                            _extract_scope_nonlocals_and_outer_globals(
+                                enclosing_chain[-1][2],
+                                u_start,
+                                u_end,
+                                u_start_col=u_start_col,
+                                u_end_col=u_end_col,
+                            )
+                        )
+                        enc_escaping = enc_nonlocals | enc_outer_globals
+                        with collect_heuristic_ctx_managers() as pre_heur_mgrs:
+                            def_pre_bound = (
+                                _find_enclosing_chain_definite_pre_bound(
+                                    enclosing_chain,
+                                    u_start,
+                                    u_end,
+                                    u_start_col=u_start_col,
+                                    u_end_col=u_end_col,
+                                    mod_tree=mod_tree,
+                                    strict_with_suppression=strict_with_flag,
+                                    extra_non_suppressing_ctx_managers=extra_non_sup,
+                                )
+                            )
+                        unit_heuristic_mgrs.update(pre_heur_mgrs)
+                        write_only_cond_cands = {
+                            v
+                            for v in cond_escaping_cands
+                            if v not in enc_escaping
+                            and v not in visitor.loads
+                            and v not in live_in_visitor.live_ins
+                            and v in pre_bound
+                            and v in def_pre_bound
+                        }
+                        live_write_only_cond: Set[str] = set()
+                        if write_only_cond_cands:
+                            pre_outs_decl = resolve_unit_declared_outputs(unit)
+                            if isinstance(
+                                pre_outs_decl, (list, tuple, set, frozenset)
+                            ):
+                                live_write_only_cond = (
+                                    write_only_cond_cands & set(pre_outs_decl)
+                                )
+                            elif visitor.returns and not is_subroutine:
+                                live_write_only_cond = (
+                                    write_only_cond_cands & set(visitor.returns)
+                                )
+                            else:
+                                full_src_text = _get_full_source() or ""
+                                ds_unit: Dict[str, Any] = {
+                                    **unit,
+                                    "start": u_start,
+                                    "end": u_end,
+                                }
+                                if u_start_col is not None:
+                                    ds_unit["start_col"] = u_start_col
+                                if u_end_col is not None:
+                                    ds_unit["end_col"] = u_end_col
+                                # Always include pre-unit closures when checking whether a
+                                # write-only conditional variable is live downstream: pruning
+                                # a required output in lenient mode would break callers.
+                                ds_live = collect_downstream_read_names(
+                                    full_src_text,
+                                    ds_unit,
+                                    candidates=write_only_cond_cands,
+                                    tree=mod_tree,
+                                    skip_pre_unit_closures=False,
+                                    source_digest=(
+                                        None
+                                        if full_src_text
+                                        else _get_tree_sha256_digest(mod_tree)
+                                    ),
+                                )
+                                if ds_live is None:
+                                    live_write_only_cond = set(
+                                        write_only_cond_cands
+                                    )
+                                else:
+                                    live_write_only_cond = (
+                                        write_only_cond_cands & ds_live
+                                    )
+                        for v in cond_escaping_cands:
+                            if v in enc_escaping:
+                                if (
+                                    v in enc_nonlocals
+                                    and v in pre_bound
+                                    and v in def_pre_bound
+                                ):
+                                    if v not in visitor.loads:
+                                        visitor.loads.append(v)
+                                    if v not in visitor.read_before_write:
+                                        visitor.read_before_write.append(v)
+                                else:
+                                    rejected_escaping_vars.add(v)
+                                    if (
+                                        v in visitor.read_before_write
+                                        and v not in def_pre_bound
+                                    ):
+                                        visitor.read_before_write.remove(v)
+                                    if "severed_closure_cell" not in hazards:
+                                        hazards.append("severed_closure_cell")
+                                    sub_r = (
+                                        "global_escape"
+                                        if v in enc_outer_globals
+                                        else "cell_severing"
+                                    )
+                                    if sub_r not in closure_hazard_reasons:
+                                        closure_hazard_reasons.append(sub_r)
+                            elif (
+                                not in_enclosing_class_body
+                                and not visitor.has_yield
+                                and v in pre_bound
+                                and v in def_pre_bound
+                                and (
+                                    v in visitor.loads
+                                    or v in live_in_visitor.live_ins
+                                    or v in live_write_only_cond
+                                )
+                            ):
+                                if v not in visitor.loads:
+                                    visitor.loads.append(v)
+                                if v not in visitor.read_before_write:
+                                    visitor.read_before_write.append(v)
+                            elif (
+                                in_enclosing_class_body
+                                or v not in def_pre_bound
+                            ):
+                                rejected_escaping_vars.add(v)
+                        for v in cond_live_ins:
+                            if v not in def_pre_bound or (
+                                in_enclosing_class_body
+                                and v not in enc_escaping
+                            ):
+                                rejected_escaping_vars.add(v)
+                                if v in pre_bound:
+                                    if "severed_closure_cell" not in hazards:
+                                        hazards.append("severed_closure_cell")
+                                    if (
+                                        "conditional_live_in"
+                                        not in closure_hazard_reasons
+                                    ):
+                                        closure_hazard_reasons.append(
+                                            "conditional_live_in"
+                                        )
                 has_enclosing_context = mod_tree is not None and (
                     u_start > 1 or bool(_get_tree_scope_intervals(mod_tree))
                 )
                 for v in cond_live_ins:
-                    if v in pre_bound or (not has_enclosing_context and v in def_assigned):
+                    if (
+                        v not in rejected_escaping_vars
+                        and (
+                            v in pre_bound
+                            or (not has_enclosing_context and v in def_assigned)
+                        )
+                        and v not in visitor.read_before_write
+                    ):
                         visitor.read_before_write.append(v)
 
         free_vars = [
@@ -2138,6 +2932,7 @@ def _inspect_unit_scope(
                     unit,
                     candidates=alias_cands,
                     tree=file_tree,
+                    skip_pre_unit_closures=skip_pre_unit_closures_flag,
                     unit_inputs=set(inputs),
                 )
                 downstream_aliases = (
@@ -2207,17 +3002,92 @@ def _inspect_unit_scope(
         ):
             hazards.append("deleted_output")
 
-        is_control_flow_safe = not any(
-            h
-            in (
-                "naked_break",
-                "naked_continue",
-                "embedded_return",
-                "type_param_closure_capture",
-                "pathological_ast",
-                "deleted_output",
+        lex_stmts: Sequence[ast.stmt] = (
+            tree.body
+            if isinstance(tree, ast.Module)
+            and len(tree.body) == 1
+            and isinstance(
+                tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)
             )
-            for h in hazards
+            and getattr(tree.body[0], "name", None) != _SYNTHETIC_WRAPPER_NAME
+            else candidate_stmts
+        )
+        if (
+            "severed_closure_cell" not in hazards
+            and _has_invalid_lexical_scope_declarations(
+                lex_stmts,
+                enclosing_chain=enclosing_chain,
+                mod_tree=mod_tree,
+                source_lines=full_mod_lines,
+            )
+        ):
+            hazards.append("severed_closure_cell")
+            if "invalid_lexical_declaration" not in closure_hazard_reasons:
+                closure_hazard_reasons.append("invalid_lexical_declaration")
+
+        if is_subroutine or unit.get("kind") in (
+            "closure",
+            "comprehension",
+            "complex_expr",
+        ):
+            if u_start > 0 and mod_tree is not None:
+                if "severed_closure_cell" not in hazards:
+                    with collect_heuristic_ctx_managers() as cell_heur_mgrs:
+                        hazard_res = _evaluate_severed_closure_cell_hazard(
+                            _UnitClosureHazardContext(
+                                candidate_stmts=candidate_stmts,
+                                mod_tree=mod_tree,
+                                u_start=u_start,
+                                u_end=u_end,
+                                u_start_col=resolved_s_col,
+                                u_end_col=resolved_e_col,
+                                is_subroutine=is_subroutine,
+                                unit_kind=str(unit.get("kind") or ""),
+                                inputs=inputs,
+                                outputs=outputs,
+                                stores=visitor.stores,
+                                deleted_names=all_deleted,
+                                unit_top_locals=visitor.unit_top_locals,
+                                free_vars=free_vars,
+                                nonlocals=visitor.nonlocals,
+                                has_yield=visitor.has_yield,
+                                is_async=visitor.is_async,
+                                skip_pre_unit_closures=skip_pre_unit_closures_flag,
+                                strict_with_suppression=strict_with_flag,
+                                extra_non_suppressing_ctx_managers=extra_non_sup,
+                                definite_stores=def_assigned,
+                                cols_resolved=cols_resolved,
+                                enclosing_chain=enclosing_chain,
+                                lex_validated=True,
+                            )
+                        )
+                    unit_heuristic_mgrs.update(cell_heur_mgrs)
+                    if hazard_res.has_hazard:
+                        hazards.append("severed_closure_cell")
+                        for r in hazard_res.reasons:
+                            if r not in closure_hazard_reasons:
+                                closure_hazard_reasons.append(r)
+            elif "severed_closure_cell" not in hazards:
+                if bool(_get_full_source()) or (
+                    unit.get("kind") == "closure" and bool(free_vars)
+                ):
+                    hazards.append("severed_closure_cell")
+                    if "unresolved_span_bounds" not in closure_hazard_reasons:
+                        closure_hazard_reasons.append("unresolved_span_bounds")
+                elif not bool(unit.get("allow_snippet_only")):
+                    # Fail closed when enclosing module context is absent unless the
+                    # caller explicitly opted into isolated snippet-only inspection.
+                    hazards.append("severed_closure_cell")
+                    if (
+                        "snippet_only_missing_enclosing_context"
+                        not in closure_hazard_reasons
+                    ):
+                        closure_hazard_reasons.append(
+                            "snippet_only_missing_enclosing_context"
+                        )
+
+        is_control_flow_safe = not any(
+            h in BLOCKING_CONTROL_FLOW_HAZARDS for h in hazards
         )
 
         has_receiver_access = bool(
@@ -2280,6 +3150,7 @@ def _inspect_unit_scope(
             "param_details": visitor.param_details,
             "return_type": visitor.return_type,
             "control_flow_hazards": hazards,
+            "closure_hazard_reasons": closure_hazard_reasons,
             "is_control_flow_safe": is_control_flow_safe,
             "has_yield": visitor.has_yield,
             "has_yield_assignment": visitor.has_yield_assignment,
@@ -2310,6 +3181,11 @@ def _inspect_unit_scope(
             "type_param_free_vars": list(visitor.type_param_free_vars),
             "has_class_scoped_type_params": has_class_scoped_type_params,
             "deleted_names": sorted(may_deleted),
+            "scope_schema_version": SCOPE_SCHEMA_VERSION,
+            "skip_pre_unit_closures": skip_pre_unit_closures_flag,
+            "strict_with_suppression": strict_with_flag,
+            "non_suppressing_ctx_managers": sorted(extra_non_sup),
+            "heuristic_ctx_managers": sorted(unit_heuristic_mgrs),
         }
     except (RecursionError, MemoryError):
         return {
@@ -2319,13 +3195,45 @@ def _inspect_unit_scope(
         }
 
 
-
 def inspect_single_unit_scope(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
     tree: Optional[ast.AST] = None,
+    *,
+    closure_strictness: Optional[str] = None,
+    skip_pre_unit_closures: Optional[bool] = None,
+    strict_with_suppression: Optional[bool] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping for an individual code unit."""
+    if (
+        closure_strictness is not None
+        or skip_pre_unit_closures is not None
+        or strict_with_suppression is not None
+        or non_suppressing_ctx_managers is not None
+    ):
+        resolved_flags = resolve_unit_closure_flags(
+            unit,
+            closure_strictness=closure_strictness,
+            skip_pre_unit_closures=skip_pre_unit_closures,
+            strict_with_suppression=strict_with_suppression,
+        )
+        unit = dict(unit)
+        if (
+            closure_strictness is not None
+            or skip_pre_unit_closures is not None
+            or strict_with_suppression is not None
+        ):
+            unit.pop("closure_strictness", None)
+            unit["skip_pre_unit_closures"] = resolved_flags.skip_pre_unit_closures
+            unit["strict_with_suppression"] = resolved_flags.strict_with_suppression
+        if non_suppressing_ctx_managers is not None:
+            unit["non_suppressing_ctx_managers"] = list(
+                normalize_non_suppressing_ctx_managers(
+                    non_suppressing_ctx_managers,
+                    unit.get("non_suppressing_ctx_managers"),
+                )
+            )
     return _inspect_unit_scope(unit, repo_root=repo_root, file_tree=tree)
 
 
@@ -2376,6 +3284,212 @@ def _merge_type_params(tp1: Sequence[str], tp2: Sequence[str]) -> List[str]:
     ]
 
 
+def scope_matches_closure_mode(
+    scope: Optional[Dict[str, Any]],
+    expected_skip: bool,
+    *,
+    strict_with_suppression: Optional[bool] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+) -> bool:
+    """Checks whether a precomputed scope dictionary matches the current schema and mode.
+
+    Requires ``scope_schema_version == SCOPE_SCHEMA_VERSION`` and an explicit boolean
+    ``skip_pre_unit_closures`` matching ``expected_skip`` so unmarked or legacy
+    serialized scopes are never trusted without recomputation.
+    """
+    if scope is None:
+        return False
+    if scope.get("scope_schema_version") != SCOPE_SCHEMA_VERSION:
+        return False
+    if "skip_pre_unit_closures" not in scope:
+        return False
+    for flag_key, expected_val in (
+        ("skip_pre_unit_closures", bool(expected_skip)),
+        ("strict_with_suppression", strict_with_suppression),
+    ):
+        if expected_val is None:
+            continue
+        if flag_key in scope:
+            raw_flag = scope.get(flag_key)
+            if not (isinstance(raw_flag, bool) and raw_flag is bool(expected_val)):
+                return False
+        elif bool(expected_val) is not False:
+            return False
+    scope_non_sup = frozenset(
+        normalize_non_suppressing_ctx_managers(
+            scope.get("non_suppressing_ctx_managers")
+        )
+    )
+    target_non_sup = frozenset(
+        normalize_non_suppressing_ctx_managers(non_suppressing_ctx_managers)
+    )
+    if scope_non_sup != target_non_sup:
+        return False
+    return True
+
+
+def ensure_unit_scope_closure_mode(
+    unit: Dict[str, Any],
+    scope: Optional[Dict[str, Any]],
+    skip_pre_unit_closures: bool,
+    *,
+    strict_with_suppression: Optional[bool] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    source_text: Optional[str] = None,
+    tree: Optional[ast.AST] = None,
+    repo_root: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Returns scope if its schema version and closure mode match, else recomputes it.
+
+    Caller-supplied scopes lacking ``scope_schema_version == SCOPE_SCHEMA_VERSION`` (or
+    whose ``skip_pre_unit_closures`` / ``strict_with_suppression`` /
+    ``non_suppressing_ctx_managers`` flags differ from the requested configuration) are
+    discarded — losing any manual caller overrides in those dicts — and recomputed from
+    the backing module source/AST, or fail closed when backing source is unavailable.
+
+    Note:
+        Scopes that already record terminal ``"pathological_ast"``,
+        ``"stale_source_code"``, or ``"invalid_unit_columns"`` in
+        ``control_flow_hazards`` are returned directly without re-parsing or mutating
+        the terminal hazard dict, as they are unconditionally rejected downstream
+        regardless of closure mode. When a caller-supplied ``scope`` (or
+        ``unit["scope"]``) is discarded due to a missing schema stamp or mode mismatch,
+        a once-per-run ``WARNING`` is emitted.
+    """
+    eff_skip = bool(skip_pre_unit_closures)
+    if eff_skip:
+        eff_strict_with = False
+    elif strict_with_suppression is not None:
+        eff_strict_with = bool(strict_with_suppression)
+    else:
+        eff_strict_with = resolve_unit_closure_flags(unit).strict_with_suppression
+    eff_non_sup = normalize_non_suppressing_ctx_managers(
+        non_suppressing_ctx_managers,
+        unit.get("non_suppressing_ctx_managers"),
+    )
+    eff_scope: Optional[Dict[str, Any]] = (
+        scope
+        if scope is not None
+        else (unit.get("scope") if isinstance(unit.get("scope"), dict) else None)
+    )
+    if eff_scope is not None and (
+        scope_matches_closure_mode(
+            eff_scope,
+            eff_skip,
+            strict_with_suppression=eff_strict_with,
+            non_suppressing_ctx_managers=eff_non_sup,
+        )
+        or any(
+            h in eff_scope.get("control_flow_hazards", ())
+            for h in (
+                "pathological_ast",
+                "stale_source_code",
+                "invalid_unit_columns",
+            )
+        )
+    ):
+        return eff_scope
+    u_copy = {
+        **unit,
+        "skip_pre_unit_closures": eff_skip,
+        "strict_with_suppression": eff_strict_with,
+    }
+    u_copy.pop("closure_strictness", None)
+    u_copy.pop("scope", None)
+    if eff_non_sup or "non_suppressing_ctx_managers" in u_copy:
+        u_copy["non_suppressing_ctx_managers"] = list(eff_non_sup)
+    if source_text is not None and not str(u_copy.get("source_text") or "").strip():
+        u_copy["source_text"] = source_text
+    if eff_scope is not None:
+        if should_warn_closure_event("precomputed_scope_discarded"):
+            discard_reason = (
+                f"missing scope_schema_version={SCOPE_SCHEMA_VERSION}"
+                if eff_scope.get("scope_schema_version") != SCOPE_SCHEMA_VERSION
+                else "closure mode or allowlist mismatch"
+            )
+            logger.warning(
+                "Discarding caller-supplied precomputed scope (%s) and recomputing "
+                "from source (further occurrences suppressed for this run)",
+                discard_reason,
+            )
+        src_text_val = u_copy.get("source_text")
+        file_src_val = u_copy.get("file_source")
+        src_code_val = u_copy.get("source_code")
+        src_lines_val = u_copy.get("source_lines")
+        needs_enclosing_module = bool(u_copy.get("is_subroutine")) or str(
+            u_copy.get("kind") or ""
+        ) in (
+            *_SUBROUTINE_KINDS,
+            "subroutine",
+            "basic_block",
+            "linear_block",
+            "stmt_seq",
+            "statement",
+            "closure",
+            "comprehension",
+            "complex_expr",
+        )
+        has_full_module_source = (
+            tree is not None
+            or (isinstance(src_text_val, str) and bool(src_text_val.strip()))
+            or (isinstance(file_src_val, str) and bool(file_src_val.strip()))
+            or (
+                isinstance(src_lines_val, (list, tuple))
+                and not is_sliced_unit_source_lines(u_copy, src_lines_val)
+                and any(
+                    isinstance(ln, str) and bool(ln.strip())
+                    for ln in src_lines_val
+                )
+            )
+            or bool(_load_unit_file_text(u_copy, repo_root=repo_root))
+        )
+        has_snippet_source = (
+            isinstance(src_code_val, str) and bool(src_code_val.strip())
+        ) or (
+            isinstance(src_lines_val, (list, tuple))
+            and any(
+                isinstance(ln, str) and bool(ln.strip())
+                for ln in src_lines_val
+            )
+        )
+        has_unit_source = has_full_module_source or (
+            has_snippet_source
+            and (not needs_enclosing_module or bool(u_copy.get("allow_snippet_only")))
+        )
+        if not has_unit_source:
+            logger.debug(
+                "Precomputed scope for unit %r does not match active closure mode "
+                "and backing source is unavailable; failing closed",
+                unit.get("name"),
+            )
+            hazards = list(eff_scope.get("control_flow_hazards", ()))
+            if "unavailable_source_for_closure_mode" not in hazards:
+                hazards.append("unavailable_source_for_closure_mode")
+            if "severed_closure_cell" not in hazards:
+                hazards.append("severed_closure_cell")
+            reasons = list(eff_scope.get("closure_hazard_reasons", ()))
+            if "unavailable_source_for_closure_mode" not in reasons:
+                reasons.append("unavailable_source_for_closure_mode")
+            return {
+                **eff_scope,
+                "control_flow_hazards": hazards,
+                "closure_hazard_reasons": reasons,
+                "is_control_flow_safe": False,
+                "scope_schema_version": SCOPE_SCHEMA_VERSION,
+                "skip_pre_unit_closures": eff_skip,
+                "strict_with_suppression": eff_strict_with,
+                "non_suppressing_ctx_managers": list(eff_non_sup),
+                "heuristic_ctx_managers": list(
+                    eff_scope.get("heuristic_ctx_managers", ())
+                ),
+            }
+        logger.debug(
+            "Recomputing precomputed scope for unit %r to match active closure mode",
+            unit.get("name"),
+        )
+    return inspect_single_unit_scope(u_copy, repo_root=repo_root, tree=tree)
+
+
 def analyze_unit_variable_scope(
     u1: Dict[str, Any],
     u2: Optional[Dict[str, Any]] = None,
@@ -2384,14 +3498,50 @@ def analyze_unit_variable_scope(
     tree2: Optional[ast.AST] = None,
     scope1: Optional[Dict[str, Any]] = None,
     scope2: Optional[Dict[str, Any]] = None,
+    *,
+    skip_pre_unit_closures: Optional[bool] = None,
+    closure_strictness: Optional[str] = None,
+    strict_with_suppression: Optional[bool] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
-    info1 = scope1 if scope1 is not None else inspect_single_unit_scope(
-        u1, repo_root=repo_root, tree=tree1
-    )
+    """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes.
+
+    Note:
+        Precomputed ``scope1`` / ``scope2`` dictionaries (or ``unit["scope"]``) are validated
+        via ``ensure_unit_scope_closure_mode``: any caller-supplied scope missing
+        ``scope_schema_version == SCOPE_SCHEMA_VERSION`` or computed under a different
+        closure strictness / allowlist configuration is discarded (dropping manual caller
+        overrides) and recomputed from backing module source, or fails closed if backing
+        source is unavailable.
+    """
     if u2 is not None:
-        info2 = scope2 if scope2 is not None else inspect_single_unit_scope(
-            u2, repo_root=repo_root, tree=tree2
+        pair_flags = resolve_pair_closure_flags(
+            u1,
+            u2,
+            closure_strictness=closure_strictness,
+            skip_pre_unit_closures=skip_pre_unit_closures,
+            strict_with_suppression=strict_with_suppression,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        )
+        eff_skip = pair_flags.effective_skip_pre_unit_closures
+        eff_strict_with = pair_flags.effective_strict_with_suppression
+        info1 = ensure_unit_scope_closure_mode(
+            u1,
+            scope1,
+            eff_skip,
+            strict_with_suppression=eff_strict_with,
+            non_suppressing_ctx_managers=pair_flags.unit1.non_suppressing_ctx_managers,
+            repo_root=repo_root,
+            tree=tree1,
+        )
+        info2 = ensure_unit_scope_closure_mode(
+            u2,
+            scope2,
+            eff_skip,
+            strict_with_suppression=eff_strict_with,
+            non_suppressing_ctx_managers=pair_flags.unit2.non_suppressing_ctx_managers,
+            repo_root=repo_root,
+            tree=tree2,
         )
         inputs = _align_symmetric_var_list(info1["inputs"], info2["inputs"])
         outputs = _align_symmetric_var_list(info1["outputs"], info2["outputs"])
@@ -2447,6 +3597,25 @@ def analyze_unit_variable_scope(
             )
         )
     else:
+        expected_skip1, expected_strict_with1 = resolve_unit_closure_flags(
+            u1,
+            closure_strictness=closure_strictness,
+            skip_pre_unit_closures=skip_pre_unit_closures,
+            strict_with_suppression=strict_with_suppression,
+        )
+        expected_non_sup1 = normalize_non_suppressing_ctx_managers(
+            non_suppressing_ctx_managers,
+            u1.get("non_suppressing_ctx_managers"),
+        )
+        info1 = ensure_unit_scope_closure_mode(
+            u1,
+            scope1,
+            expected_skip1,
+            strict_with_suppression=expected_strict_with1,
+            non_suppressing_ctx_managers=expected_non_sup1,
+            repo_root=repo_root,
+            tree=tree1,
+        )
         inputs = info1["inputs"]
         outputs = info1["outputs"]
         free_vars = info1["free_vars"]
@@ -2564,4 +3733,43 @@ def analyze_unit_variable_scope(
             )
         ),
         "deleted_names": deleted_names,
+        "closure_hazard_reasons": list(
+            dict.fromkeys(
+                info1.get("closure_hazard_reasons", [])
+                + (
+                    info2.get("closure_hazard_reasons", [])
+                    if u2 is not None
+                    else []
+                )
+            )
+        ),
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
+        "skip_pre_unit_closures": bool(
+            info1.get("skip_pre_unit_closures", False)
+        )
+        and (
+            u2 is None
+            or bool(info2.get("skip_pre_unit_closures", False))
+        ),
+        "strict_with_suppression": bool(
+            info1.get("strict_with_suppression", False)
+        )
+        or (
+            u2 is not None
+            and bool(info2.get("strict_with_suppression", False))
+        ),
+        "non_suppressing_ctx_managers": sorted(
+            set(info1.get("non_suppressing_ctx_managers", ()))
+            & set(info2.get("non_suppressing_ctx_managers", ()))
+            if u2 is not None
+            else set(info1.get("non_suppressing_ctx_managers", ()))
+        ),
+        "heuristic_ctx_managers": sorted(
+            set(info1.get("heuristic_ctx_managers", ()))
+            | (
+                set(info2.get("heuristic_ctx_managers", ()))
+                if u2 is not None
+                else set()
+            )
+        ),
     }

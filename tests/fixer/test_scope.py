@@ -13,6 +13,7 @@ import pytest
 from pydoppelgangerhunt import (
     analyze_unit_variable_scope,
     generate_refactoring_patch,
+    inspect_single_unit_scope,
     synthesize_shared_helper_code,
 )
 from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
@@ -560,7 +561,7 @@ def test_comprehension_multi_generator_scoping(tmp_path: Path) -> None:
         "start": 2,
         "end": 2,
         "start_col": 7,
-        "end_col": 42,
+        "end_col": 41,  # Byte length of line 2 ("flat = [x for row in matrix for x in row]") without trailing newline
         "name": "flat_comp",
         "kind": "comprehension",
     }
@@ -1421,7 +1422,7 @@ def test_match_pattern_stores_deletion_and_as_pattern_definite_assignment() -> N
 
 @pytest.mark.skipif(sys.version_info < (3, 10), reason="Pattern matching requires Python 3.10+")
 def test_match_guard_walrus_definite_in_case_body() -> None:
-    """Verifies that walrus variables defined in match guards are recognized as definite within the case body."""
+    """Verifies that walrus variables defined in match guards are definite inside the case body and spill conditionally on guard failure."""
     code = (
         "match x:\n"
         "    case items if (n := len(items)) > 0:\n"
@@ -1433,11 +1434,74 @@ def test_match_guard_walrus_definite_in_case_body() -> None:
     tree = ast.parse(code)
     definite, conditional = _analyze_block_assignment(tree.body)
 
-    # res is definitely assigned across the whole match
+    # Verify Python runtime semantics: when x = [1], del n removes n; when x = [], the guard
+    # binds n = 0 and evaluates False, entering case _ with n still bound.
+    ns_nonempty: dict[str, object] = {"x": [1]}
+    exec(compile(code, "<match_guard_nonempty>", "exec"), ns_nonempty)  # nosec B102  # pylint: disable=exec-used
+    assert "n" not in ns_nonempty
+
+    ns_empty: dict[str, object] = {"x": []}
+    exec(compile(code, "<match_guard_empty>", "exec"), ns_empty)  # nosec B102  # pylint: disable=exec-used
+    assert ns_empty["n"] == 0
+
+    # res is definitely assigned across the whole match; n is conditionally bound across fallthrough
     assert "res" in definite
-    # n was walrus-assigned in the guard and deleted inside the case body, so it should not be definite or conditional
     assert "n" not in definite
-    assert "n" not in conditional
+    assert "n" in conditional
+
+    # Inside the guarded case body itself, n is definite prior to use/deletion, so n is not a free input
+    scope_info = inspect_single_unit_scope(
+        {
+            "file": "virtual.py",
+            "name": "guarded_match",
+            "kind": "compound_block",
+            "start": 1,
+            "end": 7,
+            "source_code": (
+                "match x:\n"
+                "    case items if (n := len(items)) > 0:\n"
+                "        used = n\n"
+                "        del n\n"
+                "        res = used\n"
+                "    case _:\n"
+                "        res = 2\n"
+            ),
+        }
+    )
+    assert "n" not in scope_info["inputs"]
+
+    scope_without_walrus = inspect_single_unit_scope(
+        {
+            "file": "virtual.py",
+            "name": "unguarded_match",
+            "kind": "compound_block",
+            "start": 1,
+            "end": 7,
+            "source_code": (
+                "match x:\n"
+                "    case items if len(items) > 0:\n"
+                "        used = n\n"
+                "        del n\n"
+                "        res = used\n"
+                "    case _:\n"
+                "        res = 2\n"
+            ),
+        }
+    )
+    assert "n" in scope_without_walrus["inputs"]
+
+    # When case _ also binds n without deleting it in case 1, n is definite across the entire match
+    definite_all, _ = _analyze_block_assignment(
+        ast.parse(
+            "match x:\n"
+            "    case items if (n := len(items)) > 0:\n"
+            "        res = n\n"
+            "    case _:\n"
+            "        n = 0\n"
+            "        res = 2\n"
+        ).body
+    )
+    assert "n" in definite_all
 
 
 def test_unfold_receiver_attribute_custom_receivers() -> None:

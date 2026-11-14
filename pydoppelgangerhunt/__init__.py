@@ -44,6 +44,7 @@ from pydoppelgangerhunt.config import (
     DEFAULT_EXCLUDES,
     DEFAULT_TOOL_TOML_CONTENT,
     canonical_path_key,
+    heuristic_ctx_manager_session,
     init_tool_configuration,
     load_toml_section,
     load_tool_config,
@@ -56,11 +57,14 @@ from pydoppelgangerhunt.coverage import (
 )
 from pydoppelgangerhunt.fixer import (
     ReplacementItem,
+    SCOPE_SCHEMA_VERSION,
     UnitCollisionError,
     UnitDict,
+    UnitSchema,
     UnitSpan,
     analyze_unit_variable_scope,
     check_units_overlap,
+    clear_dataflow_cache,
     col_offset_to_char_offset,
     compute_line_offsets,
     compute_unit_byte_offsets,
@@ -69,11 +73,14 @@ from pydoppelgangerhunt.fixer import (
     compute_unit_spans,
     count_physical_newlines,
     detect_line_ending,
+    ensure_unit_scope_closure_mode,
+    evict_tree_scopes,
     extract_unit_comments_and_pragmas,
     filter_overlapping_clone_units,
     find_enclosing_class,
     find_enclosing_function,
     generate_refactoring_patch,
+    inspect_single_unit_scope,
     intervals_overlap,
     is_subroutine_unit,
     is_valid_unit_coordinates,
@@ -81,10 +88,12 @@ from pydoppelgangerhunt.fixer import (
     refactor_module_units,
     replace_unit_in_source,
     resolve_unit_replacement,
+    scope_matches_closure_mode,
     slice_source_by_token_range,
     split_source_lines,
     synthesize_shared_helper_code,
     validate_module_unit_replacements,
+    validate_unit_schema,
 )
 from pydoppelgangerhunt.git_diff import (
     DiffRangeMap,
@@ -134,6 +143,7 @@ from pydoppelgangerhunt.reporters import (
     colorize,
     emit_structured_report,
     extract_unit_source_code,
+    extract_unit_source_lines_with_state,
     format_github_annotations,
     format_json_report,
     format_markdown_summary,
@@ -143,9 +153,10 @@ from pydoppelgangerhunt.reporters import (
     supports_color,
     synthesize_refactoring_suggestion,
 )
-from pydoppelgangerhunt.source_lines import _PHYSICAL_LINE_RE
+from pydoppelgangerhunt.config import APP_VERSION
+from pydoppelgangerhunt.source_lines import SourceLinesOrigin, _PHYSICAL_LINE_RE
 
-__version__ = "1.0.0"
+__version__ = APP_VERSION
 __all__ = [
     "__version__",
     "main",
@@ -183,6 +194,8 @@ __all__ = [
     "generate_clone_diff",
     "synthesize_refactoring_suggestion",
     "extract_unit_source_code",
+    "extract_unit_source_lines_with_state",
+    "SourceLinesOrigin",
     "supports_color",
     "colorize",
     "parse_git_diff_hunks",
@@ -204,6 +217,13 @@ __all__ = [
     "compute_unit_coverage",
     "check_asymmetric_coverage",
     "analyze_unit_variable_scope",
+    "clear_dataflow_cache",
+    "ensure_unit_scope_closure_mode",
+    "evict_tree_scopes",
+    "heuristic_ctx_manager_session",
+    "inspect_single_unit_scope",
+    "scope_matches_closure_mode",
+    "SCOPE_SCHEMA_VERSION",
     "synthesize_shared_helper_code",
     "replace_unit_in_source",
     "slice_source_by_token_range",
@@ -219,6 +239,7 @@ __all__ = [
     "detect_line_ending",
     "UnitCollisionError",
     "UnitDict",
+    "UnitSchema",
     "UnitSpan",
     "ReplacementItem",
     "resolve_unit_replacement",
@@ -233,6 +254,7 @@ __all__ = [
     "split_source_lines",
     "_PHYSICAL_LINE_RE",
     "validate_module_unit_replacements",
+    "validate_unit_schema",
     "generate_refactoring_patch",
     "compute_unit_structural_hash",
     "extract_unit_namespace",

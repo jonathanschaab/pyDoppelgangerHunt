@@ -2837,12 +2837,15 @@ def test_cli_closure_strictness_and_skip_closures_precedence_warning(
             _, kwargs = mock_patch.call_args
             assert kwargs.get("skip_pre_unit_closures") is False
             assert kwargs.get("closure_strictness") == "strict"
-            assert any(
-                "takes precedence over --skip-pre-unit-closures" in r.message
+            precedence_warnings = [
+                r.message
                 for r in caplog.records
-            )
+                if "takes precedence over skip_pre_unit_closures=True (--skip-pre-unit-closures)"
+                in r.message
+            ]
+            assert len(precedence_warnings) == 1
 
-            # 3. CLI --closure-strictness fail_closed overrides CLI --skip-pre-unit-closures
+            # 3. CLI --closure-strictness pedantic overrides CLI --skip-pre-unit-closures
             caplog.clear()
             mock_patch.reset_mock()
             with caplog.at_level(logging.WARNING):
@@ -2851,18 +2854,24 @@ def test_cli_closure_strictness_and_skip_closures_precedence_warning(
                     "--patch",
                     str(patch_out),
                     "--closure-strictness",
-                    "fail_closed",
+                    "pedantic",
                     "--skip-pre-unit-closures",
+                    "--non-suppressing-ctx-managers",
+                    "SafeA,SafeB",
                 ])
             assert exit_code == 1
             mock_patch.assert_called_once()
             _, kwargs = mock_patch.call_args
             assert kwargs.get("skip_pre_unit_closures") is False
-            assert kwargs.get("closure_strictness") == "strict"
-            assert any(
-                "takes precedence over --skip-pre-unit-closures" in r.message
+            assert kwargs.get("closure_strictness") == "pedantic"
+            assert kwargs.get("non_suppressing_ctx_managers") == ("SafeA", "SafeB")
+            precedence_warnings_fc = [
+                r.message
                 for r in caplog.records
-            )
+                if "takes precedence over skip_pre_unit_closures=True (--skip-pre-unit-closures)"
+                in r.message
+            ]
+            assert len(precedence_warnings_fc) == 1
 
 
 def test_cli_unrecognized_config_closure_strictness_falls_back(
@@ -2908,20 +2917,62 @@ def test_cli_unrecognized_config_closure_strictness_falls_back(
 
 
 def test_resolve_closure_strictness_mode_thread_safety() -> None:
-    """Verifies that concurrent invocations of resolve_closure_strictness_mode are thread-safe."""
+    """Verifies that concurrent invocations of resolve_closure_strictness_mode deduplicate warnings across threads."""
     import concurrent.futures  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        clear_closure_warning_cache,
         resolve_closure_strictness_mode,
     )
+
+    clear_closure_warning_cache()
 
     def _worker(val: str) -> tuple[str, bool]:
         return resolve_closure_strictness_mode(val)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(_worker, f"unknown_mode_{i % 3}") for i in range(50)]
-        results = [f.result() for f in futures]
+    with mock.patch("pydoppelgangerhunt.config.logger.warning") as mock_warn:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(_worker, f"unknown_mode_{i % 3}") for i in range(50)]
+            results = [f.result() for f in futures]
 
     assert all(r == ("strict", False) for r in results)
+    assert mock_warn.call_count == 3
+
+
+def test_resolve_closure_strictness_rejects_unshipped_and_unknown_modes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies that non-canonical and unknown strictness strings warn once per distinct value and fall back to strict."""
+    import logging  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        clear_closure_warning_cache,
+        resolve_closure_strictness_mode,
+    )
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert resolve_closure_strictness_mode("fail_closed") == ("pedantic", False)
+        assert resolve_closure_strictness_mode("fail_closed") == ("pedantic", False)
+        assert resolve_closure_strictness_mode("fast") == ("lenient", True)
+        assert resolve_closure_strictness_mode("skip") == ("lenient", True)
+        assert resolve_closure_strictness_mode("strict_with") == ("strict", False)
+
+    dep_msgs = [
+        r.message
+        for r in caplog.records
+        if "Deprecated closure_strictness" in r.message
+    ]
+    assert len(dep_msgs) == 3
+    for dep_val in ("fail_closed", "fast", "skip"):
+        assert any(f"Deprecated closure_strictness '{dep_val}'" in m for m in dep_msgs)
+
+    warn_msgs = [
+        r.message
+        for r in caplog.records
+        if "Unrecognized closure_strictness" in r.message
+    ]
+    assert len(warn_msgs) == 1
+    assert "Unrecognized closure_strictness 'strict_with'" in warn_msgs[0]
 
 
 def test_resolve_closure_strictness_mode_config_conflict_warning(
@@ -2944,3 +2995,213 @@ def test_resolve_closure_strictness_mode_config_conflict_warning(
         for r in caplog.records
     )
 
+
+def test_cli_strict_with_suppression_config_and_ctx_manager_merging(
+    tmp_path: Path,
+) -> None:
+    """Verifies strict_with_suppression in pyproject.toml maps to pedantic closure_strictness and normalize_non_suppressing_ctx_managers merges variadic inputs."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        normalize_non_suppressing_ctx_managers,
+    )
+
+    merged = normalize_non_suppressing_ctx_managers(
+        "LockA, LockB",
+        ["LockB", "pkg.LockC"],
+        None,
+        ("LockA", "LockD"),
+    )
+    assert merged == ("LockA", "LockB", "LockD", "pkg.LockC")
+
+    repo = tmp_path / "strict_with_repo"
+    repo.mkdir()
+    patch_out = repo / "refactor.patch"
+    (repo / "f.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "pyproject.toml").write_text(
+        "[tool.pydoppelgangerhunt]\nstrict_with_suppression = true\n",
+        encoding="utf-8",
+    )
+    dummy_clone = (
+        0.95,
+        {"name": "u1", "file": "f.py", "start": 1, "end": 1},
+        {"name": "u2", "file": "f.py", "start": 1, "end": 1},
+    )
+    with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[dummy_clone]):
+        with mock.patch(
+            "pydoppelgangerhunt.cli.generate_refactoring_patch", return_value="# patch\n"
+        ) as mock_patch:
+            exit_code = main([str(repo), "--patch", str(patch_out)])
+            assert exit_code == 1
+            _, kwargs = mock_patch.call_args
+            assert kwargs.get("closure_strictness") == "pedantic"
+            assert kwargs.get("skip_pre_unit_closures") is False
+
+            # Explicit CLI --closure-strictness pedantic overriding pyproject.toml strict_with_suppression = false
+            # must NOT emit a spurious config conflict warning.
+            (repo / "pyproject.toml").write_text(
+                '[tool.pydoppelgangerhunt]\nclosure_strictness = "strict"\nstrict_with_suppression = false\n',
+                encoding="utf-8",
+            )
+            with mock.patch("pydoppelgangerhunt.config.logger.warning") as mock_warn:
+                exit_code2 = main([
+                    str(repo),
+                    "--patch",
+                    str(patch_out),
+                    "--closure-strictness",
+                    "pedantic",
+                ])
+                assert exit_code2 == 1
+                mock_warn.assert_not_called()
+                _, kwargs2 = mock_patch.call_args
+                assert kwargs2.get("closure_strictness") == "pedantic"
+
+            # Repeated --non-suppressing-ctx-managers flags merge with config list
+            (repo / "pyproject.toml").write_text(
+                '[tool.pydoppelgangerhunt]\nnon_suppressing_ctx_managers = ["CfgMgr"]\n',
+                encoding="utf-8",
+            )
+            mock_patch.reset_mock()
+            exit_code3 = main([
+                str(repo),
+                "--patch",
+                str(patch_out),
+                "--non-suppressing-ctx-managers",
+                "CliA,CliB",
+                "--non-suppressing-ctx-managers",
+                "CliC",
+            ])
+            assert exit_code3 == 1
+            _, kwargs3 = mock_patch.call_args
+            assert kwargs3.get("non_suppressing_ctx_managers") == (
+                "CfgMgr",
+                "CliA",
+                "CliB",
+                "CliC",
+            )
+
+
+def test_cli_suggest_plumbing_and_strict_with_vs_skip_config_conflict(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies --suggest forwards closure_strictness/non_suppressing_ctx_managers and config conflicts between strict_with_suppression and skip_pre_unit_closures warn."""
+    import logging  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.reporters import (  # pylint: disable=import-outside-toplevel
+        synthesize_refactoring_suggestion,
+    )
+
+    repo = tmp_path / "suggest_plumbing_repo"
+    repo.mkdir()
+    mod_src = (
+        "def run_a(items, compute):\n"
+        "    with CustomSafeMgr():\n"
+        "        val = compute(items)\n"
+        "    res = val + 1\n"
+        "    return res\n\n"
+        "def run_b(items, compute):\n"
+        "    with CustomSafeMgr():\n"
+        "        val = compute(items)\n"
+        "    res = val + 1\n"
+        "    return res\n"
+    )
+    f_path = repo / "svc.py"
+    f_path.write_text(mod_src, encoding="utf-8")
+    u1 = {
+        "name": "run_a:block",
+        "file": str(f_path),
+        "start": 2,
+        "end": 4,
+        "kind": "compound_block",
+        "source_text": mod_src,
+    }
+    u2 = {
+        "name": "run_b:block",
+        "file": str(f_path),
+        "start": 8,
+        "end": 10,
+        "kind": "compound_block",
+        "source_text": mod_src,
+    }
+
+    # synthesize_refactoring_suggestion forwards closure_strictness and non_suppressing_ctx_managers
+    sug_pedantic_allowed = synthesize_refactoring_suggestion(
+        u1,
+        u2,
+        repo_root=str(repo),
+        closure_strictness="pedantic",
+        non_suppressing_ctx_managers=("CustomSafeMgr",),
+    )
+    assert "def _shared_" in sug_pedantic_allowed
+
+    # CLI --suggest forwards closure_strictness, skip_pre_unit_closures, and non_suppressing_ctx_managers
+    dummy_clone = (0.98, u1, u2)
+    with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[dummy_clone]):
+        with mock.patch(
+            "pydoppelgangerhunt.cli.synthesize_refactoring_suggestion",
+            return_value="# suggestion",
+        ) as mock_suggest:
+            exit_code = main([
+                str(repo),
+                "--suggest",
+                "--closure-strictness",
+                "pedantic",
+                "--non-suppressing-ctx-managers",
+                "MgrOne,MgrTwo",
+                "--non-suppressing-ctx-managers",
+                "MgrThree",
+            ])
+            assert exit_code == 1
+            mock_suggest.assert_called_once()
+            _, sug_kwargs = mock_suggest.call_args
+            assert sug_kwargs.get("closure_strictness") == "pedantic"
+            assert sug_kwargs.get("skip_pre_unit_closures") is False
+            assert sug_kwargs.get("non_suppressing_ctx_managers") == (
+                "MgrOne",
+                "MgrThree",
+                "MgrTwo",
+            )
+
+        # Config strict_with_suppression = true combined with config skip_pre_unit_closures = true warns
+        (repo / "pyproject.toml").write_text(
+            "[tool.pydoppelgangerhunt]\nstrict_with_suppression = true\nskip_pre_unit_closures = true\n",
+            encoding="utf-8",
+        )
+        caplog.clear()
+        with mock.patch(
+            "pydoppelgangerhunt.cli.generate_refactoring_patch", return_value="# patch\n"
+        ) as mock_patch:
+            with caplog.at_level(logging.WARNING):
+                exit_code_conf = main([
+                    str(repo),
+                    "--patch",
+                    str(repo / "out.patch"),
+                ])
+            assert exit_code_conf == 1
+            _, conf_kwargs = mock_patch.call_args
+            assert conf_kwargs.get("closure_strictness") == "lenient"
+            assert conf_kwargs.get("skip_pre_unit_closures") is True
+            assert any(
+                "strict_with_suppression=True and skip_pre_unit_closures=True cannot both be active"
+                in r.message
+                for r in caplog.records
+            )
+
+            # Config strict_with_suppression = true overridden by CLI --skip-pre-unit-closures warns
+            (repo / "pyproject.toml").write_text(
+                "[tool.pydoppelgangerhunt]\nstrict_with_suppression = true\n",
+                encoding="utf-8",
+            )
+            caplog.clear()
+            with caplog.at_level(logging.WARNING):
+                exit_code_cli_override = main([
+                    str(repo),
+                    "--patch",
+                    str(repo / "out.patch"),
+                    "--skip-pre-unit-closures",
+                ])
+            assert exit_code_cli_override == 1
+            assert any(
+                "CLI flag --skip-pre-unit-closures overrides configured strict_with_suppression=True"
+                in r.message
+                for r in caplog.records
+            )

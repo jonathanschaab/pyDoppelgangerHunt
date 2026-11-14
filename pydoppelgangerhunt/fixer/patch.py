@@ -6,14 +6,36 @@ import ast
 import builtins
 from collections import defaultdict
 import difflib
+import functools
 import hashlib
+import inspect
 import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, TypedDict, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TypeVar,
+    TypedDict,
+    Union,
+    cast,
+)
 
-from pydoppelgangerhunt.config import normalize_path_string, resolve_closure_strictness_mode
+from pydoppelgangerhunt.config import (
+    format_heuristic_ctx_manager_comment,
+    heuristic_ctx_manager_session,
+    normalize_non_suppressing_ctx_managers,
+    normalize_path_string,
+    resolve_closure_strictness_mode,
+    resolve_pair_closure_flags,
+)
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
     _extract_child_indentation,
@@ -27,7 +49,10 @@ from pydoppelgangerhunt.fixer.binding import (
     find_enclosing_class,
     find_enclosing_function,
 )
-from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
+from pydoppelgangerhunt.fixer._df_cache import (
+    _get_or_parse_tree,
+    _parse_ast_no_syntax_warnings,
+)
 from pydoppelgangerhunt.fixer._df_closures import (
     _extract_comprehension_walrus_names,
     iter_nested_scope_header_nodes,
@@ -80,8 +105,8 @@ from pydoppelgangerhunt.fixer.source import (
     resolve_unit_replacement,
     split_source_lines,
 )
-from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.source_lines import (
+    extract_unit_source_lines_with_state,
     normalize_unit_coordinates,
     resolve_unit_line_bounds,
 )
@@ -581,7 +606,7 @@ def _build_whole_method_delegation(
     base_u_name = raw_u_name.rsplit(":", maxsplit=1)[-1] if raw_u_name else ""
 
     try:
-        tree = ast.parse(source_text)
+        tree = _parse_ast_no_syntax_warnings(source_text)
         cand_nodes: List[Tuple[int, Union[ast.FunctionDef, ast.AsyncFunctionDef]]] = []
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1610,7 +1635,7 @@ def _has_future_annotations(source_text: str) -> bool:
     if not source_text or "__future__" not in source_text:
         return False
     try:
-        tree = ast.parse(source_text)
+        tree = _parse_ast_no_syntax_warnings(source_text)
     except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         return False
     for node in ast.walk(tree):
@@ -1626,7 +1651,7 @@ def _helper_requires_future_annotations(helper_code: str) -> bool:
     if not helper_code or "|" not in helper_code:
         return False
     try:
-        tree = ast.parse(helper_code)
+        tree = _parse_ast_no_syntax_warnings(helper_code)
     except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         return False
     for node in ast.walk(tree):
@@ -1747,7 +1772,7 @@ def _extract_module_import_statements(
     if not source_text.strip():
         return _ModuleImportsResult(stmts, wildcards)
     try:
-        tree = ast.parse(source_text)
+        tree = _parse_ast_no_syntax_warnings(source_text)
         for stmt in tree.body:
             if isinstance(stmt, (ast.Import, ast.ImportFrom)):
                 name_stmts, wilds = _parse_import_node_statements(
@@ -1805,7 +1830,7 @@ def _canonicalize_helper_relative_imports(
     if not valid_mods:
         return helper_code
     try:
-        tree = ast.parse(helper_code)
+        tree = _parse_ast_no_syntax_warnings(helper_code)
     except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         return helper_code
 
@@ -1900,7 +1925,7 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
     if not source_text.strip():
         return set()
     try:
-        tree = ast.parse(source_text)
+        tree = _parse_ast_no_syntax_warnings(source_text)
     except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         return set()
     names: Set[str] = set()
@@ -2408,7 +2433,7 @@ def _parse_local_import_statements(
         if not s_loc:
             continue
         try:
-            loc_tree = ast.parse(s_loc)
+            loc_tree = _parse_ast_no_syntax_warnings(s_loc)
         except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
             continue
 
@@ -2560,7 +2585,7 @@ def _collect_host_missing_imports(
 
     # 3. Source dependencies referenced in helper_code
     try:
-        helper_tree = ast.parse(helper_code)
+        helper_tree = _parse_ast_no_syntax_warnings(helper_code)
     except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         helper_tree = None
 
@@ -3163,7 +3188,46 @@ def _unit_start(u: Dict[str, Any]) -> int:
     return max(1, parse_unit_coord(u, "start", default=1))
 
 
-def _generate_refactoring_patch_impl(
+_PatchCallableT = TypeVar("_PatchCallableT", bound=Callable[..., str])
+
+
+def _apply_replace_clones_default_policy(
+    unit: Dict[str, Any],
+    *,
+    replace_clones: bool,
+    closure_strictness: Optional[str],
+    skip_pre_unit_closures: Optional[bool],
+) -> Dict[str, Any]:
+    """Defaults unset unit closure policy to 'pedantic' when replace_clones=True."""
+    if (
+        replace_clones
+        and closure_strictness is None
+        and skip_pre_unit_closures is None
+        and unit.get("closure_strictness") is None
+        and unit.get("skip_pre_unit_closures") is None
+        and unit.get("strict_with_suppression") is None
+    ):
+        return {**unit, "closure_strictness": "pedantic"}
+    return unit
+
+
+def _with_patch_session(fn: _PatchCallableT) -> _PatchCallableT:
+    """Enters heuristic session (escalating to WARNING on replace_clones)."""
+    sig = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def _wrapped(*args: Any, **kwargs: Any) -> str:
+        bound = sig.bind_partial(*args, **kwargs)
+        bound.apply_defaults()
+        warn_mode = bool(bound.arguments.get("replace_clones", False))
+        with heuristic_ctx_manager_session(warn=warn_mode):
+            return fn(*args, **kwargs)
+
+    return cast(_PatchCallableT, _wrapped)
+
+
+@_with_patch_session
+def generate_refactoring_patch(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     repo_root: Optional[str] = None,
     type_merge_strategy: str = "fallback_any",
@@ -3172,8 +3236,9 @@ def _generate_refactoring_patch_impl(
     cross_file_strategy: str = "auto",
     shared_module_name: str = "_common.py",
     depgraph: Optional[ModuleDependencyGraph] = None,
-    skip_pre_unit_closures: bool = False,
+    skip_pre_unit_closures: Optional[bool] = None,
     closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> str:
     """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
     if not clones:
@@ -3203,7 +3268,10 @@ def _generate_refactoring_patch_impl(
         method_binding = "auto"
     _, effective_skip_closures = resolve_closure_strictness_mode(
         closure_strictness=closure_strictness,
-        skip_pre_unit_closures=skip_pre_unit_closures,
+        skip_pre_unit_closures=bool(skip_pre_unit_closures),
+    )
+    eff_non_sup = normalize_non_suppressing_ctx_managers(
+        non_suppressing_ctx_managers
     )
     if effective_skip_closures:
         logger.debug("Generating patches in lenient closure strictness mode")
@@ -3477,29 +3545,77 @@ def _generate_refactoring_patch_impl(
                     (fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static"))
                 )
 
+            # Apply monotone strict-wins pair resolution (pedantic > strict > lenient)
+            # across both units so u1_eff and u2_eff are inspected under a single
+            # consistent closure and context-manager suppression policy. When
+            # replace_clones=True and no explicit policy is set on the call or unit,
+            # default to pedantic so automated call-site rewrites fail closed on
+            # unproven context managers.
+            u1_policy = _apply_replace_clones_default_policy(
+                u1,
+                replace_clones=replace_clones,
+                closure_strictness=closure_strictness,
+                skip_pre_unit_closures=skip_pre_unit_closures,
+            )
+            u2_policy = _apply_replace_clones_default_policy(
+                u2,
+                replace_clones=replace_clones,
+                closure_strictness=closure_strictness,
+                skip_pre_unit_closures=skip_pre_unit_closures,
+            )
+            pair_flags = resolve_pair_closure_flags(
+                u1_policy,
+                u2_policy,
+                closure_strictness=closure_strictness,
+                skip_pre_unit_closures=skip_pre_unit_closures,
+            )
+            u1_eff["skip_pre_unit_closures"] = (
+                pair_flags.effective_skip_pre_unit_closures
+            )
+            u1_eff["strict_with_suppression"] = (
+                pair_flags.effective_strict_with_suppression
+            )
+            u2_eff["skip_pre_unit_closures"] = (
+                pair_flags.effective_skip_pre_unit_closures
+            )
+            u2_eff["strict_with_suppression"] = (
+                pair_flags.effective_strict_with_suppression
+            )
+            u1_eff.pop("closure_strictness", None)
+            u2_eff.pop("closure_strictness", None)
+            merged_non_sup1 = normalize_non_suppressing_ctx_managers(
+                eff_non_sup, u1_eff.get("non_suppressing_ctx_managers")
+            )
+            if merged_non_sup1 or "non_suppressing_ctx_managers" in u1_eff:
+                u1_eff["non_suppressing_ctx_managers"] = list(merged_non_sup1)
+            merged_non_sup2 = normalize_non_suppressing_ctx_managers(
+                eff_non_sup, u2_eff.get("non_suppressing_ctx_managers")
+            )
+            if merged_non_sup2 or "non_suppressing_ctx_managers" in u2_eff:
+                u2_eff["non_suppressing_ctx_managers"] = list(merged_non_sup2)
             s1 = inspect_single_unit_scope(u1_eff, repo_root=str(root), tree=tree1)
             s2 = inspect_single_unit_scope(u2_eff, repo_root=str(root), tree=tree2)
             if u1_eff.get("kind") in ("comprehension", "complex_expr") or u2_eff.get(
                 "kind"
             ) in ("comprehension", "complex_expr"):
+                raw_l1, _ = extract_unit_source_lines_with_state(
+                    u1_eff, repo_root=str(root)
+                )
+                raw_l2, _ = extract_unit_source_lines_with_state(
+                    u2_eff, repo_root=str(root)
+                )
                 stmt_lines1 = _slice_unit_token_lines(
                     u1_eff,
                     _extract_unit_body_lines(
                         u1_eff,
-                        [
-                            ln.rstrip("\r\n")
-                            for ln in extract_unit_source_code(u1_eff, repo_root=str(root))
-                        ],
+                        [ln.rstrip("\r\n") for ln in raw_l1],
                     ),
                 )
                 stmt_lines2 = _slice_unit_token_lines(
                     u2_eff,
                     _extract_unit_body_lines(
                         u2_eff,
-                        [
-                            ln.rstrip("\r\n")
-                            for ln in extract_unit_source_code(u2_eff, repo_root=str(root))
-                        ],
+                        [ln.rstrip("\r\n") for ln in raw_l2],
                     ),
                 )
                 if not _prune_pair_lhs_and_augassign_scopes(
@@ -3547,17 +3663,59 @@ def _generate_refactoring_patch_impl(
 
             hazards1 = set(s1.get("control_flow_hazards", []))
             hazards2 = set(s2.get("control_flow_hazards", []))
-            if "pathological_ast" in hazards1 | hazards2:
+            combined_pair_hazards = hazards1 | hazards2
+            # Intentional host-caller asymmetry: u1 supplies the extracted helper AST and
+            # always rejects unavailable_source_placeholder; u2 permits preview-only
+            # (not replace_clones, not is_sub1, f2_text is None) host-module helper emission
+            # with a manual-import note when u2's caller file is missing on disk.
+            if "unavailable_source_placeholder" in hazards1 or (
+                "unavailable_source_placeholder" in hazards2
+                and (is_sub1 or replace_clones or f2_text is not None)
+            ):
+                skip_reasons["unavailable source placeholder"] += 1
+                continue
+            if "unavailable_source_for_closure_mode" in combined_pair_hazards:
+                skip_reasons["unavailable source for closure mode"] += 1
+                continue
+            if "invalid_unit_columns" in combined_pair_hazards:
+                skip_reasons["invalid unit columns"] += 1
+                continue
+            if "stale_source_code" in combined_pair_hazards:
+                skip_reasons["stale source code"] += 1
+                continue
+            if "pathological_ast" in combined_pair_hazards:
                 skip_reasons["pathological ast"] += 1
                 continue
-            if "type_param_closure_capture" in hazards1 | hazards2:
+            if "type_param_closure_capture" in combined_pair_hazards:
                 skip_reasons["type_param closure capture"] += 1
                 continue
-            if any(h in ("naked_break", "naked_continue") for h in hazards1 | hazards2):
+            if any(
+                h in ("naked_break", "naked_continue")
+                for h in combined_pair_hazards
+            ):
                 skip_reasons["naked break or continue"] += 1
                 continue
-            if "deleted_output" in hazards1 | hazards2:
+            if "deleted_output" in combined_pair_hazards:
                 skip_reasons["deleted output hazard"] += 1
+                continue
+            if "severed_closure_cell" in combined_pair_hazards:
+                sub_reasons = list(
+                    dict.fromkeys(
+                        list(s1.get("closure_hazard_reasons", ()))
+                        + list(s2.get("closure_hazard_reasons", ()))
+                    )
+                )
+                skip_reasons["severed closure cell"] += 1
+                if sub_reasons and sub_reasons != ["cell_severing"]:
+                    reason_detail = "/".join(
+                        r.replace("_", " ") for r in sub_reasons
+                    )
+                    logger.debug(
+                        "Skipping clone pair (%s, %s): severed closure cell (%s)",
+                        u1.get("name"),
+                        u2.get("name"),
+                        reason_detail,
+                    )
                 continue
             if "embedded_return" in hazards1 | hazards2:
                 lines1 = u1_lines
@@ -3646,6 +3804,15 @@ def _generate_refactoring_patch_impl(
                     inputs, u1_eff, u2_eff, s1, s2, repo_root=str(root)
                 )
 
+            effective_pair_strictness = (
+                "lenient"
+                if pair_flags.effective_skip_pre_unit_closures
+                else (
+                    "pedantic"
+                    if pair_flags.effective_strict_with_suppression
+                    else "strict"
+                )
+            )
             resolved_outs = resolve_clone_pair_outputs(
                 u1=u1_eff,
                 u2=u2_eff,
@@ -3656,9 +3823,11 @@ def _generate_refactoring_patch_impl(
                 tree1=tree1,
                 tree2=tree2,
                 repo_root=str(root),
-                skip_pre_unit_closures=effective_skip_closures,
+                skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
                 source_digest1=digest1,
                 source_digest2=digest2,
+                closure_strictness=effective_pair_strictness,
+                non_suppressing_ctx_managers=eff_non_sup or None,
                 require_pairing=replace_clones,
                 return_details=True,
             )
@@ -3815,8 +3984,9 @@ def _generate_refactoring_patch_impl(
                 source_text2=f2_text,
                 tree1=tree1,
                 tree2=tree2,
-                skip_pre_unit_closures=effective_skip_closures,
-                closure_strictness=closure_strictness,
+                skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
+                closure_strictness=effective_pair_strictness,
+                non_suppressing_ctx_managers=eff_non_sup or None,
                 outputs=outputs,
                 outputs2=target_outs2,
                 scope1=s1,
@@ -3832,6 +4002,15 @@ def _generate_refactoring_patch_impl(
             f1_disp = normalize_path_string(str(u1.get("file") or "file1"), strip_anchor=False)
             f2_disp = normalize_path_string(str(u2.get("file") or "file2"), strip_anchor=False)
             pair_comment = f"# Clone Pair ({sim:.1%}): {f1_disp} <===> {f2_disp}\n"
+            pair_heuristics = sorted(
+                set(s1.get("heuristic_ctx_managers", ()))
+                | set(s2.get("heuristic_ctx_managers", ()))
+                | set(scope.get("heuristic_ctx_managers", ()))
+            )
+            if pair_heuristics:
+                pair_comment += (
+                    format_heuristic_ctx_manager_comment(pair_heuristics) + "\n"
+                )
 
             candidate_units = [u1_eff]
             if is_same_file and not check_units_overlap(u1_eff, u2_eff, repo_root=str(root)):
@@ -4381,30 +4560,3 @@ def _generate_refactoring_patch_impl(
             patch_chunks.append(chunk)
 
     return "\n".join(patch_chunks)
-
-
-def generate_refactoring_patch(
-    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
-    repo_root: Optional[str] = None,
-    type_merge_strategy: str = "fallback_any",
-    replace_clones: bool = False,
-    method_binding: str = "auto",
-    cross_file_strategy: str = "auto",
-    shared_module_name: str = "_common.py",
-    depgraph: Optional[ModuleDependencyGraph] = None,
-    skip_pre_unit_closures: bool = False,
-    closure_strictness: Optional[str] = None,
-) -> str:
-    """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
-    return _generate_refactoring_patch_impl(
-        clones=clones,
-        repo_root=repo_root,
-        type_merge_strategy=type_merge_strategy,
-        replace_clones=replace_clones,
-        method_binding=method_binding,
-        cross_file_strategy=cross_file_strategy,
-        shared_module_name=shared_module_name,
-        depgraph=depgraph,
-        skip_pre_unit_closures=skip_pre_unit_closures,
-        closure_strictness=closure_strictness,
-    )

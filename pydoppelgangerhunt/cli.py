@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import ast
+from collections import OrderedDict
 from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.baseline import (
     BaselineFingerprints,
@@ -25,8 +27,11 @@ from pydoppelgangerhunt.baseline import (
 from pydoppelgangerhunt.clustering import cluster_clone_families
 from pydoppelgangerhunt.config import (
     DEFAULT_EXCLUDES,
+    heuristic_ctx_manager_session,
     init_tool_configuration,
+    is_recognized_closure_strictness,
     load_tool_config,
+    normalize_non_suppressing_ctx_managers,
     normalize_path_string,
     resolve_closure_strictness_mode,
 )
@@ -59,10 +64,14 @@ from pydoppelgangerhunt.reporters import (
     format_sarif_report,
     generate_clone_diff,
     generate_html_report,
+    resolve_cached_unit_source_and_tree,
     supports_color,
     synthesize_refactoring_suggestion,
 )
-from pydoppelgangerhunt.source_lines import resolve_unit_line_bounds
+from pydoppelgangerhunt.source_lines import (
+    resolve_unit_line_bounds,
+    with_unit_source_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -193,16 +202,31 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
     parser.add_argument(
         "--skip-pre-unit-closures",
         action="store_true",
-        help="Skip scanning pre-unit closures for live variables during subroutine extraction",
+        help="Relax unreferenced pre-unit sibling closure checks during subroutine extraction",
     )
     parser.add_argument(
         "--closure-strictness",
         type=str,
         default=None,
-        choices=["strict", "lenient", "fail_closed", "fast", "skip"],
+        choices=[
+            "strict",
+            "lenient",
+            "pedantic",
+        ],
         help=(
-            "Closure strictness ('strict'/'fail_closed' vs 'lenient'/'fast'/'skip'; "
+            "Closure strictness ('strict' [heuristic with-suppression, default; '--replace-clones' "
+            "defaults to 'pedantic' when unset], 'pedantic' [all unproven with-managers treated "
+            "as potentially suppressing], or 'lenient' [relax unreferenced sibling closure checks]; "
             "takes precedence over --skip-pre-unit-closures)"
+        ),
+    )
+    parser.add_argument(
+        "--non-suppressing-ctx-managers",
+        action="append",
+        default=[],
+        help=(
+            "Context manager names, dotted paths, or suffix wildcards ('*.attr' / '.attr') "
+            "proven not to suppress exceptions (comma-separated or repeatable)"
         ),
     )
 
@@ -386,19 +410,90 @@ def _render_pair_diff_and_suggestions(
     repo_root: Optional[str] = None,
     use_color: bool,
     indent: str = "    ",
+    closure_strictness: Optional[str] = None,
+    skip_pre_unit_closures: Optional[bool] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    file_cache: Optional[
+        OrderedDict[str, Tuple[Optional[str], Optional[ast.AST]]]
+    ] = None,
+    on_diagnostic_error: Optional[Callable[[], None]] = None,
 ) -> List[str]:
     """Renders optional refactoring suggestion and unified diff for a pair of clone units."""
     effective_root = repo_root or target_repo_root
     lines: List[str] = []
+    src1: Optional[str] = None
+    src2: Optional[str] = None
+    tree1: Optional[ast.AST] = None
+    tree2: Optional[ast.AST] = None
+    if (args.suggest or args.diff) and file_cache is not None:
+        try:
+            src1, tree1 = resolve_cached_unit_source_and_tree(
+                u1, repo_root=effective_root, file_cache=file_cache
+            )
+            src2, tree2 = resolve_cached_unit_source_and_tree(
+                u2, repo_root=effective_root, file_cache=file_cache
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            if on_diagnostic_error is not None:
+                on_diagnostic_error()
+            logger.warning(
+                "Failed to preload cached source/AST for clone pair (%r, %r)",
+                u1.get("name") if isinstance(u1, dict) else u1,
+                u2.get("name") if isinstance(u2, dict) else u2,
+                exc_info=True,
+            )
     if args.suggest:
-        sug = synthesize_refactoring_suggestion(u1, u2, repo_root=effective_root)
+        try:
+            sug_kwargs: Dict[str, Any] = {"repo_root": effective_root}
+            if src1 is not None or tree1 is not None:
+                sug_kwargs["source_text1"] = src1
+                sug_kwargs["tree1"] = tree1
+            if src2 is not None or tree2 is not None:
+                sug_kwargs["source_text2"] = src2
+                sug_kwargs["tree2"] = tree2
+            if closure_strictness is not None:
+                sug_kwargs["closure_strictness"] = closure_strictness
+                sug_kwargs["skip_pre_unit_closures"] = bool(skip_pre_unit_closures)
+            elif skip_pre_unit_closures is not None:
+                sug_kwargs["skip_pre_unit_closures"] = skip_pre_unit_closures
+            if non_suppressing_ctx_managers is not None:
+                sug_kwargs["non_suppressing_ctx_managers"] = (
+                    non_suppressing_ctx_managers
+                )
+            sug = synthesize_refactoring_suggestion(u1, u2, **sug_kwargs)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            if on_diagnostic_error is not None:
+                on_diagnostic_error()
+            logger.warning(
+                "Failed to synthesize refactoring suggestion for clone pair (%r, %r)",
+                u1.get("name") if isinstance(u1, dict) else u1,
+                u2.get("name") if isinstance(u2, dict) else u2,
+                exc_info=True,
+            )
+            sug = (
+                f"[REFACTOR SUGGESTION] Diagnostic: suggestion skipped due to "
+                f"{type(exc).__name__}: {exc}"
+            )
         sug_colored = colorize(sug, COLOR_YELLOW, use_color)
         print(indent + sug_colored.replace("\n", "\n" + indent))
         lines.append(indent + sug.replace("\n", "\n" + indent))
     if args.diff:
-        diff_out = generate_clone_diff(
-            u1, u2, repo_root=effective_root, color=use_color
-        )
+        try:
+            u1_diff = with_unit_source_text(u1, src1)
+            u2_diff = with_unit_source_text(u2, src2)
+            diff_out = generate_clone_diff(
+                u1_diff, u2_diff, repo_root=effective_root, color=use_color
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            if on_diagnostic_error is not None:
+                on_diagnostic_error()
+            logger.warning(
+                "Failed to render unified diff for clone pair (%r, %r)",
+                u1.get("name") if isinstance(u1, dict) else u1,
+                u2.get("name") if isinstance(u2, dict) else u2,
+                exc_info=True,
+            )
+            diff_out = f"# Diagnostic: diff skipped due to {type(exc).__name__}: {exc}"
         if diff_out:
             print(f"{indent}--- Diff ---")
             print(indent + diff_out.replace("\n", "\n" + indent))
@@ -635,11 +730,18 @@ def _render_text_violations(
     target_repo_root: str = ".",
     repo_root: Optional[str] = None,
     audit_tests_enabled: bool = False,
+    closure_strictness: Optional[str] = None,
+    skip_pre_unit_closures: Optional[bool] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    on_diagnostic_error: Optional[Callable[[], None]] = None,
 ) -> List[str]:
     """Renders human-readable text output for clone violations (either clustered families or pairwise)."""
     effective_root = repo_root or target_repo_root
     report_lines: List[str] = []
     active_cov = cov_data or {}
+    file_cache: Optional[
+        OrderedDict[str, Tuple[Optional[str], Optional[ast.AST]]]
+    ] = OrderedDict() if (args.suggest or args.diff) else None
     if args.cluster and families is not None:
         title = f"\n[VIOLATION] Clustered into {len(families)} Clone Family/Families (from {len(clones)} pairwise hits) >= {threshold:.0%}:\n"
         print(colorize(title, COLOR_BOLD + COLOR_RED, use_color))
@@ -687,6 +789,11 @@ def _render_text_violations(
                         target_repo_root=effective_root,
                         use_color=use_color,
                         indent="      ",
+                        closure_strictness=closure_strictness,
+                        skip_pre_unit_closures=skip_pre_unit_closures,
+                        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+                        file_cache=file_cache,
+                        on_diagnostic_error=on_diagnostic_error,
                     )
                 )
     else:
@@ -732,6 +839,11 @@ def _render_text_violations(
                     target_repo_root=effective_root,
                     use_color=use_color,
                     indent="    ",
+                    closure_strictness=closure_strictness,
+                    skip_pre_unit_closures=skip_pre_unit_closures,
+                    non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+                    file_cache=file_cache,
+                    on_diagnostic_error=on_diagnostic_error,
                 )
             )
 
@@ -1132,39 +1244,96 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     cfg_strictness = tool_cfg.get("closure_strictness")
     cfg_skip = _safe_bool(tool_cfg.get("skip_pre_unit_closures", False))
+    has_cfg_skip = cfg_skip
 
-    if args.closure_strictness is not None:
-        cli_strictness: Optional[str] = args.closure_strictness
-        cli_skip: bool = _safe_bool(args.skip_pre_unit_closures)
-        if (
-            str(cli_strictness).strip().lower() in ("strict", "fail_closed")
-            and args.skip_pre_unit_closures
-        ):
-            cli_skip = False
-            logger.warning(
-                "Conflicting flags: --closure-strictness '%s' takes precedence over "
-                "--skip-pre-unit-closures",
-                cli_strictness,
+    cfg_strict_with = (
+        _safe_bool(tool_cfg.get("strict_with_suppression"))
+        if "strict_with_suppression" in tool_cfg
+        and tool_cfg.get("strict_with_suppression") is not None
+        else None
+    )
+    has_cfg_closure = (
+        is_recognized_closure_strictness(cfg_strictness)
+        or has_cfg_skip
+        or bool(cfg_strict_with)
+    )
+    has_cli_closure = args.closure_strictness is not None or bool(
+        args.skip_pre_unit_closures
+    )
+    has_explicit_closure_cfg = has_cfg_closure or has_cli_closure
+    closure_strictness: Optional[str]
+    skip_pre_unit_closures: Optional[bool]
+    if not has_explicit_closure_cfg:
+        cfg_fallback_mode: Optional[str] = None
+        cfg_fallback_skip: Optional[bool] = None
+        if cfg_strictness is not None:
+            cfg_fallback_mode, cfg_fallback_skip = resolve_closure_strictness_mode(
+                closure_strictness=cfg_strictness,
+                skip_pre_unit_closures=cfg_skip,
+                strict_with_suppression=cfg_strict_with,
             )
-    elif args.skip_pre_unit_closures:
-        cli_strictness = "lenient"
-        cli_skip = True
-        if cfg_strictness is not None and str(cfg_strictness).strip().lower() in (
-            "strict",
-            "fail_closed",
-        ):
-            logger.warning(
-                "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
-                "configured closure_strictness='%s'",
-                cfg_strictness,
-            )
+        if replace_clones:
+            closure_strictness = "pedantic"
+            skip_pre_unit_closures = False
+        else:
+            closure_strictness = cfg_fallback_mode
+            skip_pre_unit_closures = cfg_fallback_skip
     else:
-        cli_strictness = cfg_strictness
-        cli_skip = cfg_skip
-
-    closure_strictness, skip_pre_unit_closures = resolve_closure_strictness_mode(
-        closure_strictness=cli_strictness,
-        skip_pre_unit_closures=cli_skip,
+        if args.closure_strictness is not None:
+            cli_strictness_str = str(args.closure_strictness)
+            cli_skip = _safe_bool(args.skip_pre_unit_closures)
+            closure_strictness, skip_pre_unit_closures = (
+                resolve_closure_strictness_mode(
+                    closure_strictness=cli_strictness_str,
+                    skip_pre_unit_closures=False,
+                    strict_with_suppression=True if cfg_strict_with is True else None,
+                )
+            )
+            if cli_skip and not skip_pre_unit_closures:
+                logger.warning(
+                    "Conflicting configuration: closure_strictness '%s' takes precedence over "
+                    "skip_pre_unit_closures=True (--skip-pre-unit-closures)",
+                    cli_strictness_str,
+                )
+        else:
+            cfg_resolved_strictness: Optional[str] = None
+            cfg_resolved_skip: bool = False
+            if cfg_strictness is not None or has_cfg_skip or cfg_strict_with is not None:
+                cfg_resolved_strictness, cfg_resolved_skip = (
+                    resolve_closure_strictness_mode(
+                        closure_strictness=cfg_strictness,
+                        skip_pre_unit_closures=cfg_skip,
+                        strict_with_suppression=cfg_strict_with,
+                    )
+                )
+            if args.skip_pre_unit_closures:
+                if cfg_resolved_strictness in ("strict", "pedantic"):
+                    if cfg_strictness is not None and str(cfg_strictness).strip().lower() in (
+                        "strict",
+                        "pedantic",
+                    ):
+                        logger.warning(
+                            "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
+                            "configured closure_strictness='%s'",
+                            cfg_strictness,
+                        )
+                    elif cfg_strict_with:
+                        logger.warning(
+                            "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
+                            "configured strict_with_suppression=True"
+                        )
+                closure_strictness, skip_pre_unit_closures = (
+                    resolve_closure_strictness_mode(
+                        closure_strictness="lenient",
+                        skip_pre_unit_closures=True,
+                    )
+                )
+            else:
+                closure_strictness = cfg_resolved_strictness
+                skip_pre_unit_closures = cfg_resolved_skip
+    non_suppressing_ctx_managers = normalize_non_suppressing_ctx_managers(
+        tool_cfg.get("non_suppressing_ctx_managers"),
+        getattr(args, "non_suppressing_ctx_managers", ()),
     )
     if skip_pre_unit_closures and getattr(args, "patch", False):
         logger.info(
@@ -1474,6 +1643,59 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.coverage:
         cov_data = read_coverage_data(args.coverage)
 
+    with heuristic_ctx_manager_session(warn=replace_clones):
+        return _emit_scan_artifacts_and_report(
+            args=args,
+            clones=clones,
+            target=target,
+            threshold=threshold,
+            sort_by=sort_by,
+            families=families,
+            stats=stats,
+            cov_data=cov_data,
+            use_color=use_color,
+            git_worktree_root=git_worktree_root,
+            audit_tests_enabled=audit_tests_enabled,
+            type_merge_strategy=type_merge_strategy,
+            replace_clones=replace_clones,
+            method_binding=method_binding,
+            cross_file_strategy=cross_file_strategy,
+            shared_module_name=shared_module_name,
+            skip_pre_unit_closures=skip_pre_unit_closures,
+            closure_strictness=closure_strictness,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        )
+
+
+def _emit_scan_artifacts_and_report(
+    *,
+    args: argparse.Namespace,
+    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
+    target: str,
+    threshold: float,
+    sort_by: str,
+    families: Optional[List[Dict[str, Any]]],
+    stats: Optional[Dict[str, Any]],
+    cov_data: Dict[str, Set[int]],
+    use_color: bool,
+    git_worktree_root: str,
+    audit_tests_enabled: bool,
+    type_merge_strategy: str,
+    replace_clones: bool,
+    method_binding: str,
+    cross_file_strategy: str,
+    shared_module_name: str,
+    skip_pre_unit_closures: Optional[bool],
+    closure_strictness: Optional[str],
+    non_suppressing_ctx_managers: Tuple[str, ...],
+) -> int:
+    """Emits HTML/patch/annotation artifacts and structured or text scan reports."""
+    diagnostic_errors = 0
+
+    def _record_diagnostic_error() -> None:
+        nonlocal diagnostic_errors
+        diagnostic_errors += 1
+
     if args.html:
         html_report = generate_html_report(
             clones,
@@ -1482,6 +1704,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             families=families,
             stats=stats,
             repo_root=git_worktree_root,
+            closure_strictness=closure_strictness,
+            skip_pre_unit_closures=skip_pre_unit_closures,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+            on_diagnostic_error=_record_diagnostic_error,
         )
         _write_artifact_file(args.html, html_report, "HTML", args.format == "text")
 
@@ -1497,6 +1723,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 shared_module_name=shared_module_name,
                 skip_pre_unit_closures=skip_pre_unit_closures,
                 closure_strictness=closure_strictness,
+                non_suppressing_ctx_managers=non_suppressing_ctx_managers,
             )
             if clones
             else ""
@@ -1516,6 +1743,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if annotations:
             print("\n".join(annotations))
 
+    def _emit_diagnostic_error_summary() -> None:
+        if diagnostic_errors > 0:
+            print(
+                f"Warning: {diagnostic_errors} internal diagnostic error(s) occurred while "
+                f"rendering clone pair suggestions, diffs, or HTML cards; see logs for details.",
+                file=sys.stderr,
+            )
+
     if args.format in ("sarif", "json"):
         report_data = (
             format_sarif_report(clones, target, threshold)
@@ -1525,20 +1760,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         emit_structured_report(
             report_data, "SARIF 2.1.0" if args.format == "sarif" else "JSON", args.output
         )
-        return 0 if not clones else 1
+        _emit_diagnostic_error_summary()
+        return 0 if (not clones and diagnostic_errors == 0) else 1
 
-    # Text format
     if stats and args.stats:
         _render_dry_scorecard(stats, use_color)
 
     if not clones:
-        ok_msg = colorize(f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!", COLOR_BOLD + COLOR_GREEN, use_color)
+        ok_msg = colorize(
+            f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!",
+            COLOR_BOLD + COLOR_GREEN,
+            use_color,
+        )
         print(ok_msg)
         if args.output:
             out_p = Path(args.output)
             out_p.parent.mkdir(parents=True, exist_ok=True)
             with open(out_p, "w", encoding="utf-8") as fh:
-                fh.write(f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!\n")
+                fh.write(
+                    f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!\n"
+                )
         return 0
 
     report_lines = _render_text_violations(
@@ -1551,6 +1792,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         use_color=use_color,
         target_repo_root=git_worktree_root,
         audit_tests_enabled=audit_tests_enabled,
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        on_diagnostic_error=_record_diagnostic_error,
     )
 
     if args.output:
@@ -1558,6 +1803,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         out_p.parent.mkdir(parents=True, exist_ok=True)
         with open(out_p, "w", encoding="utf-8") as fh:
             fh.write("\n".join(report_lines) + "\n")
+
+    _emit_diagnostic_error_summary()
 
     return 1
 

@@ -46,7 +46,7 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
 
 def test_modular_pydoppelgangerhunt_exports() -> None:
     """Test that pydoppelgangerhunt package exports clean public API and metadata."""
-    assert pydoppelgangerhunt.__version__ == "1.0.0"
+    assert pydoppelgangerhunt.__version__ == "2.0.0"
     assert callable(pydoppelgangerhunt.main)
     assert callable(pydoppelgangerhunt.scan_target)
     assert callable(pydoppelgangerhunt.cluster_clone_families)

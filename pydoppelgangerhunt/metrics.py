@@ -8,7 +8,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pydoppelgangerhunt.clustering import cluster_clone_families
 from pydoppelgangerhunt.config import canonical_path_key, find_python_files
-from pydoppelgangerhunt.source_lines import resolve_unit_line_bounds
+from pydoppelgangerhunt.source_lines import (
+    extract_notebook_code_cell_text,
+    resolve_unit_line_bounds,
+)
 
 
 def compute_repository_dry_stats(
@@ -32,12 +35,11 @@ def compute_repository_dry_stats(
                 try:
                     nb_data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
                     count = 0
-                    cells = nb_data.get("cells", [])
+                    cells = nb_data.get("cells", []) if isinstance(nb_data, dict) else None
                     if isinstance(cells, list):
                         for cell in cells:
-                            if isinstance(cell, dict) and cell.get("cell_type") == "code":
-                                src = cell.get("source", [])
-                                cell_code = "".join(src) if isinstance(src, list) else str(src)
+                            cell_code = extract_notebook_code_cell_text(cell)
+                            if cell_code is not None:
                                 count += sum(
                                     1
                                     for line in cell_code.splitlines()

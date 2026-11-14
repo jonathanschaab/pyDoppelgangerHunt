@@ -715,6 +715,8 @@ def test_scope_intervals_col_offset_sig_and_lru_shrink_and_decorated_pragma() ->
     """Verifies col_offset signature invalidation, dynamic LRU shrinkage, and decorated pragma leading scan."""
     from collections import OrderedDict  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=protected-access,import-outside-toplevel
+        _debug_ast_immutability,
+        _evict_tree_scopes,
         _store_lru_cache_entry,
     )
     from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=protected-access,import-outside-toplevel
@@ -732,6 +734,15 @@ def test_scope_intervals_col_offset_sig_and_lru_shrink_and_decorated_pragma() ->
     intervals1 = _get_tree_scope_intervals(tree)
     assert intervals1[0][3] is tree.body[1]
     tree.body[0].col_offset = 30
+    with pytest.raises(RuntimeError, match="Cached AST node was mutated in-place"):
+        _get_tree_scope_intervals(tree)
+    prev_dbg = _debug_ast_immutability[0]
+    _debug_ast_immutability[0] = False
+    try:
+        assert _get_tree_scope_intervals(tree)[0][3] is tree.body[0]
+    finally:
+        _debug_ast_immutability[0] = prev_dbg
+    _evict_tree_scopes(tree)
     intervals2 = _get_tree_scope_intervals(tree)
     assert intervals2[0][3] is tree.body[0]
 
@@ -1187,6 +1198,7 @@ def test_positional_meta2_internal_nonlocal_and_global_type_param_bounds() -> No
     """Verifies positional meta2 lookup, internal nonlocal scoping, enclosing global PEP 695 bounds, and multiline end_col."""
     import sys  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=protected-access,import-outside-toplevel
+        _evict_tree_scopes,
         _get_or_parse_tree,
         _resolve_unit_ast_end_col,
     )
@@ -1260,10 +1272,12 @@ def test_positional_meta2_internal_nonlocal_and_global_type_param_bounds() -> No
     orig_col = cached_tree.body[0].col_offset  # type: ignore[attr-defined]
     try:
         cached_tree.body[0].col_offset = 99  # type: ignore[attr-defined]
+        _evict_tree_scopes(cached_tree)
         intervals2 = _get_tree_scope_intervals(cached_tree)
         assert intervals2 is not intervals1
     finally:
         cached_tree.body[0].col_offset = orig_col  # type: ignore[attr-defined]
+        _evict_tree_scopes(cached_tree)
 
     multi_stmt_tree = ast.parse("if True:\n    x = (\n        1 + 2\n    )\n")
     assert (
@@ -2374,10 +2388,3 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     assert "self" in super_scope["inputs"]
     assert super_scope["has_instance_binding"] is True
     assert super_scope["binding_kind"] == "instance"
-
-
-
-
-
-
-

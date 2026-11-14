@@ -8,10 +8,35 @@ import logging
 import textwrap
 import tokenize
 import warnings
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    AbstractSet,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TypedDict,
+    Union,
+)
 
-from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
+from pydoppelgangerhunt.fixer._ast_compat import is_trystar_node
+from pydoppelgangerhunt.fixer._df_cache import (
+    _get_cached_tree_source_lines,
+    _get_or_parse_tree,
+    _register_tree_source_lines,
+    _suppress_syntax_warnings,
+)
+from pydoppelgangerhunt.fixer._df_closures import (
+    _get_tree_scope_intervals,
+    _node_scope_bounds,
+)
 from pydoppelgangerhunt.source_lines import (
+    SourceLinesOrigin,
     count_physical_newlines,
     detect_line_ending,
     is_sliced_unit_source_lines,
@@ -27,6 +52,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ReplacementItem",
     "UnitDict",
+    "UnitSchema",
     "UnitSpan",
     "col_offset_to_char_offset",
     "compute_line_offsets",
@@ -49,9 +75,416 @@ __all__ = [
     "resolve_unit_replacement",
     "slice_source_by_token_range",
     "split_source_lines",
+    "validate_unit_schema",
 ]
 
+
+class UnitSchema(TypedDict, total=False):
+    """Documented schema for AST unit dictionaries across parser, matcher, and fixer.
+
+    Source Resolution Precedence:
+        When extracting unit source lines (`extract_unit_source_lines_with_state`),
+        fields are consulted in the following order:
+        1. ``source_lines`` (sliced directly when ``source_lines_is_sliced`` is True or
+           matches the unit line span; otherwise indexed by ``start``..``end``).
+        2. ``source_text`` (full module text split into physical lines).
+        3. ``file_source`` (fallback full module text split into physical lines).
+        4. ``file`` on disk (resolved relative to ``repo_root``).
+        5. ``source_code`` (used by ``inspect_single_unit_scope`` when no full-module
+           source is available, or validated against the backing module/tree for
+           staleness when both are present).
+
+    Attributes:
+        file: Relative or absolute source file path (may include ``#cell_N`` for notebooks).
+        name: Qualified or simple name of the unit (e.g., ``"ClassName.method"`` or ``"fn:block"``).
+        kind: Structural unit kind (e.g., ``"function"``, ``"method"``, ``"closure"``,
+            ``"compound_block"``, ``"sliding_window"``, ``"clause_branch"``,
+            ``"comprehension"``, ``"complex_expr"``, ``"class"``, ``"data_table"``).
+        type: Legacy alias for ``kind`` in report payloads.
+        start: 1-based inclusive start line number (or ``"line:col"`` string).
+        end: 1-based inclusive end line number (or ``"line:col"`` string).
+        lineno: Alias for ``start`` on AST-derived unit payloads.
+        end_lineno: Alias for ``end`` on AST-derived unit payloads.
+        start_col: 0-based UTF-8 byte start column offset on ``start`` line.
+        end_col: 0-based UTF-8 byte end column offset on ``end`` line.
+        col_offset: Alias for ``start_col``.
+        start_col_offset: Alias for ``start_col``.
+        end_col_offset: Alias for ``end_col``.
+        docstring_end: Optional 1-based end line of the unit's leading docstring.
+        is_subroutine: Explicit boolean override indicating whether the unit is an
+            extracted subroutine block rather than a whole callable/class.
+        source_code: Pre-sliced source text of the unit itself.
+        source_text: Complete in-memory source text of the containing module.
+        file_source: Fallback complete in-memory source text of the containing module.
+        source_lines: Sequence of source lines (either pre-sliced excerpt or full module).
+        source_lines_is_sliced: Explicit boolean disambiguating whether ``source_lines``
+            is already sliced to the unit's line boundaries (``True``) or represents
+            the full module buffer (``False``).
+        source_lines_is_col_sliced: Explicit boolean disambiguating whether ``source_lines``
+            is already trimmed to ``start_col``..``end_col`` (``True``) or still requires
+            column slicing (``False``).
+        inputs: Ordered list of live-in variable names required by the unit.
+        outputs: Ordered list of live-out variable names exported by the unit.
+        precomputed_outputs: Explicit caller-supplied output variable list taking
+            precedence over ``outputs``.
+        scope: Precomputed scope analysis dictionary from ``inspect_single_unit_scope``.
+        receiver_param: Receiver parameter name (e.g., ``"self"`` or ``"cls"``).
+        receiver_kind: Receiver binding kind (``"instance"``, ``"class"``, or ``"module"``).
+        enclosing_class: Name of the enclosing class when the unit is a method or nested block.
+        enclosing_class_start: 1-based start line of the enclosing class definition.
+        enclosing_is_async: Whether the immediately enclosing function is ``async def``.
+        enclosing_function: Name of the immediately enclosing function.
+        is_static: Whether the unit is decorated with ``@staticmethod``.
+        is_class_method: Whether the unit is decorated with ``@classmethod``.
+        is_async: Whether the unit itself is an async function or contains top-level async constructs.
+        has_yield: Whether the unit yields values (generator function or generator subroutine).
+        has_await: Whether the unit contains ``await`` expressions.
+        closure_strictness: Per-unit closure strictness mode override
+            (``"strict"``, ``"pedantic"``, or ``"lenient"``).
+        skip_pre_unit_closures: Per-unit boolean fallback when ``closure_strictness`` is omitted
+            (``False`` for strict/pedantic mode, ``True`` for lenient mode).
+        strict_with_suppression: Per-unit boolean override for conservative ``with``-statement
+            exception suppression treatment (``True`` in pedantic mode, ``False`` in strict/lenient).
+        non_suppressing_ctx_managers: Optional iterable of context manager names/paths
+            configured to be treated as non-suppressing in ``with`` statements.
+        allow_snippet_only: Explicit boolean opt-in permitting subroutine, closure,
+            comprehension, or complex-expression scope analysis when only isolated
+            snippet ``source_code`` / ``source_lines`` is supplied without a backing
+            module ``tree``, ``source_text``, or ``file``. Defaults to ``False`` (fail-closed).
+        token_count: Number of normalized AST tokens in the unit.
+        tokens: Legacy alias for ``token_count``.
+        lines: Total line span count emitted by the parser.
+        sloc: Source lines of code count.
+        complexity: McCabe cyclomatic complexity of the unit.
+        shingles: Normalized AST k-shingle collection emitted by the parser (a set of
+            token tuples; order-insensitive, so sequences and sets are both accepted).
+        vector: Characteristic token/shingle Counter or vector emitted by the parser.
+        calls: Sequence of called function/method names extracted by the parser.
+        structural_hash: Exact structural AST digest emitted by the parser.
+        ast_node: Optional in-memory AST node reference.
+    """
+
+    file: Optional[str]
+    name: Optional[str]
+    kind: Optional[str]
+    type: Optional[str]
+    start: Union[int, str, None]
+    end: Union[int, str, None]
+    lineno: Union[int, str, None]
+    end_lineno: Union[int, str, None]
+    start_col: Union[int, str, None]
+    end_col: Union[int, str, None]
+    col_offset: Union[int, str, None]
+    start_col_offset: Union[int, str, None]
+    end_col_offset: Union[int, str, None]
+    docstring_end: Optional[int]
+    is_subroutine: Optional[bool]
+    source_code: Optional[str]
+    source_text: Optional[str]
+    file_source: Optional[str]
+    source_lines: Optional[Sequence[str]]
+    source_lines_is_sliced: Optional[bool]
+    source_lines_is_col_sliced: Optional[bool]
+    inputs: Sequence[str]
+    outputs: Sequence[str]
+    precomputed_outputs: Optional[Sequence[str]]
+    scope: Dict[str, Any]
+    receiver_param: Optional[str]
+    receiver_kind: Optional[str]
+    self_param: Optional[str]
+    cls_param: Optional[str]
+    enclosing_class: Optional[str]
+    enclosing_class_start: Optional[int]
+    enclosing_is_async: Optional[bool]
+    enclosing_is_classmethod: Optional[bool]
+    enclosing_is_staticmethod: Optional[bool]
+    enclosing_function: Optional[str]
+    is_static: Optional[bool]
+    is_class_method: Optional[bool]
+    is_async: Optional[bool]
+    has_yield: Optional[bool]
+    has_await: Optional[bool]
+    closure_strictness: Optional[str]
+    skip_pre_unit_closures: Optional[bool]
+    strict_with_suppression: Optional[bool]
+    non_suppressing_ctx_managers: Optional[Union[Sequence[str], AbstractSet[str]]]
+    allow_snippet_only: Optional[bool]
+    token_count: Optional[int]
+    tokens: Optional[Union[int, Sequence[str]]]
+    norm_tokens: Optional[Sequence[str]]
+    lines: Optional[int]
+    sloc: Optional[int]
+    complexity: Optional[int]
+    shingles: Optional[Union[Sequence[Any], AbstractSet[Any]]]
+    vector: Optional[Any]
+    calls: Optional[Sequence[str]]
+    structural_hash: Optional[str]
+    ast_node: Optional[ast.AST]
+
+
 UnitDict = Dict[str, Any]
+
+_UNIT_SCHEMA_KEYS: frozenset[str] = frozenset(UnitSchema.__annotations__.keys())
+
+_UNIT_BOOL_KEYS: frozenset[str] = frozenset(
+    {
+        "is_subroutine",
+        "source_lines_is_sliced",
+        "source_lines_is_col_sliced",
+        "enclosing_is_async",
+        "enclosing_is_classmethod",
+        "enclosing_is_staticmethod",
+        "is_static",
+        "is_class_method",
+        "is_async",
+        "has_yield",
+        "has_await",
+        "skip_pre_unit_closures",
+        "strict_with_suppression",
+        "allow_snippet_only",
+    }
+)
+_UNIT_STR_KEYS: frozenset[str] = frozenset(
+    {
+        "file",
+        "name",
+        "kind",
+        "type",
+        "source_code",
+        "source_text",
+        "file_source",
+        "receiver_param",
+        "receiver_kind",
+        "self_param",
+        "cls_param",
+        "enclosing_class",
+        "enclosing_function",
+        "closure_strictness",
+        "structural_hash",
+    }
+)
+_UNIT_POSITIVE_INT_KEYS: frozenset[str] = frozenset(
+    {
+        "docstring_end",
+        "enclosing_class_start",
+    }
+)
+_UNIT_NONNEG_INT_KEYS: frozenset[str] = frozenset(
+    {
+        "token_count",
+        "lines",
+        "sloc",
+        "complexity",
+    }
+)
+_UNIT_LINE_COORD_KEYS: frozenset[str] = frozenset(
+    {"start", "end", "lineno", "end_lineno"}
+)
+_UNIT_COL_COORD_KEYS: frozenset[str] = frozenset(
+    {"start_col", "end_col", "col_offset", "start_col_offset", "end_col_offset"}
+)
+# Positionally consumed fields (helper parameter order, output pairing, token streams)
+# require ordered sequences; unordered sets would make helper signatures nondeterministic.
+_UNIT_ORDERED_STR_SEQ_KEYS: frozenset[str] = frozenset(
+    {
+        "source_lines",
+        "inputs",
+        "outputs",
+        "precomputed_outputs",
+        "norm_tokens",
+        "calls",
+    }
+)
+# Membership-only fields accept either ordered sequences or unordered sets.
+_UNIT_STR_COLLECTION_KEYS: frozenset[str] = frozenset({"non_suppressing_ctx_managers"})
+# Mutually aliased coordinate keys that must agree when more than one is supplied.
+_UNIT_COORD_ALIAS_GROUPS: Tuple[Tuple[str, ...], ...] = (
+    ("start", "lineno"),
+    ("end", "end_lineno"),
+    ("start_col", "col_offset", "start_col_offset"),
+    ("end_col", "end_col_offset"),
+)
+_VALID_CLOSURE_STRICTNESS_VALUES: frozenset[str] = frozenset(
+    {"strict", "pedantic", "lenient"}
+)
+
+
+def _is_valid_ordered_str_sequence(val: Any) -> bool:
+    """Returns True if val is an ordered non-string sequence of strings (sets are rejected)."""
+    if isinstance(val, (str, bytes, bytearray)) or not isinstance(val, Sequence):
+        return False
+    return all(isinstance(item, str) for item in val)
+
+
+def _is_valid_str_collection(val: Any) -> bool:
+    """Returns True if val is a non-string sequence or set of strings."""
+    if isinstance(val, (str, bytes, bytearray, Mapping)) or not isinstance(
+        val, (Sequence, AbstractSet)
+    ):
+        return False
+    return all(isinstance(item, str) for item in val)
+
+
+# (field keys, validator, error description) for string-collection UnitSchema fields.
+_UNIT_STR_COLLECTION_RULES: Tuple[
+    Tuple[frozenset[str], Callable[[Any], bool], str], ...
+] = (
+    (_UNIT_ORDERED_STR_SEQ_KEYS, _is_valid_ordered_str_sequence, "ordered sequence"),
+    (_UNIT_STR_COLLECTION_KEYS, _is_valid_str_collection, "sequence or set"),
+)
+
+
+def _validate_int_field(key: str, val: Any, *, minimum: int) -> None:
+    """Raises ValueError unless val is a non-bool int >= minimum."""
+    if isinstance(val, bool) or not isinstance(val, int) or val < minimum:
+        qualifier = "positive" if minimum > 0 else "non-negative"
+        raise ValueError(
+            f"Expected {qualifier} int for unit field {key!r}, got {val!r}"
+        )
+
+
+def _validate_known_unit_field_value(key: str, val: Any) -> None:
+    """Raises ValueError if a non-None value for a known UnitSchema key has an invalid type or domain."""
+    if key in _UNIT_BOOL_KEYS:
+        if not isinstance(val, bool):
+            raise ValueError(f"Expected bool for unit field {key!r}, got {val!r}")
+        return
+    if key in _UNIT_STR_KEYS:
+        if not isinstance(val, str):
+            raise ValueError(f"Expected str for unit field {key!r}, got {val!r}")
+        if (
+            key == "closure_strictness"
+            and val.strip().lower() not in _VALID_CLOSURE_STRICTNESS_VALUES
+        ):
+            raise ValueError(
+                f"Invalid closure_strictness value {val!r}; expected one of "
+                f"{sorted(_VALID_CLOSURE_STRICTNESS_VALUES)}"
+            )
+        return
+    if key in _UNIT_POSITIVE_INT_KEYS:
+        _validate_int_field(key, val, minimum=1)
+        return
+    if key in _UNIT_NONNEG_INT_KEYS:
+        _validate_int_field(key, val, minimum=0)
+        return
+    if key in _UNIT_LINE_COORD_KEYS or key in _UNIT_COL_COORD_KEYS:
+        min_coord = 1 if key in _UNIT_LINE_COORD_KEYS else 0
+        if isinstance(val, bool) or not isinstance(val, (int, str)):
+            raise ValueError(
+                f"Expected coordinate int or str for unit field {key!r}, got {val!r}"
+            )
+        try:
+            parsed = parse_unit_coord({key: val}, key, default=None, strict=True)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid coordinate value for unit field {key!r}: {val!r}"
+            ) from exc
+        if parsed is None or parsed < min_coord:
+            raise ValueError(
+                f"Invalid coordinate value for unit field {key!r}: {val!r}"
+            )
+        return
+    for keys, is_valid, description in _UNIT_STR_COLLECTION_RULES:
+        if key in keys:
+            if not is_valid(val):
+                raise ValueError(
+                    f"Expected {description} of str for unit field {key!r}, got {val!r}"
+                )
+            return
+    if key == "tokens":
+        is_nonneg_int = not isinstance(val, bool) and isinstance(val, int) and val >= 0
+        if not (is_nonneg_int or _is_valid_ordered_str_sequence(val)):
+            raise ValueError(
+                f"Expected non-negative int or ordered sequence of str for 'tokens', got {val!r}"
+            )
+        return
+    if key == "shingles":
+        if isinstance(val, (str, bytes, bytearray, Mapping)) or not isinstance(
+            val, (Sequence, AbstractSet)
+        ):
+            raise ValueError(f"Expected sequence or set for 'shingles', got {val!r}")
+        return
+    if key == "scope" and not isinstance(val, Mapping):
+        raise ValueError(f"Expected mapping for 'scope', got {val!r}")
+    if key == "ast_node" and not isinstance(val, ast.AST):
+        raise ValueError(f"Expected ast.AST for 'ast_node', got {val!r}")
+
+
+def _validate_coordinate_alias_agreement(unit: Mapping[str, Any]) -> None:
+    """Raises ValueError when aliased coordinate keys (e.g. ``start`` / ``lineno``) disagree."""
+    for group in _UNIT_COORD_ALIAS_GROUPS:
+        parsed = {
+            key: parse_unit_coord({key: unit[key]}, key, default=None, strict=True)
+            for key in group
+            if unit.get(key) is not None
+        }
+        if len(set(parsed.values())) > 1:
+            raise ValueError(
+                f"Conflicting coordinate aliases in unit dictionary: {parsed}"
+            )
+
+
+def _parse_first_unit_coord(
+    unit: Mapping[str, Any], keys: Tuple[str, ...]
+) -> Optional[int]:
+    for key in keys:
+        if unit.get(key) is not None:
+            return parse_unit_coord({key: unit[key]}, key, default=None, strict=True)
+    return None
+
+
+def validate_unit_schema(
+    unit: Mapping[str, Any], *, strict: bool = False
+) -> Set[str]:
+    """Validates a unit dictionary against documented UnitSchema keys and field types.
+
+    Raises ``TypeError`` if ``unit`` is not a mapping, or ``ValueError`` if any
+    known field has an invalid value type/range (or when ``strict=True`` and
+    unrecognized keys are present). Returns the set of unrecognized keys not
+    declared on ``UnitSchema``.
+
+    Note:
+        Positionally consumed fields (``source_lines``, ``inputs``, ``outputs``,
+        ``precomputed_outputs``, ``norm_tokens``, ``calls``, and list-valued
+        ``tokens``) must be ordered sequences; unordered sets are rejected because
+        they make helper parameter order and output pairing nondeterministic.
+        ``docstring_end`` and ``enclosing_class_start`` are 1-based line numbers and
+        reject zero. Aliased coordinates (``start`` / ``lineno``, ``end`` /
+        ``end_lineno``, ``start_col`` / ``col_offset`` / ``start_col_offset``, and
+        ``end_col`` / ``end_col_offset``) must agree when more than one is supplied.
+    """
+    if not isinstance(unit, Mapping):
+        raise TypeError(f"Expected a unit mapping, got {type(unit).__name__}")
+    unknown = {str(k) for k in unit.keys() if k not in _UNIT_SCHEMA_KEYS}
+    if strict and unknown:
+        raise ValueError(
+            f"Unrecognized keys in unit dictionary: {sorted(unknown)}"
+        )
+    for k, v in unit.items():
+        if k in _UNIT_SCHEMA_KEYS and v is not None:
+            _validate_known_unit_field_value(str(k), v)
+    _validate_coordinate_alias_agreement(unit)
+    start_raw = unit.get("start") if unit.get("start") is not None else unit.get("lineno")
+    end_raw = unit.get("end") if unit.get("end") is not None else unit.get("end_lineno")
+    if start_raw is not None and end_raw is not None:
+        s_val = parse_unit_coord({"start": start_raw}, "start", default=None, strict=True)
+        e_val = parse_unit_coord({"end": end_raw}, "end", default=None, strict=True)
+        if s_val is not None and e_val is not None:
+            if e_val < s_val:
+                raise ValueError(
+                    f"Inverted line coordinates in unit dictionary: start={s_val} > end={e_val}"
+                )
+            if s_val == e_val:
+                s_col = _parse_first_unit_coord(
+                    unit, ("start_col", "col_offset", "start_col_offset")
+                )
+                e_col = _parse_first_unit_coord(unit, ("end_col", "end_col_offset"))
+                if s_col is not None and e_col is not None and e_col < s_col:
+                    raise ValueError(
+                        f"Inverted column coordinates on line {s_val}: "
+                        f"start_col={s_col} > end_col={e_col}"
+                    )
+    return unknown
 
 _parse_unit_coord = parse_unit_coord
 _resolve_safe_unit_file_path = resolve_safe_unit_file_path
@@ -445,7 +878,7 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
             if body_nodes:
                 d_lines = [ln.rstrip("\r\n") for ln in split_source_lines(dedented)]
                 first_body = body_nodes[0]
-                start_l = _node_scope_bounds(first_body)[0] - line_offset
+                start_l = _node_scope_bounds(first_body, d_lines)[0] - line_offset
                 end_l = (
                     getattr(body_nodes[-1], "end_lineno", len(d_lines) + line_offset)
                     - line_offset
@@ -454,7 +887,7 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
                 if extracted:
                     if start_l == fn_node.lineno - line_offset:
                         b_col = getattr(first_body, "col_offset", 0)
-                        extracted[0] = extracted[0][b_col:]
+                        extracted[0] = _slice_utf8_line(extracted[0], b_col)
                     return [
                         ln.rstrip("\r\n")
                         for ln in split_source_lines(dedent_source_text("\n".join(extracted)))
@@ -520,7 +953,7 @@ def _find_module_helper_insertion_index(lines: List[str]) -> int:
             last_import_line = max(last_import_line, end_l)
         elif (
             isinstance(node, (ast.Try, ast.If, ast.With, ast.AsyncWith))
-            or type(node).__name__ == "TryStar"
+            or is_trystar_node(node)
         ):
             for sub in ast.walk(node):
                 if isinstance(sub, (ast.Import, ast.ImportFrom)):
@@ -550,27 +983,93 @@ def _extract_slice_col_offset(
     return default
 
 
-def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]:
-    """Slices source lines to the exact start_col and end_col offsets of the unit."""
+def _slice_utf8_line(
+    line: str, s_col: int, e_col: Optional[int] = None
+) -> str:
+    """Slices a single line by UTF-8 byte column offsets.
+
+    When e_col < s_col (inverted column bounds), intentionally falls back to
+    line[s_char:] rather than collapsing the line to empty.
+    """
+    s_char = col_offset_to_char_offset(line, s_col)
+    if e_col is not None and e_col >= s_col:
+        return line[s_char : col_offset_to_char_offset(line, e_col)]
+    return line[s_char:]
+
+
+def _is_valid_eval_expr(text: str) -> bool:
+    """Returns True if text parses as a standalone Python expression."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    try:
+        with _suppress_syntax_warnings():
+            ast.parse(stripped, mode="eval")
+        return True
+    except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
+        return False
+
+
+def _slice_unit_token_lines(
+    unit: Dict[str, Any],
+    lines: List[str],
+    *,
+    is_pre_sliced: Optional[Union[bool, SourceLinesOrigin]] = None,
+    explicit_col_sliced: Optional[bool] = None,
+) -> List[str]:
+    """Slices source lines to the exact start_col and end_col offsets of the unit.
+
+    Line-sliced excerpts still undergo first/last-line column clipping unless
+    ``source_lines_is_col_sliced=True`` (or ``explicit_col_sliced=True``) explicitly
+    declares that column offsets were already stripped. Out-of-bounds column
+    coordinates fail closed by returning ``[]``.
+    """
+    del is_pre_sliced
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
         return lines
+    raw_col_flag = unit.get("source_lines_is_col_sliced")
+    eff_col_sliced = (
+        explicit_col_sliced
+        if explicit_col_sliced is not None
+        else (raw_col_flag if isinstance(raw_col_flag, bool) else None)
+    )
+    if eff_col_sliced is True:
+        return list(lines)
     s_col_opt = _extract_slice_col_offset(
         unit, ("start_col", "start_col_offset"), default=0
     )
     e_col = _extract_slice_col_offset(
         unit, ("end_col", "end_col_offset"), default=None
     )
-    if s_col_opt is None or s_col_opt < 0 or e_col == -1:
+    if s_col_opt is None or s_col_opt < 0:
         return lines
+    if e_col is not None and e_col < 0:
+        return []
     s_col = s_col_opt
     res = list(lines)
+    first_byte_len = len(res[0].rstrip("\r\n").encode("utf-8"))
     if len(res) == 1:
-        res[0] = res[0][s_col:e_col] if (e_col is not None and e_col >= s_col) else res[0][s_col:]
-    else:
-        res[0] = res[0][s_col:]
-        if e_col is not None:
-            res[-1] = res[-1][:e_col]
-    return res
+        if (
+            s_col > first_byte_len
+            or (s_col == first_byte_len and e_col != first_byte_len)
+            or (e_col is not None and e_col > first_byte_len)
+        ):
+            return []
+        res[0] = _slice_utf8_line(res[0], s_col, e_col)
+        return res
+    last_byte_len = len(res[-1].rstrip("\r\n").encode("utf-8"))
+    if (
+        s_col > first_byte_len
+        or 0 < first_byte_len == s_col
+        or (e_col is not None and e_col > last_byte_len)
+    ):
+        return []
+    clipped = list(res)
+    if 0 < s_col < first_byte_len:
+        clipped[0] = _slice_utf8_line(clipped[0], s_col, None)
+    if e_col is not None and 0 <= e_col <= last_byte_len:
+        clipped[-1] = _slice_utf8_line(clipped[-1].rstrip("\r\n"), 0, e_col)
+    return clipped
 
 
 def _get_module_imported_names(
@@ -593,7 +1092,7 @@ def _get_module_imported_names(
                 imported.add(alias.asname or alias.name)
         elif include_conditional and (
             isinstance(stmt, (ast.If, ast.Try, ast.With, ast.AsyncWith))
-            or type(stmt).__name__ == "TryStar"
+            or is_trystar_node(stmt)
         ):
             for sub in ast.walk(stmt):
                 if isinstance(sub, ast.Import):
@@ -1435,69 +1934,6 @@ def _find_sig_colon(line: str) -> int:
     return line.rfind(":")
 
 
-def _node_scope_bounds(node: ast.AST) -> Tuple[int, int]:
-    """Computes (earliest_start, n_end) line bounds for a scope AST node."""
-    n_start = getattr(node, "lineno", 0) or 0
-    n_end = getattr(node, "end_lineno", None) or n_start
-    decorators = getattr(node, "decorator_list", [])
-    dec_start = (
-        min((getattr(d, "lineno", None) or n_start) for d in decorators)
-        if decorators
-        else n_start
-    )
-    return min(dec_start, n_start), n_end
-
-
-def _compute_scope_intervals_sig(
-    tree: ast.AST, intervals: Sequence[Tuple[int, int, int, ast.AST]]
-) -> Tuple[Any, ...]:
-    """Computes a lightweight O(K) structural signature for scope interval cache validation."""
-    return (
-        tuple(id(s) for s in getattr(tree, "body", ())),
-        *(
-            (
-                id(node),
-                _node_scope_bounds(node),
-                getattr(node, "col_offset", 0),
-                tuple(id(s) for s in getattr(node, "body", ())),
-            )
-            for _, _, _, node in intervals
-        ),
-    )
-
-
-def _get_tree_scope_intervals(
-    tree: ast.AST,
-) -> List[Tuple[int, int, int, ast.AST]]:
-    """Builds and caches sorted intervals (earliest_start, n_end, span, node) on the tree."""
-    cached = getattr(tree, "_scope_intervals", None)
-    if (
-        isinstance(cached, list)
-        and getattr(tree, "_scope_intervals_sig", None)
-        == _compute_scope_intervals_sig(tree, cached)
-    ):
-        return cached
-    intervals: List[Tuple[int, int, int, ast.AST]] = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            earliest_start, n_end = _node_scope_bounds(node)
-            intervals.append((earliest_start, n_end, n_end - earliest_start, node))
-    intervals.sort(
-        key=lambda item: (item[2], -item[0], -getattr(item[3], "col_offset", 0))
-    )
-    try:
-        setattr(tree, "_scope_intervals", intervals)
-        setattr(
-            tree,
-            "_scope_intervals_sig",
-            _compute_scope_intervals_sig(tree, intervals),
-        )
-    except (AttributeError, TypeError):
-        pass
-    return intervals
-
-
-
 def _find_innermost_enclosing_node(
     source_text: str,
     unit: Dict[str, Any],
@@ -1527,8 +1963,16 @@ def _find_innermost_enclosing_node(
         if tree is None:
             return None
 
+    src_lines: Optional[Tuple[str, ...]] = _get_cached_tree_source_lines(tree)
+    if src_lines is None and source_text:
+        src_lines = _register_tree_source_lines(tree, source_text=source_text)
+        if src_lines is None:
+            src_lines = tuple(
+                ln.rstrip("\r\n") for ln in split_source_lines(source_text)
+            )
+
     candidates: List[Tuple[int, ast.AST, int, int]] = []
-    intervals = _get_tree_scope_intervals(tree)
+    intervals = _get_tree_scope_intervals(tree, source_lines=src_lines)
     for earliest_start, n_end, span, node in intervals:
         if isinstance(node, node_types):
             if earliest_start <= u_start <= u_end <= n_end:
@@ -1541,15 +1985,7 @@ def _find_innermost_enclosing_node(
     ):
         for node in ast.walk(tree):
             if isinstance(node, node_types):
-                n_start = getattr(node, "lineno", 0) or 0
-                n_end = getattr(node, "end_lineno", None) or n_start
-                decorators = getattr(node, "decorator_list", [])
-                dec_start = (
-                    min((getattr(d, "lineno", None) or n_start) for d in decorators)
-                    if decorators
-                    else n_start
-                )
-                earliest_start = min(dec_start, n_start)
+                earliest_start, n_end = _node_scope_bounds(node, src_lines)
                 if earliest_start <= u_start <= u_end <= n_end:
                     candidates.append((n_end - earliest_start, node, earliest_start, n_end))
 
