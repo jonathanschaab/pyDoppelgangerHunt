@@ -2603,3 +2603,40 @@ def test_weak_parent_map_len_excludes_collected_parents() -> None:
     gc.collect()
     assert len(pmap) == 0
     assert len(list(pmap)) == 0
+
+
+def test_normalize_non_suppressing_ctx_managers_handles_cyclic_input() -> None:
+    """Verifies self-referential containers passed to normalize_non_suppressing_ctx_managers terminate cleanly."""
+    from pydoppelgangerhunt.config import normalize_non_suppressing_ctx_managers
+
+    cyclic: list[Any] = ["LockA"]
+    cyclic.append(cyclic)
+    assert normalize_non_suppressing_ctx_managers(cyclic) == ("LockA",)
+
+
+def test_app_version_matches_pyproject_toml() -> None:
+    """Verifies APP_VERSION stays synchronized with pyproject.toml."""
+    import tomllib
+    from pydoppelgangerhunt.config import APP_VERSION
+
+    repo_root = Path(__file__).resolve().parents[2]
+    pyproject_data = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+    assert APP_VERSION == pyproject_data["project"]["version"]
+
+
+def test_full_buffer_out_of_range_slice_returns_placeholder() -> None:
+    """Verifies out-of-range FULL_BUFFER line slices fail closed as PLACEHOLDER."""
+    from pydoppelgangerhunt.source_lines import (
+        SourceLinesOrigin,
+        extract_unit_source_lines_with_state,
+    )
+
+    _, origin = extract_unit_source_lines_with_state(
+        {
+            "file": "missing.py",
+            "start": 10,
+            "end": 12,
+            "source_lines": ["x = 1\n", "y = 2\n"],
+        }
+    )
+    assert origin is SourceLinesOrigin.PLACEHOLDER

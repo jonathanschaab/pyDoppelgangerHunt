@@ -38,7 +38,6 @@ logger = logging.getLogger(__name__)
 _warned_closure_lock: threading.Lock = threading.Lock()
 _MAX_WARNED_CLOSURE_EVENTS: int = 4096
 _MAX_HEURISTIC_CTX_MANAGERS: int = 16384
-_MAX_DEFAULT_THREAD_BUCKETS: int = 256
 _warned_closure_strictness_values: OrderedDict[str, None] = OrderedDict()
 _next_heuristic_session_id = itertools.count(1)
 _heuristic_collector_tls: threading.local = threading.local()
@@ -569,6 +568,7 @@ def resolve_pair_closure_flags(
 def normalize_non_suppressing_ctx_managers(*sources: Any) -> Tuple[str, ...]:
     """Normalizes one or more context-manager name sources into a sorted tuple of names."""
     collected: Set[str] = set()
+    seen_container_ids: Set[int] = set()
     stack: List[Any] = list(sources)
     while stack:
         item = stack.pop()
@@ -582,6 +582,10 @@ def normalize_non_suppressing_ctx_managers(*sources: Any) -> Tuple[str, ...]:
         elif not isinstance(item, (bytes, bytearray, Mapping)) and isinstance(
             item, (Sequence, AbstractSet)
         ):
+            obj_id = id(item)
+            if obj_id in seen_container_ids:
+                continue
+            seen_container_ids.add(obj_id)
             stack.extend(item)
         else:
             invalid_key = f"invalid_non_sup_type:{type(item).__name__}"

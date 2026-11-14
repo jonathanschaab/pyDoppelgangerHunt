@@ -4313,3 +4313,27 @@ def test_exit_protocol_scanner_avoids_non_builtin_eval_and_nested_attr_stores(
     scan = scan_exit_protocol_patches(ast.parse(stmt))
     assert scan.has_patch is expect_has_patch
     assert bool(scan.rebound_attrs) is expect_rebound_attrs
+
+
+@pytest.mark.parametrize(
+    ("src", "expect_has_patch"),
+    [
+        ("class C:\n    def m(self, k, v):\n        setattr(self, k, v)\n", False),
+        ("class C:\n    def m(self, v):\n        setattr(self, '__class__', v)\n", True),
+        ("class C:\n    @classmethod\n    def m(cls, k, v):\n        setattr(cls, k, v)\n", True),
+        ("__import__('builtins').setattr(M, '__exit__', f)\n", True),
+        ("import importlib\nimportlib.import_module('builtins').setattr(M, '__exit__', f)\n", True),
+        ("import builtins\nvars(builtins)['setattr'](M, '__exit__', f)\n", True),
+        ("import sys\nsys.modules['builtins'].setattr(M, '__exit__', f)\n", True),
+    ],
+)
+def test_exit_protocol_scanner_self_setattr_and_dynamic_builtins_lookup(
+    src: str, expect_has_patch: bool
+) -> None:
+    """Verifies instance setattr(self, k, v) does not false-positive while dynamic builtins lookups are flagged."""
+    import ast
+
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    scan = scan_exit_protocol_patches(ast.parse(src))
+    assert scan.has_patch is expect_has_patch

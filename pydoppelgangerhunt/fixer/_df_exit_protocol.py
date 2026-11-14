@@ -284,6 +284,59 @@ def _is_getattr_of_mutation_builtin(
     )
 
 
+def _is_dynamic_builtins_lookup(
+    node: ast.AST, builtins_mod_aliases: AbstractSet[str]
+) -> bool:
+    """Returns True for __import__('builtins'), import_module('builtins'), vars(builtins), or sys.modules['builtins']."""
+    if isinstance(node, ast.Call):
+        func = node.func
+        is_import_call = (
+            isinstance(func, ast.Name) and func.id in ("__import__", "import_module")
+        ) or (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "importlib"
+            and func.attr == "import_module"
+        )
+        if (
+            is_import_call
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "builtins"
+        ):
+            return True
+        if (
+            isinstance(func, ast.Name)
+            and func.id == "vars"
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in builtins_mod_aliases
+        ):
+            return True
+    elif isinstance(node, ast.Subscript):
+        if (
+            isinstance(node.value, ast.Attribute)
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == "sys"
+            and node.value.attr == "modules"
+            and isinstance(node.slice, ast.Constant)
+            and node.slice.value == "builtins"
+        ):
+            return True
+    return False
+
+
+def _instance_self_param(fn: ast.AST) -> Optional[str]:
+    """Returns the first parameter name of an instance method (excluding classmethod/staticmethod)."""
+    if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    for dec in fn.decorator_list:
+        if isinstance(dec, ast.Name) and dec.id in ("classmethod", "staticmethod"):
+            return None
+    pos_args = fn.args.posonlyargs or fn.args.args
+    return pos_args[0].arg if pos_args else None
+
+
 def _scan_exit_protocol_patches_uncached(tree: ast.AST) -> ExitProtocolPatchScan:
     """Walks every scope of tree collecting exit-protocol and stdlib-factory patch targets."""
     (
@@ -300,12 +353,29 @@ def _scan_exit_protocol_patches_uncached(tree: ast.AST) -> ExitProtocolPatchScan
     if has_wildcard:
         rebound_attrs.add((None, None))
     call_func_ids: Set[int] = set()
-    stack: List[ast.AST] = [tree]
+    stack: List[Tuple[ast.AST, Optional[str]]] = [(tree, None)]
     while stack:
-        node = stack.pop()
+        node, instance_self = stack.pop()
         if isinstance(node, ast.Call):
             call_func_ids.add(id(node.func))
-        stack.extend(ast.iter_child_nodes(node))
+        if isinstance(node, ast.ClassDef):
+            for cls_stmt in node.body:
+                stack.append((cls_stmt, _instance_self_param(cls_stmt)))
+            for cls_hdr in (*node.bases, *node.keywords, *node.decorator_list):
+                stack.append((cls_hdr, None))
+            continue
+        child_self = (
+            None
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and not instance_self
+            else instance_self
+        )
+        for sub_node in ast.iter_child_nodes(node):
+            stack.append((sub_node, child_self))
+        if _is_dynamic_builtins_lookup(node, builtins_mod_aliases):
+            has_patch = True
+            rebound_attrs.add((None, None))
+            continue
         if isinstance(node, ast.Attribute) and isinstance(
             node.ctx, (ast.Store, ast.Del)
         ):
@@ -333,6 +403,13 @@ def _scan_exit_protocol_patches_uncached(tree: ast.AST) -> ExitProtocolPatchScan
             if mut_info is None:
                 continue
             target_expr, literal_attr = mut_info
+            if (
+                literal_attr is None
+                and instance_self is not None
+                and isinstance(target_expr, ast.Name)
+                and target_expr.id == instance_self
+            ):
+                continue
             if literal_attr is not None and literal_attr in _STDLIB_FACTORY_ATTRS:
                 rebound_attrs.add(
                     (

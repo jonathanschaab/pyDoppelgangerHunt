@@ -547,6 +547,8 @@ def extract_unit_source_lines_with_state(
         start = max(1, s_d)
         end = min(len(source_lines), e_d)
         sliced_buf = source_lines[start - 1 : end]
+        if not sliced_buf:
+            return placeholder, SourceLinesOrigin.PLACEHOLDER
         return (
             [_ensure_trailing_lf(str(ln)) for ln in sliced_buf],
             SourceLinesOrigin.FULL_BUFFER,

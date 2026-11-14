@@ -292,10 +292,11 @@ escaping callbacks across lexical scopes.
   across CLI and programmatic APIs: explicit valid `closure_strictness` takes precedence over
   `strict_with_suppression` and `skip_pre_unit_closures` (logging a once-per-run conflict warning when
   both are supplied and disagree), while `strict_with_suppression = true` selects `pedantic` when
-  `closure_strictness` is unset, and unrecognized `closure_strictness` strings in configuration files or
-  unit dictionaries log a warning and fall back to the boolean flags (`lenient` when
-  `skip_pre_unit_closures = true`, `pedantic` when `strict_with_suppression = true`, and `strict`
-  otherwise):
+  `closure_strictness` is unset. Legacy `closure_strictness` values in configuration files or unit
+  dictionaries log a deprecation warning and map directly (`"fail_closed"` → `pedantic`, `"fast"`
+  and `"skip"` → `lenient`), while unrecognized `closure_strictness` strings log a warning and fall
+  back to the boolean flags (`lenient` when `skip_pre_unit_closures = true`, `pedantic` when
+  `strict_with_suppression = true`, and `strict` otherwise):
   - `strict` (default for reporting, `--suggest`, `--html`, and preview patch generation with
     `replace_clones=False`): **Heuristic context-manager safety mode** with conservative closure-cell
     analysis. Treats pre-unit closures capturing candidate outputs as live escaping callbacks and
