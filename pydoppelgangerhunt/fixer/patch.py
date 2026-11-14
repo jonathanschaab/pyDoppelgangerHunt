@@ -8,7 +8,6 @@ from collections import defaultdict
 import difflib
 import functools
 import hashlib
-import inspect
 import logging
 import os
 import re
@@ -31,6 +30,7 @@ from typing import (
 from pydoppelgangerhunt.config import (
     format_heuristic_ctx_manager_comment,
     heuristic_ctx_manager_session,
+    is_recognized_closure_strictness,
     normalize_non_suppressing_ctx_managers,
     normalize_path_string,
     resolve_closure_strictness_mode,
@@ -3199,28 +3199,30 @@ def _apply_replace_clones_default_policy(
     skip_pre_unit_closures: Optional[bool],
 ) -> Dict[str, Any]:
     """Defaults unset unit closure policy to 'pedantic' when replace_clones=True."""
+    has_explicit_caller_policy = (
+        is_recognized_closure_strictness(closure_strictness)
+        or skip_pre_unit_closures is True
+    )
+    has_explicit_unit_policy = (
+        is_recognized_closure_strictness(unit.get("closure_strictness"))
+        or unit.get("skip_pre_unit_closures") is True
+        or unit.get("strict_with_suppression") is True
+    )
     if (
         replace_clones
-        and closure_strictness is None
-        and skip_pre_unit_closures is None
-        and unit.get("closure_strictness") is None
-        and unit.get("skip_pre_unit_closures") is None
-        and unit.get("strict_with_suppression") is None
+        and not has_explicit_caller_policy
+        and not has_explicit_unit_policy
     ):
         return {**unit, "closure_strictness": "pedantic"}
     return unit
 
 
 def _with_patch_session(fn: _PatchCallableT) -> _PatchCallableT:
-    """Enters heuristic session (escalating to WARNING on replace_clones)."""
-    sig = inspect.signature(fn)
+    """Enters heuristic session so consolidated strict-mode assumptions log a summary warning."""
 
     @functools.wraps(fn)
     def _wrapped(*args: Any, **kwargs: Any) -> str:
-        bound = sig.bind_partial(*args, **kwargs)
-        bound.apply_defaults()
-        warn_mode = bool(bound.arguments.get("replace_clones", False))
-        with heuristic_ctx_manager_session(warn=warn_mode):
+        with heuristic_ctx_manager_session(warn=True):
             return fn(*args, **kwargs)
 
     return cast(_PatchCallableT, _wrapped)
@@ -3269,6 +3271,11 @@ def generate_refactoring_patch(
     _, effective_skip_closures = resolve_closure_strictness_mode(
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=bool(skip_pre_unit_closures),
+    )
+    eff_caller_strictness = (
+        closure_strictness
+        if is_recognized_closure_strictness(closure_strictness)
+        else None
     )
     eff_non_sup = normalize_non_suppressing_ctx_managers(
         non_suppressing_ctx_managers
@@ -3554,19 +3561,19 @@ def generate_refactoring_patch(
             u1_policy = _apply_replace_clones_default_policy(
                 u1,
                 replace_clones=replace_clones,
-                closure_strictness=closure_strictness,
+                closure_strictness=eff_caller_strictness,
                 skip_pre_unit_closures=skip_pre_unit_closures,
             )
             u2_policy = _apply_replace_clones_default_policy(
                 u2,
                 replace_clones=replace_clones,
-                closure_strictness=closure_strictness,
+                closure_strictness=eff_caller_strictness,
                 skip_pre_unit_closures=skip_pre_unit_closures,
             )
             pair_flags = resolve_pair_closure_flags(
                 u1_policy,
                 u2_policy,
-                closure_strictness=closure_strictness,
+                closure_strictness=eff_caller_strictness,
                 skip_pre_unit_closures=skip_pre_unit_closures,
             )
             u1_eff["skip_pre_unit_closures"] = (

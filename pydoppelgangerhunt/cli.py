@@ -1639,7 +1639,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.coverage:
         cov_data = read_coverage_data(args.coverage)
 
-    with heuristic_ctx_manager_session(warn=replace_clones):
+    with heuristic_ctx_manager_session(warn=True):
         return _emit_scan_artifacts_and_report(
             args=args,
             clones=clones,
@@ -1769,7 +1769,9 @@ def _emit_scan_artifacts_and_report(
             report_data, "SARIF 2.1.0" if args.format == "sarif" else "JSON", args.output
         )
         _emit_diagnostic_error_summary()
-        return 0 if (not clones and diagnostic_errors == 0) else 1
+        if diagnostic_errors > 0:
+            return 2
+        return 0 if not clones else 1
 
     if stats and args.stats:
         _render_dry_scorecard(stats, use_color)
@@ -1788,7 +1790,8 @@ def _emit_scan_artifacts_and_report(
                 fh.write(
                     f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!\n"
                 )
-        return 0
+        _emit_diagnostic_error_summary()
+        return 2 if diagnostic_errors > 0 else 0
 
     report_lines = _render_text_violations(
         clones,
@@ -1814,7 +1817,7 @@ def _emit_scan_artifacts_and_report(
 
     _emit_diagnostic_error_summary()
 
-    return 1
+    return 2 if diagnostic_errors > 0 else 1
 
 
 if __name__ == "__main__":

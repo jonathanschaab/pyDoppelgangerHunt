@@ -57,10 +57,12 @@ resolve_generator_subroutine_outputs = (
     _df_pairing.resolve_generator_subroutine_outputs
 )
 CloneOutputResolution = _df_pairing.CloneOutputResolution
+SAFETY_PAIR_SKIP_REASONS = _df_pairing.SAFETY_PAIR_SKIP_REASONS
 
 __all__ = [
     "CloneOutputResolution",
     "GeneratorCloneSideData",
+    "SAFETY_PAIR_SKIP_REASONS",
     "clear_dataflow_cache",
     "collect_downstream_read_names",
     "evict_tree_scopes",

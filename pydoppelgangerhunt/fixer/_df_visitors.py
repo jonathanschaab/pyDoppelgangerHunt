@@ -21,6 +21,7 @@ from typing import (
 )
 
 _BUILTIN_NAMES: Set[str] = set(dir(builtins))
+_MAX_AST_RECURSION_DEPTH: int = 200
 logger = logging.getLogger(__name__)
 
 
@@ -751,16 +752,17 @@ def _extract_nested_scope_free_reads(
 
 def _extract_assigned_names(target: ast.AST) -> List[str]:
     """Extracts bare variable names bound by an assignment target."""
-    if isinstance(target, ast.Name):
-        return [target.id]
-    if isinstance(target, (ast.Tuple, ast.List)):
-        names: List[str] = []
-        for elt in target.elts:
-            names.extend(_extract_assigned_names(elt))
-        return names
-    if isinstance(target, ast.Starred):
-        return _extract_assigned_names(target.value)
-    return []
+    names: List[str] = []
+    stack: List[ast.AST] = [target]
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, ast.Name):
+            names.append(curr.id)
+        elif isinstance(curr, (ast.Tuple, ast.List)):
+            stack.extend(reversed(curr.elts))
+        elif isinstance(curr, ast.Starred):
+            stack.append(curr.value)
+    return names
 
 
 class _VisitorPassMode(str, Enum):
@@ -1255,13 +1257,19 @@ class _StrictPostLineVisitor(_DownstreamReadVisitor):
         )
 
 
-def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
+def _block_terminates(statements: Sequence[ast.stmt], *, _depth: int = 0) -> bool:
     """Checks whether a sequence of statements unconditionally returns or raises."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return False
     for stmt in statements:
         if isinstance(stmt, (ast.Return, ast.Raise)):
             return True
         if isinstance(stmt, ast.If):
-            if stmt.orelse and _block_terminates(stmt.body) and _block_terminates(stmt.orelse):
+            if (
+                stmt.orelse
+                and _block_terminates(stmt.body, _depth=_depth + 1)
+                and _block_terminates(stmt.orelse, _depth=_depth + 1)
+            ):
                 return True
     return False
 

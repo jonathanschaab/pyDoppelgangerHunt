@@ -41,6 +41,7 @@ from pydoppelgangerhunt.clustering import (
     unit_key,
 )
 from pydoppelgangerhunt.config import (
+    APP_VERSION,
     DEFAULT_EXCLUDES,
     DEFAULT_TOOL_TOML_CONTENT,
     canonical_path_key,
@@ -153,7 +154,6 @@ from pydoppelgangerhunt.reporters import (
     supports_color,
     synthesize_refactoring_suggestion,
 )
-from pydoppelgangerhunt.config import APP_VERSION
 from pydoppelgangerhunt.source_lines import SourceLinesOrigin, _PHYSICAL_LINE_RE
 
 __version__ = APP_VERSION

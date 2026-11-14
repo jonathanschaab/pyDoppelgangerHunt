@@ -584,7 +584,7 @@ def test_neutral_named_suppressor_strict_vs_pedantic_and_summary_log(
         recorded = log_heuristic_ctx_manager_summary()
     assert set(recorded) == {"Guard", "SpanContext", "Transaction"}
     assert any(
-        rec.levelno == logging.INFO
+        rec.levelno == logging.WARNING
         and "3 unproven context manager(s)" in rec.message
         and "were treated as non-suppressing" in rec.message
         for rec in caplog.records
@@ -1078,7 +1078,7 @@ def test_heuristic_ctx_manager_summary_logged_once_at_batch_boundary(
     assert set(flushed) == {"CustomMgrAlpha", "CustomMgrBeta"}
     summary_records = [r for r in caplog.records if "Summary:" in r.message]
     assert len(summary_records) == 1
-    assert summary_records[0].levelno == logging.INFO
+    assert summary_records[0].levelno == logging.WARNING
     assert "2 unproven context manager(s)" in summary_records[0].message
 
     clear_closure_warning_cache()
@@ -1091,7 +1091,7 @@ def test_heuristic_ctx_manager_summary_logged_once_at_batch_boundary(
     assert "def _shared_" in patch
     patch_summaries = [r for r in caplog.records if "Summary:" in r.message]
     assert len(patch_summaries) == 1
-    assert patch_summaries[0].levelno == logging.INFO
+    assert patch_summaries[0].levelno == logging.WARNING
     assert "2 unproven context manager(s)" in patch_summaries[0].message
 
 
@@ -1634,7 +1634,7 @@ def test_cli_text_report_clean_stdout_and_session_worker_heuristic_harvesting(
     capsys: pytest.CaptureFixture[str],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Verifies CLI text report keeps stdout/--output clean of '# Note:', qualifies manager names, and harvests worker threads."""
+    """Verifies CLI text report records '# Note:' on '--suggest' while keeping 'Summary:' out of stdout/--output, qualifies manager names, and harvests worker threads."""
     import concurrent.futures
     import logging
     from pydoppelgangerhunt.cli import main
@@ -1692,9 +1692,10 @@ def test_cli_text_report_clean_stdout_and_session_worker_heuristic_harvesting(
     captured = capsys.readouterr()
     report_text = out_report.read_text(encoding="utf-8")
     assert rc in (0, 1)
-    assert "# Note:" not in captured.out
-    assert "unproven context manager" not in captured.out
-    assert "# Note:" not in report_text
+    assert "# Note:" in captured.out
+    assert "# Note:" in report_text
+    assert "Summary:" not in captured.out
+    assert "Summary:" not in report_text
     assert "StaleLeftoverMgr" not in captured.err
     assert not any("StaleLeftoverMgr" in r.message for r in caplog.records)
 
@@ -2264,7 +2265,7 @@ def test_report_boundary_isolates_malformed_clone_pair_without_aborting_run(
             ):
                 exit_code = main([str(tmp_path), "--suggest", "--diff", "--no-color"])
     captured = capsys.readouterr()
-    assert exit_code == 1
+    assert exit_code == 2
     assert (
         "[REFACTOR SUGGESTION] Diagnostic: suggestion skipped due to TypeError: synthetic AST defect"
         in captured.out
@@ -2793,7 +2794,7 @@ def test_suggestion_and_html_report_record_strict_heuristic_ctx_manager_assumpti
             non_suppressing_ctx_managers=allowlist,
         )
     assert "Extract duplicated logic into common helper" in suggestion
-    assert "# Note:" not in suggestion
+    assert ("# Note:" in suggestion) is expect_heuristic
     assert ("Transaction" in suggest_heuristics) is expect_heuristic
     suggest_msgs = [record.getMessage() for record in caplog.records]
     assert (
@@ -2813,7 +2814,7 @@ def test_suggestion_and_html_report_record_strict_heuristic_ctx_manager_assumpti
             closure_strictness=closure_strictness,
             non_suppressing_ctx_managers=allowlist,
         )
-    assert "unproven context manager(s)" not in html_report
+    assert ("unproven context manager(s)" in html_report) is expect_heuristic
     assert ("Transaction" in html_heuristics) is expect_heuristic
     html_msgs = [record.getMessage() for record in caplog.records]
     assert (
@@ -2844,7 +2845,7 @@ def test_cli_surfaces_internal_diagnostic_error_count_to_stderr(
     monkeypatch.setattr("pydoppelgangerhunt.reporters.synthesize_refactoring_suggestion", _boom)
     html_out = tmp_path / "report.html"
     exit_code = main([str(target), "--min-lines", "3", "--suggest", "--html", str(html_out)])
-    assert exit_code == 1
+    assert exit_code == 2
     captured = capsys.readouterr()
     assert "2 internal diagnostic error(s) occurred" in captured.err
 
@@ -2983,7 +2984,7 @@ def test_cli_json_format_surfaces_internal_diagnostic_error_count(
     exit_code = main(
         [str(target), "--min-lines", "3", "--format", "json", "--html", str(html_out)]
     )
-    assert exit_code == 1
+    assert exit_code == 2
     captured = capsys.readouterr()
     assert "1 internal diagnostic error(s) occurred" in captured.err
 

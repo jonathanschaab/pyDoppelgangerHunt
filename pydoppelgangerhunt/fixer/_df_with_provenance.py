@@ -65,7 +65,9 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _node_has_star_import,
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
+    _MAX_AST_RECURSION_DEPTH,
     _collect_func_params as _extract_arg_names,
+    _extract_assigned_names,
     _extract_pattern_bound_name,
     _record_import_names,
 )
@@ -1328,21 +1330,27 @@ _DISALLOWED_ANNOTATION_NODE_TYPES: Tuple[type, ...] = (
 
 def _is_static_class_attr_value(node: Optional[ast.AST]) -> bool:
     """Returns True if an expression is a side-effect-free constant or literal container."""
-    if node is None or isinstance(node, ast.Constant):
-        return True
-    if isinstance(node, ast.UnaryOp) and isinstance(
-        node.op, (ast.UAdd, ast.USub, ast.Invert, ast.Not)
-    ):
-        return _is_static_class_attr_value(node.operand)
-    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
-        return all(_is_static_class_attr_value(elt) for elt in node.elts)
-    if isinstance(node, ast.Dict):
-        return all(
-            (k is None or _is_static_class_attr_value(k))
-            and _is_static_class_attr_value(v)
-            for k, v in zip(node.keys, node.values)
-        )
-    return False
+    stack: List[Optional[ast.AST]] = [node]
+    while stack:
+        curr = stack.pop()
+        if curr is None or isinstance(curr, ast.Constant):
+            continue
+        if isinstance(curr, ast.UnaryOp) and isinstance(
+            curr.op, (ast.UAdd, ast.USub, ast.Invert, ast.Not)
+        ):
+            stack.append(curr.operand)
+            continue
+        if isinstance(curr, (ast.Tuple, ast.List, ast.Set)):
+            stack.extend(curr.elts)
+            continue
+        if isinstance(curr, ast.Dict):
+            for k, v in zip(curr.keys, curr.values):
+                if k is not None:
+                    stack.append(k)
+                stack.append(v)
+            continue
+        return False
+    return True
 
 
 def _annotation_is_call_free(node: Optional[ast.AST]) -> bool:
@@ -1551,18 +1559,146 @@ def _class_def_is_proven_non_suppressing_in_exit(
     return not _class_def_may_suppress_in_exit(cls_node, prov)
 
 
+class _ShallowAstFlowSummary(NamedTuple):
+    """Shallow iterative AST summary used by depth-limit fallback handlers."""
+
+    assigned: Set[str]
+    deleted: Set[str]
+    except_names: Set[str]
+    has_star_import: bool
+    has_dynamic_store: bool
+    has_break: bool
+    has_continue: bool
+
+
+def _record_shallow_extra_binding(
+    curr: ast.AST,
+    assigned: Set[str],
+    except_names: Set[str],
+) -> None:
+    """Collect ExceptHandler, TypeAlias, and pattern bindings during shallow AST traversal."""
+    if isinstance(curr, ast.ExceptHandler):
+        if isinstance(curr.name, str) and curr.name:
+            except_names.add(curr.name)
+        return
+    if is_type_alias_node(curr):  # pragma: no cover (py312+)
+        bound = _extract_type_alias_or_pattern_name(curr)
+    else:
+        bound = _extract_pattern_bound_name(curr)
+    if bound is not None:
+        assigned.add(bound)
+
+
+def _push_shallow_ast_children(
+    curr: ast.AST,
+    in_nested_loop: bool,
+    stack: List[Tuple[ast.AST, bool]],
+    assigned: Set[str],
+) -> None:
+    """Push shallow child expressions/headers onto stack without descending into inner scope bodies."""
+    if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        assigned.add(curr.name)
+        stack.extend((h, in_nested_loop) for h in iter_nested_scope_header_nodes(curr))
+        return
+    if isinstance(curr, ast.Lambda):
+        stack.extend((h, in_nested_loop) for h in iter_nested_scope_header_nodes(curr))
+        return
+    if isinstance(curr, _COMPREHENSION_TYPES):
+        for gen in curr.generators:
+            stack.append((gen.iter, in_nested_loop))
+            stack.extend((if_e, in_nested_loop) for if_e in gen.ifs)
+        elts: Tuple[ast.AST, ...] = (
+            (curr.key, curr.value) if isinstance(curr, ast.DictComp) else (curr.elt,)
+        )
+        stack.extend((el, in_nested_loop) for el in elts)
+        return
+    next_in_loop = in_nested_loop or isinstance(
+        curr, (ast.For, ast.AsyncFor, ast.While)
+    )
+    stack.extend((ch, next_in_loop) for ch in ast.iter_child_nodes(curr))
+
+
+def _collect_shallow_ast_flow_summary(
+    nodes: Iterable[ast.AST],
+) -> _ShallowAstFlowSummary:
+    """Iteratively collect shallow assignments, deletions, imports, and loop exits across nodes."""
+    assigned: Set[str] = set()
+    deleted: Set[str] = set()
+    except_names: Set[str] = set()
+    flags = [False, False, False, False]  # [star_import, dynamic_store, break, continue]
+    stack: List[Tuple[ast.AST, bool]] = [(s, False) for s in nodes]
+    while stack:
+        curr, in_nested_loop = stack.pop()
+        if isinstance(curr, (ast.Break, ast.Continue)):
+            if not in_nested_loop:
+                flags[2 if isinstance(curr, ast.Break) else 3] = True
+            continue
+        if isinstance(curr, ast.Name):
+            if isinstance(curr.ctx, ast.Store):
+                assigned.add(curr.id)
+            elif isinstance(curr.ctx, ast.Del):
+                deleted.add(curr.id)
+            continue
+        if isinstance(curr, (ast.Import, ast.ImportFrom)):
+            if any(alias.name == "*" for alias in curr.names):
+                flags[0] = True
+            _record_import_names(curr, assigned)
+            continue
+        if isinstance(curr, (ast.Attribute, ast.Subscript)) and isinstance(
+            curr.ctx, (ast.Store, ast.Del)
+        ):
+            flags[1] = True
+        _record_shallow_extra_binding(curr, assigned, except_names)
+        _push_shallow_ast_children(curr, in_nested_loop, stack, assigned)
+    return _ShallowAstFlowSummary(
+        assigned=assigned,
+        deleted=deleted,
+        except_names=except_names,
+        has_star_import=flags[0],
+        has_dynamic_store=flags[1],
+        has_break=flags[2],
+        has_continue=flags[3],
+    )
+
+
+def _conservatively_update_prov_at_depth_limit(
+    nodes: Iterable[ast.AST],
+    prov: _SuppressProvenance,
+) -> _SuppressProvenance:
+    """Fail-closed provenance update using iterative traversal past the AST depth limit."""
+    summary = _collect_shallow_ast_flow_summary(nodes)
+    touched = summary.assigned | summary.deleted | summary.except_names
+    shad_b = frozenset(n for n in touched if n in _SHADOWABLE_BUILTIN_CTX_NAMES)
+    return replace(
+        prov,
+        suppressors=prov.suppressors | summary.assigned,
+        non_suppressors=frozenset(),
+        non_suppressor_instances=frozenset(),
+        stdlib_modules=frozenset(),
+        imported_symbols=frozenset(),
+        shadowed_builtins=prov.shadowed_builtins | shad_b,
+        shadowed_names=prov.shadowed_names | touched,
+        has_star_import=prov.has_star_import or summary.has_star_import,
+        has_exit_patch=prov.has_exit_patch or summary.has_dynamic_store,
+    )
+
+
 def _func_def_may_return_suppressor(
     fn_stmt: Union[ast.FunctionDef, ast.AsyncFunctionDef],
     prov: _SuppressProvenance,
+    *,
+    _depth: int = 0,
 ) -> bool:
     """Returns True if a function definition may return a suppressor or suppress exceptions around yield."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return True
     local_prov = prov
     for p_name in _extract_arg_names(fn_stmt.args):
         local_prov = local_prov.clear_name(p_name)
     for tp_name in _extract_node_type_param_names(fn_stmt):
         local_prov = local_prov.clear_name(tp_name)
     body_prov = _update_suppress_provenance_from_stmts(
-        fn_stmt.body, local_prov, in_branch=True
+        fn_stmt.body, local_prov, in_branch=True, _depth=_depth + 1
     )
     fn_prov = local_prov.merge_branch_conservative(body_prov)
 
@@ -1921,8 +2057,11 @@ def _update_suppress_provenance_from_stmts(
     in_branch: bool = True,
     strict_with_suppression: bool = False,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
+    _depth: int = 0,
 ) -> _SuppressProvenance:
     """Applies _update_suppress_provenance_from_stmt across a statement sequence."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return _conservatively_update_prov_at_depth_limit(stmts, prov)
     for sub_stmt in stmts:
         prov = _update_suppress_provenance_from_stmt(
             sub_stmt,
@@ -1930,6 +2069,7 @@ def _update_suppress_provenance_from_stmts(
             in_branch=in_branch,
             strict_with_suppression=strict_with_suppression,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+            _depth=_depth + 1,
         )
     return prov
 
@@ -1943,6 +2083,7 @@ def _update_clause_branch_provenance(
     in_branch: bool = True,
     strict_with_suppression: bool = False,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
+    _depth: int = 0,
 ) -> _SuppressProvenance:
     """Updates provenance for an except handler or match case branch."""
     if isinstance(header_expr, ast.AST):
@@ -1957,7 +2098,31 @@ def _update_clause_branch_provenance(
         in_branch=in_branch,
         strict_with_suppression=strict_with_suppression,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+        _depth=_depth + 1,
     )
+
+
+def _advance_prov_through_exprs(
+    exprs: Sequence[ast.AST],
+    prov: _SuppressProvenance,
+    *,
+    allow_positive: bool,
+    extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
+) -> _SuppressProvenance:
+    """Updates provenance across shallow expression roots (walrus + cross-scope call check)."""
+    if not exprs:
+        return prov
+    updated = _update_suppress_provenance_from_expr_walrus(
+        exprs,
+        prov,
+        allow_positive=allow_positive,
+        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+    )
+    if _exprs_may_invoke_cross_scope_mutator(
+        exprs, updated, extra_non_suppressing_ctx_managers
+    ):
+        return updated.apply_cross_scope_invalidation()
+    return updated
 
 
 def _advance_prov_through_opt_expr(
@@ -1970,17 +2135,12 @@ def _advance_prov_through_opt_expr(
     """Updates provenance across an optional header expression (walrus + cross-scope call check)."""
     if not isinstance(expr, ast.AST):
         return prov
-    updated = _update_suppress_provenance_from_expr_walrus(
+    return _advance_prov_through_exprs(
         (expr,),
         prov,
         allow_positive=allow_positive,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
     )
-    if _exprs_may_invoke_cross_scope_mutator(
-        (expr,), updated, extra_non_suppressing_ctx_managers
-    ):
-        return updated.apply_cross_scope_invalidation()
-    return updated
 
 
 def _advance_prov_through_for_header(
@@ -2017,16 +2177,13 @@ def _advance_prov_through_for_header(
     return post_iter, post_target
 
 
-def _update_suppress_provenance_from_stmt(
-    stmt: ast.AST,
+def _update_import_stmt_provenance(
+    stmt: Union[ast.Import, ast.ImportFrom],
     prov: _SuppressProvenance,
     *,
-    in_branch: bool = False,
-    strict_with_suppression: bool = False,
-    extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
+    allow_positive: bool,
 ) -> _SuppressProvenance:
-    """Returns updated _SuppressProvenance from a statement, recursing into compound blocks."""
-    allow_pos = not in_branch
+    """Updates provenance for ast.Import and ast.ImportFrom statements."""
     if isinstance(stmt, ast.Import):
         for alias in stmt.names:
             bound = alias.asname or alias.name.split(".", 1)[0]
@@ -2040,79 +2197,82 @@ def _update_suppress_provenance_from_stmt(
                 alias.asname is not None or "." not in alias.name
             ):
                 prov = prov.with_stdlib_module(
-                    bound, alias.name, allow_positive=allow_pos
+                    bound, alias.name, allow_positive=allow_positive
                 )
-            elif allow_pos and bound not in _SHADOWABLE_BUILTIN_CTX_NAMES:
+            elif allow_positive and bound not in _SHADOWABLE_BUILTIN_CTX_NAMES:
                 prov = prov.with_imported_symbol(
-                    bound, target_qual, allow_positive=allow_pos
+                    bound, target_qual, allow_positive=allow_positive
                 )
             else:
                 prov = prov.clear_name(bound)
         return prov
 
-    if isinstance(stmt, ast.ImportFrom):
-        level = int(getattr(stmt, "level", 0) or 0)
-        mod_name = stmt.module or ""
-        is_abs_mod = level == 0 and bool(mod_name)
-        rel_prefix = "." * level if level > 0 else ""
-        allowed_nonsup = (
-            _STDLIB_NON_SUPPRESSING_MODULES.get(mod_name, frozenset())
-            if is_abs_mod
-            else frozenset()
-        )
-        for alias in stmt.names:
-            if alias.name == "*":
-                prov = prov.with_star_import()
-                continue
-            bound = alias.asname or alias.name
-            if is_abs_mod:
-                imp_qual: Optional[str] = f"{mod_name}.{alias.name}"
-            elif level > 0:
-                imp_qual = (
-                    f"{rel_prefix}{mod_name}.{alias.name}"
-                    if mod_name
-                    else f"{rel_prefix}{alias.name}"
-                )
-            else:
-                imp_qual = None
-            if alias.name in allowed_nonsup:
-                prov = prov.with_non_suppressor(
-                    bound,
-                    allow_positive=allow_pos,
-                    imported_qualname=imp_qual,
-                )
-            elif alias.name in _SUPPRESSING_CTX_MANAGER_NAMES:
-                prov = prov.with_suppressor(
-                    bound,
-                    allow_positive=allow_pos,
-                    imported_qualname=imp_qual,
-                )
-            elif (
-                imp_qual is not None
-                and allow_pos
-                and bound not in _SHADOWABLE_BUILTIN_CTX_NAMES
-            ):
-                prov = prov.with_imported_symbol(
-                    bound,
-                    imp_qual,
-                    allow_positive=allow_pos,
-                )
-            else:
-                prov = prov.clear_name(bound)
-        return prov
+    level = int(getattr(stmt, "level", 0) or 0)
+    mod_name = stmt.module or ""
+    is_abs_mod = level == 0 and bool(mod_name)
+    rel_prefix = "." * level if level > 0 else ""
+    allowed_nonsup = (
+        _STDLIB_NON_SUPPRESSING_MODULES.get(mod_name, frozenset())
+        if is_abs_mod
+        else frozenset()
+    )
+    for alias in stmt.names:
+        if alias.name == "*":
+            prov = prov.with_star_import()
+            continue
+        bound = alias.asname or alias.name
+        if is_abs_mod:
+            imp_qual: Optional[str] = f"{mod_name}.{alias.name}"
+        elif level > 0:
+            imp_qual = (
+                f"{rel_prefix}{mod_name}.{alias.name}"
+                if mod_name
+                else f"{rel_prefix}{alias.name}"
+            )
+        else:
+            imp_qual = None
+        if alias.name in allowed_nonsup:
+            prov = prov.with_non_suppressor(
+                bound,
+                allow_positive=allow_positive,
+                imported_qualname=imp_qual,
+            )
+        elif alias.name in _SUPPRESSING_CTX_MANAGER_NAMES:
+            prov = prov.with_suppressor(
+                bound,
+                allow_positive=allow_positive,
+                imported_qualname=imp_qual,
+            )
+        elif (
+            imp_qual is not None
+            and allow_positive
+            and bound not in _SHADOWABLE_BUILTIN_CTX_NAMES
+        ):
+            prov = prov.with_imported_symbol(
+                bound,
+                imp_qual,
+                allow_positive=allow_positive,
+            )
+        else:
+            prov = prov.clear_name(bound)
+    return prov
 
+
+def _update_assign_or_delete_stmt_provenance(
+    stmt: ast.AST,
+    prov: _SuppressProvenance,
+    *,
+    allow_positive: bool,
+    extra_non_suppressing_ctx_managers: AbstractSet[str],
+) -> _SuppressProvenance:
+    """Updates provenance for Assign, AnnAssign, AugAssign, Delete, and TypeAlias statements."""
     if isinstance(stmt, ast.Assign):
-        eval_roots = (stmt.value, *stmt.targets)
-        prov = _update_suppress_provenance_from_expr_walrus(
-            eval_roots,
+        prov = _advance_prov_through_exprs(
+            (stmt.value, *stmt.targets),
             prov,
-            allow_positive=allow_pos,
+            allow_positive=allow_positive,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         )
-        if _exprs_may_invoke_cross_scope_mutator(
-            eval_roots, prov, extra_non_suppressing_ctx_managers
-        ):
-            prov = prov.apply_cross_scope_invalidation()
         for tgt in stmt.targets:
             for t_name in _extract_store_names_in_node(tgt):
                 prov = (
@@ -2120,7 +2280,7 @@ def _update_suppress_provenance_from_stmt(
                         prov,
                         t_name,
                         stmt.value,
-                        allow_positive=allow_pos,
+                        allow_positive=allow_positive,
                         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
                     )
                     if isinstance(tgt, ast.Name)
@@ -2129,136 +2289,175 @@ def _update_suppress_provenance_from_stmt(
         return prov
 
     if isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
-        exprs = [
+        exprs = tuple(
             e
-            for e in (
-                getattr(stmt, "annotation", None),
-                stmt.value,
-                stmt.target,
-            )
+            for e in (getattr(stmt, "annotation", None), stmt.value, stmt.target)
             if isinstance(e, ast.AST)
-        ]
-        prov = _update_suppress_provenance_from_expr_walrus(
+        )
+        prov = _advance_prov_through_exprs(
             exprs,
             prov,
-            allow_positive=allow_pos,
+            allow_positive=allow_positive,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         )
-        if _exprs_may_invoke_cross_scope_mutator(
-            exprs, prov, extra_non_suppressing_ctx_managers
-        ):
-            prov = prov.apply_cross_scope_invalidation()
         if stmt.value is not None:
+            is_plain_ann = isinstance(stmt, ast.AnnAssign) and isinstance(
+                stmt.target, ast.Name
+            )
             for t_name in _extract_store_names_in_node(stmt.target):
                 prov = (
                     _bind_expr_target_provenance(
                         prov,
                         t_name,
                         stmt.value,
-                        allow_positive=allow_pos and isinstance(stmt, ast.AnnAssign),
+                        allow_positive=allow_positive and isinstance(stmt, ast.AnnAssign),
                         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
                     )
-                    if isinstance(stmt, ast.AnnAssign)
-                    and isinstance(stmt.target, ast.Name)
+                    if is_plain_ann
                     else prov.clear_name(t_name)
                 )
         return prov
 
-    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        hdr_nodes = tuple(iter_nested_scope_header_nodes(stmt))
-        prov = _update_suppress_provenance_from_expr_walrus(
-            hdr_nodes,
-            prov,
-            allow_positive=allow_pos,
-            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-        )
-        if _exprs_may_invoke_cross_scope_mutator(
-            hdr_nodes, prov, extra_non_suppressing_ctx_managers
-        ):
-            prov = prov.apply_cross_scope_invalidation()
-        cs_mut, cs_sup, cs_susp = _extract_nested_cross_scope_mutations(stmt, prov)
-        prov = prov.with_cross_scope_mutations(cs_mut, cs_sup, cs_susp)
-        if in_branch and cs_mut:
-            prov = prov.apply_cross_scope_invalidation()
-        if _func_def_may_return_suppressor(stmt, prov):
-            return prov.with_suppressor(stmt.name)
-        return prov.clear_name(stmt.name)
-
-    if isinstance(stmt, ast.ClassDef):
-        hdr_nodes = tuple(iter_nested_scope_header_nodes(stmt))
-        prov = _update_suppress_provenance_from_expr_walrus(
-            hdr_nodes,
-            prov,
-            allow_positive=allow_pos,
-            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-        )
-        if _exprs_may_invoke_cross_scope_mutator(
-            hdr_nodes, prov, extra_non_suppressing_ctx_managers
-        ):
-            prov = prov.apply_cross_scope_invalidation()
-        cs_mut, cs_sup, cs_susp = _extract_nested_cross_scope_mutations(stmt, prov)
-        prov = prov.with_cross_scope_mutations(cs_mut, cs_sup, cs_susp)
-        if in_branch and cs_mut:
-            prov = prov.apply_cross_scope_invalidation()
-        if _class_def_may_suppress_in_exit(stmt, prov):
-            return prov.with_suppressor(stmt.name)
-        if (
-            _class_def_is_proven_non_suppressing_in_exit(stmt, prov)
-            and stmt.name not in _SUPPRESSING_CTX_MANAGER_NAMES
-        ):
-            return prov.with_non_suppressor(
-                stmt.name,
-                allow_positive=allow_pos,
-                imported_qualname=stmt.name if allow_pos else None,
-            )
-        if allow_pos and stmt.name not in _SHADOWABLE_BUILTIN_CTX_NAMES:
-            return prov.with_imported_symbol(stmt.name, stmt.name, allow_positive=True)
-        return prov.clear_name(stmt.name)
-
     if isinstance(stmt, ast.Delete):
-        prov = _update_suppress_provenance_from_expr_walrus(
+        prov = _advance_prov_through_exprs(
             stmt.targets,
             prov,
-            allow_positive=allow_pos,
+            allow_positive=allow_positive,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         )
-        if _exprs_may_invoke_cross_scope_mutator(
-            stmt.targets, prov, extra_non_suppressing_ctx_managers
-        ):
-            prov = prov.apply_cross_scope_invalidation()
         for d_name in _extract_shallow_deleted_names(stmt):
             prov = prov.clear_name(d_name)
         return prov
 
-    if is_type_alias_node(stmt):
-        ta_val = getattr(stmt, "value", None)
-        if isinstance(ta_val, ast.AST):
-            prov = _update_suppress_provenance_from_expr_walrus(
-                (ta_val,),
-                prov,
-                allow_positive=allow_pos,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-            )
-        ta_name = _extract_type_alias_or_pattern_name(stmt)
-        if ta_name is not None:
-            prov = prov.clear_name(ta_name)
-        return prov
+    ta_val = getattr(stmt, "value", None)
+    if isinstance(ta_val, ast.AST):
+        prov = _update_suppress_provenance_from_expr_walrus(
+            (ta_val,),
+            prov,
+            allow_positive=allow_positive,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+        )
+    ta_name = _extract_type_alias_or_pattern_name(stmt)
+    return prov.clear_name(ta_name) if ta_name is not None else prov
 
+
+class _ProvenanceWalkContext(NamedTuple):
+    """Policy and recursion depth context passed across compound provenance updaters."""
+
+    in_branch: bool = False
+    strict_with_suppression: bool = False
+    extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset()
+    depth: int = 0
+
+
+class _TryBodySplitProvenance(NamedTuple):
+    """Remaining suffix and updated provenance states across a split try body."""
+
+    risky_suffix: List[ast.stmt]
+    prefix_prov: _SuppressProvenance
+    mid_prov: _SuppressProvenance
+
+
+def _compute_try_body_split_provenance(
+    t_body: Sequence[ast.stmt],
+    prov: _SuppressProvenance,
+    ctx: _ProvenanceWalkContext,
+    *,
+    safe_names: AbstractSet[str] = frozenset(),
+    strict_names: bool = True,
+) -> _TryBodySplitProvenance:
+    """Split a try body at its first potentially raising statement and advance provenance."""
+    safe_prefix, risky_suffix = _split_suppress_with_body(
+        t_body,
+        safe_names=safe_names,
+        strict_names=strict_names,
+        suppress_aliases=prov,
+        _depth=ctx.depth + 1,
+    )
+    prefix_prov = _update_suppress_provenance_from_stmts(
+        safe_prefix,
+        prov,
+        in_branch=ctx.in_branch,
+        strict_with_suppression=ctx.strict_with_suppression,
+        extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+        _depth=ctx.depth + 1,
+    )
+    mid_prov = _update_suppress_provenance_from_stmts(
+        risky_suffix,
+        prefix_prov,
+        in_branch=True,
+        strict_with_suppression=ctx.strict_with_suppression,
+        extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+        _depth=ctx.depth + 1,
+    )
+    return _TryBodySplitProvenance(risky_suffix, prefix_prov, mid_prov)
+
+
+def _update_scope_def_stmt_provenance(
+    stmt: ast.AST,
+    prov: _SuppressProvenance,
+    ctx: _ProvenanceWalkContext,
+) -> _SuppressProvenance:
+    """Updates provenance from a FunctionDef, AsyncFunctionDef, or ClassDef statement."""
+    if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return prov
+    allow_pos = not ctx.in_branch
+    hdr_nodes = tuple(iter_nested_scope_header_nodes(stmt))
+    prov = _advance_prov_through_exprs(
+        hdr_nodes,
+        prov,
+        allow_positive=allow_pos,
+        extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+    )
+    cs_mut, cs_sup, cs_susp = _extract_nested_cross_scope_mutations(stmt, prov)
+    prov = prov.with_cross_scope_mutations(cs_mut, cs_sup, cs_susp)
+    if ctx.in_branch and cs_mut:
+        prov = prov.apply_cross_scope_invalidation()
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if _func_def_may_return_suppressor(stmt, prov, _depth=ctx.depth + 1):
+            return prov.with_suppressor(stmt.name)
+        return prov.clear_name(stmt.name)
+    if _class_def_may_suppress_in_exit(stmt, prov):
+        return prov.with_suppressor(stmt.name)
+    if (
+        _class_def_is_proven_non_suppressing_in_exit(stmt, prov)
+        and stmt.name not in _SUPPRESSING_CTX_MANAGER_NAMES
+    ):
+        return prov.with_non_suppressor(
+            stmt.name,
+            allow_positive=allow_pos,
+            imported_qualname=stmt.name if allow_pos else None,
+        )
+    if allow_pos and stmt.name not in _SHADOWABLE_BUILTIN_CTX_NAMES:
+        return prov.with_imported_symbol(stmt.name, stmt.name, allow_positive=True)
+    return prov.clear_name(stmt.name)
+
+
+def _update_loop_or_if_stmt_provenance(
+    stmt: ast.AST,
+    prov: _SuppressProvenance,
+    ctx: _ProvenanceWalkContext,
+) -> _SuppressProvenance:
+    """Updates provenance across If, While, For, and AsyncFor compound statements."""
+    if not isinstance(stmt, (ast.If, ast.While, ast.For, ast.AsyncFor)):
+        return prov
+    allow_pos = not ctx.in_branch
     if isinstance(stmt, (ast.If, ast.While)):
         is_while = isinstance(stmt, ast.While)
         prov = _advance_prov_through_opt_expr(
             stmt.test,
             prov,
             allow_positive=allow_pos,
-            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+            extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
         )
-        branch_flag = True if is_while else in_branch
+        branch_flag = True if is_while else ctx.in_branch
         b_prov = _update_suppress_provenance_from_stmts(
             stmt.body,
             prov,
             in_branch=branch_flag,
-            strict_with_suppression=strict_with_suppression,
-            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+            strict_with_suppression=ctx.strict_with_suppression,
+            extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+            _depth=ctx.depth + 1,
         )
         else_base = b_prov if is_while else prov
         o_prov = (
@@ -2266,8 +2465,9 @@ def _update_suppress_provenance_from_stmt(
                 stmt.orelse,
                 else_base,
                 in_branch=branch_flag,
-                strict_with_suppression=strict_with_suppression,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                strict_with_suppression=ctx.strict_with_suppression,
+                extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+                _depth=ctx.depth + 1,
             )
             if stmt.orelse
             else else_base
@@ -2275,218 +2475,286 @@ def _update_suppress_provenance_from_stmt(
         merged = b_prov.merge_branch_conservative(o_prov)
         return prov.merge_branch_conservative(merged) if is_while else merged
 
-    if isinstance(stmt, (ast.For, ast.AsyncFor)):
-        prov, iter_prov = _advance_prov_through_for_header(
-            stmt,
-            prov,
-            allow_positive=allow_pos,
-            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+    prov, iter_prov = _advance_prov_through_for_header(
+        stmt,
+        prov,
+        allow_positive=allow_pos,
+        extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+    )
+    b_prov = _update_suppress_provenance_from_stmts(
+        stmt.body,
+        iter_prov,
+        in_branch=True,
+        strict_with_suppression=ctx.strict_with_suppression,
+        extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+        _depth=ctx.depth + 1,
+    )
+    o_base = prov.merge_branch_conservative(b_prov)
+    o_prov = (
+        _update_suppress_provenance_from_stmts(
+            stmt.orelse,
+            o_base,
+            in_branch=True,
+            strict_with_suppression=ctx.strict_with_suppression,
+            extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+            _depth=ctx.depth + 1,
         )
-        b_prov = _update_suppress_provenance_from_stmts(
+        if stmt.orelse
+        else b_prov
+    )
+    return o_base.merge_branch_conservative(o_prov)
+
+
+def _update_with_stmt_provenance(
+    stmt: ast.AST,
+    prov: _SuppressProvenance,
+    ctx: _ProvenanceWalkContext,
+) -> _SuppressProvenance:
+    """Updates provenance across a With/AsyncWith header and body prefix/suffix."""
+    if not isinstance(stmt, (ast.With, ast.AsyncWith)):
+        return prov
+    allow_pos = not ctx.in_branch
+    header_prov = prov
+    item_prov = prov
+    after_sup = False
+    header_risky = False
+    for step in _iter_with_item_provenance_steps(
+        stmt,
+        prov,
+        allow_positive=allow_pos,
+        extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+        strict_with_suppression=ctx.strict_with_suppression,
+    ):
+        if step.after_prior_sup or step.opt_vars_conditional:
+            header_risky = True
+        if step.item_may_suppress:
+            after_sup = True
+        item_prov = step.post_item_prov
+    if (
+        not header_risky
+        and not after_sup
+        and _classify_with_suppression(
+            stmt,
+            header_prov,
+            extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+        )
+        == "non_suppressing"
+    ):
+        return _update_suppress_provenance_from_stmts(
             stmt.body,
-            iter_prov,
-            in_branch=True,
-            strict_with_suppression=strict_with_suppression,
-            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+            item_prov,
+            in_branch=ctx.in_branch,
+            strict_with_suppression=ctx.strict_with_suppression,
+            extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+            _depth=ctx.depth + 1,
         )
-        o_base = prov.merge_branch_conservative(b_prov)
-        o_prov = (
-            _update_suppress_provenance_from_stmts(
-                stmt.orelse,
-                o_base,
-                in_branch=True,
-                strict_with_suppression=strict_with_suppression,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-            )
-            if stmt.orelse
-            else b_prov
+    safe_prefix, risky_suffix = (
+        ([], list(stmt.body))
+        if header_risky
+        else _split_suppress_with_body(
+            stmt.body, suppress_aliases=item_prov, _depth=ctx.depth + 1
         )
-        return o_base.merge_branch_conservative(o_prov)
+    )
+    prefix_prov = _update_suppress_provenance_from_stmts(
+        safe_prefix,
+        item_prov,
+        in_branch=ctx.in_branch,
+        strict_with_suppression=ctx.strict_with_suppression,
+        extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+        _depth=ctx.depth + 1,
+    )
+    if not risky_suffix:
+        return prefix_prov
+    # Statements in risky_suffix execute after a potentially raising expression inside a
+    # potentially exception-suppressing with-block; if an exception is raised and suppressed,
+    # the remainder of risky_suffix is skipped, so bindings in risky_suffix are conditional
+    # (in_branch=True) relative to code following the with-block.
+    suffix_prov = _update_suppress_provenance_from_stmts(
+        risky_suffix,
+        prefix_prov,
+        in_branch=True,
+        strict_with_suppression=ctx.strict_with_suppression,
+        extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+        _depth=ctx.depth + 1,
+    )
+    return prefix_prov.merge_branch_conservative(suffix_prov)
 
-    if isinstance(stmt, (ast.With, ast.AsyncWith)):
-        header_prov = prov
-        item_prov = prov
-        after_sup = False
-        header_risky = False
-        for step in _iter_with_item_provenance_steps(
+
+def _update_try_stmt_provenance(
+    stmt: ast.AST,
+    prov: _SuppressProvenance,
+    ctx: _ProvenanceWalkContext,
+) -> _SuppressProvenance:
+    """Updates provenance across Try/TryStar body, handlers, orelse, and finalbody."""
+    t_body = getattr(stmt, "body", ())
+    split = _compute_try_body_split_provenance(t_body, prov, ctx)
+    try_prov = _update_suppress_provenance_from_stmts(
+        split.risky_suffix,
+        split.prefix_prov,
+        in_branch=ctx.in_branch,
+        strict_with_suppression=ctx.strict_with_suppression,
+        extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+        _depth=ctx.depth + 1,
+    )
+    handler_base = split.prefix_prov.merge_branch_conservative(
+        split.mid_prov
+    ).merge_branch_conservative(try_prov)
+    o_stmts = getattr(stmt, "orelse", ())
+    merged_try = (
+        _update_suppress_provenance_from_stmts(
+            o_stmts,
+            try_prov,
+            in_branch=ctx.in_branch,
+            strict_with_suppression=ctx.strict_with_suppression,
+            extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+            _depth=ctx.depth + 1,
+        )
+        if o_stmts
+        else try_prov
+    )
+    for h_node in getattr(stmt, "handlers", ()):
+        h_name = getattr(h_node, "name", None)
+        h_prov = _update_clause_branch_provenance(
+            handler_base,
+            getattr(h_node, "type", None),
+            (h_name,) if isinstance(h_name, str) else (),
+            getattr(h_node, "body", ()),
+            in_branch=ctx.in_branch,
+            strict_with_suppression=ctx.strict_with_suppression,
+            extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+            _depth=ctx.depth + 1,
+        )
+        merged_try = merged_try.merge_branch_conservative(h_prov)
+    f_body = getattr(stmt, "finalbody", ())
+    if f_body:
+        return _update_suppress_provenance_from_stmts(
+            f_body,
+            merged_try,
+            in_branch=ctx.in_branch,
+            strict_with_suppression=ctx.strict_with_suppression,
+            extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+            _depth=ctx.depth + 1,
+        )
+    return merged_try
+
+
+def _update_match_stmt_provenance(
+    stmt: ast.AST,
+    prov: _SuppressProvenance,
+    ctx: _ProvenanceWalkContext,
+) -> _SuppressProvenance:
+    """Updates provenance across a Python 3.10+ Match statement."""
+    prov = _advance_prov_through_opt_expr(
+        getattr(stmt, "subject", None),
+        prov,
+        allow_positive=not ctx.in_branch,
+        extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+    )
+    cases = getattr(stmt, "cases", ())
+    if not cases:
+        return prov
+    case_provs: List[_SuppressProvenance] = []
+    has_irrefutable = False
+    for case in cases:
+        pattern = getattr(case, "pattern", None)
+        pat_names = (
+            [
+                p_name
+                for p_node in ast.walk(pattern)
+                for p_name in (_extract_pattern_bound_name(p_node),)
+                if p_name is not None
+            ]
+            if isinstance(pattern, ast.AST)
+            else []
+        )
+        c_prov = _update_clause_branch_provenance(
+            prov,
+            getattr(case, "guard", None),
+            pat_names,
+            getattr(case, "body", ()),
+            strict_with_suppression=ctx.strict_with_suppression,
+            extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+            _depth=ctx.depth + 1,
+        )
+        case_provs.append(c_prov)
+        if _is_irrefutable_case(case):
+            has_irrefutable = True
+            break
+    merged_match = case_provs[0]
+    for cp in case_provs[1:]:
+        merged_match = merged_match.merge_branch_conservative(cp)
+    if not has_irrefutable:
+        merged_match = prov.merge_branch_conservative(merged_match)
+    return merged_match
+
+
+_COMPOUND_STMT_PROVENANCE_HANDLERS: Tuple[
+    Tuple[
+        Callable[[ast.AST], bool],
+        Callable[
+            [ast.AST, _SuppressProvenance, _ProvenanceWalkContext],
+            _SuppressProvenance,
+        ],
+    ],
+    ...,
+] = (
+    (
+        lambda s: isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)),
+        _update_scope_def_stmt_provenance,
+    ),
+    (
+        lambda s: isinstance(s, (ast.If, ast.While, ast.For, ast.AsyncFor)),
+        _update_loop_or_if_stmt_provenance,
+    ),
+    (lambda s: isinstance(s, (ast.With, ast.AsyncWith)), _update_with_stmt_provenance),
+    (is_try_or_trystar_node, _update_try_stmt_provenance),
+    (is_match_node, _update_match_stmt_provenance),
+)
+
+
+def _update_suppress_provenance_from_stmt(
+    stmt: ast.AST,
+    prov: _SuppressProvenance,
+    *,
+    in_branch: bool = False,
+    strict_with_suppression: bool = False,
+    extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
+    _depth: int = 0,
+) -> _SuppressProvenance:
+    """Returns updated _SuppressProvenance from a statement, recursing into compound blocks."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return _conservatively_update_prov_at_depth_limit((stmt,), prov)
+    allow_pos = not in_branch
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        return _update_import_stmt_provenance(stmt, prov, allow_positive=allow_pos)
+    if isinstance(
+        stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Delete)
+    ) or is_type_alias_node(stmt):
+        return _update_assign_or_delete_stmt_provenance(
             stmt,
             prov,
             allow_positive=allow_pos,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-            strict_with_suppression=strict_with_suppression,
-        ):
-            if step.after_prior_sup or step.opt_vars_conditional:
-                header_risky = True
-            if step.item_may_suppress:
-                after_sup = True
-            item_prov = step.post_item_prov
-        if (
-            not header_risky
-            and not after_sup
-            and _classify_with_suppression(
-                stmt,
-                header_prov,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-            )
-            == "non_suppressing"
-        ):
-            return _update_suppress_provenance_from_stmts(
-                stmt.body,
-                item_prov,
-                in_branch=in_branch,
-                strict_with_suppression=strict_with_suppression,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-            )
-        safe_prefix, risky_suffix = (
-            ([], list(stmt.body))
-            if header_risky
-            else _split_suppress_with_body(stmt.body, suppress_aliases=item_prov)
         )
-        prefix_prov = _update_suppress_provenance_from_stmts(
-            safe_prefix,
-            item_prov,
-            in_branch=in_branch,
-            strict_with_suppression=strict_with_suppression,
-            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+    walk_ctx = _ProvenanceWalkContext(
+        in_branch=in_branch,
+        strict_with_suppression=strict_with_suppression,
+        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+        depth=_depth,
+    )
+    for matcher, handler in _COMPOUND_STMT_PROVENANCE_HANDLERS:
+        if matcher(stmt):
+            return handler(stmt, prov, walk_ctx)
+    if not isinstance(stmt, _INNER_SCOPE_TYPES):
+        child_exprs = tuple(
+            ch for ch in ast.iter_child_nodes(stmt) if not isinstance(ch, ast.stmt)
         )
-        if not risky_suffix:
-            return prefix_prov
-        # Statements in risky_suffix execute after a potentially raising expression inside a
-        # potentially exception-suppressing with-block; if an exception is raised and suppressed,
-        # the remainder of risky_suffix is skipped, so bindings in risky_suffix are conditional
-        # (in_branch=True) relative to code following the with-block.
-        suffix_prov = _update_suppress_provenance_from_stmts(
-            risky_suffix,
-            prefix_prov,
-            in_branch=True,
-            strict_with_suppression=strict_with_suppression,
-            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-        )
-        return prefix_prov.merge_branch_conservative(suffix_prov)
-
-    if is_try_or_trystar_node(stmt):
-        t_body = getattr(stmt, "body", ())
-        t_safe_prefix, t_risky_suffix = _split_suppress_with_body(
-            t_body, suppress_aliases=prov
-        )
-        prefix_prov = _update_suppress_provenance_from_stmts(
-            t_safe_prefix,
-            prov,
-            in_branch=in_branch,
-            strict_with_suppression=strict_with_suppression,
-            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-        )
-        try_mid_prov = _update_suppress_provenance_from_stmts(
-            t_risky_suffix,
-            prefix_prov,
-            in_branch=True,
-            strict_with_suppression=strict_with_suppression,
-            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-        )
-        try_prov = _update_suppress_provenance_from_stmts(
-            t_risky_suffix,
-            prefix_prov,
-            in_branch=in_branch,
-            strict_with_suppression=strict_with_suppression,
-            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-        )
-        handler_base = prefix_prov.merge_branch_conservative(
-            try_mid_prov
-        ).merge_branch_conservative(try_prov)
-        o_stmts = getattr(stmt, "orelse", ())
-        normal_prov = (
-            _update_suppress_provenance_from_stmts(
-                o_stmts,
-                try_prov,
-                in_branch=in_branch,
-                strict_with_suppression=strict_with_suppression,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-            )
-            if o_stmts
-            else try_prov
-        )
-        merged_try = normal_prov
-        for h_node in getattr(stmt, "handlers", ()):
-            h_name = getattr(h_node, "name", None)
-            h_prov = _update_clause_branch_provenance(
-                handler_base,
-                getattr(h_node, "type", None),
-                (h_name,) if isinstance(h_name, str) else (),
-                getattr(h_node, "body", ()),
-                in_branch=in_branch,
-                strict_with_suppression=strict_with_suppression,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-            )
-            merged_try = merged_try.merge_branch_conservative(h_prov)
-        f_body = getattr(stmt, "finalbody", ())
-        if f_body:
-            return _update_suppress_provenance_from_stmts(
-                f_body,
-                merged_try,
-                in_branch=in_branch,
-                strict_with_suppression=strict_with_suppression,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-            )
-        return merged_try
-
-    if is_match_node(stmt):
-        prov = _advance_prov_through_opt_expr(
-            getattr(stmt, "subject", None),
+        return _advance_prov_through_exprs(
+            child_exprs,
             prov,
             allow_positive=allow_pos,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         )
-        cases = getattr(stmt, "cases", ())
-        if not cases:
-            return prov
-        case_provs: List[_SuppressProvenance] = []
-        has_irrefutable = False
-        for case in cases:
-            pattern = getattr(case, "pattern", None)
-            pat_names = (
-                [
-                    p_name
-                    for p_node in ast.walk(pattern)
-                    for p_name in (_extract_pattern_bound_name(p_node),)
-                    if p_name is not None
-                ]
-                if isinstance(pattern, ast.AST)
-                else []
-            )
-            c_prov = _update_clause_branch_provenance(
-                prov,
-                getattr(case, "guard", None),
-                pat_names,
-                getattr(case, "body", ()),
-                strict_with_suppression=strict_with_suppression,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-            )
-            case_provs.append(c_prov)
-            if _is_irrefutable_case(case):
-                has_irrefutable = True
-                break
-        merged_match = case_provs[0]
-        for cp in case_provs[1:]:
-            merged_match = merged_match.merge_branch_conservative(cp)
-        if not has_irrefutable:
-            merged_match = prov.merge_branch_conservative(merged_match)
-        return merged_match
-
-    if not isinstance(stmt, _INNER_SCOPE_TYPES):
-        child_exprs = [
-            ch for ch in ast.iter_child_nodes(stmt) if not isinstance(ch, ast.stmt)
-        ]
-        if child_exprs:
-            prov = _update_suppress_provenance_from_expr_walrus(
-                child_exprs,
-                prov,
-                allow_positive=allow_pos,
-                extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-            )
-            if _exprs_may_invoke_cross_scope_mutator(
-                child_exprs, prov, extra_non_suppressing_ctx_managers
-            ):
-                prov = prov.apply_cross_scope_invalidation()
     return prov
 
 
@@ -3099,8 +3367,11 @@ def _advance_enclosing_compound_stmt_seed(
     *,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
     strict_with_suppression: bool = False,
+    _depth: int = 0,
 ) -> _SuppressProvenance:
     """Advances provenance into a compound statement enclosing target_node or target_lineno."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return _conservatively_update_prov_at_depth_limit((stmt,), prov)
     is_loop = isinstance(stmt, (ast.While, ast.For, ast.AsyncFor))
     if isinstance(stmt, (ast.If, ast.While)):
         prov = _advance_prov_through_opt_expr(
@@ -3198,6 +3469,7 @@ def _advance_enclosing_compound_stmt_seed(
                 in_branch=True,
                 strict_with_suppression=strict_with_suppression,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                _depth=_depth + 1,
             )
         )
 
@@ -3214,6 +3486,7 @@ def _advance_enclosing_compound_stmt_seed(
                 in_branch=not is_orelse,
                 strict_with_suppression=strict_with_suppression,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+                _depth=_depth + 1,
             )
             prov = tb_p if is_orelse else prov.merge_branch_conservative(tb_p)
     prov = _advance_prov_through_opt_expr(
@@ -3232,6 +3505,7 @@ def _advance_enclosing_compound_stmt_seed(
         target_lineno,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         strict_with_suppression=strict_with_suppression,
+        _depth=_depth + 1,
     )
 
     for c_idx, (sib_body, sib_bound, sib_hdr) in enumerate(clauses):
@@ -3253,6 +3527,7 @@ def _advance_enclosing_compound_stmt_seed(
             in_branch=True,
             strict_with_suppression=strict_with_suppression,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+            _depth=_depth + 1,
         )
         prov = prov.merge_branch_conservative(sib_prov)
     return prov
@@ -3266,8 +3541,11 @@ def _advance_prov_across_stmts_until_target(
     *,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
     strict_with_suppression: bool = False,
+    _depth: int = 0,
 ) -> _SuppressProvenance:
     """Advances provenance forward to (target_node, target_lineno) and conservatively merges trailing statements."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return _conservatively_update_prov_at_depth_limit(stmts, prov)
     reached = False
     for sub_stmt in stmts:
         if target_node is not None and sub_stmt is target_node:
@@ -3285,6 +3563,7 @@ def _advance_prov_across_stmts_until_target(
                 target_lineno,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
                 strict_with_suppression=strict_with_suppression,
+                _depth=_depth + 1,
             )
             if target_node is None:
                 return prov
@@ -3300,6 +3579,7 @@ def _advance_prov_across_stmts_until_target(
             in_branch=reached,
             strict_with_suppression=strict_with_suppression,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+            _depth=_depth + 1,
         )
         prov = prov.merge_branch_conservative(next_sub) if reached else next_sub
     return prov
@@ -3749,8 +4029,7 @@ def _looks_like_suppressing_ctx_manager(
             stack.append(sub.target)
             stack.append(sub.value)
         elif isinstance(sub, ast.IfExp):
-            stack.append(sub.body)
-            stack.append(sub.orelse)
+            stack.extend((sub.body, sub.orelse))
         elif isinstance(sub, ast.BoolOp):
             stack.extend(sub.values)
         elif isinstance(sub, (ast.List, ast.Tuple, ast.Set)):
@@ -4004,6 +4283,7 @@ def _is_non_raising_bool_expr(
     safe_bool_names: AbstractSet[str] = frozenset(),
     *,
     strict_names: bool = True,
+    _depth: int = 0,
 ) -> bool:
     """Returns True if evaluating bool(expr) cannot raise an exception."""
     return _is_non_raising_expr(
@@ -4012,6 +4292,7 @@ def _is_non_raising_bool_expr(
         safe_bool_names,
         require_bool_safe=True,
         strict_names=strict_names,
+        _depth=_depth,
     )
 
 
@@ -4022,14 +4303,20 @@ def _apply_non_raising_if_branch_updates(
     *,
     strict_names: bool,
     is_conditional: bool = False,
+    _depth: int = 0,
 ) -> None:
     """Applies walrus/statement safe updates across test, body, and orelse of If/IfExp."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        cur_safe.clear()
+        cur_bool.clear()
+        return
     _apply_non_raising_expr_walrus_updates(
         node.test,
         cur_safe,
         cur_bool,
         strict_names=strict_names,
         is_conditional=is_conditional,
+        _depth=_depth + 1,
     )
     then_safe, then_bool = set(cur_safe), set(cur_bool)
     else_safe, else_bool = set(cur_safe), set(cur_bool)
@@ -4040,6 +4327,7 @@ def _apply_non_raising_if_branch_updates(
             then_bool,
             strict_names=strict_names,
             is_conditional=is_conditional,
+            _depth=_depth + 1,
         )
         _apply_non_raising_expr_walrus_updates(
             node.orelse,
@@ -4047,13 +4335,22 @@ def _apply_non_raising_if_branch_updates(
             else_bool,
             strict_names=strict_names,
             is_conditional=is_conditional,
+            _depth=_depth + 1,
         )
     else:
         _apply_non_raising_seq_safe_updates(
-            node.body, then_safe, then_bool, strict_names=strict_names
+            node.body,
+            then_safe,
+            then_bool,
+            strict_names=strict_names,
+            _depth=_depth + 1,
         )
         _apply_non_raising_seq_safe_updates(
-            node.orelse, else_safe, else_bool, strict_names=strict_names
+            node.orelse,
+            else_safe,
+            else_bool,
+            strict_names=strict_names,
+            _depth=_depth + 1,
         )
     cur_safe.clear()
     cur_safe.update(then_safe & else_safe)
@@ -4068,8 +4365,13 @@ def _apply_non_raising_expr_walrus_updates(
     *,
     strict_names: bool,
     is_conditional: bool = False,
+    _depth: int = 0,
 ) -> None:
     """Applies left-to-right cur_safe and cur_bool updates from NamedExpr nodes in a non-raising expr."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        cur_safe.clear()
+        cur_bool.clear()
+        return
     if expr is None or isinstance(expr, ast.Constant):
         return
     if isinstance(expr, ast.IfExp):
@@ -4079,6 +4381,7 @@ def _apply_non_raising_expr_walrus_updates(
             cur_bool,
             strict_names=strict_names,
             is_conditional=is_conditional,
+            _depth=_depth + 1,
         )
         return
     if isinstance(expr, ast.NamedExpr):
@@ -4088,11 +4391,16 @@ def _apply_non_raising_expr_walrus_updates(
             cur_bool,
             strict_names=strict_names,
             is_conditional=is_conditional,
+            _depth=_depth + 1,
         )
         if isinstance(expr.target, ast.Name):
             t_name = expr.target.id
             val_bool = _is_non_raising_bool_expr(
-                expr.value, cur_safe, cur_bool, strict_names=strict_names
+                expr.value,
+                cur_safe,
+                cur_bool,
+                strict_names=strict_names,
+                _depth=_depth + 1,
             )
             if not is_conditional:
                 cur_safe.add(t_name)
@@ -4136,7 +4444,12 @@ def _apply_non_raising_expr_walrus_updates(
         )
     for sub_node, sub_cond in sub_exprs:
         _apply_non_raising_expr_walrus_updates(
-            sub_node, cur_safe, cur_bool, strict_names=strict_names, is_conditional=sub_cond
+            sub_node,
+            cur_safe,
+            cur_bool,
+            strict_names=strict_names,
+            is_conditional=sub_cond,
+            _depth=_depth + 1,
         )
 
 
@@ -4148,18 +4461,29 @@ def _check_and_advance_non_raising_seq(
     strict_names: bool,
     require_bool_safe: bool = False,
     conditional_from_idx: Optional[int] = None,
+    _depth: int = 0,
 ) -> Optional[Tuple[Set[str], Set[str]]]:
     """Verifies each node in nodes is non-raising left-to-right and returns updated (safe, bool) sets."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return None
     cur_safe = set(safe_names)
     cur_bool = set(safe_bool_names)
     for idx, node in enumerate(nodes):
         ok = (
             _is_non_raising_bool_expr(
-                node, cur_safe, cur_bool, strict_names=strict_names
+                node,
+                cur_safe,
+                cur_bool,
+                strict_names=strict_names,
+                _depth=_depth + 1,
             )
             if require_bool_safe
             else _is_non_raising_expr(
-                node, cur_safe, cur_bool, strict_names=strict_names
+                node,
+                cur_safe,
+                cur_bool,
+                strict_names=strict_names,
+                _depth=_depth + 1,
             )
         )
         if not ok:
@@ -4172,6 +4496,7 @@ def _check_and_advance_non_raising_seq(
             is_conditional=(
                 conditional_from_idx is not None and idx >= conditional_from_idx
             ),
+            _depth=_depth + 1,
         )
     return cur_safe, cur_bool
 
@@ -4183,8 +4508,15 @@ def _is_non_raising_expr(
     *,
     require_bool_safe: bool = False,
     strict_names: bool = True,
+    _depth: int = 0,
 ) -> bool:
     """Returns True if evaluating expr cannot raise an exception caught by a with block."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return False
+    while isinstance(expr, ast.NamedExpr):
+        if not isinstance(expr.target, ast.Name):
+            return False
+        expr = expr.value
     if expr is None or isinstance(expr, ast.Constant):
         return True
     if isinstance(expr, ast.Name):
@@ -4202,6 +4534,7 @@ def _is_non_raising_expr(
                 safe_names,
                 safe_bool_names,
                 strict_names=strict_names,
+                _depth=_depth + 1,
             )
             is not None
         )
@@ -4214,6 +4547,7 @@ def _is_non_raising_expr(
                 safe_names,
                 safe_bool_names,
                 strict_names=strict_names,
+                _depth=_depth + 1,
             )
             is not None
         )
@@ -4224,6 +4558,7 @@ def _is_non_raising_expr(
                 safe_names,
                 safe_bool_names,
                 strict_names=strict_names,
+                _depth=_depth + 1,
             )
         if isinstance(expr.op, ast.Invert):
             return isinstance(expr.operand, ast.Constant) and isinstance(
@@ -4244,6 +4579,7 @@ def _is_non_raising_expr(
             strict_names=strict_names,
             require_bool_safe=True,
             conditional_from_idx=1,
+            _depth=_depth + 1,
         )
         return advanced is not None and _is_non_raising_expr(
             expr.values[-1],
@@ -4251,6 +4587,7 @@ def _is_non_raising_expr(
             advanced[1],
             require_bool_safe=require_bool_safe,
             strict_names=strict_names,
+            _depth=_depth + 1,
         )
     if isinstance(expr, ast.IfExp):
         advanced = _check_and_advance_non_raising_seq(
@@ -4259,6 +4596,7 @@ def _is_non_raising_expr(
             safe_bool_names,
             strict_names=strict_names,
             require_bool_safe=True,
+            _depth=_depth + 1,
         )
         return advanced is not None and all(
             _is_non_raising_expr(
@@ -4267,6 +4605,7 @@ def _is_non_raising_expr(
                 advanced[1],
                 require_bool_safe=require_bool_safe,
                 strict_names=strict_names,
+                _depth=_depth + 1,
             )
             for b in (expr.body, expr.orelse)
         )
@@ -4280,16 +4619,9 @@ def _is_non_raising_expr(
                 safe_bool_names,
                 strict_names=strict_names,
                 conditional_from_idx=2,
+                _depth=_depth + 1,
             )
             is not None
-        )
-    if isinstance(expr, ast.NamedExpr):
-        return isinstance(expr.target, ast.Name) and _is_non_raising_expr(
-            expr.value,
-            safe_names,
-            safe_bool_names,
-            require_bool_safe=require_bool_safe,
-            strict_names=strict_names,
         )
     return False
 
@@ -4301,35 +4633,34 @@ def _is_non_raising_store_target(
     leaf_predicate: Optional[Callable[[ast.AST], bool]] = None,
 ) -> bool:
     """Returns True if storing value into target avoids unpacking errors and satisfies any leaf predicate."""
-    while isinstance(value, ast.NamedExpr):
-        value = value.value
-    if isinstance(target, ast.Name):
-        return True if leaf_predicate is None else (value is not None and leaf_predicate(value))
-    if (
-        isinstance(target, (ast.Tuple, ast.List))
-        and isinstance(value, (ast.Tuple, ast.List))
-        and len(target.elts) == len(value.elts)
-        and not any(isinstance(e, ast.Starred) for e in (*target.elts, *value.elts))
-    ):
-        return all(
-            _is_non_raising_store_target(t, v, leaf_predicate=leaf_predicate)
-            for t, v in zip(target.elts, value.elts)
-        )
-    return False
+    stack: List[Tuple[ast.AST, Optional[ast.AST]]] = [(target, value)]
+    while stack:
+        curr_target, curr_value = stack.pop()
+        while isinstance(curr_value, ast.NamedExpr):
+            curr_value = curr_value.value
+        if isinstance(curr_target, ast.Name):
+            if leaf_predicate is not None and (
+                curr_value is None or not leaf_predicate(curr_value)
+            ):
+                return False
+            continue
+        if (
+            isinstance(curr_target, (ast.Tuple, ast.List))
+            and isinstance(curr_value, (ast.Tuple, ast.List))
+            and len(curr_target.elts) == len(curr_value.elts)
+            and not any(
+                isinstance(e, ast.Starred) for e in (*curr_target.elts, *curr_value.elts)
+            )
+        ):
+            stack.extend(zip(curr_target.elts, curr_value.elts))
+            continue
+        return False
+    return True
 
 
 def _extract_definite_target_names(target: ast.AST) -> Set[str]:
     """Extracts variable names unconditionally bound by an assignment target."""
-    if isinstance(target, ast.Name):
-        return {target.id}
-    if isinstance(target, (ast.Tuple, ast.List)):
-        names: Set[str] = set()
-        for elt in target.elts:
-            names.update(_extract_definite_target_names(elt))
-        return names
-    if isinstance(target, ast.Starred):
-        return _extract_definite_target_names(target.value)
-    return set()
+    return set(_extract_assigned_names(target))
 
 
 def _is_non_raising_suppress_or_null_with(
@@ -4354,15 +4685,21 @@ def _is_non_raising_suppress_or_null_with(
     return True
 
 
-def _non_raising_stmt_terminates(stmt: ast.AST) -> bool:
+def _non_raising_stmt_terminates(stmt: ast.AST, *, _depth: int = 0) -> bool:
     """Returns True if a proven non-raising statement unconditionally exits the block."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return False
     if isinstance(stmt, (ast.Return, ast.Break, ast.Continue)):
         return True
     if isinstance(stmt, (ast.With, ast.AsyncWith)):
-        return any(_non_raising_stmt_terminates(s) for s in stmt.body)
+        return any(
+            _non_raising_stmt_terminates(s, _depth=_depth + 1) for s in stmt.body
+        )
     if isinstance(stmt, ast.If) and stmt.orelse:
-        return any(_non_raising_stmt_terminates(s) for s in stmt.body) and any(
-            _non_raising_stmt_terminates(s) for s in stmt.orelse
+        return any(
+            _non_raising_stmt_terminates(s, _depth=_depth + 1) for s in stmt.body
+        ) and any(
+            _non_raising_stmt_terminates(s, _depth=_depth + 1) for s in stmt.orelse
         )
     return False
 
@@ -4376,8 +4713,11 @@ def _stmt_cannot_raise_in_suppress(
     suppress_aliases: Union[
         _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
+    _depth: int = 0,
 ) -> bool:
     """Returns True if stmt executes and completes without raising a catchable exception."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return False
     if isinstance(stmt, (ast.Pass, ast.Global, ast.Nonlocal, ast.Break, ast.Continue)):
         return True
     if isinstance(stmt, ast.Delete):
@@ -4386,7 +4726,11 @@ def _stmt_cannot_raise_in_suppress(
         )
     if isinstance(stmt, (ast.Return, ast.Expr)):
         return _is_non_raising_expr(
-            stmt.value, safe_names, safe_bool_names, strict_names=strict_names
+            stmt.value,
+            safe_names,
+            safe_bool_names,
+            strict_names=strict_names,
+            _depth=_depth + 1,
         )
     if isinstance(stmt, ast.Assign):
         return (
@@ -4396,6 +4740,7 @@ def _stmt_cannot_raise_in_suppress(
                 safe_names,
                 safe_bool_names,
                 strict_names=strict_names,
+                _depth=_depth + 1,
             )
             and all(_is_non_raising_store_target(t, stmt.value) for t in stmt.targets)
         )
@@ -4405,6 +4750,7 @@ def _stmt_cannot_raise_in_suppress(
             safe_names,
             safe_bool_names,
             strict_names=strict_names,
+            _depth=_depth + 1,
         )
         if ann_sets is None:
             return False
@@ -4414,6 +4760,7 @@ def _stmt_cannot_raise_in_suppress(
                 ann_sets[0],
                 ann_sets[1],
                 strict_names=strict_names,
+                _depth=_depth + 1,
             )
             and _is_non_raising_store_target(stmt.target, stmt.value)
         )
@@ -4426,6 +4773,7 @@ def _stmt_cannot_raise_in_suppress(
                 safe_names,
                 safe_bool_names,
                 strict_names=strict_names,
+                _depth=_depth + 1,
             )
             is not None
         )
@@ -4436,6 +4784,7 @@ def _stmt_cannot_raise_in_suppress(
             safe_bool_names,
             strict_names=strict_names,
             require_bool_safe=True,
+            _depth=_depth + 1,
         )
         if test_sets is None:
             return False
@@ -4450,6 +4799,7 @@ def _stmt_cannot_raise_in_suppress(
                 safe_bool_names=test_bool,
                 strict_names=strict_names,
                 suppress_aliases=test_prov,
+                _depth=_depth + 1,
             )[1]
             and not _split_suppress_with_body(
                 stmt.orelse,
@@ -4457,6 +4807,7 @@ def _stmt_cannot_raise_in_suppress(
                 safe_bool_names=test_bool,
                 strict_names=strict_names,
                 suppress_aliases=test_prov,
+                _depth=_depth + 1,
             )[1]
         )
     if isinstance(stmt, (ast.With, ast.AsyncWith)):
@@ -4487,6 +4838,7 @@ def _stmt_cannot_raise_in_suppress(
                     inner_safe | _SAFE_EXCEPTION_TYPE_NAMES,
                     inner_bool,
                     strict_names=strict_names,
+                    _depth=_depth + 1,
                 )
                 is None
             ):
@@ -4496,6 +4848,7 @@ def _stmt_cannot_raise_in_suppress(
                 inner_safe,
                 inner_bool,
                 strict_names=strict_names,
+                _depth=_depth + 1,
             )
             inner_prov = _update_suppress_provenance_from_expr_walrus(
                 (item.context_expr,), inner_prov
@@ -4512,6 +4865,7 @@ def _stmt_cannot_raise_in_suppress(
             safe_bool_names=inner_bool,
             strict_names=strict_names,
             suppress_aliases=inner_prov,
+            _depth=_depth + 1,
         )[1]
     return False
 
@@ -4523,38 +4877,42 @@ def _collect_target_unpack_bool_flags(
     rhs_bool: AbstractSet[str],
     *,
     strict_names: bool,
+    _depth: int = 0,
 ) -> List[Tuple[str, bool]]:
     """Collects left-to-right (target_name, is_bool_safe) pairs evaluated against RHS state."""
-    while isinstance(value, ast.NamedExpr):
-        value = value.value
-    if isinstance(target, ast.Name):
-        return [
-            (
-                target.id,
-                _is_non_raising_bool_expr(
-                    value, rhs_safe, rhs_bool, strict_names=strict_names
-                ),
-            )
-        ]
-    if (
-        isinstance(target, (ast.Tuple, ast.List))
-        and isinstance(value, (ast.Tuple, ast.List))
-        and len(target.elts) == len(value.elts)
-        and not any(isinstance(e, ast.Starred) for e in (*target.elts, *value.elts))
-    ):
-        pairs: List[Tuple[str, bool]] = []
-        for t_elt, v_elt in zip(target.elts, value.elts):
-            pairs.extend(
-                _collect_target_unpack_bool_flags(
-                    t_elt,
-                    v_elt,
-                    rhs_safe,
-                    rhs_bool,
-                    strict_names=strict_names,
+    pairs: List[Tuple[str, bool]] = []
+    stack: List[Tuple[ast.AST, Optional[ast.AST]]] = [(target, value)]
+    while stack:
+        curr_target, curr_value = stack.pop()
+        while isinstance(curr_value, ast.NamedExpr):
+            curr_value = curr_value.value
+        if isinstance(curr_target, ast.Name):
+            pairs.append(
+                (
+                    curr_target.id,
+                    _is_non_raising_bool_expr(
+                        curr_value,
+                        rhs_safe,
+                        rhs_bool,
+                        strict_names=strict_names,
+                        _depth=_depth + 1,
+                    ),
                 )
             )
-        return pairs
-    return [(t_name, False) for t_name in _extract_definite_target_names(target)]
+        elif (
+            isinstance(curr_target, (ast.Tuple, ast.List))
+            and isinstance(curr_value, (ast.Tuple, ast.List))
+            and len(curr_target.elts) == len(curr_value.elts)
+            and not any(
+                isinstance(e, ast.Starred)
+                for e in (*curr_target.elts, *curr_value.elts)
+            )
+        ):
+            stack.extend(reversed(list(zip(curr_target.elts, curr_value.elts))))
+        else:
+            for t_name in _extract_definite_target_names(curr_target):
+                pairs.append((t_name, False))
+    return pairs
 
 
 def _apply_target_unpack_safe_updates(
@@ -4564,6 +4922,7 @@ def _apply_target_unpack_safe_updates(
     cur_bool: Set[str],
     *,
     strict_names: bool,
+    _depth: int = 0,
 ) -> None:
     """Updates cur_safe and cur_bool for an assignment target matched against value."""
     for t_name, is_bool_safe in _collect_target_unpack_bool_flags(
@@ -4572,6 +4931,7 @@ def _apply_target_unpack_safe_updates(
         frozenset(cur_safe),
         frozenset(cur_bool),
         strict_names=strict_names,
+        _depth=_depth,
     ):
         cur_safe.add(t_name)
         if is_bool_safe:
@@ -4586,8 +4946,13 @@ def _apply_non_raising_stmt_safe_updates(
     cur_bool: Set[str],
     *,
     strict_names: bool,
+    _depth: int = 0,
 ) -> None:
     """Updates cur_safe and cur_bool after a statement proven non-raising by _stmt_cannot_raise_in_suppress."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        cur_safe.clear()
+        cur_bool.clear()
+        return
     if isinstance(b_stmt, ast.Delete):
         for tgt in b_stmt.targets:
             if isinstance(tgt, ast.Name):
@@ -4595,11 +4960,19 @@ def _apply_non_raising_stmt_safe_updates(
                 cur_bool.discard(tgt.id)
     elif isinstance(b_stmt, (ast.Return, ast.Expr)):
         _apply_non_raising_expr_walrus_updates(
-            b_stmt.value, cur_safe, cur_bool, strict_names=strict_names
+            b_stmt.value,
+            cur_safe,
+            cur_bool,
+            strict_names=strict_names,
+            _depth=_depth + 1,
         )
     elif isinstance(b_stmt, ast.Assign):
         _apply_non_raising_expr_walrus_updates(
-            b_stmt.value, cur_safe, cur_bool, strict_names=strict_names
+            b_stmt.value,
+            cur_safe,
+            cur_bool,
+            strict_names=strict_names,
+            _depth=_depth + 1,
         )
         for tgt in b_stmt.targets:
             _apply_target_unpack_safe_updates(
@@ -4608,14 +4981,23 @@ def _apply_non_raising_stmt_safe_updates(
                 cur_safe,
                 cur_bool,
                 strict_names=strict_names,
+                _depth=_depth + 1,
             )
     elif isinstance(b_stmt, ast.AnnAssign):
         _apply_non_raising_expr_walrus_updates(
-            b_stmt.annotation, cur_safe, cur_bool, strict_names=strict_names
+            b_stmt.annotation,
+            cur_safe,
+            cur_bool,
+            strict_names=strict_names,
+            _depth=_depth + 1,
         )
         if b_stmt.value is not None:
             _apply_non_raising_expr_walrus_updates(
-                b_stmt.value, cur_safe, cur_bool, strict_names=strict_names
+                b_stmt.value,
+                cur_safe,
+                cur_bool,
+                strict_names=strict_names,
+                _depth=_depth + 1,
             )
             _apply_target_unpack_safe_updates(
                 b_stmt.target,
@@ -4623,11 +5005,16 @@ def _apply_non_raising_stmt_safe_updates(
                 cur_safe,
                 cur_bool,
                 strict_names=strict_names,
+                _depth=_depth + 1,
             )
     elif isinstance(b_stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
         for h in iter_nested_scope_header_nodes(b_stmt):
             _apply_non_raising_expr_walrus_updates(
-                h, cur_safe, cur_bool, strict_names=strict_names
+                h,
+                cur_safe,
+                cur_bool,
+                strict_names=strict_names,
+                _depth=_depth + 1,
             )
         cur_safe.add(b_stmt.name)
         cur_bool.add(b_stmt.name)
@@ -4638,16 +5025,25 @@ def _apply_non_raising_stmt_safe_updates(
                 cur_safe,
                 cur_bool,
                 strict_names=strict_names,
+                _depth=_depth + 1,
             )
             if isinstance(item.optional_vars, ast.Name):
                 cur_safe.add(item.optional_vars.id)
                 cur_bool.discard(item.optional_vars.id)
         _apply_non_raising_seq_safe_updates(
-            b_stmt.body, cur_safe, cur_bool, strict_names=strict_names
+            b_stmt.body,
+            cur_safe,
+            cur_bool,
+            strict_names=strict_names,
+            _depth=_depth + 1,
         )
     elif isinstance(b_stmt, ast.If):
         _apply_non_raising_if_branch_updates(
-            b_stmt, cur_safe, cur_bool, strict_names=strict_names
+            b_stmt,
+            cur_safe,
+            cur_bool,
+            strict_names=strict_names,
+            _depth=_depth + 1,
         )
 
 
@@ -4657,13 +5053,22 @@ def _apply_non_raising_seq_safe_updates(
     cur_bool: Set[str],
     *,
     strict_names: bool,
+    _depth: int = 0,
 ) -> None:
     """Propagates safe bindings sequentially across a non-raising statement list until termination."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        cur_safe.clear()
+        cur_bool.clear()
+        return
     for sub_s in stmts:
-        if _non_raising_stmt_terminates(sub_s):
+        if _non_raising_stmt_terminates(sub_s, _depth=_depth + 1):
             break
         _apply_non_raising_stmt_safe_updates(
-            sub_s, cur_safe, cur_bool, strict_names=strict_names
+            sub_s,
+            cur_safe,
+            cur_bool,
+            strict_names=strict_names,
+            _depth=_depth + 1,
         )
 
 
@@ -4676,8 +5081,11 @@ def _split_suppress_with_body(
     suppress_aliases: Union[
         _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
+    _depth: int = 0,
 ) -> Tuple[List[ast.stmt], List[ast.stmt]]:
     """Splits a potentially suppressing with-block body into (non_raising_prefix, potentially_raising_suffix)."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return [], list(body)
     safe_prefix: List[ast.stmt] = []
     cur_prov = _coerce_suppress_provenance(suppress_aliases)
     cur_safe: Set[str] = (
@@ -4696,14 +5104,21 @@ def _split_suppress_with_body(
             cur_bool,
             strict_names=strict_names,
             suppress_aliases=cur_prov,
+            _depth=_depth + 1,
         ):
             safe_prefix.append(b_stmt)
-            if _non_raising_stmt_terminates(b_stmt):
+            if _non_raising_stmt_terminates(b_stmt, _depth=_depth + 1):
                 return safe_prefix, []
             _apply_non_raising_stmt_safe_updates(
-                b_stmt, cur_safe, cur_bool, strict_names=strict_names
+                b_stmt,
+                cur_safe,
+                cur_bool,
+                strict_names=strict_names,
+                _depth=_depth + 1,
             )
-            cur_prov = _update_suppress_provenance_from_stmt(b_stmt, cur_prov)
+            cur_prov = _update_suppress_provenance_from_stmt(
+                b_stmt, cur_prov, _depth=_depth + 1
+            )
         else:
             return safe_prefix, list(body[idx:])
     return safe_prefix, []
@@ -4717,6 +5132,7 @@ def _split_unknown_with_body(
     suppress_aliases: Union[
         _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
+    _depth: int = 0,
 ) -> Tuple[List[ast.stmt], List[ast.stmt]]:
     """Splits an unknown context manager's body into (guaranteed_non_raising_prefix, potentially_raising_suffix)."""
     return _split_suppress_with_body(
@@ -4724,6 +5140,7 @@ def _split_unknown_with_body(
         safe_names=safe_names,
         strict_names=strict_names,
         suppress_aliases=suppress_aliases,
+        _depth=_depth,
     )
 
 
@@ -4803,6 +5220,7 @@ def _split_with_body_by_mode(
     strict_names: bool = True,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
     strict_with_suppression: bool = False,
+    _depth: int = 0,
 ) -> Tuple[List[ast.stmt], List[ast.stmt]]:
     """Splits a with-block body into (guaranteed_prefix, potentially_suppressed_suffix) across 3 suppression states."""
     _record_with_items_heuristic_ctx_managers(
@@ -4811,7 +5229,7 @@ def _split_with_body_by_mode(
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         strict_with_suppression=strict_with_suppression,
     )
-    if _with_header_has_post_suppress_risk(
+    if _depth > _MAX_AST_RECURSION_DEPTH or _with_header_has_post_suppress_risk(
         stmt,
         suppress_aliases,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
@@ -4839,6 +5257,7 @@ def _split_with_body_by_mode(
             safe_names=safe_names,
             strict_names=strict_names,
             suppress_aliases=body_prov,
+            _depth=_depth,
         )
     if w_mode == "unknown":
         if strict_with_suppression or _with_stmt_looks_suppressing(
@@ -4851,6 +5270,7 @@ def _split_with_body_by_mode(
                 safe_names=safe_names,
                 strict_names=strict_names,
                 suppress_aliases=body_prov,
+                _depth=_depth,
             )
     return list(stmt.body), []
 
@@ -4858,6 +5278,8 @@ def _split_with_body_by_mode(
 def _walrus_in_sequence(
     items: Sequence[Optional[ast.AST]],
     is_conditional: bool = False,
+    *,
+    _depth: int = 0,
 ) -> Tuple[Set[str], Set[str]]:
     """Evaluates walrus assignments sequentially across expressions with short-circuiting tail conditions."""
     definite: Set[str] = set()
@@ -4865,7 +5287,7 @@ def _walrus_in_sequence(
     for idx, item in enumerate(items):
         if item is not None:
             d, c = _walrus_assignment_in_expr(
-                item, is_conditional if idx == 0 else True
+                item, is_conditional if idx == 0 else True, _depth=_depth
             )
             definite.update(d)
             conditional.update(c)
@@ -4875,6 +5297,8 @@ def _walrus_in_sequence(
 def _walrus_assignment_in_expr(
     expr: Optional[ast.AST],
     is_conditional: bool = False,
+    *,
+    _depth: int = 0,
 ) -> Tuple[Set[str], Set[str]]:
     """Analyzes walrus assignments in an expression to distinguish definite from conditional stores."""
     definite: Set[str] = set()
@@ -4882,75 +5306,67 @@ def _walrus_assignment_in_expr(
     if expr is None:
         return definite, conditional
 
-    if isinstance(expr, _COMPREHENSION_TYPES):
-        d_seq, c_seq = _walrus_in_sequence(
-            [g.iter for g in expr.generators], is_conditional
-        )
-        definite.update(d_seq)
-        conditional.update(c_seq)
-        for child in ast.iter_child_nodes(expr):
-            if (
-                isinstance(expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp))
-                and child is expr.elt
-            ):
-                d_c, c_c = _walrus_assignment_in_expr(child, True)
-                conditional.update(d_c | c_c)
-            elif isinstance(expr, ast.DictComp) and child in (
-                expr.key,
-                expr.value,
-            ):
-                d_c, c_c = _walrus_assignment_in_expr(child, True)
-                conditional.update(d_c | c_c)
-            elif isinstance(child, ast.comprehension):
-                for if_expr in child.ifs:
-                    d_c, c_c = _walrus_assignment_in_expr(if_expr, True)
-                    conditional.update(d_c | c_c)
-        return definite, conditional - definite
+    work: List[Tuple[ast.AST, bool]] = [(expr, is_conditional)]
+    while work:
+        curr, curr_cond = work.pop()
+        if isinstance(curr, _COMPREHENSION_TYPES):
+            for idx, gen in enumerate(curr.generators):
+                work.append((gen.iter, curr_cond if idx == 0 else True))
+                for if_expr in gen.ifs:
+                    work.append((if_expr, True))
+            if isinstance(curr, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+                work.append((curr.elt, True))
+            elif isinstance(curr, ast.DictComp):
+                work.append((curr.key, True))
+                work.append((curr.value, True))
+            continue
 
-    if isinstance(expr, _INNER_SCOPE_TYPES):
-        for hdr in iter_nested_scope_header_nodes(expr):
-            d_h, c_h = _walrus_assignment_in_expr(hdr, is_conditional)
-            definite.update(d_h)
-            conditional.update(c_h)
-        return definite, conditional - definite
+        if isinstance(curr, _INNER_SCOPE_TYPES):
+            for hdr in iter_nested_scope_header_nodes(curr):
+                work.append((hdr, curr_cond))
+            continue
 
-    if isinstance(expr, ast.NamedExpr) and isinstance(expr.target, ast.Name):
-        if is_conditional:
-            conditional.add(expr.target.id)
-        else:
-            definite.add(expr.target.id)
+        if isinstance(curr, ast.NamedExpr):
+            if isinstance(curr.target, ast.Name):
+                if curr_cond:
+                    conditional.add(curr.target.id)
+                else:
+                    definite.add(curr.target.id)
+            work.append((curr.value, curr_cond))
+            continue
 
-    if isinstance(expr, ast.BoolOp):
-        d_seq, c_seq = _walrus_in_sequence(expr.values, is_conditional)
-        definite.update(d_seq)
-        conditional.update(c_seq)
-        return definite, conditional - definite
+        if isinstance(curr, ast.BoolOp):
+            for idx, val in enumerate(curr.values):
+                work.append((val, curr_cond if idx == 0 else True))
+            continue
 
-    if isinstance(expr, ast.IfExp):
-        d_t, c_t = _walrus_assignment_in_expr(expr.test, is_conditional)
-        d_b, c_b = _walrus_assignment_in_expr(expr.body, False)
-        d_o, c_o = _walrus_assignment_in_expr(expr.orelse, False)
-        definite.update(d_t)
-        both_def = (d_b & d_o) if not is_conditional else set()
-        definite.update(both_def)
-        conditional.update(c_t | ((d_b | c_b | d_o | c_o) - both_def))
-        return definite, conditional - definite
+        if isinstance(curr, ast.IfExp):
+            work.append((curr.test, curr_cond))
+            if _depth >= _MAX_AST_RECURSION_DEPTH:
+                work.append((curr.body, True))
+                work.append((curr.orelse, True))
+            else:
+                d_b, c_b = _walrus_assignment_in_expr(
+                    curr.body, False, _depth=_depth + 1
+                )
+                d_o, c_o = _walrus_assignment_in_expr(
+                    curr.orelse, False, _depth=_depth + 1
+                )
+                both_def = (d_b & d_o) if not curr_cond else set()
+                definite.update(both_def)
+                conditional.update((d_b | c_b | d_o | c_o) - both_def)
+            continue
 
-    if isinstance(expr, ast.Compare):
-        d_l, c_l = _walrus_assignment_in_expr(expr.left, is_conditional)
-        definite.update(d_l)
-        conditional.update(c_l)
-        d_seq, c_seq = _walrus_in_sequence(expr.comparators, is_conditional)
-        definite.update(d_seq)
-        conditional.update(c_seq)
-        return definite, conditional - definite
+        if isinstance(curr, ast.Compare):
+            work.append((curr.left, curr_cond))
+            for idx, comp in enumerate(curr.comparators):
+                work.append((comp, curr_cond if idx == 0 else True))
+            continue
 
-    for child in ast.iter_child_nodes(expr):
-        target_child = child.value if isinstance(child, ast.keyword) else child
-        if isinstance(target_child, ast.AST):
-            d_ch, c_ch = _walrus_assignment_in_expr(target_child, is_conditional)
-            definite.update(d_ch)
-            conditional.update(c_ch)
+        for child in ast.iter_child_nodes(curr):
+            target_child = child.value if isinstance(child, ast.keyword) else child
+            if isinstance(target_child, ast.AST):
+                work.append((target_child, curr_cond))
 
     return definite, conditional - definite
 
@@ -4963,7 +5379,9 @@ def _extract_unconditional_walrus_names(node: ast.AST) -> Set[str]:
 def _extract_deleted_names(statements: Sequence[ast.AST]) -> Set[str]:
     """Finds all variable names deleted within a statement sequence without recursing into nested functions."""
     deleted: Set[str] = set()
-    for stmt in statements:
+    stack: List[ast.AST] = list(statements)
+    while stack:
+        stmt = stack.pop()
         if isinstance(stmt, ast.Delete):
             deleted.update(
                 node.id
@@ -4974,14 +5392,14 @@ def _extract_deleted_names(statements: Sequence[ast.AST]) -> Set[str]:
         elif isinstance(stmt, _INNER_SCOPE_TYPES):
             continue
         elif isinstance(stmt, ast.ExceptHandler):
-            deleted.update(_extract_deleted_names(stmt.body))
+            stack.extend(stmt.body)
         elif is_match_node(stmt):  # pragma: no cover (py310+)
             for case in getattr(stmt, "cases", []):
-                deleted.update(_extract_deleted_names(getattr(case, "body", [])))
+                stack.extend(getattr(case, "body", []))
         else:
             for child in ast.iter_child_nodes(stmt):
                 if isinstance(child, (ast.stmt, ast.ExceptHandler)):
-                    deleted.update(_extract_deleted_names([child]))
+                    stack.append(child)
     return deleted
 
 
@@ -5133,6 +5551,56 @@ def _finalize_surviving_branch_flow(
     return not surviving, out_prov
 
 
+def _collect_block_shallow_flow_at_depth_limit(
+    statements: Sequence[ast.AST],
+) -> Tuple[Set[str], Set[str], bool, bool]:
+    """Iteratively collects (raw_assigned, raw_deleted, has_break, has_continue) for depth fallback."""
+    summary = _collect_shallow_ast_flow_summary(statements)
+    return (
+        summary.assigned | summary.except_names,
+        summary.deleted | summary.except_names,
+        summary.has_break,
+        summary.has_continue,
+    )
+
+
+def _apply_depth_bailout_block_flow(
+    statements: Sequence[ast.AST],
+    definite: Set[str],
+    conditional: Set[str],
+    may_del: Set[str],
+    must_del: Set[str],
+    live_in_del: Set[str],
+    local_prov: _SuppressProvenance,
+    *,
+    active_nonlocals: Optional[Set[str]],
+    fn_globals: AbstractSet[str],
+    loop_jumps: Optional[_LoopJumpSummary],
+    ever_bound: Optional[Set[str]],
+) -> Tuple[Set[str], Set[str], bool, _SuppressProvenance]:
+    """Conservatively summarizes a statement sequence when recursion reaches _MAX_AST_RECURSION_DEPTH."""
+    raw_assigned, raw_deleted, has_break, has_continue = (
+        _collect_block_shallow_flow_at_depth_limit(statements)
+    )
+    assigned = _filter_scope_names(raw_assigned, active_nonlocals, fn_globals)
+    before_def = set(definite)
+    live_in_del.update(raw_deleted - before_def)
+    definite.difference_update(raw_deleted)
+    conditional.update(assigned | (before_def & raw_deleted))
+    may_del.update(raw_deleted)
+    must_del.difference_update(assigned)
+    if ever_bound is not None:
+        ever_bound.update(assigned)
+    if loop_jumps is not None and (has_break or has_continue):
+        loop_jumps.has_jump = True
+        if has_break:
+            loop_jumps.has_break = True
+        loop_jumps.may_bound.update(definite | conditional | assigned)
+        loop_jumps.may_deleted.update(may_del)
+    local_prov = _conservatively_update_prov_at_depth_limit(statements, local_prov)
+    return definite, conditional - definite, False, local_prov
+
+
 def _analyze_if_stmt_assignment(
     stmt: ast.If,
     definite: Set[str],
@@ -5151,6 +5619,7 @@ def _analyze_if_stmt_assignment(
     strict_names: bool = True,
     extra_non_suppressing_ctx_managers: AbstractSet[str],
     strict_with_suppression: bool,
+    _depth: int = 0,
 ) -> Tuple[bool, _SuppressProvenance]:
     """Analyzes an ast.If statement and updates flow sets in place."""
     d_in = set(definite)
@@ -5179,6 +5648,7 @@ def _analyze_if_stmt_assignment(
         strict_names=strict_names,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         strict_with_suppression=strict_with_suppression,
+        _depth=_depth + 1,
     )
     b_state = _BranchFlowState(b_def, b_cond, b_may, b_must)
 
@@ -5203,6 +5673,7 @@ def _analyze_if_stmt_assignment(
             strict_names=strict_names,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
             strict_with_suppression=strict_with_suppression,
+            _depth=_depth + 1,
         )
         o_state = _BranchFlowState(o_def, o_cond, o_may, o_must)
     else:
@@ -5244,6 +5715,7 @@ def _analyze_with_stmt_assignment(
     strict_with_suppression: bool,
     bind_def_cond: Any,
     apply_expr_effects: Any,
+    _depth: int = 0,
 ) -> Tuple[bool, _SuppressProvenance]:
     """Analyzes a With/AsyncWith statement and updates flow sets in place."""
     header_prov = local_prov
@@ -5271,6 +5743,7 @@ def _analyze_with_stmt_assignment(
         strict_names=strict_names,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         strict_with_suppression=strict_with_suppression,
+        _depth=_depth + 1,
     )
     _, _, w_term, local_prov = _analyze_block_assignment_impl(
         safe_prefix,
@@ -5289,6 +5762,7 @@ def _analyze_with_stmt_assignment(
         strict_names=strict_names,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         strict_with_suppression=strict_with_suppression,
+        _depth=_depth + 1,
     )
     if w_term:
         return True, local_prov
@@ -5318,6 +5792,7 @@ def _analyze_with_stmt_assignment(
             strict_names=strict_names,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
             strict_with_suppression=strict_with_suppression,
+            _depth=_depth + 1,
         )
         if ever_bound is not None:
             ever_bound.update(w_ever)
@@ -5359,6 +5834,7 @@ def _analyze_try_stmt_assignment(
     extra_non_suppressing_ctx_managers: AbstractSet[str],
     strict_with_suppression: bool,
     apply_expr_effects: Any,
+    _depth: int = 0,
 ) -> Tuple[bool, _SuppressProvenance]:
     """Analyzes a Try/TryStar statement and updates flow sets in place."""
     d_in = set(definite)
@@ -5371,26 +5847,20 @@ def _analyze_try_stmt_assignment(
     is_trystar = is_trystar_node(stmt)
     cur_safe = d_in | set(known_safe_names)
 
-    t_safe_prefix, t_risky_suffix = _split_suppress_with_body(
+    split = _compute_try_body_split_provenance(
         t_body,
+        local_prov,
+        _ProvenanceWalkContext(
+            in_branch=False,
+            strict_with_suppression=strict_with_suppression,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+            depth=_depth,
+        ),
         safe_names=cur_safe,
         strict_names=strict_names,
-        suppress_aliases=local_prov,
     )
-    try_prefix_prov = _update_suppress_provenance_from_stmts(
-        t_safe_prefix,
-        local_prov,
-        in_branch=False,
-        strict_with_suppression=strict_with_suppression,
-        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-    )
-    try_mid_prov = _update_suppress_provenance_from_stmts(
-        t_risky_suffix,
-        try_prefix_prov,
-        in_branch=True,
-        strict_with_suppression=strict_with_suppression,
-        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-    )
+    try_prefix_prov = split.prefix_prov
+    try_mid_prov = split.mid_prov
 
     inner_jumps: Optional[_LoopJumpSummary] = (
         _LoopJumpSummary() if (loop_jumps is not None and f_body) else loop_jumps
@@ -5416,6 +5886,7 @@ def _analyze_try_stmt_assignment(
         strict_names=strict_names,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         strict_with_suppression=strict_with_suppression,
+        _depth=_depth + 1,
     )
     if ever_bound is not None:
         ever_bound.update(t_ever)
@@ -5448,6 +5919,7 @@ def _analyze_try_stmt_assignment(
             strict_names=strict_names,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
             strict_with_suppression=strict_with_suppression,
+            _depth=_depth + 1,
         )
         if ever_bound is not None:
             ever_bound.update(o_ever)
@@ -5529,6 +6001,7 @@ def _analyze_try_stmt_assignment(
             strict_names=strict_names,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
             strict_with_suppression=strict_with_suppression,
+            _depth=_depth + 1,
         )
         final_prov = final_prov.merge_branch_conservative(h_out_prov)
         h_raw_bound = {h_name} if isinstance(h_name, str) else set()
@@ -5611,6 +6084,7 @@ def _analyze_try_stmt_assignment(
                 strict_names=strict_names,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
                 strict_with_suppression=strict_with_suppression,
+                _depth=_depth + 1,
             )
             _analyze_block_assignment_impl(
                 f_body,
@@ -5626,6 +6100,7 @@ def _analyze_try_stmt_assignment(
                 strict_names=strict_names,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
                 strict_with_suppression=strict_with_suppression,
+                _depth=_depth + 1,
             )
         _, _, f_term, f_out_prov = _analyze_block_assignment_impl(
             f_body,
@@ -5643,6 +6118,7 @@ def _analyze_try_stmt_assignment(
             strict_names=strict_names,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
             strict_with_suppression=strict_with_suppression,
+            _depth=_depth + 1,
         )
         if loop_jumps is not None:
             if f_jumps is not None and f_jumps.has_jump:
@@ -5669,6 +6145,7 @@ def _analyze_try_stmt_assignment(
             in_branch=False,
             strict_with_suppression=strict_with_suppression,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+            _depth=_depth + 1,
         )
         local_prov = _merge_hazard_provenance(post_f_prov, f_out_prov)
     else:
@@ -5696,6 +6173,7 @@ def _analyze_match_stmt_assignment(
     extra_non_suppressing_ctx_managers: AbstractSet[str],
     strict_with_suppression: bool,
     apply_expr_effects: Any,
+    _depth: int = 0,
 ) -> Tuple[bool, _SuppressProvenance]:
     """Analyzes a Match statement and updates flow sets in place."""
     subject = getattr(stmt, "subject", None)
@@ -5764,6 +6242,7 @@ def _analyze_match_stmt_assignment(
             strict_names=strict_names,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
             strict_with_suppression=strict_with_suppression,
+            _depth=_depth + 1,
         )
         merged_match_prov = merged_match_prov.merge_branch_conservative(c_out_prov)
         live_in_del.update((c_live - case_init_def) - d_in)
@@ -5821,6 +6300,7 @@ def _analyze_loop_stmt_assignment(
     strict_names: bool,
     extra_non_suppressing_ctx_managers: AbstractSet[str],
     strict_with_suppression: bool,
+    _depth: int = 0,
 ) -> Tuple[bool, _SuppressProvenance]:
     """Analyzes a While/For/AsyncFor loop with break/continue jump tracking and orelse composition."""
     d_in = set(definite)
@@ -5854,6 +6334,7 @@ def _analyze_loop_stmt_assignment(
         strict_names=strict_names,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         strict_with_suppression=strict_with_suppression,
+        _depth=_depth + 1,
     )
     live_in_del.update((b_live - target_raw_names) - d_in)
     merged_prov = local_prov.merge_branch_conservative(b_prov)
@@ -5891,6 +6372,7 @@ def _analyze_loop_stmt_assignment(
         strict_names=strict_names,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         strict_with_suppression=strict_with_suppression,
+        _depth=_depth + 1,
     )
     live_in_del.update(o_live - exh_state.definite)
     merged_prov = merged_prov.merge_branch_conservative(o_prov)
@@ -5927,6 +6409,7 @@ def _analyze_block_assignment_impl(
     strict_names: bool = True,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
     strict_with_suppression: bool = False,
+    _depth: int = 0,
 ) -> Tuple[Set[str], Set[str], bool, _SuppressProvenance]:
     """Unified single-pass analyzer for definite/conditional bindings, deletions, and termination."""
     if definite is None:
@@ -5937,6 +6420,20 @@ def _analyze_block_assignment_impl(
     must_del = must_deleted if must_deleted is not None else set()
     live_in_del = live_in_deleted if live_in_deleted is not None else set()
     local_prov = _coerce_suppress_provenance(suppress_aliases)
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return _apply_depth_bailout_block_flow(
+            statements,
+            definite,
+            conditional,
+            may_del,
+            must_del,
+            live_in_del,
+            local_prov,
+            active_nonlocals=active_nonlocals,
+            fn_globals=fn_globals,
+            loop_jumps=loop_jumps,
+            ever_bound=ever_bound,
+        )
 
     def _bind_def_cond(d_raw: Iterable[str], c_raw: Iterable[str] = ()) -> None:
         d_filt = _filter_scope_names(d_raw, active_nonlocals, fn_globals)
@@ -5969,6 +6466,7 @@ def _analyze_block_assignment_impl(
             local_prov,
             strict_with_suppression=strict_with_suppression,
             extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+            _depth=_depth,
         )
 
     for stmt in statements:
@@ -6055,6 +6553,7 @@ def _analyze_block_assignment_impl(
                 strict_names=strict_names,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
                 strict_with_suppression=strict_with_suppression,
+                _depth=_depth,
             )
             if if_term:
                 may_del.difference_update(definite - before_def)
@@ -6085,6 +6584,7 @@ def _analyze_block_assignment_impl(
                 strict_names=strict_names,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
                 strict_with_suppression=strict_with_suppression,
+                _depth=_depth,
             )
             if w_loop_term:
                 may_del.difference_update(definite - before_def)
@@ -6120,6 +6620,7 @@ def _analyze_block_assignment_impl(
                 strict_names=strict_names,
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
                 strict_with_suppression=strict_with_suppression,
+                _depth=_depth,
             )
             if f_loop_term:
                 may_del.difference_update(definite - before_def)
@@ -6144,6 +6645,7 @@ def _analyze_block_assignment_impl(
                 strict_with_suppression=strict_with_suppression,
                 bind_def_cond=_bind_def_cond,
                 apply_expr_effects=_apply_expr_effects,
+                _depth=_depth,
             )
             if w_term:
                 may_del.difference_update(definite - before_def)
@@ -6167,6 +6669,7 @@ def _analyze_block_assignment_impl(
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
                 strict_with_suppression=strict_with_suppression,
                 apply_expr_effects=_apply_expr_effects,
+                _depth=_depth,
             )
             if t_term:
                 may_del.difference_update(definite - before_def)
@@ -6190,6 +6693,7 @@ def _analyze_block_assignment_impl(
                 extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
                 strict_with_suppression=strict_with_suppression,
                 apply_expr_effects=_apply_expr_effects,
+                _depth=_depth,
             )
             if m_term:
                 may_del.difference_update(definite - before_def)

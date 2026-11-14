@@ -105,6 +105,13 @@ def _has_deleted_output_hazard(
     )
 
 
+ENCLOSING_TRY_OR_WITH_CLEANUP_HAZARD_REASON = "enclosing try or with cleanup hazard"
+DELETED_OUTPUT_HAZARD_REASON = "deleted output hazard"
+INVALID_UNIT_BOUNDS_REASON = "invalid unit bounds"
+GENERATOR_OUTPUT_OR_CLOSURE_CONFLICT_REASON = "generator output or closure conflict"
+ASYNC_GENERATOR_DELEGATION_HAZARD_REASON = "async generator delegation hazard"
+
+
 def _validate_try_cleanup_hazard(
     unit: Dict[str, Any],
     needed_outs: Sequence[str],
@@ -117,7 +124,7 @@ def _validate_try_cleanup_hazard(
     """Validates that needed outputs are not read in enclosing try/except/finally/with blocks."""
     if not needed_outs:
         return None
-    hazard = "enclosing try or with cleanup hazard"
+    hazard = ENCLOSING_TRY_OR_WITH_CLEANUP_HAZARD_REASON
     missing_inputs = source_text is None and tree is None
     scope_node = (
         None
@@ -312,6 +319,16 @@ _BLOCKING_SCOPE_HAZARDS: Tuple[Tuple[str, str], ...] = (
     ("pathological_ast", "pathological ast"),
 )
 
+SAFETY_PAIR_SKIP_REASONS: frozenset[str] = frozenset(
+    {
+        *(reason for _, reason in _BLOCKING_SCOPE_HAZARDS),
+        ENCLOSING_TRY_OR_WITH_CLEANUP_HAZARD_REASON,
+        DELETED_OUTPUT_HAZARD_REASON,
+        ASYNC_GENERATOR_DELEGATION_HAZARD_REASON,
+        INVALID_UNIT_BOUNDS_REASON,
+    }
+)
+
 
 def _ensure_pair_scopes_closure_mode(
     u1: Dict[str, Any],
@@ -451,7 +468,7 @@ def resolve_clone_generator_subroutine_outputs(
                     u_chk,
                 )
                 return (
-                    CloneOutputResolution(None, "invalid unit bounds")
+                    CloneOutputResolution(None, INVALID_UNIT_BOUNDS_REASON)
                     if return_details
                     else None
                 )
@@ -498,7 +515,7 @@ def resolve_clone_generator_subroutine_outputs(
     outs2 = _extract_effective_unit_outputs(u2, scope2)
     if _has_deleted_output_hazard(scope1, scope2, outs1, outs2):
         return _reject_gen_pair(
-            "deleted output hazard", "deleted output hazard"
+            DELETED_OUTPUT_HAZARD_REASON, DELETED_OUTPUT_HAZARD_REASON
         )
 
     u1_cond = set(scope1.get("conditional_outputs", [])) | set(
@@ -567,7 +584,7 @@ def resolve_clone_generator_subroutine_outputs(
     )
     if resolved is None:
         return (
-            CloneOutputResolution(None, "generator output or closure conflict")
+            CloneOutputResolution(None, GENERATOR_OUTPUT_OR_CLOSURE_CONFLICT_REASON)
             if return_details
             else None
         )
@@ -589,7 +606,9 @@ def resolve_clone_generator_subroutine_outputs(
                 bounds = _get_valid_unit_bounds(u_item)
                 if scope_node is None or bounds is None:
                     return (
-                        CloneOutputResolution(None, "generator output or closure conflict")
+                        CloneOutputResolution(
+                            None, GENERATOR_OUTPUT_OR_CLOSURE_CONFLICT_REASON
+                        )
                         if return_details
                         else None
                     )
@@ -614,13 +633,15 @@ def resolve_clone_generator_subroutine_outputs(
                             side_idx + 1,
                         )
                         return (
-                            CloneOutputResolution(None, "generator output or closure conflict")
+                            CloneOutputResolution(
+                                None, GENERATOR_OUTPUT_OR_CLOSURE_CONFLICT_REASON
+                            )
                             if return_details
                             else None
                         )
     except (RecursionError, MemoryError):
         return (
-            CloneOutputResolution(None, "generator output or closure conflict")
+            CloneOutputResolution(None, GENERATOR_OUTPUT_OR_CLOSURE_CONFLICT_REASON)
             if return_details
             else None
         )
@@ -832,10 +853,11 @@ def resolve_clone_pair_outputs(
             )
     if is_sub and _has_deleted_output_hazard(scope1, scope2, outs1, outs2):
         logger.debug(
-            "Rejecting clone pair output resolution: deleted output hazard"
+            "Rejecting clone pair output resolution: %s",
+            DELETED_OUTPUT_HAZARD_REASON,
         )
         return (
-            CloneOutputResolution(None, "deleted output hazard")
+            CloneOutputResolution(None, DELETED_OUTPUT_HAZARD_REASON)
             if return_details
             else None
         )

@@ -1058,7 +1058,7 @@ def _slice_unit_token_lines(
         if (
             s_col > first_byte_len
             or (s_col == first_byte_len and e_col != first_byte_len)
-            or (e_col is not None and e_col > first_byte_len)
+            or (e_col is not None and (e_col > first_byte_len or e_col < s_col))
         ):
             return []
         res[0] = _slice_utf8_line(res[0], s_col, e_col)

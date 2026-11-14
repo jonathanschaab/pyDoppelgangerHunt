@@ -16,6 +16,8 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tu
 from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
 from pydoppelgangerhunt.config import (
     APP_VERSION,
+    collect_heuristic_ctx_managers,
+    format_heuristic_ctx_manager_comment,
     heuristic_ctx_manager_session,
     normalize_path_string,
     resolve_pair_closure_flags,
@@ -31,8 +33,8 @@ from pydoppelgangerhunt.source_lines import (
     resolve_unit_line_bounds,
     with_unit_source_text,
 )
-from pydoppelgangerhunt.source_lines import (  # pylint: disable=unused-import
-    extract_unit_source_lines_with_state,
+from pydoppelgangerhunt.source_lines import (  # pylint: disable=unused-import,useless-import-alias
+    extract_unit_source_lines_with_state as extract_unit_source_lines_with_state,
 )
 
 logger = logging.getLogger(__name__)
@@ -136,21 +138,6 @@ class _SuggestionRejectionInfo(NamedTuple):
     has_safety_hazard: bool
 
 
-_PAIR_SAFETY_HAZARD_REASONS = frozenset(
-    {
-        "enclosing try/with cleanup hazard",
-        "deleted output hazard",
-        "generator cleanup hazard",
-        "severed closure cell",
-        "stale source code",
-        "invalid unit columns",
-        "pathological ast",
-        "unavailable source for closure mode",
-        "unavailable source placeholder",
-    }
-)
-
-
 def _collect_suggestion_rejection_reasons(
     u1: Dict[str, Any],
     u2: Dict[str, Any],
@@ -162,6 +149,10 @@ def _collect_suggestion_rejection_reasons(
     synthesis_failed_with_error: bool = False,
 ) -> _SuggestionRejectionInfo:
     """Classifies per-unit safety hazards and pair-level structural incompatibilities."""
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        SAFETY_PAIR_SKIP_REASONS,
+    )
+
     safety_reasons: List[str] = []
     structural_reasons: List[str] = []
 
@@ -177,7 +168,7 @@ def _collect_suggestion_rejection_reasons(
             _add_unique(safety_reasons, str(cr).replace("_", " "))
 
     if pair_skip_reason:
-        if pair_skip_reason in _PAIR_SAFETY_HAZARD_REASONS or "hazard" in pair_skip_reason:
+        if pair_skip_reason in SAFETY_PAIR_SKIP_REASONS:
             _add_unique(safety_reasons, pair_skip_reason)
         elif pair_skip_reason not in safety_reasons:
             _add_unique(structural_reasons, pair_skip_reason)
@@ -408,108 +399,125 @@ def synthesize_refactoring_suggestion(
     _align_pair_expr_kinds(p1.unit, p2.unit)
     is_expr_unit = p1.unit.get("kind") in ("comprehension", "complex_expr")
 
-    pair_flags = resolve_pair_closure_flags(
-        p1.unit,
-        p2.unit,
-        closure_strictness=closure_strictness,
-        skip_pre_unit_closures=skip_pre_unit_closures,
-        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
-    )
-    pre_sc1 = p1.unit.get("scope") if isinstance(p1.unit.get("scope"), dict) else None
-    pre_sc2 = p2.unit.get("scope") if isinstance(p2.unit.get("scope"), dict) else None
-    sc1 = ensure_unit_scope_closure_mode(
-        p1.unit,
-        pre_sc1,
-        pair_flags.effective_skip_pre_unit_closures,
-        strict_with_suppression=pair_flags.effective_strict_with_suppression,
-        non_suppressing_ctx_managers=pair_flags.unit1.non_suppressing_ctx_managers,
-        source_text=p1.source_text,
-        tree=p1.tree,
-        repo_root=repo_root,
-    )
-    sc2 = ensure_unit_scope_closure_mode(
-        p2.unit,
-        pre_sc2,
-        pair_flags.effective_skip_pre_unit_closures,
-        strict_with_suppression=pair_flags.effective_strict_with_suppression,
-        non_suppressing_ctx_managers=pair_flags.unit2.non_suppressing_ctx_managers,
-        source_text=p2.source_text,
-        tree=p2.tree,
-        repo_root=repo_root,
-    )
-    has_naked_loop_jump = any(
-        h in ("naked_break", "naked_continue")
-        for h in (*sc1.get("control_flow_hazards", ()), *sc2.get("control_flow_hazards", ()))
-    )
-    effective_pair_strictness = (
-        "lenient"
-        if pair_flags.effective_skip_pre_unit_closures
-        else ("pedantic" if pair_flags.effective_strict_with_suppression else "strict")
-    )
-    pair_out_raw = resolve_clone_pair_outputs(
-        u1=p1.unit,
-        u2=p2.unit,
-        scope1=sc1,
-        scope2=sc2,
-        source_text1=p1.source_text,
-        source_text2=p2.source_text,
-        tree1=p1.tree,
-        tree2=p2.tree,
-        repo_root=repo_root,
-        skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
-        closure_strictness=effective_pair_strictness,
-        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
-        return_details=True,
-    )
-    pair_outputs: Optional[Tuple[List[str], List[str]]] = (
-        pair_out_raw.outputs
-        if isinstance(pair_out_raw, CloneOutputResolution)
-        else pair_out_raw
-    )
-    pair_skip_reason: Optional[str] = (
-        pair_out_raw.skip_reason
-        if isinstance(pair_out_raw, CloneOutputResolution)
-        else None
-    )
+    with collect_heuristic_ctx_managers() as pair_heuristics:
+        pair_flags = resolve_pair_closure_flags(
+            p1.unit,
+            p2.unit,
+            closure_strictness=closure_strictness,
+            skip_pre_unit_closures=skip_pre_unit_closures,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        )
+        pre_sc1 = (
+            p1.unit.get("scope") if isinstance(p1.unit.get("scope"), dict) else None
+        )
+        pre_sc2 = (
+            p2.unit.get("scope") if isinstance(p2.unit.get("scope"), dict) else None
+        )
+        sc1 = ensure_unit_scope_closure_mode(
+            p1.unit,
+            pre_sc1,
+            pair_flags.effective_skip_pre_unit_closures,
+            strict_with_suppression=pair_flags.effective_strict_with_suppression,
+            non_suppressing_ctx_managers=pair_flags.unit1.non_suppressing_ctx_managers,
+            source_text=p1.source_text,
+            tree=p1.tree,
+            repo_root=repo_root,
+        )
+        sc2 = ensure_unit_scope_closure_mode(
+            p2.unit,
+            pre_sc2,
+            pair_flags.effective_skip_pre_unit_closures,
+            strict_with_suppression=pair_flags.effective_strict_with_suppression,
+            non_suppressing_ctx_managers=pair_flags.unit2.non_suppressing_ctx_managers,
+            source_text=p2.source_text,
+            tree=p2.tree,
+            repo_root=repo_root,
+        )
+        has_naked_loop_jump = any(
+            h in ("naked_break", "naked_continue")
+            for h in (
+                *sc1.get("control_flow_hazards", ()),
+                *sc2.get("control_flow_hazards", ()),
+            )
+        )
+        effective_pair_strictness = (
+            "lenient"
+            if pair_flags.effective_skip_pre_unit_closures
+            else (
+                "pedantic" if pair_flags.effective_strict_with_suppression else "strict"
+            )
+        )
+        pair_out_raw = resolve_clone_pair_outputs(
+            u1=p1.unit,
+            u2=p2.unit,
+            scope1=sc1,
+            scope2=sc2,
+            source_text1=p1.source_text,
+            source_text2=p2.source_text,
+            tree1=p1.tree,
+            tree2=p2.tree,
+            repo_root=repo_root,
+            skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
+            closure_strictness=effective_pair_strictness,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+            return_details=True,
+        )
+        pair_outputs: Optional[Tuple[List[str], List[str]]] = (
+            pair_out_raw.outputs
+            if isinstance(pair_out_raw, CloneOutputResolution)
+            else pair_out_raw
+        )
+        pair_skip_reason: Optional[str] = (
+            pair_out_raw.skip_reason
+            if isinstance(pair_out_raw, CloneOutputResolution)
+            else None
+        )
 
-    helper_code = ""
-    synthesis_failed_with_error = False
-    if not has_naked_loop_jump and (pair_outputs is not None or is_expr_unit):
-        try:
-            helper_code = synthesize_shared_helper_code(
-                p1.unit,
-                p2.unit,
-                helper_name=helper_name,
-                repo_root=repo_root,
-                source_text1=p1.source_text,
-                source_text2=p2.source_text,
-                tree1=p1.tree,
-                tree2=p2.tree,
-                closure_strictness=effective_pair_strictness,
-                skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
-                non_suppressing_ctx_managers=non_suppressing_ctx_managers,
-                outputs=None if is_expr_unit or pair_outputs is None else pair_outputs[0],
-                outputs2=None if is_expr_unit or pair_outputs is None else pair_outputs[1],
-                scope1=sc1,
-                scope2=sc2,
-            )
-        except (
-            SyntaxError,
-            OSError,
-            UnicodeDecodeError,
-            RecursionError,
-            MemoryError,
-        ) as exc:
-            logger.debug(
-                "Failed to synthesize refactoring suggestion for (%s, %s): %s",
-                n1,
-                n2,
-                exc,
-                exc_info=True,
-            )
-            helper_code = ""
-            synthesis_failed_with_error = True
+        helper_code = ""
+        synthesis_failed_with_error = False
+        if not has_naked_loop_jump and (pair_outputs is not None or is_expr_unit):
+            try:
+                helper_code = synthesize_shared_helper_code(
+                    p1.unit,
+                    p2.unit,
+                    helper_name=helper_name,
+                    repo_root=repo_root,
+                    source_text1=p1.source_text,
+                    source_text2=p2.source_text,
+                    tree1=p1.tree,
+                    tree2=p2.tree,
+                    closure_strictness=effective_pair_strictness,
+                    skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
+                    non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+                    outputs=None if is_expr_unit or pair_outputs is None else pair_outputs[0],
+                    outputs2=None if is_expr_unit or pair_outputs is None else pair_outputs[1],
+                    scope1=sc1,
+                    scope2=sc2,
+                )
+            except (
+                SyntaxError,
+                OSError,
+                UnicodeDecodeError,
+                RecursionError,
+                MemoryError,
+            ) as exc:
+                logger.debug(
+                    "Failed to synthesize refactoring suggestion for (%s, %s): %s",
+                    n1,
+                    n2,
+                    exc,
+                    exc_info=True,
+                )
+                helper_code = ""
+                synthesis_failed_with_error = True
     if helper_code:
+        effective_heuristics = sorted(
+            set(pair_heuristics)
+            | set(sc1.get("heuristic_ctx_managers", ()))
+            | set(sc2.get("heuristic_ctx_managers", ()))
+        )
+        note_comment = format_heuristic_ctx_manager_comment(effective_heuristics)
+        note_line = f"    {note_comment}\n" if note_comment else ""
         indented_helper = "\n".join(
             f"    {ln}" if ln.strip() else ""
             for ln in helper_code.rstrip("\n").splitlines()
@@ -517,6 +525,7 @@ def synthesize_refactoring_suggestion(
         return (
             f"[REFACTOR SUGGESTION] Extract duplicated logic into common helper '{helper_name}':\n"
             f"    # {diff_summary}\n"
+            f"{note_line}"
             f"{indented_helper}"
         )
 

@@ -40,7 +40,9 @@ _MAX_WARNED_CLOSURE_EVENTS: int = 4096
 _MAX_HEURISTIC_CTX_MANAGERS: int = 16384
 _warned_closure_strictness_values: OrderedDict[str, None] = OrderedDict()
 _next_heuristic_session_id = itertools.count(1)
-_heuristic_collector_tls: threading.local = threading.local()
+_heuristic_collector_stack: contextvars.ContextVar[Tuple[Set[str], ...]] = (
+    contextvars.ContextVar("_heuristic_collector_stack", default=())
+)
 
 
 @dataclass
@@ -50,7 +52,7 @@ class _HeuristicSessionBucket:
     names: Set[str] = field(default_factory=set)
     overflow_count: int = 0
     defer_depth: int = 0
-    warn_on_summary: bool = False
+    warn_on_summary: bool = True
 
     def add(self, mgr_name: str) -> None:
         """Records mgr_name up to _MAX_HEURISTIC_CTX_MANAGERS, counting overflow occurrences beyond cap."""
@@ -153,26 +155,26 @@ def _warn_closure_event_once(event_key: str, msg: str, *args: Any) -> None:
 
 @contextlib.contextmanager
 def collect_heuristic_ctx_managers() -> Iterator[Set[str]]:
-    """Collects heuristic context-manager names recorded on the current thread within this block."""
-    stack: Optional[List[Set[str]]] = getattr(_heuristic_collector_tls, "stack", None)
-    if stack is None:
-        stack = []
-        _heuristic_collector_tls.stack = stack
+    """Collects heuristic context-manager names recorded within this contextvars scope."""
     bucket: Set[str] = set()
-    stack.append(bucket)
+    prev_stack = _heuristic_collector_stack.get()
+    token = _heuristic_collector_stack.set((*prev_stack, bucket))
     try:
         yield bucket
     finally:
-        stack.pop()
+        try:
+            _heuristic_collector_stack.reset(token)
+        except ValueError:
+            _heuristic_collector_stack.set(prev_stack)
 
 
 def record_heuristic_non_suppressing_ctx_manager(mgr_name: str) -> None:
     """Records an unproven context manager accepted by the strict-mode name heuristic."""
-    stack: Optional[List[Set[str]]] = getattr(_heuristic_collector_tls, "stack", None)
-    if stack:
-        for bucket in stack:
-            bucket.add(mgr_name)
+    collector_stack = _heuristic_collector_stack.get()
     with _warned_closure_lock:
+        if collector_stack:
+            for bucket in collector_stack:
+                bucket.add(mgr_name)
         _get_or_create_thread_bucket_locked().add(mgr_name)
 
 
@@ -213,7 +215,7 @@ def defer_heuristic_ctx_manager_summary() -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def heuristic_ctx_manager_session(*, warn: bool = False) -> Iterator[None]:
+def heuristic_ctx_manager_session(*, warn: bool = True) -> Iterator[None]:
     """Scopes a batch CLI or patch-generation run in a context-isolated session keyed by session ID.
 
     Propagates across ``asyncio`` tasks automatically via ``contextvars`` and across worker
@@ -268,8 +270,8 @@ def log_heuristic_ctx_manager_summary(
 ) -> Tuple[str, ...]:
     """Logs a consolidated summary of unproven context managers recorded in the active session or thread.
 
-    Logs at ``INFO`` by default so read-only scans and previews remain quiet in CI,
-    and escalates to ``WARNING`` when ``warn=True`` (e.g. ``--replace-clones``).
+    Logs a single consolidated ``WARNING`` by default so heuristic strict-mode assumptions remain
+    visible without per-item warning noise, or ``INFO`` when ``warn=False`` is explicitly active.
     """
     with _warned_closure_lock:
         bucket = _get_or_create_thread_bucket_locked()
@@ -452,9 +454,8 @@ def resolve_unit_closure_flags(
     Precedence Order:
         1. Explicit ``closure_strictness`` argument from the caller.
         2. When ``closure_strictness`` is ``None`` and the unit itself explicitly sets a
-           non-lenient closure policy (``unit["closure_strictness"]``,
-           ``unit["strict_with_suppression"] is True``, or
-           ``unit["skip_pre_unit_closures"] is False``), caller boolean flags
+           non-default closure mode (a recognized ``unit["closure_strictness"]`` or
+           ``unit["strict_with_suppression"] is True``), caller boolean flags
            (``skip_pre_unit_closures``, ``strict_with_suppression``) combine monotonically:
            they may strengthen the unit's policy (``lenient -> strict -> pedantic``) but
            never weaken an explicit stricter unit policy.
@@ -482,7 +483,6 @@ def resolve_unit_closure_flags(
     has_explicit_unit_mode = (
         is_recognized_closure_strictness(unit.get("closure_strictness"))
         or unit.get("strict_with_suppression") is True
-        or unit.get("skip_pre_unit_closures") is False
     )
     unit_mode, unit_skip = resolve_closure_strictness_mode(
         closure_strictness=unit.get("closure_strictness"),
@@ -606,13 +606,17 @@ def normalize_non_suppressing_ctx_managers(*sources: Any) -> Tuple[str, ...]:
 
 
 def clear_closure_warning_cache() -> None:
-    """Clears warned closure strictness events and resets heuristic context-manager accumulators."""
+    """Clears warned closure strictness events and resets heuristic accumulators for the current context/thread."""
+    sess_stack = _heuristic_session_stack.get()
+    curr_thread = threading.current_thread()
     with _warned_closure_lock:
         _warned_closure_strictness_values.clear()
-        _default_thread_buckets.clear()
-        for bucket in _active_heuristic_sessions.values():
-            bucket.names.clear()
-            bucket.overflow_count = 0
+        _default_thread_buckets.pop(curr_thread, None)
+        for sid in sess_stack:
+            bucket = _active_heuristic_sessions.get(sid)
+            if bucket is not None:
+                bucket.names.clear()
+                bucket.overflow_count = 0
 
 
 DEFAULT_EXCLUDES: List[str] = [
@@ -648,7 +652,7 @@ exclude = [
 call_sequences = true
 idioms = true
 # closure_strictness = "strict"  # Options: "strict", "pedantic", "lenient"
-# non_suppressing_ctx_managers = ["mylib.SafeTransaction", "*.lock"]
+# non_suppressing_ctx_managers = ["mylib.Transaction", "*.lock"]
 """
 
 

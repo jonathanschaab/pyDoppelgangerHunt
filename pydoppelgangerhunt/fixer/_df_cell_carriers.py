@@ -55,6 +55,7 @@ from pydoppelgangerhunt.fixer._df_span_index import (
     _extract_type_alias_or_pattern_name,
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
+    _MAX_AST_RECURSION_DEPTH,
     _collect_reachable_names,
     _extract_nested_scope_free_reads,
     _is_ast_node_within_unit_bounds,
@@ -467,8 +468,15 @@ def _scan_scope_nonlocal_mutations_and_deletions(
     *,
     include_nested: bool = True,
     use_cache: bool = True,
+    _depth: int = 0,
 ) -> Tuple[Set[str], Set[str]]:
     """Scans scope_node for (mutated_or_deleted, deleted) nonlocal variables."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        nonlocal_names: Set[str] = set()
+        for sub in ast.walk(scope_node):
+            if isinstance(sub, ast.Nonlocal):
+                nonlocal_names.update(sub.names)
+        return nonlocal_names, set(nonlocal_names)
     own_locals = (
         set()
         if (not include_nested or isinstance(scope_node, ast.ClassDef))
@@ -493,7 +501,7 @@ def _scan_scope_nonlocal_mutations_and_deletions(
             direct_mutated.add(curr.name)
             if include_nested:
                 sub_mut, sub_del = _extract_closure_nonlocal_mutations_and_deletions(
-                    curr, use_cache=use_cache
+                    curr, use_cache=use_cache, _depth=_depth + 1
                 )
                 nested_mutated.update(sub_mut - own_locals)
                 nested_deleted.update(sub_del - own_locals)
@@ -541,6 +549,7 @@ def _extract_closure_nonlocal_mutations_and_deletions_uncached(
     scope_node: ast.AST,
     *,
     use_cache: bool = True,
+    _depth: int = 0,
 ) -> Tuple[frozenset[str], frozenset[str]]:
     """Computes (mutated_or_deleted, deleted) outer-scope variables via nonlocal in scope_node.
 
@@ -549,7 +558,7 @@ def _extract_closure_nonlocal_mutations_and_deletions_uncached(
     own_locals is empty when scope_node is an ast.ClassDef.
     """
     muts, dels = _scan_scope_nonlocal_mutations_and_deletions(
-        scope_node, include_nested=True, use_cache=use_cache
+        scope_node, include_nested=True, use_cache=use_cache, _depth=_depth
     )
     return frozenset(muts), frozenset(dels)
 
@@ -579,15 +588,17 @@ def _resolve_cached_str_set_pair(
 
 
 def _extract_closure_nonlocal_mutations_and_deletions(
-    scope_node: ast.AST, *, use_cache: bool = True
+    scope_node: ast.AST, *, use_cache: bool = True, _depth: int = 0
 ) -> Tuple[Set[str], Set[str]]:
     """Extracts and caches (mutated_or_deleted, deleted) nonlocal variables in scope_node."""
     return _resolve_cached_str_set_pair(
         scope_node,
         (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
         _make_trusted_scope_cache_key(scope_node, "nl_muts_dels"),
-        lambda c: _extract_closure_nonlocal_mutations_and_deletions_uncached(scope_node, use_cache=c),
-        use_cache=use_cache,
+        lambda c: _extract_closure_nonlocal_mutations_and_deletions_uncached(
+            scope_node, use_cache=c, _depth=_depth
+        ),
+        use_cache=use_cache and _depth == 0,
     )
 
 
@@ -1235,31 +1246,34 @@ def _is_non_closure_scalar_expr(
         Only literals (``ast.Constant``, ``ast.JoinedStr``), boolean negation
         (``not x``), calls to unshadowed ``_NON_CLOSURE_RETURN_BUILTINS`` (excluding
         callable subclasses of ``int``/``str``/``float``/``bytes``),
-        and unary/binary/comparison operations whose operands are all recursively
+        and unary/binary/comparison operations whose operands are all
         non-closure scalars are classified as scalar. Binary, unary, or comparison
         operations involving arbitrary variables or custom objects are NOT assumed
         to be scalar because custom dunders (``__add__``, ``__abs__``, ``__eq__``,
         etc.) can return closures. Inline mutations inside scalar sub-expressions
         are still extracted by ``_extract_carrier_value_closure_and_load_info``.
     """
-    if isinstance(node, (ast.Constant, ast.JoinedStr)):
-        return True
-    if _is_non_closure_builtin_call(node, scope_ctx):
-        return True
-    if isinstance(node, ast.UnaryOp):
-        return isinstance(node.op, ast.Not) or _is_non_closure_scalar_expr(
-            node.operand, scope_ctx
-        )
-    if isinstance(node, ast.BinOp):
-        return _is_non_closure_scalar_expr(
-            node.left, scope_ctx
-        ) and _is_non_closure_scalar_expr(node.right, scope_ctx)
-    if isinstance(node, ast.Compare):
-        return _is_non_closure_scalar_expr(node.left, scope_ctx) and all(
-            _is_non_closure_scalar_expr(comp, scope_ctx)
-            for comp in node.comparators
-        )
-    return False
+    stack: List[ast.AST] = [node]
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, (ast.Constant, ast.JoinedStr)):
+            continue
+        if _is_non_closure_builtin_call(curr, scope_ctx):
+            continue
+        if isinstance(curr, ast.UnaryOp):
+            if not isinstance(curr.op, ast.Not):
+                stack.append(curr.operand)
+            continue
+        if isinstance(curr, ast.BinOp):
+            stack.append(curr.left)
+            stack.append(curr.right)
+            continue
+        if isinstance(curr, ast.Compare):
+            stack.append(curr.left)
+            stack.extend(curr.comparators)
+            continue
+        return False
+    return True
 
 
 def _extract_expr_closure_and_load_info(
@@ -1267,6 +1281,7 @@ def _extract_expr_closure_and_load_info(
     scope_ctx: Optional[_FnScopeContext] = None,
     *,
     called_names_out: Optional[Set[str]] = None,
+    _depth: int = 0,
 ) -> Tuple[Set[str], Set[str], Set[str]]:
     """Extracts (inline_closure_reads, inline_closure_muts, loaded_names) from expressions.
 
@@ -1320,35 +1335,28 @@ def _extract_expr_closure_and_load_info(
                 comp_exprs, comp_targets = (
                     _iter_comprehension_body_exprs_and_targets(curr)
                 )
-                sub_calls: Set[str] = set()
-                _, _, sub_loads = _extract_expr_closure_and_load_info(
-                    comp_exprs, scope_ctx, called_names_out=sub_calls
-                )
-                loaded_names.update(sub_loads - comp_targets)
-                if called_names_out is not None:
-                    called_names_out.update(sub_calls - comp_targets)
+                if _depth >= _MAX_AST_RECURSION_DEPTH:
+                    stack.extend(comp_exprs)
                 else:
-                    loaded_names.update(sub_calls - comp_targets)
+                    sub_calls: Set[str] = set()
+                    _, _, sub_loads = _extract_expr_closure_and_load_info(
+                        comp_exprs,
+                        scope_ctx,
+                        called_names_out=sub_calls,
+                        _depth=_depth + 1,
+                    )
+                    loaded_names.update(sub_loads - comp_targets)
+                    if called_names_out is not None:
+                        called_names_out.update(sub_calls - comp_targets)
+                    else:
+                        loaded_names.update(sub_calls - comp_targets)
             continue
         if isinstance(curr, ast.Call):
             if _is_non_closure_builtin_call(curr, scope_ctx):
-                sub_reads, sub_muts, sub_loads = (
-                    _extract_expr_closure_and_load_info(
-                        [
-                            *curr.args,
-                            *(
-                                kw.value
-                                for kw in curr.keywords
-                                if kw.value is not None
-                            ),
-                        ],
-                        scope_ctx,
-                        called_names_out=called_names_out,
-                    )
+                stack.extend(curr.args)
+                stack.extend(
+                    kw.value for kw in curr.keywords if kw.value is not None
                 )
-                inline_reads.update(sub_reads)
-                inline_muts.update(sub_muts)
-                loaded_names.update(sub_loads)
                 continue
             if isinstance(curr.func, ast.Attribute):
                 stack.append(curr.func.value)
@@ -2077,8 +2085,11 @@ def _is_closure_factory_scope_uncached(
     scope_ctx: Optional[_FnScopeContext] = None,
     *,
     use_cache: bool = True,
+    _depth: int = 0,
 ) -> bool:
     """Computes whether a nested function or class can return a closure or carrier."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return True
     if isinstance(scope_node, (ast.ClassDef, ast.AsyncFunctionDef)):
         unshadowed_builtins = _BUILTIN_NAMES - (
             set(scope_ctx.shadowed_names) if scope_ctx is not None else set()
@@ -2114,7 +2125,7 @@ def _is_closure_factory_scope_uncached(
                 or (
                     isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef))
                     and _is_closure_factory_scope_uncached(
-                        sub, scope_ctx, use_cache=use_cache
+                        sub, scope_ctx, use_cache=use_cache, _depth=_depth + 1
                     )
                 )
                 for sub in ast.walk(scope_node)

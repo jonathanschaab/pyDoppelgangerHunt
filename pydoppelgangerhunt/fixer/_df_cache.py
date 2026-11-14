@@ -33,6 +33,7 @@ from typing import (
 )
 
 from pydoppelgangerhunt.config import clear_closure_warning_cache
+from pydoppelgangerhunt.fixer._df_visitors import _MAX_AST_RECURSION_DEPTH
 from pydoppelgangerhunt.source_lines import (
     parse_unit_coord,
     split_source_lines,
@@ -384,14 +385,16 @@ def _validate_scope_cache_params(params: Any) -> None:
         )
 
 
-def _canonical_param_type_key(obj: Any) -> Any:
+def _canonical_param_type_key(obj: Any, *, _depth: int = 0) -> Any:
     """Builds a canonical structural and exact-type key for params so 1, True, and 1.0 never collide at any depth."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return (type(obj), id(obj))
     if isinstance(obj, tuple):
-        return (tuple, tuple(_canonical_param_type_key(x) for x in obj))
+        return (tuple, tuple(_canonical_param_type_key(x, _depth=_depth + 1) for x in obj))
     if isinstance(obj, frozenset):
         return (
             frozenset,
-            frozenset(_canonical_param_type_key(x) for x in obj),
+            frozenset(_canonical_param_type_key(x, _depth=_depth + 1) for x in obj),
         )
     if isinstance(obj, float):
         if math.isnan(obj):
@@ -402,15 +405,17 @@ def _canonical_param_type_key(obj: Any) -> Any:
     return (type(obj), obj)
 
 
-def _params_exact_types_match(a: Any, b: Any) -> bool:
+def _params_exact_types_match(a: Any, b: Any, *, _depth: int = 0) -> bool:
     """Checks that equal parameter structures also match exact scalar types at all nesting depths."""
     if a is b:
         return True
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return False
     if type(a) is not type(b):
         return False
     if isinstance(a, tuple):
         return len(a) == len(b) and all(
-            _params_exact_types_match(x, y) for x, y in zip(a, b)
+            _params_exact_types_match(x, y, _depth=_depth + 1) for x, y in zip(a, b)
         )
     if isinstance(a, frozenset):
         if len(a) != len(b):

@@ -488,7 +488,7 @@ def test_batch_82_get_module_imported_names_guarded_imports() -> None:
     assert "List" not in unconditional
     assert "Sequence" not in unconditional
 
-def test_batch_82_slice_unit_token_lines_single_line_bounds() -> None:
+def test_slice_unit_token_lines_single_line_bounds() -> None:
     """Verifies defensive single-line column bounds check in _slice_unit_token_lines."""
     from pydoppelgangerhunt.fixer import _slice_unit_token_lines  # pylint: disable=import-outside-toplevel
 
@@ -500,12 +500,12 @@ def test_batch_82_slice_unit_token_lines_single_line_bounds() -> None:
     )
     assert res_normal == ["sum(x for x in data)"]
 
-    # Inverted column bounds (e_col <= s_col) must not collapse the line to empty
+    # Inverted column bounds (e_col < s_col) must fail closed rather than slicing to EOL
     res_inverted = _slice_unit_token_lines(
         {"kind": "comprehension", "start_col": 12, "end_col": 5},
         list(line),
     )
-    assert res_inverted == ["sum(x for x in data)"]
+    assert res_inverted == []
 
 
 def test_insert_imports_orders_future_annotations_first() -> None:

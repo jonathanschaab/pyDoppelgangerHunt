@@ -1445,19 +1445,6 @@ def synthesize_shared_helper_code(
             non_suppressing_ctx_managers=sorted(set(eff_non_sup1) & set(eff_non_sup2)),
         )
     )
-    can_skip_tree_parse = (
-        has_precomputed_scopes
-        and (
-            not is_expr_unit
-            or (
-                bool(scope1 and scope1.get("_lhs_pruned"))
-                and bool(scope2 and scope2.get("_lhs_pruned"))
-            )
-        )
-        and outputs is not None
-        and outputs2 is not None
-    )
-
     def _resolve_tree(
         given_tree: Optional[ast.AST],
         given_src: Optional[str],
@@ -1465,23 +1452,6 @@ def synthesize_shared_helper_code(
     ) -> Optional[ast.AST]:
         if given_tree is not None:
             return given_tree
-        if (
-            can_skip_tree_parse
-            and (
-                not unit.get("enclosing_class")
-                or unit.get("receiver_kind") is not None
-            )
-            and unit.get("kind")
-            in (
-                "function",
-                "method",
-                "async_function",
-                "compound_block",
-                "sliding_window",
-                "clause_branch",
-            )
-        ):
-            return None
         raw_text = given_src or _load_unit_file_text(unit, repo_root=repo_root)
         if raw_text:
             return _get_or_parse_tree(raw_text)

@@ -36,6 +36,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _extract_single_node_local_names,
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
+    _MAX_AST_RECURSION_DEPTH,
     _DownstreamReadVisitor,
     _StrictPostLineVisitor,
     _VisitorPassMode,
@@ -97,35 +98,43 @@ def _find_enclosing_loops(
     ]
 
 
-def _stmt_definitely_terminates(stmt: ast.stmt) -> bool:
+def _stmt_definitely_terminates(stmt: ast.stmt, *, _depth: int = 0) -> bool:
     """Checks whether an AST statement unconditionally exits execution."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return False
     if isinstance(stmt, (ast.Return, ast.Raise)):
         return True
     if isinstance(stmt, ast.If):
         return (
             bool(stmt.orelse)
-            and _block_definitely_terminates(stmt.body)
-            and _block_definitely_terminates(stmt.orelse)
+            and _block_definitely_terminates(stmt.body, _depth=_depth + 1)
+            and _block_definitely_terminates(stmt.orelse, _depth=_depth + 1)
         )
     if isinstance(stmt, ast.Try):
-        if stmt.finalbody and _block_definitely_terminates(stmt.finalbody):
+        if stmt.finalbody and _block_definitely_terminates(stmt.finalbody, _depth=_depth + 1):
             return True
-        if stmt.handlers and _block_definitely_terminates(stmt.body):
-            return all(_block_definitely_terminates(h.body) for h in stmt.handlers)
+        if stmt.handlers and _block_definitely_terminates(stmt.body, _depth=_depth + 1):
+            return all(
+                _block_definitely_terminates(h.body, _depth=_depth + 1) for h in stmt.handlers
+            )
     if type(stmt).__name__ == "TryStar":
         finalbody = getattr(stmt, "finalbody", None)
-        if finalbody and _block_definitely_terminates(finalbody):
+        if finalbody and _block_definitely_terminates(finalbody, _depth=_depth + 1):
             return True
         handlers = getattr(stmt, "handlers", [])
         body = getattr(stmt, "body", [])
-        if handlers and _block_definitely_terminates(body):
-            return all(_block_definitely_terminates(h.body) for h in handlers)
+        if handlers and _block_definitely_terminates(body, _depth=_depth + 1):
+            return all(
+                _block_definitely_terminates(h.body, _depth=_depth + 1) for h in handlers
+            )
     return False
 
 
-def _block_definitely_terminates(stmts: Sequence[ast.stmt]) -> bool:
+def _block_definitely_terminates(stmts: Sequence[ast.stmt], *, _depth: int = 0) -> bool:
     """Checks whether any statement in a sequence unconditionally terminates execution."""
-    return any(_stmt_definitely_terminates(s) for s in stmts)
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return False
+    return any(_stmt_definitely_terminates(s, _depth=_depth) for s in stmts)
 
 
 def _stmts_enclose_unit(stmts: Sequence[ast.stmt], u_start: int, u_end: int) -> bool:

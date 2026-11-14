@@ -1347,21 +1347,22 @@ def test_pre_try_and_pre_match_bindings_survive_loop_control_termination() -> No
     assert "x" in defs_try
     assert "x" not in conds_try
 
-    match_loop_src = (
-        "x = 1\n"
-        "match status:\n"
-        "    case 200:\n"
-        "        break\n"
-        "    case _:\n"
-        "        continue\n"
-    )
-    defs_match, conds_match, term_match, _ = _analyze_block_assignment_impl(
-        ast.parse(match_loop_src).body,
-        loop_control_terminates=True,
-    )
-    assert term_match is True
-    assert "x" in defs_match
-    assert "x" not in conds_match
+    if sys.version_info >= (3, 10):
+        match_loop_src = (
+            "x = 1\n"
+            "match status:\n"
+            "    case 200:\n"
+            "        break\n"
+            "    case _:\n"
+            "        continue\n"
+        )
+        defs_match, conds_match, term_match, _ = _analyze_block_assignment_impl(
+            ast.parse(match_loop_src).body,
+            loop_control_terminates=True,
+        )
+        assert term_match is True
+        assert "x" in defs_match
+        assert "x" not in conds_match
 
 
 def test_walrus_left_to_right_order_and_compare_short_circuit_provenance() -> None:
@@ -2508,11 +2509,11 @@ def test_multi_item_with_heuristic_telemetry_and_overflow_summary(
     for idx in range(_MAX_HEURISTIC_CTX_MANAGERS + 5):
         record_heuristic_non_suppressing_ctx_manager(f"CustomMgr_{idx:04d}")
     caplog.clear()
-    with caplog.at_level(logging.INFO):
+    with caplog.at_level(logging.WARNING):
         retained = log_heuristic_ctx_manager_summary()
     assert len(retained) == _MAX_HEURISTIC_CTX_MANAGERS
     assert any(
-        rec.levelno == logging.INFO
+        rec.levelno == logging.WARNING
         and f"Summary: {_MAX_HEURISTIC_CTX_MANAGERS} unproven context manager(s)"
         in rec.message
         and "5 additional occurrence(s) omitted beyond cap" in rec.message
@@ -3175,7 +3176,7 @@ def _execute_block_runtime_paths(
     for env in input_envs:
         try:
             outcome = probe_fn(env)
-        except BaseException:  # noqa: BLE001
+        except Exception:  # pylint: disable=broad-exception-caught
             continue
         if (
             isinstance(outcome, tuple)

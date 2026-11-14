@@ -136,7 +136,7 @@ exemptions = [
 ]
 ```
 
-Leaving `closure_strictness` unset (commented out) allows `--replace-clones` (`replace_clones=True`) to default automatically to `"pedantic"` for automated call-site rewrites while keeping reporting (`--suggest`, `--html`) and preview patches (`replace_clones=False`) on `"strict"`. Setting `closure_strictness` explicitly in `pyproject.toml` or `.pydoppelgangerhunt.toml` opts `--replace-clones` out of that automatic `"pedantic"` upgrade.
+Leaving `closure_strictness` unset (commented out) allows `--replace-clones` (`replace_clones=True`) to default automatically to `"pedantic"` for automated call-site rewrites while keeping reporting (`--suggest`, `--html`) and preview patches (`replace_clones=False`) on `"strict"`. Setting a recognized `closure_strictness` (or enabling `strict_with_suppression = true` / `skip_pre_unit_closures = true`) opts `--replace-clones` out of that automatic `"pedantic"` upgrade; passing `skip_pre_unit_closures = false` or an unrecognized `closure_strictness` does not suppress `"pedantic"`.
 
 ### Cross-Module Deduplication Strategies
 
@@ -204,7 +204,7 @@ from pydoppelgangerhunt import (
 - **`extract_unit_source_code(unit, repo_root=None)`**: Extracts the source lines corresponding to a code unit from memory or disk. When an AST unit is missing an `end` line coordinate, it safely falls back to returning the single line at `start` rather than slicing to the end of the file.
 - **`refactor_module_units(source_text, replacements, lines=None, line_char_offsets=None, line_byte_offsets=None, dry_run=False, tier1=True, tier2=True, strict=True)`**: Applies multiple non-overlapping unit replacements in strict **reverse source order** (descending byte offsets) using single-pass buffer slicing, guaranteeing that downstream text expansions or contractions never invalidate upstream coordinates.
 - **`validate_module_unit_replacements(source_text, replacements, lines=None, line_char_offsets=None, line_byte_offsets=None, tier1=True, tier2=True, strict=True)`**: Non-mutating validation helper that verifies candidate replacements for collisions across Tier 1 (AST coordinate overlap) and Tier 2 (physical byte interval sweep) without modifying or allocating new source string buffers.
-- **`heuristic_ctx_manager_session(*, warn=False)`**: Context manager that isolates unproven context-manager heuristic diagnostics to the active `contextvars` execution context (propagating to worker threads via `contextvars.copy_context().run` without cross-session leakage) and emits a single consolidated summary on exit.
+- **`heuristic_ctx_manager_session(*, warn=True)`**: Context manager that isolates unproven context-manager heuristic diagnostics to the active `contextvars` execution context (propagating to worker threads via `contextvars.copy_context().run` without cross-session leakage) and emits a single consolidated summary on exit.
 - **`generate_refactoring_patch(candidate_pairs, repo_root=..., replace_clones=..., ...)`**:
   Synthesizes a multi-file unified diff (`git apply` compatible) with dependency cycle detection
   and per-pair transactional snapshot rollback. For generator subroutines (within function or
@@ -342,10 +342,10 @@ escaping callbacks across lexical scopes.
     accumulator augmented assignments (`total = 0; total += x`) under the heuristic that user dunders
     (`__len__`, `__index__`, `__bool__`, `__radd__`, etc.) do not mutate module-level globals.
     Whenever an unproven context manager is accepted via the name heuristic, `pyDoppelgangerHunt`
-    logs a deduplicated `INFO` diagnostic and a session-scoped `INFO` summary (escalated to
-    `WARNING` when `--replace-clones` / `replace_clones=True` is active) to `stderr`/logging
-    (never polluting `stdout` or `--output` report files, while recording a per-hunk advisory
-    comment in `--patch` unified diffs); automated call-site delegation (`--replace-clones` /
+    logs a deduplicated `INFO` diagnostic and a session-scoped `WARNING` summary (or `INFO`
+    when `warn=False` is passed explicitly) to `stderr`/logging (never polluting `stdout` or
+    `--output` report files, while recording an advisory `# Note:` comment in `--suggest` /
+    `--html` helper blocks and `--patch` unified diffs); automated call-site delegation (`--replace-clones` /
     `replace_clones=True`) defaults to `pedantic` unless `closure_strictness` is explicitly set.
     In every mode, positive non-suppression proofs (local class bodies and pure-Python stdlib
     managers such as `contextlib.nullcontext`) are withdrawn for the whole module when it patches
@@ -535,6 +535,8 @@ pydoppelgangerhunt --init
 | `--preserve-annotations`| Flag | Preserve PEP 484/526 type annotations (annotations stripped by default) |
 | `--max-index-frequency` | `FLOAT` | Inverted index frequency threshold to prune ubiquitous shingles (default: `0.25`) |
 | `--workers` | `INT` | Number of worker processes for parallel AST harvesting |
+
+CLI exit codes: `0` when no clones (or only baselined clones) are found cleanly, `1` when clones are reported cleanly, and `2` when internal diagnostic errors or invalid CLI/configuration arguments occur.
 
 ### Baseline Calibration & Massive Monorepo Deployments
 

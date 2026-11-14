@@ -154,6 +154,7 @@ from pydoppelgangerhunt.fixer._df_span_index import (
     _has_unresolved_span_bounds,
     _resolve_unit_col_bounds,
 )
+from pydoppelgangerhunt.fixer._df_visitors import _MAX_AST_RECURSION_DEPTH
 from pydoppelgangerhunt.fixer._df_with_provenance import (
     _SAFE_EXCEPTION_TYPE_NAMES,
     _is_non_raising_store_target,
@@ -425,6 +426,411 @@ class _ClosureHazardResult(NamedTuple):
     reasons: Tuple[str, ...] = ()
 
 
+class _ResolvedHazardAnchor(NamedTuple):
+    """Validated unit column bounds and enclosing function chain for cell hazard analysis."""
+
+    u_start_col: Optional[int]
+    u_end_col: Optional[int]
+    enclosing_chain: List[Tuple[int, int, ast.AST]]
+
+
+class _UnitMutationSets(NamedTuple):
+    """Partitioned store, output, nonlocal, and escaping mutation sets for a candidate unit."""
+
+    is_expr_unit: bool
+    unit_stores_affect_enclosing: bool
+    store_set: Set[str]
+    output_set: Set[str]
+    nonlocal_set: Set[str]
+    unit_mutated_names: Set[str]
+    explicit_nonlocal_mutations: Set[str]
+    helper_rebound_vars: Set[str]
+    escaping_unit_mutations: Set[str]
+
+
+class _EphemeralClosureFacts(NamedTuple):
+    """Intermediate facts computed inside the ephemeral unit AST context."""
+
+    enc_outer_globals: AbstractSet[str]
+    enc_escaping: AbstractSet[str]
+    unit_enclosing_scopes: List[ast.AST]
+    intra_nl_mutators: Sequence[Union[_IntraUnitMutator, Tuple[str, Set[str], bool]]]
+    is_suspended: bool
+    base_closure_reads: Set[str]
+
+
+class _UnitClosureHazardFacts(NamedTuple):
+    """Aggregated unit mutation, closure read, and escaping context facts."""
+
+    mut_sets: _UnitMutationSets
+    enc_outer_globals: AbstractSet[str]
+    enc_escaping: AbstractSet[str]
+    unit_enclosing_scopes: List[ast.AST]
+    intra_nl_mutators: Sequence[Union[_IntraUnitMutator, Tuple[str, Set[str], bool]]]
+    is_suspended: bool
+    unit_closure_reads: Set[str]
+    intra_closure_reads: Set[str]
+    eff_input_set: Set[str]
+
+
+def _single_hazard_result(reason: str) -> _ClosureHazardResult:
+    """Build a positive hazard result with a single normalized reason."""
+    reasons: List[str] = []
+    _append_hazard_reason(reasons, reason)
+    return _ClosureHazardResult(True, tuple(reasons))
+
+
+def _global_or_cell_hazard_result(
+    names: AbstractSet[str],
+    enc_outer_globals: AbstractSet[str],
+) -> _ClosureHazardResult:
+    """Build a positive hazard result classifying global escapes vs cell severing."""
+    reasons: List[str] = []
+    _append_global_or_cell_hazard(reasons, names, enc_outer_globals)
+    return _ClosureHazardResult(True, tuple(reasons))
+
+
+def _unit_is_suspended_async_or_generator(ctx: _UnitClosureHazardContext) -> bool:
+    """Return True when extracting a subroutine suspends execution via yield or await."""
+    if not ctx.is_subroutine:
+        return False
+    if ctx.has_yield:
+        return True
+    if not ctx.is_async:
+        return False
+    target: Union[Sequence[ast.stmt], ast.AST] = (
+        ctx.candidate_stmts[0].body
+        if len(ctx.candidate_stmts) == 1
+        and isinstance(ctx.candidate_stmts[0], (ast.FunctionDef, ast.AsyncFunctionDef))
+        else ctx.candidate_stmts
+    )
+    return _node_is_effectively_async(target, True)
+
+
+def _resolve_unit_hazard_anchor(
+    ctx: _UnitClosureHazardContext,
+) -> Union[_ClosureHazardResult, _ResolvedHazardAnchor]:
+    """Resolve unit column bounds, enclosing chain, and span/lexical validity."""
+    if not ctx.is_subroutine and ctx.unit_kind not in (
+        "closure",
+        "comprehension",
+        "complex_expr",
+    ):
+        return _ClosureHazardResult(False, ())
+    if ctx.mod_tree is None or ctx.u_start <= 0:
+        return _single_hazard_result("unresolved_span_bounds")
+    u_start_col, u_end_col = (
+        (ctx.u_start_col, ctx.u_end_col)
+        if ctx.cols_resolved
+        else _resolve_unit_col_bounds(
+            ctx.candidate_stmts,
+            ctx.mod_tree,
+            ctx.u_start,
+            ctx.u_end,
+            ctx.u_start_col,
+            ctx.u_end_col,
+        )
+    )
+    enclosing_chain = (
+        list(ctx.enclosing_chain)
+        if ctx.enclosing_chain is not None
+        else _find_enclosing_function_chain(
+            ctx.mod_tree, ctx.u_start, ctx.u_end, u_start_col, u_end_col
+        )
+    )
+    if not ctx.lex_validated and _has_invalid_lexical_scope_declarations(
+        ctx.candidate_stmts,
+        enclosing_chain=enclosing_chain,
+        mod_tree=ctx.mod_tree,
+    ):
+        return _single_hazard_result("invalid_lexical_declaration")
+    if not enclosing_chain:
+        span_idx = _get_span_line_index(ctx.mod_tree)
+        overlap = span_idx.has_closure_overlap(ctx.u_start, ctx.u_end)
+        has_unresolved = overlap.has_missing_end or (
+            overlap.has_overlapping_closure
+            and (u_start_col is None or u_end_col is None)
+            and _has_unresolved_span_bounds(
+                ctx.mod_tree,
+                ctx.u_start,
+                ctx.u_end,
+                u_start_col,
+                u_end_col,
+                ctx.candidate_stmts,
+            )
+        )
+        return (
+            _single_hazard_result("unresolved_span_bounds")
+            if has_unresolved
+            else _ClosureHazardResult(False, ())
+        )
+    if _has_unresolved_span_bounds(
+        enclosing_chain[-1][2],
+        ctx.u_start,
+        ctx.u_end,
+        u_start_col,
+        u_end_col,
+        ctx.candidate_stmts,
+    ):
+        return _single_hazard_result("unresolved_span_bounds")
+    return _ResolvedHazardAnchor(u_start_col, u_end_col, enclosing_chain)
+
+
+def _extract_unit_mutation_sets(
+    ctx: _UnitClosureHazardContext,
+    unit_mod: ast.Module,
+) -> _UnitMutationSets:
+    """Partition unit stores, outputs, nonlocals, and escaping mutation names."""
+    is_expr_unit = (
+        ctx.unit_kind in ("comprehension", "complex_expr") and not ctx.is_subroutine
+    )
+    unit_stores_affect_enclosing = ctx.is_subroutine or is_expr_unit
+    store_set = set(ctx.stores)
+    output_set = set(ctx.outputs)
+    nonlocal_set = set(ctx.nonlocals)
+    unit_mutated_names = store_set | set(ctx.deleted_names)
+    explicit_nonlocal_mutations: Set[str] = nonlocal_set & unit_mutated_names
+    helper_rebound_vars: Set[str] = (
+        (unit_mutated_names - explicit_nonlocal_mutations)
+        if ctx.is_subroutine
+        else set()
+    )
+    immediate_cell_mutations: Set[str] = (
+        (_extract_comprehension_walrus_names(unit_mod) | explicit_nonlocal_mutations)
+        if is_expr_unit
+        else explicit_nonlocal_mutations
+    )
+    escaping_unit_mutations = helper_rebound_vars | immediate_cell_mutations
+    return _UnitMutationSets(
+        is_expr_unit=is_expr_unit,
+        unit_stores_affect_enclosing=unit_stores_affect_enclosing,
+        store_set=store_set,
+        output_set=output_set,
+        nonlocal_set=nonlocal_set,
+        unit_mutated_names=unit_mutated_names,
+        explicit_nonlocal_mutations=explicit_nonlocal_mutations,
+        helper_rebound_vars=helper_rebound_vars,
+        escaping_unit_mutations=escaping_unit_mutations,
+    )
+
+
+def _collect_ephemeral_closure_facts(
+    ctx: _UnitClosureHazardContext,
+    anchor: _ResolvedHazardAnchor,
+    unit_mod: ast.Module,
+    mut: _UnitMutationSets,
+) -> Union[_ClosureHazardResult, _EphemeralClosureFacts]:
+    """Collect enclosing escape/closure facts inside `_ephemeral_unit_ast_context`."""
+    innermost_stmt_fn, enc_nonlocals, enc_outer_globals = (
+        _extract_chain_nonlocals_and_outer_globals(
+            anchor.enclosing_chain,
+            ctx.u_start,
+            ctx.u_end,
+            u_start_col=anchor.u_start_col,
+            u_end_col=anchor.u_end_col,
+        )
+    )
+    if _has_escaped_intra_unit_global_declarations(
+        innermost_stmt_fn,
+        ctx.u_start,
+        ctx.u_end,
+        u_start_col=anchor.u_start_col,
+        u_end_col=anchor.u_end_col,
+        is_subroutine=ctx.is_subroutine,
+    ):
+        return _single_hazard_result("global_escape")
+    enc_escaping = enc_nonlocals | enc_outer_globals
+    if mut.unit_stores_affect_enclosing and bool(
+        mut.escaping_unit_mutations
+        & (enc_outer_globals if ctx.is_subroutine else enc_escaping)
+    ):
+        return _global_or_cell_hazard_result(
+            mut.escaping_unit_mutations, enc_outer_globals
+        )
+    imm_scope = _resolve_immediate_scope_in_fn(
+        innermost_stmt_fn,
+        ctx.u_start,
+        ctx.u_end,
+        u_start_col=anchor.u_start_col,
+        u_end_col=anchor.u_end_col,
+    )
+    unit_enclosing_scopes: List[ast.AST] = [
+        enc_fn for _, _, enc_fn in anchor.enclosing_chain
+    ] + ([imm_scope] if isinstance(imm_scope, ast.ClassDef) else [])
+    intra_nl_mutators = _collect_unit_nonlocal_mutators(
+        ctx.candidate_stmts,
+        mod_tree=ctx.mod_tree,
+        enclosing_scopes=unit_enclosing_scopes,
+    )
+    is_suspended = _unit_is_suspended_async_or_generator(ctx)
+    if is_suspended and bool(
+        mut.unit_mutated_names & (enc_escaping | mut.nonlocal_set)
+    ):
+        return _global_or_cell_hazard_result(
+            mut.unit_mutated_names, enc_outer_globals
+        )
+    if ctx.is_subroutine and _extract_direct_nonlocals(unit_mod):
+        return _single_hazard_result("cell_severing")
+    unit_closures = _collect_scope_closures_uncached(
+        unit_mod,
+        module_tree=ctx.mod_tree,
+        genexp_include_header=False,
+        cache_parent_map=False,
+        enclosing_scopes=unit_enclosing_scopes,
+    )
+    base_closure_reads: Set[str] = (
+        set().union(*(reads for _, reads in unit_closures)) if unit_closures else set()
+    )
+    return _EphemeralClosureFacts(
+        enc_outer_globals=enc_outer_globals,
+        enc_escaping=enc_escaping,
+        unit_enclosing_scopes=unit_enclosing_scopes,
+        intra_nl_mutators=intra_nl_mutators,
+        is_suspended=is_suspended,
+        base_closure_reads=base_closure_reads,
+    )
+
+
+def _check_global_and_closure_read_escapes(
+    ctx: _UnitClosureHazardContext,
+    unit_mod: ast.Module,
+    facts: _UnitClosureHazardFacts,
+) -> Optional[_ClosureHazardResult]:
+    """Check global mutating calls and closure reads over escaping/mutated outer names."""
+    mut = facts.mut_sets
+    eff_input_set = facts.eff_input_set
+    if mut.unit_stores_affect_enclosing and bool(
+        eff_input_set & facts.enc_outer_globals
+    ):
+        shadowed: Set[str] = (
+            set(eff_input_set)
+            | mut.unit_mutated_names
+            | set(ctx.unit_top_locals)
+            | set(facts.enc_escaping)
+        )
+        if ctx.mod_tree is not None:
+            shadowed.update(_extract_single_node_local_names(ctx.mod_tree))
+        for enc_scope_node in facts.unit_enclosing_scopes:
+            shadowed.update(_extract_single_node_local_names(enc_scope_node))
+        has_star = _has_wildcard_star_import(
+            unit_mod,
+            module_tree=ctx.mod_tree,
+            cache_scope_node=False,
+            enclosing_scopes=facts.unit_enclosing_scopes,
+        )
+        if _unit_has_global_mutating_call(
+            ctx.candidate_stmts,
+            shadowed,
+            has_star_import=has_star,
+            allow_heuristic_builtins=not ctx.strict_with_suppression,
+        ):
+            return _single_hazard_result("global_escape")
+    if mut.unit_stores_affect_enclosing and bool(
+        facts.unit_closure_reads
+        & (
+            (mut.unit_mutated_names & (facts.enc_escaping | mut.nonlocal_set))
+            | (facts.enc_outer_globals & eff_input_set)
+        )
+    ):
+        return _global_or_cell_hazard_result(
+            facts.unit_closure_reads, facts.enc_outer_globals
+        )
+    return None
+
+
+def _collect_unit_closure_hazard_facts(
+    ctx: _UnitClosureHazardContext,
+    anchor: _ResolvedHazardAnchor,
+    unit_mod: ast.Module,
+) -> Union[_ClosureHazardResult, _UnitClosureHazardFacts]:
+    """Compute unit closure hazard facts and evaluate immediate outer-escape checks."""
+    with _ephemeral_unit_ast_context(unit_mod):
+        mut = _extract_unit_mutation_sets(ctx, unit_mod)
+        if not mut.unit_stores_affect_enclosing and bool(
+            mut.explicit_nonlocal_mutations
+        ):
+            return _single_hazard_result("cell_severing")
+        eph_or_result = _collect_ephemeral_closure_facts(ctx, anchor, unit_mod, mut)
+        if isinstance(eph_or_result, _ClosureHazardResult):
+            return eph_or_result
+    unit_closure_reads = set(eph_or_result.base_closure_reads)
+    if ctx.is_subroutine:
+        if eph_or_result.is_suspended:
+            unit_closure_reads.update(ctx.inputs)
+    elif ctx.unit_kind == "closure":
+        unit_closure_reads.update(ctx.free_vars)
+    intra_closure_reads: Set[str] = (
+        set(unit_closure_reads)
+        if ctx.is_subroutine
+        else (set(unit_closure_reads) | mut.nonlocal_set)
+    )
+    eff_input_set = set(ctx.inputs) | set(ctx.free_vars) | mut.nonlocal_set
+    facts = _UnitClosureHazardFacts(
+        mut_sets=mut,
+        enc_outer_globals=eph_or_result.enc_outer_globals,
+        enc_escaping=eph_or_result.enc_escaping,
+        unit_enclosing_scopes=eph_or_result.unit_enclosing_scopes,
+        intra_nl_mutators=eph_or_result.intra_nl_mutators,
+        is_suspended=eph_or_result.is_suspended,
+        unit_closure_reads=unit_closure_reads,
+        intra_closure_reads=intra_closure_reads,
+        eff_input_set=eff_input_set,
+    )
+    escape_result = _check_global_and_closure_read_escapes(ctx, unit_mod, facts)
+    if escape_result is not None:
+        return escape_result
+    return facts
+
+
+def _has_unseeded_conditional_store_hazard(
+    ctx: _UnitClosureHazardContext,
+    mut: _UnitMutationSets,
+    unit_closure_reads: AbstractSet[str],
+    chain_infos: Sequence[_EnclosingFnCellInfo],
+) -> bool:
+    """Return True if a conditionally assigned unit store reaches enclosing readers/closures."""
+    if (
+        ctx.definite_stores is None
+        or not ctx.is_subroutine
+        or ctx.has_yield
+        or not chain_infos
+    ):
+        return False
+    unseeded_cond_stores = (mut.store_set - set(ctx.definite_stores)) - set(ctx.inputs)
+    if not unseeded_cond_stores:
+        return False
+    imm_info = chain_infos[-1]
+    imm_sib_reads: Set[str] = (
+        set().union(*(s_r for _, s_r, _ in imm_info.sibling_closures))
+        if imm_info.sibling_closures
+        else set()
+    )
+    eff_sib_reads = (
+        imm_sib_reads & imm_info.post_reads
+        if ctx.skip_pre_unit_closures
+        else imm_sib_reads
+    )
+    cond_pre_post = (imm_info.pre_mutated - imm_info.pre_bound) & (
+        imm_info.post_reads | unit_closure_reads
+    )
+    cond_exported_closure_capture = (
+        mut.output_set & set(imm_info.post_reads) & unit_closure_reads
+    )
+    unexported_pre_post = (
+        imm_info.pre_mutated & imm_info.post_reads
+    ) - mut.output_set
+    return bool(
+        unseeded_cond_stores
+        & imm_info.fn_locals
+        & (
+            eff_sib_reads
+            | cond_pre_post
+            | cond_exported_closure_capture
+            | unexported_pre_post
+        )
+    )
+
+
 # Built-in functions that operate strictly on C-level object headers or primitive values
 # without invoking user-defined Python dunders (`__len__`, `__bool__`, `__int__`,
 # `__index__`, `__instancecheck__`, `__subclasscheck__`):
@@ -611,72 +1017,114 @@ def _check_proven_sync_iter(
     return False
 
 
-def _is_proven_primitive_subscript_expr(
-    expr: ast.Subscript,
+def _has_proven_subscript_slice_or_index(
+    slc: ast.AST,
     env: _PedanticPrimitiveEnv,
+    *,
+    allow_slice: bool,
+    _depth: int,
 ) -> bool:
-    """Returns True when a Load subscript avoids user dunders and yields a scalar primitive."""
-    if not isinstance(expr.ctx, ast.Load):
+    """Return True when subscript index or slice bounds evaluate strictly to safe primitives."""
+    if isinstance(slc, ast.Slice):
+        return allow_slice and all(
+            bound is None
+            or _is_proven_primitive_dunder_expr(bound, env, _depth=_depth + 1)
+            for bound in (slc.lower, slc.upper, slc.step)
+        )
+    return _is_proven_primitive_dunder_expr(slc, env, _depth=_depth + 1)
+
+
+def _check_subscript_load_safety(
+    node: ast.Subscript,
+    env: _PedanticPrimitiveEnv,
+    *,
+    require_primitive_result: bool,
+    _depth: int = 0,
+) -> bool:
+    """Validate Load subscript container and bounds, optionally requiring primitive elements."""
+    if _depth > _MAX_AST_RECURSION_DEPTH or not isinstance(node.ctx, ast.Load):
         return False
-    val: ast.AST = expr.value
+    val: ast.AST = node.value
     while isinstance(val, ast.NamedExpr):
         val = val.value
-    slc = expr.slice
-    if isinstance(val, ast.Constant) and isinstance(val.value, (str, bytes)):
-        if isinstance(slc, ast.Slice):
-            return all(
-                bound is None or _is_proven_primitive_dunder_expr(bound, env)
-                for bound in (slc.lower, slc.upper, slc.step)
-            )
-        return _is_proven_primitive_dunder_expr(slc, env)
-    if isinstance(slc, ast.Slice) or not _is_proven_primitive_dunder_expr(slc, env):
+    is_str_or_bytes = isinstance(val, ast.Constant) and isinstance(
+        val.value, (str, bytes)
+    )
+    if not _has_proven_subscript_slice_or_index(
+        node.slice,
+        env,
+        allow_slice=is_str_or_bytes or not require_primitive_result,
+        _depth=_depth,
+    ):
         return False
-    if isinstance(val, ast.Name) and val.id in env.prim_tuples:
+    if is_str_or_bytes or (isinstance(val, ast.Name) and val.id in env.prim_tuples):
         return True
     if isinstance(val, (ast.Tuple, ast.List)) and not any(
         isinstance(elt, ast.Starred) for elt in val.elts
     ):
-        return all(_is_proven_primitive_dunder_expr(elt, env) for elt in val.elts)
+        return not require_primitive_result or all(
+            _is_proven_primitive_dunder_expr(elt, env, _depth=_depth + 1)
+            for elt in val.elts
+        )
     return False
+
+
+def _is_proven_primitive_subscript_expr(
+    expr: ast.Subscript,
+    env: _PedanticPrimitiveEnv,
+    *,
+    _depth: int = 0,
+) -> bool:
+    """Returns True when a Load subscript avoids user dunders and yields a scalar primitive."""
+    return _check_subscript_load_safety(
+        expr, env, require_primitive_result=True, _depth=_depth
+    )
 
 
 def _is_proven_primitive_dunder_expr(
     expr: ast.AST,
     env: _PedanticPrimitiveEnv,
+    *,
+    _depth: int = 0,
 ) -> bool:
     """Returns True when expr evaluates to a built-in scalar primitive without invoking user dunders."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return False
     if isinstance(expr, ast.Constant):
         return True
     if isinstance(expr, ast.Name):
         return expr.id in env.primitives
     if isinstance(expr, ast.NamedExpr):
-        return _is_proven_primitive_dunder_expr(expr.value, env)
+        return _is_proven_primitive_dunder_expr(expr.value, env, _depth=_depth + 1)
     if isinstance(expr, ast.Subscript):
-        return _is_proven_primitive_subscript_expr(expr, env)
+        return _is_proven_primitive_subscript_expr(expr, env, _depth=_depth + 1)
     if isinstance(expr, ast.UnaryOp):
         if isinstance(expr.op, ast.Not):
-            return _is_proven_primitive_bool_expr(expr.operand, env)
-        return _is_proven_primitive_dunder_expr(expr.operand, env)
+            return _is_proven_primitive_bool_expr(expr.operand, env, _depth=_depth + 1)
+        return _is_proven_primitive_dunder_expr(expr.operand, env, _depth=_depth + 1)
     if isinstance(expr, ast.BinOp) and not isinstance(expr.op, ast.MatMult):
         return _is_proven_primitive_dunder_expr(
-            expr.left, env
-        ) and _is_proven_primitive_dunder_expr(expr.right, env)
+            expr.left, env, _depth=_depth + 1
+        ) and _is_proven_primitive_dunder_expr(expr.right, env, _depth=_depth + 1)
     if isinstance(expr, ast.BoolOp):
-        return all(_is_proven_primitive_dunder_expr(val, env) for val in expr.values)
+        return all(
+            _is_proven_primitive_dunder_expr(val, env, _depth=_depth + 1)
+            for val in expr.values
+        )
     if isinstance(expr, ast.IfExp):
         return (
-            _is_proven_primitive_bool_expr(expr.test, env)
-            and _is_proven_primitive_dunder_expr(expr.body, env)
-            and _is_proven_primitive_dunder_expr(expr.orelse, env)
+            _is_proven_primitive_bool_expr(expr.test, env, _depth=_depth + 1)
+            and _is_proven_primitive_dunder_expr(expr.body, env, _depth=_depth + 1)
+            and _is_proven_primitive_dunder_expr(expr.orelse, env, _depth=_depth + 1)
         )
     if isinstance(expr, ast.Compare):
-        return _is_proven_safe_compare(expr, env)
+        return _is_proven_safe_compare(expr, env, _depth=_depth + 1)
     if isinstance(expr, ast.JoinedStr):
         return all(
             isinstance(part, ast.Constant)
             or (
                 isinstance(part, ast.FormattedValue)
-                and _is_proven_safe_formatted_value(part, env)
+                and _is_proven_safe_formatted_value(part, env, _depth=_depth + 1)
             )
             for part in expr.values
         )
@@ -695,19 +1143,27 @@ def _is_proven_primitive_dunder_expr(
 def _is_proven_safe_formatted_value(
     node: ast.FormattedValue,
     env: _PedanticPrimitiveEnv,
+    *,
+    _depth: int = 0,
 ) -> bool:
     """Returns True when an f-string FormattedValue formats only a proven scalar primitive."""
-    return _is_proven_primitive_dunder_expr(node.value, env) and (
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return False
+    return _is_proven_primitive_dunder_expr(node.value, env, _depth=_depth + 1) and (
         node.format_spec is None
-        or _is_proven_primitive_dunder_expr(node.format_spec, env)
+        or _is_proven_primitive_dunder_expr(node.format_spec, env, _depth=_depth + 1)
     )
 
 
 def _is_proven_primitive_container_for_in(
     rhs: ast.AST,
     env: _PedanticPrimitiveEnv,
+    *,
+    _depth: int = 0,
 ) -> bool:
     """Returns True when rhs of 'in'/'not in' is a built-in container of proven primitives."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return False
     while isinstance(rhs, ast.NamedExpr):
         rhs = rhs.value
     if isinstance(rhs, ast.Constant) and isinstance(rhs.value, (str, bytes)):
@@ -716,11 +1172,13 @@ def _is_proven_primitive_container_for_in(
         return True
     if isinstance(rhs, (ast.Tuple, ast.List, ast.Set)):
         return not any(isinstance(elt, ast.Starred) for elt in rhs.elts) and all(
-            _is_proven_primitive_dunder_expr(elt, env) for elt in rhs.elts
+            _is_proven_primitive_dunder_expr(elt, env, _depth=_depth + 1)
+            for elt in rhs.elts
         )
     if isinstance(rhs, ast.Dict):
         return all(
-            key is not None and _is_proven_primitive_dunder_expr(key, env)
+            key is not None
+            and _is_proven_primitive_dunder_expr(key, env, _depth=_depth + 1)
             for key in rhs.keys
         )
     return False
@@ -729,21 +1187,25 @@ def _is_proven_primitive_container_for_in(
 def _is_proven_safe_compare(
     node: ast.Compare,
     env: _PedanticPrimitiveEnv,
+    *,
+    _depth: int = 0,
 ) -> bool:
     """Returns True when every step of a Compare expression cannot invoke user comparison/containment dunders."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return False
     operands = (node.left, *node.comparators)
     for lhs, op, rhs in zip(operands, node.ops, node.comparators):
         if isinstance(op, (ast.Is, ast.IsNot)):
             continue
         if isinstance(op, (ast.In, ast.NotIn)):
             if not (
-                _is_proven_primitive_dunder_expr(lhs, env)
-                and _is_proven_primitive_container_for_in(rhs, env)
+                _is_proven_primitive_dunder_expr(lhs, env, _depth=_depth + 1)
+                and _is_proven_primitive_container_for_in(rhs, env, _depth=_depth + 1)
             ):
                 return False
         elif not (
-            _is_proven_primitive_dunder_expr(lhs, env)
-            and _is_proven_primitive_dunder_expr(rhs, env)
+            _is_proven_primitive_dunder_expr(lhs, env, _depth=_depth + 1)
+            and _is_proven_primitive_dunder_expr(rhs, env, _depth=_depth + 1)
         ):
             return False
     return True
@@ -752,37 +1214,24 @@ def _is_proven_safe_compare(
 def _is_proven_safe_subscript_load(
     node: ast.Subscript,
     env: _PedanticPrimitiveEnv,
+    *,
+    _depth: int = 0,
 ) -> bool:
     """Returns True when a Load subscript indexes a literal or proven sequence/string with primitive bounds."""
-    if not isinstance(node.ctx, ast.Load):
-        return False
-    val: ast.AST = node.value
-    while isinstance(val, ast.NamedExpr):
-        val = val.value
-    val_ok = (
-        (isinstance(val, ast.Constant) and isinstance(val.value, (str, bytes)))
-        or (isinstance(val, ast.Name) and val.id in env.prim_tuples)
-        or (
-            isinstance(val, (ast.Tuple, ast.List))
-            and not any(isinstance(elt, ast.Starred) for elt in val.elts)
-        )
+    return _check_subscript_load_safety(
+        node, env, require_primitive_result=False, _depth=_depth
     )
-    if not val_ok:
-        return False
-    slc = node.slice
-    if isinstance(slc, ast.Slice):
-        return all(
-            bound is None or _is_proven_primitive_dunder_expr(bound, env)
-            for bound in (slc.lower, slc.upper, slc.step)
-        )
-    return _is_proven_primitive_dunder_expr(slc, env)
 
 
 def _is_proven_primitive_bool_expr(
     expr: ast.AST,
     env: _PedanticPrimitiveEnv,
+    *,
+    _depth: int = 0,
 ) -> bool:
     """Returns True when evaluating expr in a boolean context cannot invoke user-defined __bool__ or __len__."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return False
     if isinstance(expr, _STATIC_NON_DESCRIPTOR_VALUE_TYPES):
         return True
     if isinstance(expr, ast.Name) and expr.id in env.prim_tuples:
@@ -798,9 +1247,10 @@ def _is_proven_primitive_bool_expr(
         sub_bool_exprs = (expr.test, expr.body, expr.orelse)
     if sub_bool_exprs:
         return all(
-            _is_proven_primitive_bool_expr(sub_e, env) for sub_e in sub_bool_exprs
+            _is_proven_primitive_bool_expr(sub_e, env, _depth=_depth + 1)
+            for sub_e in sub_bool_exprs
         )
-    return _is_proven_primitive_dunder_expr(expr, env)
+    return _is_proven_primitive_dunder_expr(expr, env, _depth=_depth + 1)
 
 
 def _node_invokes_pedantic_dunder_protocol(
@@ -918,19 +1368,19 @@ def _extract_non_assign_bound_names(node: ast.AST) -> Set[str]:
 
 def _extract_unpack_leaf_names(target: ast.AST) -> Optional[Set[str]]:
     """Returns leaf Name ids when target is a Name or unstarred nested Tuple/List of Names."""
-    if isinstance(target, ast.Name):
-        return {target.id}
-    if isinstance(target, (ast.Tuple, ast.List)) and not any(
-        isinstance(e, ast.Starred) for e in target.elts
-    ):
-        names: Set[str] = set()
-        for elt in target.elts:
-            sub = _extract_unpack_leaf_names(elt)
-            if sub is None:
-                return None
-            names.update(sub)
-        return names
-    return None
+    names: Set[str] = set()
+    stack: List[ast.AST] = [target]
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, ast.Name):
+            names.add(curr.id)
+        elif isinstance(curr, (ast.Tuple, ast.List)) and not any(
+            isinstance(e, ast.Starred) for e in curr.elts
+        ):
+            stack.extend(curr.elts)
+        else:
+            return None
+    return names
 
 
 def _is_proven_primitive_target_value(
@@ -1428,334 +1878,91 @@ def _evaluate_severed_closure_cell_hazard(
         sibling closures explicitly referenced via ``eff_input_set`` remain enforced in
         both modes, guaranteeing monotonicity (lenient hazard implies strict hazard).
     """
-    reasons: List[str] = []
-    if not ctx.is_subroutine and ctx.unit_kind not in (
-        "closure",
-        "comprehension",
-        "complex_expr",
-    ):
-        return _ClosureHazardResult(False, ())
-    if ctx.mod_tree is None or ctx.u_start <= 0:
-        _append_hazard_reason(reasons, "unresolved_span_bounds")
-        return _ClosureHazardResult(True, tuple(reasons))
-
-    u_start_col, u_end_col = (
-        (ctx.u_start_col, ctx.u_end_col)
-        if ctx.cols_resolved
-        else _resolve_unit_col_bounds(
-            ctx.candidate_stmts,
-            ctx.mod_tree,
-            ctx.u_start,
-            ctx.u_end,
-            ctx.u_start_col,
-            ctx.u_end_col,
-        )
-    )
-    enclosing_chain = (
-        list(ctx.enclosing_chain)
-        if ctx.enclosing_chain is not None
-        else _find_enclosing_function_chain(
-            ctx.mod_tree, ctx.u_start, ctx.u_end, u_start_col, u_end_col
-        )
-    )
-    if not ctx.lex_validated and _has_invalid_lexical_scope_declarations(
-        ctx.candidate_stmts,
-        enclosing_chain=enclosing_chain,
-        mod_tree=ctx.mod_tree,
-    ):
-        _append_hazard_reason(reasons, "invalid_lexical_declaration")
-        return _ClosureHazardResult(True, tuple(reasons))
-    if not enclosing_chain:
-        span_idx = _get_span_line_index(ctx.mod_tree)
-        overlap = span_idx.has_closure_overlap(ctx.u_start, ctx.u_end)
-        has_unresolved = overlap.has_missing_end or (
-            overlap.has_overlapping_closure
-            and (u_start_col is None or u_end_col is None)
-            and _has_unresolved_span_bounds(
-                ctx.mod_tree,
-                ctx.u_start,
-                ctx.u_end,
-                u_start_col,
-                u_end_col,
-                ctx.candidate_stmts,
-            )
-        )
-        if has_unresolved:
-            _append_hazard_reason(reasons, "unresolved_span_bounds")
-            return _ClosureHazardResult(True, tuple(reasons))
-        return _ClosureHazardResult(False, ())
-    if _has_unresolved_span_bounds(
-        enclosing_chain[-1][2],
-        ctx.u_start,
-        ctx.u_end,
-        u_start_col,
-        u_end_col,
-        ctx.candidate_stmts,
-    ):
-        _append_hazard_reason(reasons, "unresolved_span_bounds")
-        return _ClosureHazardResult(True, tuple(reasons))
-
+    anchor_or_result = _resolve_unit_hazard_anchor(ctx)
+    if isinstance(anchor_or_result, _ClosureHazardResult):
+        return anchor_or_result
     unit_mod = ast.Module(body=list(ctx.candidate_stmts), type_ignores=[])
     _mark_ephemeral_unit_ast(unit_mod)
-    is_expr_unit = (
-        ctx.unit_kind in ("comprehension", "complex_expr") and not ctx.is_subroutine
+    facts_or_result = _collect_unit_closure_hazard_facts(
+        ctx, anchor_or_result, unit_mod
     )
-    unit_stores_affect_enclosing = ctx.is_subroutine or is_expr_unit
-    store_set = set(ctx.stores)
-    output_set = set(ctx.outputs)
-    nonlocal_set = set(ctx.nonlocals)
-    unit_mutated_names = store_set | set(ctx.deleted_names)
-    explicit_nonlocal_mutations: Set[str] = nonlocal_set & unit_mutated_names
-    helper_rebound_vars: Set[str] = (
-        (unit_mutated_names - explicit_nonlocal_mutations)
-        if ctx.is_subroutine
-        else set()
-    )
-    with _ephemeral_unit_ast_context(unit_mod):
-        immediate_cell_mutations: Set[str] = (
-            (_extract_comprehension_walrus_names(unit_mod) | explicit_nonlocal_mutations)
-            if is_expr_unit
-            else explicit_nonlocal_mutations
-        )
-        escaping_unit_mutations: Set[str] = helper_rebound_vars | immediate_cell_mutations
-        if not unit_stores_affect_enclosing and bool(explicit_nonlocal_mutations):
-            _append_hazard_reason(reasons, "cell_severing")
-            return _ClosureHazardResult(True, tuple(reasons))
-
-        innermost_stmt_fn, enc_nonlocals, enc_outer_globals = (
-            _extract_chain_nonlocals_and_outer_globals(
-                enclosing_chain,
-                ctx.u_start,
-                ctx.u_end,
-                u_start_col=u_start_col,
-                u_end_col=u_end_col,
-            )
-        )
-        if _has_escaped_intra_unit_global_declarations(
-            innermost_stmt_fn,
-            ctx.u_start,
-            ctx.u_end,
-            u_start_col=u_start_col,
-            u_end_col=u_end_col,
-            is_subroutine=ctx.is_subroutine,
-        ):
-            _append_hazard_reason(reasons, "global_escape")
-            return _ClosureHazardResult(True, tuple(reasons))
-        enc_escaping = enc_nonlocals | enc_outer_globals
-        if unit_stores_affect_enclosing and bool(
-            escaping_unit_mutations
-            & (enc_outer_globals if ctx.is_subroutine else enc_escaping)
-        ):
-            _append_global_or_cell_hazard(
-                reasons, escaping_unit_mutations, enc_outer_globals
-            )
-            return _ClosureHazardResult(True, tuple(reasons))
-        imm_scope = _resolve_immediate_scope_in_fn(
-            innermost_stmt_fn,
-            ctx.u_start,
-            ctx.u_end,
-            u_start_col=u_start_col,
-            u_end_col=u_end_col,
-        )
-        unit_enclosing_scopes: List[ast.AST] = [
-            enc_fn for _, _, enc_fn in enclosing_chain
-        ] + ([imm_scope] if isinstance(imm_scope, ast.ClassDef) else [])
-        intra_nl_mutators = _collect_unit_nonlocal_mutators(
-            ctx.candidate_stmts,
-            mod_tree=ctx.mod_tree,
-            enclosing_scopes=unit_enclosing_scopes,
-        )
-        is_suspended = ctx.is_subroutine and (
-            ctx.has_yield
-            or (
-                ctx.is_async
-                and _node_is_effectively_async(
-                    (
-                        ctx.candidate_stmts[0].body
-                        if len(ctx.candidate_stmts) == 1
-                        and isinstance(
-                            ctx.candidate_stmts[0],
-                            (ast.FunctionDef, ast.AsyncFunctionDef),
-                        )
-                        else ctx.candidate_stmts
-                    ),
-                    True,
-                )
-            )
-        )
-        if is_suspended and bool(unit_mutated_names & (enc_escaping | nonlocal_set)):
-            _append_global_or_cell_hazard(reasons, unit_mutated_names, enc_outer_globals)
-            return _ClosureHazardResult(True, tuple(reasons))
-
-        if ctx.is_subroutine and _extract_direct_nonlocals(unit_mod):
-            _append_hazard_reason(reasons, "cell_severing")
-            return _ClosureHazardResult(True, tuple(reasons))
-        unit_closures = _collect_scope_closures_uncached(
-            unit_mod,
-            module_tree=ctx.mod_tree,
-            genexp_include_header=False,
-            cache_parent_map=False,
-            enclosing_scopes=unit_enclosing_scopes,
-        )
-    unit_closure_reads: Set[str] = (
-        set().union(*(reads for _, reads in unit_closures)) if unit_closures else set()
-    )
-    if ctx.is_subroutine:
-        if is_suspended:
-            unit_closure_reads.update(ctx.inputs)
-    elif ctx.unit_kind == "closure":
-        unit_closure_reads.update(ctx.free_vars)
-
-    intra_closure_reads: Set[str] = (
-        set(unit_closure_reads)
-        if ctx.is_subroutine
-        else (set(unit_closure_reads) | nonlocal_set)
-    )
-
-    eff_input_set = set(ctx.inputs) | set(ctx.free_vars) | nonlocal_set
-    if unit_stores_affect_enclosing and bool(eff_input_set & enc_outer_globals):
-        shadowed_builtin_names: Set[str] = (
-            set(eff_input_set)
-            | store_set
-            | set(ctx.deleted_names)
-            | set(ctx.unit_top_locals)
-            | set(enc_escaping)
-        )
-        if ctx.mod_tree is not None:
-            shadowed_builtin_names.update(
-                _extract_single_node_local_names(ctx.mod_tree)
-            )
-        for enc_scope_node in unit_enclosing_scopes:
-            shadowed_builtin_names.update(
-                _extract_single_node_local_names(enc_scope_node)
-            )
-        has_star = _has_wildcard_star_import(
-            unit_mod,
-            module_tree=ctx.mod_tree,
-            cache_scope_node=False,
-            enclosing_scopes=unit_enclosing_scopes,
-        )
-        if _unit_has_global_mutating_call(
-            ctx.candidate_stmts,
-            shadowed_builtin_names,
-            has_star_import=has_star,
-            allow_heuristic_builtins=not ctx.strict_with_suppression,
-        ):
-            _append_hazard_reason(reasons, "global_escape")
-            return _ClosureHazardResult(True, tuple(reasons))
-    if unit_stores_affect_enclosing and bool(
-        unit_closure_reads
-        & (
-            (unit_mutated_names & (enc_escaping | nonlocal_set))
-            | (enc_outer_globals & eff_input_set)
-        )
-    ):
-        _append_global_or_cell_hazard(reasons, unit_closure_reads, enc_outer_globals)
-        return _ClosureHazardResult(True, tuple(reasons))
+    if isinstance(facts_or_result, _ClosureHazardResult):
+        return facts_or_result
+    mut = facts_or_result.mut_sets
     unit_mutations = (
-        (escaping_unit_mutations | (unit_mutated_names & unit_closure_reads))
-        if unit_stores_affect_enclosing
+        (
+            mut.escaping_unit_mutations
+            | (mut.unit_mutated_names & facts_or_result.unit_closure_reads)
+        )
+        if mut.unit_stores_affect_enclosing
         else set()
     )
-
     if (
-        not intra_closure_reads
-        and not intra_nl_mutators
+        not facts_or_result.intra_closure_reads
+        and not facts_or_result.intra_nl_mutators
         and not ctx.is_subroutine
         and not unit_mutations
     ):
         return _ClosureHazardResult(False, ())
 
     chain_infos = _build_enclosing_chain_cell_infos(
-        enclosing_chain,
+        anchor_or_result.enclosing_chain,
         ctx.u_start,
         ctx.u_end,
-        u_start_col,
-        u_end_col,
+        anchor_or_result.u_start_col,
+        anchor_or_result.u_end_col,
         unit_mutations,
         mod_tree=ctx.mod_tree,
         strict_with_suppression=ctx.strict_with_suppression,
         extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
     )
-    if (
-        ctx.definite_stores is not None
-        and ctx.is_subroutine
-        and not ctx.has_yield
-        and chain_infos
+    if _has_unseeded_conditional_store_hazard(
+        ctx, mut, facts_or_result.unit_closure_reads, chain_infos
     ):
-        unseeded_cond_stores = (store_set - set(ctx.definite_stores)) - set(ctx.inputs)
-        if unseeded_cond_stores:
-            imm_info = chain_infos[-1]
-            imm_sib_reads: Set[str] = (
-                set().union(*(s_r for _, s_r, _ in imm_info.sibling_closures))
-                if imm_info.sibling_closures
-                else set()
-            )
-            eff_sib_reads = (
-                imm_sib_reads & imm_info.post_reads
-                if ctx.skip_pre_unit_closures
-                else imm_sib_reads
-            )
-            cond_pre_post = (imm_info.pre_mutated - imm_info.pre_bound) & (
-                imm_info.post_reads | unit_closure_reads
-            )
-            cond_exported_closure_capture = (
-                output_set & set(imm_info.post_reads) & unit_closure_reads
-            )
-            unexported_pre_post = (
-                imm_info.pre_mutated & imm_info.post_reads
-            ) - output_set
-            if bool(
-                unseeded_cond_stores
-                & imm_info.fn_locals
-                & (
-                    eff_sib_reads
-                    | cond_pre_post
-                    | cond_exported_closure_capture
-                    | unexported_pre_post
-                )
-            ):
-                _append_hazard_reason(reasons, "cell_severing")
-                return _ClosureHazardResult(True, tuple(reasons))
+        return _single_hazard_result("cell_severing")
 
-    captured_candidates = intra_closure_reads & (
-        eff_input_set
-        | ((store_set | output_set) if unit_stores_affect_enclosing else set())
+    captured_candidates = facts_or_result.intra_closure_reads & (
+        facts_or_result.eff_input_set
+        | (
+            (mut.store_set | mut.output_set)
+            if mut.unit_stores_affect_enclosing
+            else set()
+        )
     )
-    sub_mutated = helper_rebound_vars | immediate_cell_mutations
     has_cell_hazard = (
         _check_intra_unit_nonlocal_mutators(
             ctx.candidate_stmts,
-            intra_nl_mutators,
+            facts_or_result.intra_nl_mutators,
             ctx.unit_top_locals,
-            nonlocal_set,
+            mut.nonlocal_set,
             chain_infos,
             is_subroutine=ctx.is_subroutine,
-            is_suspended=is_suspended,
-            eff_input_set=eff_input_set,
-            enc_escaping=enc_escaping,
+            is_suspended=facts_or_result.is_suspended,
+            eff_input_set=facts_or_result.eff_input_set,
+            enc_escaping=facts_or_result.enc_escaping,
         )
         or _check_captured_cell_mutations(
             captured_candidates,
-            eff_input_set,
+            facts_or_result.eff_input_set,
             chain_infos,
-            unit_closure_reads=unit_closure_reads,
+            unit_closure_reads=facts_or_result.unit_closure_reads,
         )
         or _check_sibling_closure_sharing(
-            eff_input_set,
-            sub_mutated,
+            facts_or_result.eff_input_set,
+            mut.escaping_unit_mutations,
             chain_infos,
-            helper_rebound_vars=helper_rebound_vars,
-            is_suspended=(is_suspended or is_expr_unit)
+            helper_rebound_vars=mut.helper_rebound_vars,
+            is_suspended=(facts_or_result.is_suspended or mut.is_expr_unit)
             and not ctx.skip_pre_unit_closures,
-            unreturned_mutations=is_expr_unit,
+            unreturned_mutations=mut.is_expr_unit,
             skip_pre_unit_closures=ctx.skip_pre_unit_closures,
         )
     )
-    if has_cell_hazard:
-        _append_hazard_reason(reasons, "cell_severing")
-        return _ClosureHazardResult(True, tuple(reasons))
-    return _ClosureHazardResult(False, ())
+    return (
+        _single_hazard_result("cell_severing")
+        if has_cell_hazard
+        else _ClosureHazardResult(False, ())
+    )
 
 
 def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:

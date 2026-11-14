@@ -1042,12 +1042,16 @@ def _collect_scope_closures_uncached(
         bound_names: AbstractSet[str] = frozenset(),
         cls_shadowed: AbstractSet[str] = frozenset(),
     ) -> None:
-        eff_shadowed = (
-            shadowed_names | set(cls_shadowed)
-            if cls_shadowed
-            else shadowed_names
-        )
-        for stmt in stmts:
+        work: List[Tuple[ast.AST, AbstractSet[str], AbstractSet[str]]] = [
+            (s, bound_names, cls_shadowed) for s in reversed(tuple(stmts))
+        ]
+        while work:
+            stmt, cur_bound, cur_cls_shadowed = work.pop()
+            eff_shadowed = (
+                shadowed_names | set(cur_cls_shadowed)
+                if cur_cls_shadowed
+                else shadowed_names
+            )
             stmt_start, stmt_col = _resolve_stmt_start_pos(stmt)
 
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1056,10 +1060,10 @@ def _collect_scope_closures_uncached(
                     iter_nested_scope_header_nodes(stmt, include_annotations=False),
                     stmt_start,
                     stmt_col,
-                    bound_names,
+                    cur_bound,
                     eff_shadowed,
                 )
-                inner_bound = bound_names | _extract_node_type_param_names(stmt)
+                inner_bound = cur_bound | _extract_node_type_param_names(stmt)
                 fn_scoped_exprs = (
                     [
                         arg.annotation
@@ -1078,7 +1082,7 @@ def _collect_scope_closures_uncached(
                 )
                 body_reads = frozenset(
                     _extract_nested_scope_free_reads(stmt, include_header=False)
-                    - bound_names
+                    - cur_bound
                 )
                 if body_reads or len(closures) == before_len:
                     closures.append(
@@ -1091,10 +1095,10 @@ def _collect_scope_closures_uncached(
                     stmt.decorator_list,
                     stmt_start,
                     stmt_col,
-                    bound_names,
+                    cur_bound,
                     eff_shadowed,
                 )
-                inner_bound = bound_names | _extract_node_type_param_names(stmt)
+                inner_bound = cur_bound | _extract_node_type_param_names(stmt)
                 class_scoped_exprs = (
                     list(stmt.bases)
                     + [kw.value for kw in stmt.keywords]
@@ -1110,10 +1114,13 @@ def _collect_scope_closures_uncached(
                 inner_cls_shadowed = frozenset(
                     _extract_single_node_local_names(stmt)
                 )
-                _walk_stmts(stmt.body, inner_bound, inner_cls_shadowed)
+                work.extend(
+                    (sub_s, inner_bound, inner_cls_shadowed)
+                    for sub_s in reversed(stmt.body)
+                )
                 continue
 
-            header_bound = bound_names | _extract_node_type_param_names(stmt)
+            header_bound = cur_bound | _extract_node_type_param_names(stmt)
             _record_expr_closures(
                 _extract_header_nodes(stmt),
                 stmt_start,
@@ -1122,29 +1129,33 @@ def _collect_scope_closures_uncached(
                 eff_shadowed,
             )
 
-            for attr in ("body", "orelse", "finalbody"):
-                sub_stmts = getattr(stmt, attr, None)
-                if isinstance(sub_stmts, list):
-                    _walk_stmts(sub_stmts, bound_names, cls_shadowed)
-
             # Intentional precision trade-off: treat ExceptHandler.name and match_case
             # pattern bindings as locally bound inside their respective blocks so closures
             # referencing them are not misreported as capturing prior outer variables.
+            # Push nested child blocks in reverse traversal order so DFS source order is preserved.
+            pending_children: List[Tuple[ast.AST, AbstractSet[str], AbstractSet[str]]] = []
+            for attr in ("body", "orelse", "finalbody"):
+                sub_stmts = getattr(stmt, attr, None)
+                if isinstance(sub_stmts, list):
+                    for sub_s in sub_stmts:
+                        pending_children.append((sub_s, cur_bound, cur_cls_shadowed))
+
             for handler in getattr(stmt, "handlers", []):
                 h_name = getattr(handler, "name", None)
                 h_bound = (
-                    bound_names | {h_name}
+                    cur_bound | {h_name}
                     if isinstance(h_name, str)
-                    else bound_names
+                    else cur_bound
                 )
-                _walk_stmts(getattr(handler, "body", []), h_bound, cls_shadowed)
+                for sub_s in getattr(handler, "body", []):
+                    pending_children.append((sub_s, h_bound, cur_cls_shadowed))
 
             for case in getattr(stmt, "cases", []):
                 pattern = getattr(case, "pattern", None)
-                case_bound = bound_names
+                case_bound = cur_bound
                 if isinstance(pattern, ast.AST):
                     _record_expr_closures(
-                        [pattern], stmt_start, stmt_col, bound_names, eff_shadowed
+                        [pattern], stmt_start, stmt_col, cur_bound, eff_shadowed
                     )
                     pattern_names = {
                         name
@@ -1153,13 +1164,17 @@ def _collect_scope_closures_uncached(
                         if name is not None
                     }
                     if pattern_names:
-                        case_bound = bound_names | pattern_names
+                        case_bound = cur_bound | pattern_names
                 guard = getattr(case, "guard", None)
                 if isinstance(guard, ast.AST):
                     _record_expr_closures(
                         [guard], stmt_start, stmt_col, case_bound, eff_shadowed
                     )
-                _walk_stmts(getattr(case, "body", []), case_bound, cls_shadowed)
+                for sub_s in getattr(case, "body", []):
+                    pending_children.append((sub_s, case_bound, cur_cls_shadowed))
+
+            if pending_children:
+                work.extend(reversed(pending_children))
 
     scope_stmts = (
         raw_scope_body if isinstance(raw_scope_body, list)
@@ -1297,21 +1312,27 @@ def _collect_pre_unit_closures(
 def _is_irrefutable_pattern(
     pattern: Optional[ast.AST],
 ) -> bool:  # pragma: no cover (py310+)
-    """Recursively determines if a pattern matching AST node unconditionally matches any subject.
+    """Determines whether a pattern matching AST node unconditionally matches any subject.
 
     Note:
         Passing ``None`` directly returns ``False`` (no pattern node exists). Inside an
         ``ast.MatchAs`` node, ``pattern.pattern is None`` represents a wildcard ``case _:``
-        or bare capture ``case x:`` and is handled directly before recursing.
+        or bare capture ``case x:`` and matches unconditionally.
     """
     if pattern is None:
         return False
-    if is_match_as_node(pattern):
-        sub_pat = getattr(pattern, "pattern", None)
-        return sub_pat is None or _is_irrefutable_pattern(sub_pat)
-    if is_match_or_node(pattern):
-        patterns = getattr(pattern, "patterns", [])
-        return any(_is_irrefutable_pattern(p) for p in patterns)
+    stack: List[Optional[ast.AST]] = [pattern]
+    while stack:
+        curr = stack.pop()
+        if curr is None:
+            continue
+        if is_match_as_node(curr):
+            sub_pat = getattr(curr, "pattern", None)
+            if sub_pat is None:
+                return True
+            stack.append(sub_pat)
+        elif is_match_or_node(curr):
+            stack.extend(getattr(curr, "patterns", []))
     return False
 
 
