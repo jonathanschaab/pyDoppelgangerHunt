@@ -16,6 +16,308 @@ from pydoppelgangerhunt.fixer import (
 )
 
 
+@pytest.mark.parametrize(
+    ("case_id", "src", "expect_has_patch", "expected_patched_names"),
+    [
+        pytest.param(
+            "shadowed_eval_param_assigned_to_flag_and_unrelated_call",
+            (
+                "class Mgr:\n"
+                "    def __enter__(self): return self\n"
+                "    def __exit__(self, *a): return False\n"
+                "\n"
+                "def configure(eval: bool = False):\n"
+                "    flag = eval\n"
+                "    return flag\n"
+                "\n"
+                "def run():\n"
+                "    return flag()\n"
+            ),
+            False,
+            frozenset(),
+            id="shadowed_eval_param_assigned_to_flag_and_unrelated_call",
+        ),
+        pytest.param(
+            "shadowed_eval_and_exec_params_called",
+            (
+                "def run_hook(eval):\n"
+                "    return eval(1)\n"
+                "\n"
+                "def run_local():\n"
+                "    exec = lambda cmd: cmd\n"
+                "    return exec('ok')\n"
+            ),
+            False,
+            frozenset(),
+            id="shadowed_eval_and_exec_params_called",
+        ),
+        pytest.param(
+            "shadowed_builtins_importlib_sys_and_attr_helpers",
+            (
+                "def configure(builtins=None, importlib=None, sys=None, vars=None, globals=None, getattr=None, setattr=None, delattr=None, obj=None, fn=None):\n"
+                "    builtins.setattr(obj, '__exit__', fn)\n"
+                "    builtins.eval('1')\n"
+                "    importlib.import_module('builtins')\n"
+                "    vars(builtins)\n"
+                "    globals()['__builtins__']\n"
+                "    sys.modules['builtins']\n"
+                "    getattr(builtins, 'eval')\n"
+                "    setattr(obj, '__exit__', fn)\n"
+                "    delattr(obj, '__exit__')\n"
+            ),
+            False,
+            frozenset(),
+            id="shadowed_builtins_importlib_sys_and_attr_helpers",
+        ),
+        pytest.param(
+            "shadowed_type_and_object_dunder_refs_and_comprehension_shadow",
+            (
+                "def clean(type, object):\n"
+                "    ref_a = type.__setattr__\n"
+                "    ref_b = object.__delattr__\n"
+                "    vals = [eval(i) for eval in (lambda x: x,) for i in (1, 2)]\n"
+                "    fn = lambda setattr: setattr(ref_a, '__exit__', ref_b)\n"
+                "    return vals, fn\n"
+            ),
+            False,
+            frozenset(),
+            id="shadowed_type_and_object_dunder_refs_and_comprehension_shadow",
+        ),
+        pytest.param(
+            "pure_setattr_safe_attr_only",
+            (
+                "class Mgr:\n"
+                "    pass\n"
+                "\n"
+                "def setup():\n"
+                "    sa = setattr\n"
+                "    sa(Mgr, 'safe_flag', True)\n"
+            ),
+            False,
+            frozenset(),
+            id="pure_setattr_safe_attr_only",
+        ),
+        pytest.param(
+            "positive_module_alias_eval_call",
+            (
+                "flag = eval\n"
+                "\n"
+                "def run():\n"
+                "    return flag('1 + 1')\n"
+            ),
+            True,
+            frozenset(),
+            id="positive_module_alias_eval_call",
+        ),
+        pytest.param(
+            "positive_nested_from_builtins_import_eval_inside_shadowed_outer",
+            (
+                "def outer():\n"
+                "    eval = False\n"
+                "    def inner():\n"
+                "        from builtins import eval\n"
+                "        return eval('1')\n"
+                "    return eval, inner\n"
+            ),
+            True,
+            frozenset(),
+            id="positive_nested_from_builtins_import_eval_inside_shadowed_outer",
+        ),
+        pytest.param(
+            "positive_walrus_import_builtins_eval_call",
+            (
+                "def trigger():\n"
+                "    b = (mod := __import__('builtins'))\n"
+                "    return b.eval('1')\n"
+            ),
+            True,
+            frozenset(),
+            id="positive_walrus_import_builtins_eval_call",
+        ),
+        pytest.param(
+            "positive_nested_global_eval_inside_shadowed_outer",
+            (
+                "def outer(eval: bool = False):\n"
+                "    def inner():\n"
+                "        global eval\n"
+                "        return eval('1')\n"
+                "    return eval, inner\n"
+            ),
+            True,
+            frozenset(),
+            id="positive_nested_global_eval_inside_shadowed_outer",
+        ),
+        pytest.param(
+            "positive_class_body_setattr_alias_targets_manager",
+            (
+                "class Mgr:\n"
+                "    pass\n"
+                "\n"
+                "class Patcher:\n"
+                "    sa = setattr\n"
+                "    sa(Mgr, '__exit__', lambda *a: True)\n"
+            ),
+            True,
+            frozenset({"Mgr"}),
+            id="positive_class_body_setattr_alias_targets_manager",
+        ),
+    ],
+)
+def test_exit_protocol_lexical_slot_shadowing_and_aliases(
+    case_id: str,
+    src: str,
+    expect_has_patch: bool,
+    expected_patched_names: frozenset[str],
+) -> None:
+    """Verifies lexical-slot isolation prevents shadowed parameter pollution while preserving real alias detection."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    clear_dataflow_cache()
+    tree = ast.parse(src)
+    scan = scan_exit_protocol_patches(tree)
+    assert scan.has_patch is expect_has_patch, case_id
+    assert expected_patched_names <= scan.patched_names, case_id
+
+
+def test_shadowed_eval_parameter_preserves_proven_with_safety() -> None:
+    """Verifies unrelated local eval parameter no longer withdraws non-suppression proofs on Mgr."""
+    src = (
+        "def configure(eval: bool = False):\n"
+        "    flag = eval\n"
+        "    return flag\n"
+        "\n"
+        "class SafeMgr:\n"
+        "    def __enter__(self):\n"
+        "        return self\n"
+        "    def __exit__(self, exc_type, exc, tb):\n"
+        "        return False\n"
+        "\n"
+        "def worker(step):\n"
+        "    mgr = SafeMgr()\n"
+        "    with mgr:\n"
+        "        out = step()\n"
+        "    return out\n"
+    )
+    clear_dataflow_cache()
+    tree = ast.parse(src)
+    lines = src.splitlines()
+    start_line = next(i + 1 for i, ln in enumerate(lines) if "with mgr:" in ln)
+    end_line = next(i + 1 for i, ln in enumerate(lines) if "out = step()" in ln)
+    for mode in ("strict", "pedantic"):
+        sc = inspect_single_unit_scope(
+            {
+                "start": start_line,
+                "end": end_line,
+                "kind": "compound_block",
+                "source_text": src,
+                "closure_strictness": mode,
+            },
+            tree=tree,
+        )
+        assert sc["is_control_flow_safe"] is True, mode
+
+
+@pytest.mark.parametrize(
+    ("scenario_id", "setup_src", "mode", "expect_safe"),
+    [
+        pytest.param(
+            "class_body_nonlocal_rebind_invalidates_cm",
+            (
+                "    class Trigger:\n"
+                "        nonlocal cm\n"
+                "        cm = SuppressErrors\n"
+            ),
+            "pedantic",
+            False,
+            id="class_body_nonlocal_rebind_invalidates_cm",
+        ),
+        pytest.param(
+            "class_body_mutator_call_invalidates_cm",
+            (
+                "    def mutate():\n"
+                "        nonlocal cm\n"
+                "        cm = unknown_cm\n"
+                "    class Trigger:\n"
+                "        mutate()\n"
+            ),
+            "pedantic",
+            False,
+            id="class_body_mutator_call_invalidates_cm",
+        ),
+        pytest.param(
+            "nested_fn_class_body_nonlocal_rebind_invalidates_cm",
+            (
+                "    def mutate():\n"
+                "        class InnerTrigger:\n"
+                "            nonlocal cm\n"
+                "            cm = unknown_cm\n"
+                "    mutate()\n"
+            ),
+            "pedantic",
+            False,
+            id="nested_fn_class_body_nonlocal_rebind_invalidates_cm",
+        ),
+        pytest.param(
+            "comprehension_walrus_cross_scope_mutation_invalidates_cm",
+            (
+                "    def mutate():\n"
+                "        nonlocal cm\n"
+                "        return [(cm := unknown_cm) for _ in (1,)]\n"
+                "    mutate()\n"
+            ),
+            "pedantic",
+            False,
+            id="comprehension_walrus_cross_scope_mutation_invalidates_cm",
+        ),
+        pytest.param(
+            "negative_benign_class_body_preserves_proven_cm",
+            (
+                "    class SafeHelper:\n"
+                "        TAG = 'v1'\n"
+                "        @staticmethod\n"
+                "        def noop():\n"
+                "            return 1\n"
+            ),
+            "pedantic",
+            True,
+            id="negative_benign_class_body_preserves_proven_cm",
+        ),
+    ],
+)
+def test_immediate_class_body_and_comprehension_walrus_provenance(
+    scenario_id: str,
+    setup_src: str,
+    mode: str,
+    expect_safe: bool,
+) -> None:
+    """Verifies class bodies execute eagerly for provenance/cross-scope mutation and comprehension walruses propagate."""
+    src = (
+        "from contextlib import nullcontext\n"
+        "def outer(SuppressErrors, unknown_cm, step, items):\n"
+        "    cm = nullcontext\n"
+        f"{setup_src}"
+        "    with cm():\n"
+        "        scale = step()\n"
+        "    out = [(lambda: scale + x)() for x in items]\n"
+        "    return out\n"
+    )
+    clear_dataflow_cache()
+    tree = ast.parse(src)
+    lines = src.splitlines()
+    start_line = next(i + 1 for i, ln in enumerate(lines) if "out = [" in ln)
+    sc = inspect_single_unit_scope(
+        {
+            "start": start_line,
+            "end": start_line,
+            "kind": "linear_block",
+            "source_text": src,
+            "closure_strictness": mode,
+        },
+        tree=tree,
+    )
+    assert sc["is_control_flow_safe"] is expect_safe, scenario_id
+
+
 def test_with_and_async_with_definite_bindings() -> None:
     """Covers definite-binding analysis inside with and async with bodies."""
     from pydoppelgangerhunt.fixer._df_cell_traversal import (

@@ -485,10 +485,15 @@ def validate_unit_schema(
                     unit, ("start_col", "col_offset", "start_col_offset")
                 )
                 e_col = _parse_first_unit_coord(unit, ("end_col", "end_col_offset"))
-                if s_col is not None and e_col is not None and e_col < s_col:
+                if s_col is not None and e_col is not None and e_col <= s_col:
+                    if e_col < s_col:
+                        raise ValueError(
+                            f"Inverted column coordinates on line {s_val}: "
+                            f"start_col={s_col} > end_col={e_col}"
+                        )
                     raise ValueError(
-                        f"Inverted column coordinates on line {s_val}: "
-                        f"start_col={s_col} > end_col={e_col}"
+                        f"Zero-width column coordinates on line {s_val}: "
+                        f"start_col={s_col} == end_col={e_col}"
                     )
     return unknown
 

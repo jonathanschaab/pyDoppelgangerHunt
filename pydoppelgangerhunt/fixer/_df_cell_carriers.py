@@ -1571,12 +1571,12 @@ def _extract_class_body_unconditional_def_names(
             deletions_out=shallow_dels,
             pep227_loads_out=pep227_loads,
         )
+        if shallow_dels:
+            currently_bound.difference_update(shallow_dels)
         for ref in s_loads | s_calls:
             if ref not in currently_bound:
                 used_when_unbound.add(ref)
         used_when_unbound.update(pep227_loads)
-        if shallow_dels:
-            currently_bound.difference_update(shallow_dels)
         if isinstance(
             stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
         ):

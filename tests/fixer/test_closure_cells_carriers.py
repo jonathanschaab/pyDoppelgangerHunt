@@ -3149,3 +3149,46 @@ def test_attribute_call_closure_factory_negative_controls_do_not_flag_severance(
         tmp_path, scenario_id, pre_setup, in_unit_expr
     ):
         assert "severed_closure_cell" not in sc1["control_flow_hazards"], (scenario_id, mode)
+
+
+@pytest.mark.parametrize(
+    ("case_id", "class_body_src", "expect_x_uncond_def"),
+    [
+        pytest.param(
+            "compound_del_then_call_uses_outer_before_def",
+            (
+                "    if cond:\n"
+                "        del x; x()\n"
+                "    def x(self):\n"
+                "        return 1\n"
+            ),
+            False,
+            id="compound_del_then_call_uses_outer_before_def",
+        ),
+        pytest.param(
+            "negative_rebound_before_subsequent_read",
+            (
+                "    if cond:\n"
+                "        del x\n"
+                "    x = 10\n"
+                "    y = x\n"
+            ),
+            True,
+            id="negative_rebound_before_subsequent_read",
+        ),
+    ],
+)
+def test_class_body_unconditional_def_compound_delete_before_use(
+    case_id: str,
+    class_body_src: str,
+    expect_x_uncond_def: bool,
+) -> None:
+    """Verifies compound 'del x; x()' marks x as used when unbound rather than masked by later rebinding."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _extract_class_body_unconditional_def_names,
+    )
+
+    cls_node = ast.parse(f"class Worker:\n{class_body_src}").body[0]
+    assert isinstance(cls_node, ast.ClassDef)
+    uncond = _extract_class_body_unconditional_def_names(cls_node)
+    assert ("x" in uncond) is expect_x_uncond_def, case_id

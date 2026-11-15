@@ -9189,7 +9189,7 @@ def test_generate_refactoring_patch_skips_mismatched_subroutine_kinds(
         with mock.patch(
             "pydoppelgangerhunt.fixer.patch.synthesize_shared_helper_code"
         ) as mock_synth, mock.patch(
-            "pydoppelgangerhunt.fixer.patch.inspect_single_unit_scope"
+            "pydoppelgangerhunt.fixer.patch.ensure_unit_scope_closure_mode"
         ) as mock_scope:
             patch = generate_refactoring_patch(
                 [(1.0, u1, u2)],

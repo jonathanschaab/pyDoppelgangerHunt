@@ -3087,3 +3087,116 @@ def test_local_class_receiver_in_place_container_and_subattr_mutations(
         assert "nonlocal_closure_hazard" in sc["control_flow_hazards"] or bool(
             sc["closure_hazard_reasons"]
         )
+
+
+@pytest.mark.parametrize(
+    ("case_id", "unit_kwargs", "expect_oob"),
+    [
+        pytest.param(
+            "single_line_inverted_with_placeholder_origin",
+            {
+                "start": 1,
+                "end": 1,
+                "start_col": 8,
+                "end_col": 4,
+                "is_placeholder_origin": True,
+                "explicit_col_sliced": True,
+            },
+            True,
+            id="single_line_inverted_with_placeholder_origin",
+        ),
+        pytest.param(
+            "single_line_zero_width_with_placeholder_origin",
+            {
+                "start": 1,
+                "end": 1,
+                "start_col": 4,
+                "end_col": 4,
+                "is_placeholder_origin": True,
+                "explicit_col_sliced": True,
+            },
+            True,
+            id="single_line_zero_width_with_placeholder_origin",
+        ),
+        pytest.param(
+            "multiline_allows_end_col_less_than_start_col",
+            {
+                "start": 1,
+                "end": 2,
+                "start_col": 10,
+                "end_col": 5,
+                "is_placeholder_origin": True,
+                "explicit_col_sliced": True,
+            },
+            False,
+            id="multiline_allows_end_col_less_than_start_col",
+        ),
+        pytest.param(
+            "valid_single_line_nonempty_span",
+            {
+                "start": 1,
+                "end": 1,
+                "start_col": 2,
+                "end_col": 6,
+                "is_placeholder_origin": True,
+                "explicit_col_sliced": True,
+            },
+            False,
+            id="valid_single_line_nonempty_span",
+        ),
+    ],
+)
+def test_has_out_of_bounds_unit_cols_checks_placeholder_single_line_order(
+    case_id: str,
+    unit_kwargs: dict[str, Any],
+    expect_oob: bool,
+) -> None:
+    """Verifies single-line inverted and zero-width columns are rejected even on placeholder/pre-sliced units."""
+    from pydoppelgangerhunt.fixer.scope import _has_out_of_bounds_unit_cols
+
+    unit_dict = dict(unit_kwargs)
+    is_placeholder = bool(unit_dict.pop("is_placeholder_origin", False))
+    explicit_sliced = bool(unit_dict.pop("explicit_col_sliced", False))
+    assert (
+        _has_out_of_bounds_unit_cols(
+            unit_dict,
+            [],
+            is_pre_sliced=True,
+            is_placeholder_origin=is_placeholder,
+            explicit_col_sliced=explicit_sliced,
+        )
+        is expect_oob
+    ), case_id
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "start_col", "end_col", "err_pattern"),
+    [
+        pytest.param(1, 1, 4, 4, "Zero-width column coordinates", id="single_line_zero_width"),
+        pytest.param(1, 1, 8, 4, "Inverted column coordinates", id="single_line_inverted"),
+        pytest.param(1, 2, 10, 5, None, id="multiline_cross_col_ok"),
+        pytest.param(1, 1, 2, 6, None, id="single_line_valid"),
+    ],
+)
+def test_validate_unit_schema_single_line_zero_width_and_inverted_cols(
+    start: int,
+    end: int,
+    start_col: int,
+    end_col: int,
+    err_pattern: str | None,
+) -> None:
+    """Verifies validate_unit_schema rejects both zero-width and inverted single-line column spans."""
+    from pydoppelgangerhunt.fixer.source import validate_unit_schema
+
+    unit: dict[str, Any] = {
+        "start": start,
+        "end": end,
+        "kind": "expression",
+        "start_col": start_col,
+        "end_col": end_col,
+    }
+    if err_pattern is not None:
+        with pytest.raises(ValueError, match=err_pattern):
+            validate_unit_schema(unit)
+    else:
+        validate_unit_schema(unit)

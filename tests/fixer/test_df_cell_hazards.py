@@ -1963,6 +1963,7 @@ def test_pedantic_global_escape_rejects_implicit_truth_value_evaluation(
     )
     assert sc_pedantic["is_control_flow_safe"] is False
     assert "global_escape" in sc_pedantic["closure_hazard_reasons"]
+
     patch_pedantic = generate_refactoring_patch(
         [(1.0, dict(u1), dict(u2))],
         repo_root=str(tmp_path),
@@ -2384,3 +2385,61 @@ def test_strict_builtin_allowlist_dunder_len_and_index_runtime_divergence_contro
     )
     assert sc_pedantic["is_control_flow_safe"] is False
     assert "global_escape" in sc_pedantic["closure_hazard_reasons"]
+
+
+@pytest.mark.parametrize(
+    ("case_id", "fn_body", "expect_safe_strict"),
+    [
+        pytest.param(
+            "annassign_self_referential_annotation_not_pure_accumulator",
+            ("    t: t = 0\n" "    t += 1\n"),
+            False,
+            id="annassign_self_referential_annotation_not_pure_accumulator",
+        ),
+        pytest.param(
+            "annassign_reads_later_accumulator_in_annotation",
+            ("    a: t = 0\n" "    t = 0\n" "    t += 1\n"),
+            False,
+            id="annassign_reads_later_accumulator_in_annotation",
+        ),
+        pytest.param(
+            "positive_annassign_primitive_annotation_int_remains_safe",
+            ("    t: int = 0\n" "    t += 1\n"),
+            True,
+            id="positive_annassign_primitive_annotation_int_remains_safe",
+        ),
+    ],
+)
+def test_strict_primitive_accumulator_records_annassign_annotation_reads(
+    case_id: str,
+    fn_body: str,
+    expect_safe_strict: bool,
+) -> None:
+    """Verifies AnnAssign annotation identifier reads before init prevent false pure-accumulator proofs."""
+    src = (
+        "STATE = 10\n"
+        "def run_op():\n"
+        "    global STATE\n"
+        "    first = STATE\n"
+        f"{fn_body}"
+        "    second = STATE\n"
+        "    return first, second, t\n"
+    )
+    clear_dataflow_cache()
+    tree = ast.parse(src)
+    lines = src.splitlines()
+    start_line = next(i + 1 for i, ln in enumerate(lines) if "first = STATE" in ln)
+    end_line = next(i + 1 for i, ln in enumerate(lines) if "second = STATE" in ln)
+    sc = inspect_single_unit_scope(
+        {
+            "start": start_line,
+            "end": end_line,
+            "kind": "compound_block",
+            "source_text": src,
+            "closure_strictness": "strict",
+        },
+        tree=tree,
+    )
+    assert sc["is_control_flow_safe"] is expect_safe_strict, case_id
+    if not expect_safe_strict:
+        assert "global_escape" in sc["closure_hazard_reasons"], case_id

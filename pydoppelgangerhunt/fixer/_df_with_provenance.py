@@ -784,27 +784,41 @@ class _SuppressProvenance:
             ),
         )
 
-    def apply_cross_scope_invalidation(self) -> _SuppressProvenance:
-        """Invalidates positive bindings for names mutable via global/nonlocal helpers."""
-        mut = self.cross_scope_mutated
-        if not mut:
+    def invalidate_cross_scope_targets(
+        self,
+        mutated: AbstractSet[str],
+        suppressor_targets: AbstractSet[str] = frozenset(),
+        suspicious_targets: AbstractSet[str] = frozenset(),
+    ) -> _SuppressProvenance:
+        """Invalidates positive bindings and merges suppressor provenance for mutated names."""
+        if not mutated:
             return self
-        shad_b = frozenset(n for n in mut if n in _SHADOWABLE_BUILTIN_CTX_NAMES)
+        shad_b = frozenset(n for n in mutated if n in _SHADOWABLE_BUILTIN_CTX_NAMES)
         return replace(
             self,
-            suppressors=self.suppressors | self.cross_scope_suppressors,
-            non_suppressors=self.non_suppressors - mut,
+            suppressors=self.suppressors | frozenset(suppressor_targets),
+            non_suppressors=self.non_suppressors - mutated,
             stdlib_modules=frozenset(
-                pair for pair in self.stdlib_modules if pair[0] not in mut
+                pair for pair in self.stdlib_modules if pair[0] not in mutated
             ),
             shadowed_builtins=self.shadowed_builtins | shad_b,
             imported_symbols=frozenset(
-                pair for pair in self.imported_symbols if pair[0] not in mut
+                pair for pair in self.imported_symbols if pair[0] not in mutated
             ),
-            shadowed_names=self.shadowed_names | mut,
-            non_suppressor_instances=self.non_suppressor_instances - mut,
-            suspicious_aliases=(self.suspicious_aliases - self.cross_scope_suppressors)
-            | self.cross_scope_suspicious,
+            shadowed_names=self.shadowed_names | frozenset(mutated),
+            non_suppressor_instances=self.non_suppressor_instances - mutated,
+            suspicious_aliases=(
+                (self.suspicious_aliases - frozenset(suppressor_targets))
+                | frozenset(suspicious_targets)
+            ),
+        )
+
+    def apply_cross_scope_invalidation(self) -> _SuppressProvenance:
+        """Invalidates positive bindings for names mutable via global/nonlocal helpers."""
+        return self.invalidate_cross_scope_targets(
+            self.cross_scope_mutated,
+            self.cross_scope_suppressors,
+            self.cross_scope_suspicious,
         )
 
     def merge_branch_conservative(
@@ -1296,12 +1310,26 @@ _CLASS_DISALLOWED_META_DUNDERS: frozenset[str] = frozenset(
 )
 
 
-def _iter_shallow_scope_body_nodes(scope_node: ast.AST) -> Iterator[ast.AST]:
-    """Yields AST nodes in scope_node.body without descending into nested _INNER_SCOPE_TYPES bodies."""
+_DEFERRED_DEF_SCOPE_TYPES: Tuple[type, ...] = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.Lambda,
+)
+
+
+def _iter_shallow_scope_body_nodes(
+    scope_node: ast.AST,
+    *,
+    deferred_scope_types: Tuple[type, ...] = _DEFERRED_DEF_SCOPE_TYPES,
+) -> Iterator[ast.AST]:
+    """Yields AST nodes in scope_node.body without descending into nested deferred_scope_types."""
     body_attr = getattr(scope_node, "body", ())
     if not isinstance(body_attr, (list, tuple)):
         return
-    yield from _iter_shallow_scope_nodes(body_attr)
+    yield from _iter_shallow_scope_nodes(
+        body_attr, deferred_scope_types=deferred_scope_types
+    )
 
 
 _DYNAMIC_CLASS_NAMESPACE_CALLS: frozenset[str] = frozenset(
@@ -1929,105 +1957,143 @@ def _bind_expr_target_provenance(
     return prov.clear_name(name)
 
 
+class _CrossScopeMutationAcc(NamedTuple):
+    """Mutable sets accumulating global/nonlocal target names and provenance tags."""
+
+    mutated: Set[str]
+    sup_targets: Set[str]
+    susp_targets: Set[str]
+
+
+def _collect_scope_escaping_into(
+    shallow_nodes: Sequence[ast.AST],
+    anc_locals: AbstractSet[str],
+    prov: _SuppressProvenance,
+    acc: _CrossScopeMutationAcc,
+) -> Tuple[Set[str], Set[str]]:
+    """Collects global/nonlocal escaping mutations from shallow_nodes into acc, returning (globs, nonlocs)."""
+    scope_globs: Set[str] = set()
+    scope_nonlocs: Set[str] = set()
+    for sub in shallow_nodes:
+        if isinstance(sub, ast.Global):
+            scope_globs.update(sub.names)
+        elif isinstance(sub, ast.Nonlocal):
+            scope_nonlocs.update(sub.names)
+    escaping = scope_globs | (scope_nonlocs - anc_locals)
+    if escaping:
+        def _record_escaping_value(
+            targets: AbstractSet[str], val_expr: ast.AST
+        ) -> None:
+            if not targets:
+                return
+            acc.mutated.update(targets)
+            if _is_suppress_alias_target_expr(val_expr, prov) or (
+                isinstance(val_expr, ast.Call)
+                and _is_suppress_alias_target_expr(val_expr.func, prov)
+            ):
+                acc.sup_targets.update(targets)
+            elif _looks_like_suppressing_ctx_manager(val_expr, prov):
+                acc.susp_targets.update(targets)
+
+        for sub in shallow_nodes:
+            if isinstance(sub, ast.Assign):
+                _record_escaping_value(
+                    {
+                        n
+                        for tgt in sub.targets
+                        for n in _extract_store_names_in_node(tgt)
+                        if n in escaping
+                    },
+                    sub.value,
+                )
+            elif isinstance(sub, ast.AnnAssign) and sub.value is not None:
+                _record_escaping_value(
+                    _extract_store_names_in_node(sub.target) & escaping,
+                    sub.value,
+                )
+            elif (
+                isinstance(sub, ast.NamedExpr)
+                and isinstance(sub.target, ast.Name)
+                and sub.target.id in escaping
+            ):
+                _record_escaping_value({sub.target.id}, sub.value)
+            elif isinstance(sub, ast.Name) and isinstance(
+                sub.ctx, (ast.Store, ast.Del)
+            ):
+                if sub.id in escaping:
+                    acc.mutated.add(sub.id)
+            elif isinstance(
+                sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                if sub.name in escaping:
+                    acc.mutated.add(sub.name)
+            elif isinstance(sub, (ast.Import, ast.ImportFrom)):
+                imp_s: Set[str] = set()
+                _record_import_names(sub, imp_s)
+                acc.mutated.update(imp_s & escaping)
+            elif isinstance(sub, ast.ExceptHandler) and isinstance(sub.name, str):
+                if sub.name in escaping:
+                    acc.mutated.add(sub.name)
+            else:
+                p_name = _extract_pattern_bound_name(sub)
+                if p_name is not None and p_name in escaping:
+                    acc.mutated.add(p_name)
+    return scope_globs, scope_nonlocs
+
+
 def _extract_nested_cross_scope_mutations(
     scope_stmt: ast.AST,
     prov: _SuppressProvenance,
 ) -> Tuple[Set[str], Set[str], Set[str]]:
-    """Extracts (mutated, suppressor_targets, suspicious_targets) for global/nonlocal stores in nested callables."""
-    mutated: Set[str] = set()
-    sup_targets: Set[str] = set()
-    susp_targets: Set[str] = set()
+    """Extracts (mutated, suppressor_targets, suspicious_targets) for global/nonlocal stores in nested scopes."""
+    acc = _CrossScopeMutationAcc(set(), set(), set())
     work: List[Tuple[ast.AST, frozenset[str]]] = [(scope_stmt, frozenset())]
     while work:
         curr_scope, anc_locals = work.pop()
-        if isinstance(curr_scope, ast.ClassDef):
-            for sub in _iter_shallow_scope_body_nodes(curr_scope):
-                if isinstance(sub, _INNER_SCOPE_TYPES) and not isinstance(
-                    sub, ast.Lambda
-                ):
-                    work.append((sub, anc_locals))
+        if not isinstance(
+            curr_scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
             continue
-        if not isinstance(curr_scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        fn_globs: Set[str] = set()
-        fn_nonlocs: Set[str] = set()
-        for sub in _iter_shallow_scope_body_nodes(curr_scope):
-            if isinstance(sub, ast.Global):
-                fn_globs.update(sub.names)
-            elif isinstance(sub, ast.Nonlocal):
-                fn_nonlocs.update(sub.names)
-        escaping = fn_globs | (fn_nonlocs - anc_locals)
-        if escaping:
-            def _record_escaping_value(
-                targets: AbstractSet[str], val_expr: ast.AST
-            ) -> None:
-                if not targets:
-                    return
-                mutated.update(targets)
-                if _is_suppress_alias_target_expr(val_expr, prov) or (
-                    isinstance(val_expr, ast.Call)
-                    and _is_suppress_alias_target_expr(val_expr.func, prov)
-                ):
-                    sup_targets.update(targets)
-                elif _looks_like_suppressing_ctx_manager(val_expr, prov):
-                    susp_targets.update(targets)
-
-            for sub in _iter_shallow_scope_body_nodes(curr_scope):
-                if isinstance(sub, ast.Assign):
-                    _record_escaping_value(
-                        {
-                            n
-                            for tgt in sub.targets
-                            for n in _extract_store_names_in_node(tgt)
-                            if n in escaping
-                        },
-                        sub.value,
-                    )
-                elif isinstance(sub, ast.AnnAssign) and sub.value is not None:
-                    _record_escaping_value(
-                        _extract_store_names_in_node(sub.target) & escaping,
-                        sub.value,
-                    )
-                elif (
-                    isinstance(sub, ast.NamedExpr)
-                    and isinstance(sub.target, ast.Name)
-                    and sub.target.id in escaping
-                ):
-                    _record_escaping_value({sub.target.id}, sub.value)
-                elif isinstance(sub, ast.Name) and isinstance(
-                    sub.ctx, (ast.Store, ast.Del)
-                ):
-                    if sub.id in escaping:
-                        mutated.add(sub.id)
-                elif isinstance(
-                    sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-                ):
-                    if sub.name in escaping:
-                        mutated.add(sub.name)
-                elif isinstance(sub, (ast.Import, ast.ImportFrom)):
-                    imp_s: Set[str] = set()
-                    _record_import_names(sub, imp_s)
-                    mutated.update(imp_s & escaping)
-                elif isinstance(sub, ast.ExceptHandler) and isinstance(sub.name, str):
-                    if sub.name in escaping:
-                        mutated.add(sub.name)
-                else:
-                    p_name = _extract_pattern_bound_name(sub)
-                    if p_name is not None and p_name in escaping:
-                        mutated.add(p_name)
-        own_locals = (
-            (
-                _extract_arg_names(curr_scope.args)
-                | _extract_single_node_local_names(curr_scope)
-            )
-            - fn_globs
-            - fn_nonlocs
+        shallow_nodes = tuple(_iter_shallow_scope_body_nodes(curr_scope))
+        sc_globs, sc_nonlocs = _collect_scope_escaping_into(
+            shallow_nodes, anc_locals, prov, acc
         )
-        next_anc = anc_locals | frozenset(own_locals)
-        for sub in _iter_shallow_scope_body_nodes(curr_scope):
-            if isinstance(sub, _INNER_SCOPE_TYPES) and not isinstance(sub, ast.Lambda):
+        if isinstance(curr_scope, ast.ClassDef):
+            next_anc = anc_locals
+        else:
+            own_locals = (
+                (
+                    _extract_arg_names(curr_scope.args)
+                    | _extract_single_node_local_names(curr_scope)
+                )
+                - sc_globs
+                - sc_nonlocs
+            )
+            next_anc = anc_locals | frozenset(own_locals)
+        for sub in shallow_nodes:
+            if isinstance(sub, _DEFERRED_DEF_SCOPE_TYPES) and not isinstance(
+                sub, ast.Lambda
+            ):
                 work.append((sub, next_anc))
-    return mutated, sup_targets, susp_targets
+    return acc.mutated, acc.sup_targets, acc.susp_targets
+
+
+def _has_shallow_unproven_call_or_await(
+    nodes: Iterable[ast.AST],
+    prov: _SuppressProvenance,
+    extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
+) -> bool:
+    """Returns True if any node in nodes is an Await or an unproven Call."""
+    for sub in nodes:
+        if isinstance(sub, ast.Await):
+            return True
+        if isinstance(sub, ast.Call) and not _is_proven_non_suppressing_call(
+            sub,
+            prov,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+        ):
+            return True
+    return False
 
 
 def _exprs_may_invoke_cross_scope_mutator(
@@ -2038,16 +2104,13 @@ def _exprs_may_invoke_cross_scope_mutator(
     """Returns True if shallow expressions contain Await or an unproven Call."""
     if not prov.cross_scope_mutated:
         return False
-    for sub in _iter_shallow_scope_nodes(tuple(roots)):
-        if isinstance(sub, ast.Await):
-            return True
-        if isinstance(sub, ast.Call) and not _is_proven_non_suppressing_call(
-            sub,
-            prov,
-            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
-        ):
-            return True
-    return False
+    return _has_shallow_unproven_call_or_await(
+        _iter_shallow_scope_nodes(
+            tuple(roots), deferred_scope_types=_DEFERRED_DEF_SCOPE_TYPES
+        ),
+        prov,
+        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+    )
 
 
 def _update_suppress_provenance_from_stmts(
@@ -2393,6 +2456,37 @@ def _compute_try_body_split_provenance(
     return _TryBodySplitProvenance(risky_suffix, prefix_prov, mid_prov)
 
 
+def _apply_immediate_class_body_provenance(
+    cls_stmt: ast.ClassDef,
+    prov: _SuppressProvenance,
+    ctx: _ProvenanceWalkContext,
+) -> _SuppressProvenance:
+    """Applies immediate global/nonlocal rebinds and cross-scope call invalidations for ClassDef bodies."""
+    imm_acc = _CrossScopeMutationAcc(set(), set(), set())
+    has_unproven_call = False
+    cls_work: List[ast.ClassDef] = [cls_stmt]
+    while cls_work:
+        curr_cls = cls_work.pop()
+        shallow_nodes = tuple(_iter_shallow_scope_body_nodes(curr_cls))
+        _collect_scope_escaping_into(shallow_nodes, frozenset(), prov, imm_acc)
+        if prov.cross_scope_mutated and not has_unproven_call:
+            has_unproven_call = _has_shallow_unproven_call_or_await(
+                shallow_nodes,
+                prov,
+                extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
+            )
+        for sub in shallow_nodes:
+            if isinstance(sub, ast.ClassDef):
+                cls_work.append(sub)
+    if imm_acc.mutated:
+        prov = prov.invalidate_cross_scope_targets(
+            imm_acc.mutated, imm_acc.sup_targets, imm_acc.susp_targets
+        )
+    if has_unproven_call:
+        prov = prov.apply_cross_scope_invalidation()
+    return prov
+
+
 def _update_scope_def_stmt_provenance(
     stmt: ast.AST,
     prov: _SuppressProvenance,
@@ -2411,6 +2505,8 @@ def _update_scope_def_stmt_provenance(
     )
     cs_mut, cs_sup, cs_susp = _extract_nested_cross_scope_mutations(stmt, prov)
     prov = prov.with_cross_scope_mutations(cs_mut, cs_sup, cs_susp)
+    if isinstance(stmt, ast.ClassDef):
+        prov = _apply_immediate_class_body_provenance(stmt, prov, ctx)
     if ctx.in_branch and cs_mut:
         prov = prov.apply_cross_scope_invalidation()
     if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):

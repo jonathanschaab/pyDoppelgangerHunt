@@ -3021,3 +3021,148 @@ def test_scope_cache_production_fingerprint_without_debug_mode() -> None:
     finally:
         clear_dataflow_cache()
         _debug_ast_immutability[0] = prev_debug
+
+
+def test_generate_refactoring_patch_enforces_closure_mode_and_preserves_caller_scopes(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies generate_refactoring_patch uses ensure_unit_scope_closure_mode, rejects unsafe stale caches, and never mutates caller scopes."""
+    import copy
+    import logging
+    from unittest import mock
+
+    from pydoppelgangerhunt.config import clear_closure_warning_cache
+    from pydoppelgangerhunt.fixer import scope as scope_mod
+
+    clear_dataflow_cache()
+    clear_closure_warning_cache()
+    src = (
+        "def alpha(items, step):\n"
+        "    with UnknownTx():\n"
+        "        scale = step(items)\n"
+        "    res = [(lambda x=x: scale + x)() for x in items]\n"
+        "    return res\n\n"
+        "def beta(items, step):\n"
+        "    with UnknownTx():\n"
+        "        scale = step(items)\n"
+        "    res = [(lambda x=x: scale + x)() for x in items]\n"
+        "    return res\n"
+    )
+    f = tmp_path / "mod_patch_closure.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1_base: dict[str, Any] = {"file": "mod_patch_closure.py", "start": 4, "end": 4, "kind": "linear_block", "name": "alpha"}
+    u2_base: dict[str, Any] = {"file": "mod_patch_closure.py", "start": 10, "end": 10, "kind": "linear_block", "name": "beta"}
+
+    sc1_pedantic = inspect_single_unit_scope(u1_base, repo_root=str(tmp_path), closure_strictness="pedantic")
+    sc2_pedantic = inspect_single_unit_scope(u2_base, repo_root=str(tmp_path), closure_strictness="pedantic")
+    assert sc1_pedantic["scope_schema_version"] == 2
+    assert sc1_pedantic["is_control_flow_safe"] is False
+    assert sc2_pedantic["is_control_flow_safe"] is False
+
+    # Matching valid pedantic precomputed scopes are reused without recomputing or warning
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        blocked_cached = generate_refactoring_patch(
+            [(1.0, {**u1_base, "scope": copy.deepcopy(sc1_pedantic)}, {**u2_base, "scope": copy.deepcopy(sc2_pedantic)})],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+            closure_strictness="pedantic",
+        )
+    assert blocked_cached == ""
+    assert not any("Discarding caller-supplied" in rec.message for rec in caplog.records)
+
+    # Stale/mismatched schema v1 or lenient scope claiming safety must be recomputed in pedantic mode
+    stale_safe_scope = {
+        **sc1_pedantic,
+        "scope_schema_version": 1,
+        "closure_strictness": "lenient",
+        "is_control_flow_safe": True,
+        "control_flow_hazards": [],
+        "closure_hazard_reasons": [],
+    }
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        blocked_patch = generate_refactoring_patch(
+            [(1.0, {**u1_base, "scope": dict(stale_safe_scope)}, {**u2_base, "scope": dict(stale_safe_scope)})],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+            closure_strictness="pedantic",
+        )
+    assert blocked_patch == ""
+    assert any(
+        "Discarding caller-supplied precomputed scope" in rec.message
+        and "scope_schema_version=2" in rec.message
+        for rec in caplog.records
+    )
+
+    # Matching strict scopes should reuse cleanly without mutating caller dicts (even when LHS/augassign pruning runs)
+    lhs_src = (
+        "def f1(store, x):\n"
+        "    res = x + 1\n"
+        "    store[0] = res + 2\n\n"
+        "def f2(store, x):\n"
+        "    res = x + 1\n"
+        "    store[0] = res + 2\n"
+    )
+    f_lhs = tmp_path / "lhs_no_mut.py"
+    f_lhs.write_text(lhs_src, encoding="utf-8")
+    p1: dict[str, Any] = {"file": "lhs_no_mut.py", "start": 2, "end": 3, "kind": "block", "name": "f1"}
+    p2: dict[str, Any] = {"file": "lhs_no_mut.py", "start": 6, "end": 7, "kind": "block", "name": "f2"}
+    p1["scope"] = inspect_single_unit_scope(p1, repo_root=str(tmp_path), closure_strictness="strict")
+    p2["scope"] = inspect_single_unit_scope(p2, repo_root=str(tmp_path), closure_strictness="strict")
+    p1_snapshot = copy.deepcopy(p1["scope"])
+    p2_snapshot = copy.deepcopy(p2["scope"])
+    with mock.patch(
+        "pydoppelgangerhunt.fixer.patch.ensure_unit_scope_closure_mode",
+        wraps=scope_mod.ensure_unit_scope_closure_mode,
+    ) as ensure_spy:
+        patch_ok = generate_refactoring_patch(
+            [(1.0, p1, p2)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+            closure_strictness="strict",
+        )
+    assert ensure_spy.call_count == 2
+    assert "+def _shared_f1_f2(" in patch_ok
+    assert p1["scope"] == p1_snapshot
+    assert p2["scope"] == p2_snapshot
+
+    # Mismatched precomputed scope with missing backing file fails closed cleanly without trusting stale safe cache
+    clear_closure_warning_cache()
+    caplog.clear()
+    missing_u2 = {
+        "file": "missing_file.py",
+        "start": 1,
+        "end": 3,
+        "kind": "compound_block",
+        "scope": dict(stale_safe_scope),
+    }
+    with caplog.at_level(logging.INFO), mock.patch(
+        "pydoppelgangerhunt.fixer.patch.ensure_unit_scope_closure_mode",
+        wraps=scope_mod.ensure_unit_scope_closure_mode,
+    ) as missing_spy:
+        blocked_missing_preview = generate_refactoring_patch(
+            [(1.0, copy.deepcopy(p1), copy.deepcopy(missing_u2))],
+            repo_root=str(tmp_path),
+            replace_clones=False,
+            closure_strictness="pedantic",
+        )
+    assert blocked_missing_preview == ""
+    assert missing_spy.call_count == 2
+    assert any(
+        "Discarding caller-supplied precomputed scope" in rec.message
+        for rec in caplog.records
+    )
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        blocked_missing_replace = generate_refactoring_patch(
+            [(1.0, copy.deepcopy(p1), copy.deepcopy(missing_u2))],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+            closure_strictness="pedantic",
+        )
+    assert blocked_missing_replace == ""
+    assert any("unreadable file" in rec.message for rec in caplog.records)

@@ -2946,3 +2946,103 @@ def test_try_apply_cached_stmt_delta_self_rebinding_with_cm_as_cm() -> None:
     assert "x" not in bufs2.state.pre_bound
     assert bufs2.state.suppress_aliases is not None
     assert "cm" not in bufs2.state.suppress_aliases.suppressors
+
+
+@pytest.mark.parametrize(
+    ("case_id", "setup_sig", "setup_body", "expect_safe"),
+    [
+        pytest.param(
+            "setattr_self_callbacks_links_sibling_closure",
+            "def setup(self):",
+            "setattr(self, 'callbacks', [lambda: total])",
+            False,
+            id="setattr_self_callbacks_links_sibling_closure",
+        ),
+        pytest.param(
+            "self_dunder_setattr_callbacks_links_sibling_closure",
+            "def setup(self):",
+            "self.__setattr__('callbacks', [lambda: total])",
+            False,
+            id="self_dunder_setattr_callbacks_links_sibling_closure",
+        ),
+        pytest.param(
+            "external_sibling_dynamic_setattr_attr_name_escapes",
+            "def setup(self, attr_name):",
+            "setattr(self, attr_name, [lambda: total])",
+            False,
+            id="external_sibling_dynamic_setattr_attr_name_escapes",
+        ),
+        pytest.param(
+            "external_sibling_self_escape_to_registry",
+            "def setup(self, registry):",
+            "registry.append(self)",
+            False,
+            id="external_sibling_self_escape_to_registry",
+        ),
+        pytest.param(
+            "negative_setattr_unrelated_attr_preserves_safety",
+            "def setup(self):",
+            "setattr(self, 'other', [lambda: total])",
+            True,
+            id="negative_setattr_unrelated_attr_preserves_safety",
+        ),
+        pytest.param(
+            "negative_delattr_unrelated_attr_preserves_safety",
+            "def setup(self):",
+            "delattr(self, 'other')",
+            True,
+            id="negative_delattr_unrelated_attr_preserves_safety",
+        ),
+    ],
+)
+def test_receiver_setattr_delattr_and_external_sibling_escape(
+    case_id: str,
+    setup_sig: str,
+    setup_body: str,
+    expect_safe: bool,
+) -> None:
+    """Verifies setattr/delattr on self and externally-invoked sibling self escapes link local-class closures."""
+    from pydoppelgangerhunt.fixer import clear_dataflow_cache, inspect_single_unit_scope
+
+    init_other_line = (
+        "            self.other = [lambda: total]\n"
+        if case_id == "external_sibling_self_escape_to_registry"
+        else "            self.other = []\n"
+    )
+    src = (
+        "def outer(items):\n"
+        "    total = 0\n"
+        "    class Worker:\n"
+        "        def __init__(self):\n"
+        "            self.callbacks = []\n"
+        f"{init_other_line}"
+        f"        {setup_sig}\n"
+        f"            {setup_body}\n"
+        "        def run(self):\n"
+        "            nonlocal total\n"
+        "            out = []\n"
+        "            for x in items:\n"
+        "                total += x\n"
+        "                out.append(self.callbacks[0]())\n"
+        "            return out\n"
+        "    return Worker(), total\n"
+    )
+    clear_dataflow_cache()
+    tree = ast.parse(src)
+    lines = src.splitlines()
+    start_line = next(i + 1 for i, ln in enumerate(lines) if "out = []" in ln)
+    end_line = next(i + 1 for i, ln in enumerate(lines) if "return out" in ln) - 1
+    sc = inspect_single_unit_scope(
+        {
+            "start": start_line,
+            "end": end_line,
+            "kind": "block",
+            "source_text": src,
+            "source_lines": src.splitlines(keepends=True),
+        },
+        tree=tree,
+    )
+    assert sc["is_control_flow_safe"] is expect_safe, case_id
+    if not expect_safe:
+        assert "severed_closure_cell" in sc["control_flow_hazards"], case_id
+        assert sc["closure_hazard_reasons"], case_id

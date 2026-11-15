@@ -1643,6 +1643,7 @@ def _collect_local_primitive_accumulators(
             and isinstance(stmt.value, ast.Constant)
             and isinstance(stmt.value.value, _PRIMITIVE_ACCUMULATOR_CONST_TYPES)
         ):
+            _record_immediate_expr_names((stmt.annotation,), seen_before_init)
             t_name = stmt.target.id
             if t_name not in seen_before_init:
                 initialized_primitives.add(t_name)

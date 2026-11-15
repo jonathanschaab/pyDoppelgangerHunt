@@ -20,7 +20,6 @@ from typing import (
     Mapping,
     NamedTuple,
     Optional,
-    Sequence,
     Set,
     Tuple,
     Union,
@@ -134,18 +133,22 @@ def is_factory_rebound_target(
 _NO_PATCH_SCAN = ExitProtocolPatchScan(frozenset(), False, frozenset())
 
 
-class _BuiltinAliasTable(NamedTuple):
-    exec_eval: Set[str]
-    setattr_delattr: Set[str]
-    getattr_fns: Set[str]
-    vars_fns: Set[str]
-    globals_fns: Set[str]
-    namespace_dicts: Set[str]
-    builtins_mods: Set[str]
-    import_fns: Set[str]
-    importlib_mods: Set[str]
-    sys_mods: Set[str]
-    has_wildcard: bool
+_Slot = Tuple[int, str]
+
+
+class _SlotAliasTable(NamedTuple):
+    graph: _CollectedScopeGraph
+    exec_eval: Set[_Slot]
+    setattr_delattr: Set[_Slot]
+    getattr_fns: Set[_Slot]
+    vars_fns: Set[_Slot]
+    globals_fns: Set[_Slot]
+    namespace_dicts: Set[_Slot]
+    builtins_mods: Set[_Slot]
+    import_fns: Set[_Slot]
+    importlib_mods: Set[_Slot]
+    sys_mods: Set[_Slot]
+    type_object_refs: Set[_Slot]
 
 
 def _unwrap_named_expr(node: ast.AST) -> ast.AST:
@@ -167,34 +170,72 @@ def _extract_call_arg(node: ast.Call, pos: int, kw_name: str) -> Optional[ast.AS
     return None
 
 
-def _is_namespace_dict_call(node: ast.AST, aliases: _BuiltinAliasTable) -> bool:
+def _is_name_in_slots(
+    node: ast.AST,
+    slot_set: AbstractSet[_Slot],
+    table: _SlotAliasTable,
+) -> bool:
+    """Returns True when node is an ast.Name whose resolved slot is in slot_set."""
+    if not isinstance(node, ast.Name):
+        return False
+    eval_sid = table.graph.node_sids.get(id(node), table.graph.root_sid)
+    lex_slot = _resolve_lexical_slot(
+        table.graph.scopes, table.graph.root_sid, eval_sid, node.id
+    )
+    if lex_slot in slot_set:
+        return True
+    sc = table.graph.scopes[eval_sid]
+    return (
+        sc.kind == "class"
+        and node.id not in sc.globals_decl
+        and node.id not in sc.nonlocals_decl
+        and (eval_sid, node.id) in slot_set
+    )
+
+
+def _visible_builtins_mod_names(node: ast.AST, table: _SlotAliasTable) -> Set[str]:
+    """Returns builtins-module identifier names visible from node's lexical scope chain."""
+    anc_sids: Set[int] = {table.graph.root_sid}
+    curr: Optional[int] = table.graph.node_sids.get(id(node), table.graph.root_sid)
+    while curr is not None:
+        anc_sids.add(curr)
+        curr = table.graph.scopes[curr].parent_lexical_sid
+    return {name for sid, name in table.builtins_mods if sid in anc_sids}
+
+
+def _is_namespace_dict_call(node: ast.AST, table: _SlotAliasTable) -> bool:
     """Returns True if node calls globals() (or alias) or 0-arg vars() (or alias)."""
     if not isinstance(node, ast.Call):
         return False
     func = _unwrap_named_expr(node.func)
-    is_glob = (isinstance(func, ast.Name) and func.id in aliases.globals_fns) or _is_builtins_attr(
-        func, aliases.builtins_mods, frozenset({"globals"})
+    is_glob = _is_name_in_slots(func, table.globals_fns, table) or _is_builtins_attr(
+        func, table, frozenset({"globals"})
     )
     if is_glob:
         return True
     is_zero_arg_vars = not node.args and not node.keywords and (
-        (isinstance(func, ast.Name) and func.id in aliases.vars_fns)
-        or _is_builtins_attr(func, aliases.builtins_mods, frozenset({"vars"}))
+        _is_name_in_slots(func, table.vars_fns, table)
+        or _is_builtins_attr(func, table, frozenset({"vars"}))
     )
     return is_zero_arg_vars
 
 
-def _is_builtins_namespace_expr(node: ast.AST, table: _BuiltinAliasTable) -> bool:
+def _is_builtins_namespace_expr(node: ast.AST, table: _SlotAliasTable) -> bool:
     """Returns True when node dynamically evaluates to the builtins module or its __dict__."""
     expr = _unwrap_named_expr(node)
     if isinstance(expr, ast.Call):
         func = _unwrap_named_expr(expr.func)
-        is_import_call = (isinstance(func, ast.Name) and func.id in table.import_fns) or (
+        is_import_call = _is_name_in_slots(func, table.import_fns, table) or (
             isinstance(func, ast.Attribute)
-            and isinstance(func.value, ast.Name)
             and (
-                (func.value.id in table.importlib_mods and func.attr == "import_module")
-                or (func.value.id in table.builtins_mods and func.attr == "__import__")
+                (
+                    _is_name_in_slots(func.value, table.importlib_mods, table)
+                    and func.attr == "import_module"
+                )
+                or (
+                    _is_name_in_slots(func.value, table.builtins_mods, table)
+                    and func.attr == "__import__"
+                )
             )
         )
         if is_import_call:
@@ -204,27 +245,24 @@ def _is_builtins_namespace_expr(node: ast.AST, table: _BuiltinAliasTable) -> boo
                 "__builtins__",
             ):
                 return True
-        is_vars_call = (
-            isinstance(func, ast.Name) and func.id in table.vars_fns
-        ) or _is_builtins_attr(func, table.builtins_mods, frozenset({"vars"}))
+        is_vars_call = _is_name_in_slots(
+            func, table.vars_fns, table
+        ) or _is_builtins_attr(func, table, frozenset({"vars"}))
         if (
             is_vars_call
             and expr.args
-            and isinstance(expr.args[0], ast.Name)
-            and expr.args[0].id in table.builtins_mods
+            and _is_name_in_slots(expr.args[0], table.builtins_mods, table)
         ):
             return True
     elif isinstance(expr, ast.Attribute):
         return (
-            isinstance(expr.value, ast.Name)
-            and expr.value.id in table.builtins_mods
+            _is_name_in_slots(expr.value, table.builtins_mods, table)
             and expr.attr == "__dict__"
         )
     elif isinstance(expr, ast.Subscript):
         if (
             isinstance(expr.value, ast.Attribute)
-            and isinstance(expr.value.value, ast.Name)
-            and expr.value.value.id in table.sys_mods
+            and _is_name_in_slots(expr.value.value, table.sys_mods, table)
             and expr.value.attr == "modules"
             and isinstance(expr.slice, ast.Constant)
             and expr.slice.value in ("builtins", "__builtins__")
@@ -233,17 +271,17 @@ def _is_builtins_namespace_expr(node: ast.AST, table: _BuiltinAliasTable) -> boo
         if _is_namespace_dict_expr(expr.value, table):
             if isinstance(expr.slice, ast.Constant) and expr.slice.value in (
                 "__builtins__",
-                *table.builtins_mods,
+                *_visible_builtins_mod_names(expr, table),
             ):
                 return True
     return False
 
 
-def _is_namespace_dict_expr(node: ast.AST, aliases: _BuiltinAliasTable) -> bool:
+def _is_namespace_dict_expr(node: ast.AST, table: _SlotAliasTable) -> bool:
     """Returns True for globals() / 0-arg vars() calls or variables aliasing them."""
-    return (
-        isinstance(node, ast.Name) and node.id in aliases.namespace_dicts
-    ) or _is_namespace_dict_call(node, aliases)
+    return _is_name_in_slots(
+        node, table.namespace_dicts, table
+    ) or _is_namespace_dict_call(node, table)
 
 
 class _AttrMutationCallee(NamedTuple):
@@ -271,25 +309,30 @@ class _AliasCandidate(NamedTuple):
 class _BuiltinBindRecord(NamedTuple):
     owner_sid: int
     name: str
+    alias_kind: str
     is_pure_setattr_import: bool
 
 
 class _CollectedScopeGraph(NamedTuple):
     root_sid: int
     scopes: Dict[int, _ScopeRecord]
+    node_sids: Dict[int, int]
+    nodes: List[ast.AST]
+    call_func_ids: Set[int]
+    wildcard_sids: Set[int]
     alias_candidates: List[_AliasCandidate]
     non_alias_writes: List[Tuple[int, str, bool]]
     builtin_binds: List[_BuiltinBindRecord]
     load_records: List[Tuple[ast.Name, int]]
 
 
-def _is_getattr_call(node: ast.AST, aliases: _BuiltinAliasTable) -> Optional[ast.Call]:
+def _is_getattr_call(node: ast.AST, table: _SlotAliasTable) -> Optional[ast.Call]:
     """Returns node when it calls getattr (or an alias), else None."""
     if not isinstance(node, ast.Call):
         return None
     func = _unwrap_named_expr(node.func)
-    if (isinstance(func, ast.Name) and func.id in aliases.getattr_fns) or _is_builtins_attr(
-        func, aliases.builtins_mods, frozenset({"getattr"})
+    if _is_name_in_slots(func, table.getattr_fns, table) or _is_builtins_attr(
+        func, table, frozenset({"getattr"})
     ):
         return node
     return None
@@ -310,7 +353,7 @@ def _extract_container_and_key(node: ast.AST) -> Optional[Tuple[ast.AST, ast.AST
     return None
 
 
-def _is_container_key_mutation_ref(node: ast.AST, table: _BuiltinAliasTable) -> bool:
+def _is_container_key_mutation_ref(node: ast.AST, table: _SlotAliasTable) -> bool:
     """Returns True for builtins/namespace[...] or .get(...) indexing setattr or delattr."""
     extracted = _extract_container_and_key(node)
     if extracted is None:
@@ -323,7 +366,7 @@ def _is_container_key_mutation_ref(node: ast.AST, table: _BuiltinAliasTable) -> 
     ):
         return False
     return (
-        (isinstance(container, ast.Name) and container.id in table.builtins_mods)
+        _is_name_in_slots(container, table.builtins_mods, table)
         or _is_namespace_dict_expr(container, table)
         or _is_builtins_namespace_expr(container, table)
     )
@@ -331,6 +374,7 @@ def _is_container_key_mutation_ref(node: ast.AST, table: _BuiltinAliasTable) -> 
 
 def _resolve_getattr_mutation_callee(
     getattr_call: ast.Call,
+    table: _SlotAliasTable,
     *,
     allow_bound_dunder: bool,
 ) -> Optional[_AttrMutationCallee]:
@@ -349,7 +393,7 @@ def _resolve_getattr_mutation_callee(
         return _AttrMutationCallee(0, None)
     if attr_name in _ATTR_MUTATION_DUNDERS:
         recv = getattr_call.args[0]
-        if isinstance(recv, ast.Name) and recv.id in ("type", "object"):
+        if _is_name_in_slots(recv, table.type_object_refs, table):
             return _AttrMutationCallee(0, None)
         if allow_bound_dunder:
             return _AttrMutationCallee(-1, recv)
@@ -358,7 +402,7 @@ def _resolve_getattr_mutation_callee(
 
 def _resolve_attr_mutation_callee(
     func: ast.AST,
-    table: _BuiltinAliasTable,
+    table: _SlotAliasTable,
     *,
     allow_bound_dunder: bool = True,
 ) -> Optional[_AttrMutationCallee]:
@@ -366,8 +410,8 @@ def _resolve_attr_mutation_callee(
     expr = _unwrap_named_expr(func)
     result: Optional[_AttrMutationCallee] = None
     if (
-        (isinstance(expr, ast.Name) and expr.id in table.setattr_delattr)
-        or _is_builtins_attr(expr, table.builtins_mods, _ATTR_MUTATION_BUILTINS)
+        _is_name_in_slots(expr, table.setattr_delattr, table)
+        or _is_builtins_attr(expr, table, _ATTR_MUTATION_BUILTINS)
         or (
             isinstance(expr, ast.Attribute)
             and expr.attr in _ATTR_MUTATION_BUILTINS
@@ -380,30 +424,48 @@ def _resolve_attr_mutation_callee(
         getattr_call = _is_getattr_call(expr, table)
         if getattr_call is not None:
             result = _resolve_getattr_mutation_callee(
-                getattr_call, allow_bound_dunder=allow_bound_dunder
+                getattr_call, table, allow_bound_dunder=allow_bound_dunder
             )
         elif isinstance(expr, ast.Attribute) and expr.attr in _ATTR_MUTATION_DUNDERS:
-            if isinstance(expr.value, ast.Name) and expr.value.id in ("type", "object"):
+            if _is_name_in_slots(expr.value, table.type_object_refs, table):
                 result = _AttrMutationCallee(0, None)
             elif allow_bound_dunder:
                 result = _AttrMutationCallee(-1, expr.value)
     return result
 
 
-def _propagate_alias_step(
-    assign_pairs: Sequence[Tuple[str, ast.AST]],
-    table: _BuiltinAliasTable,
+def _propagate_attr_alias(
+    tgt_slot: _Slot,
+    val: ast.Attribute,
+    table: _SlotAliasTable,
 ) -> bool:
-    """Propagates one fixed-point iteration across assignment pairs; returns True if changed."""
-    changed = False
-    attr_targets: Tuple[Tuple[AbstractSet[str], str, Set[str]], ...] = (
-        (table.builtins_mods, "__import__", table.import_fns),
-        (table.builtins_mods, "getattr", table.getattr_fns),
-        (table.builtins_mods, "vars", table.vars_fns),
-        (table.builtins_mods, "globals", table.globals_fns),
-        (table.importlib_mods, "import_module", table.import_fns),
+    """Propagates attribute-load alias candidates (e.g. builtins.eval, importlib.import_module)."""
+    attr_rules: Tuple[Tuple[Set[_Slot], AbstractSet[str], Set[_Slot]], ...] = (
+        (table.builtins_mods, _DYNAMIC_CODE_BUILTINS, table.exec_eval),
+        (table.builtins_mods, _ATTR_MUTATION_BUILTINS, table.setattr_delattr),
+        (table.builtins_mods, frozenset({"__import__"}), table.import_fns),
+        (table.builtins_mods, frozenset({"getattr"}), table.getattr_fns),
+        (table.builtins_mods, frozenset({"vars"}), table.vars_fns),
+        (table.builtins_mods, frozenset({"globals"}), table.globals_fns),
+        (table.builtins_mods, frozenset({"type", "object"}), table.type_object_refs),
+        (table.importlib_mods, frozenset({"import_module"}), table.import_fns),
     )
-    name_sets: Tuple[Set[str], ...] = (
+    changed = False
+    for mod_set, allowed_attrs, dest_set in attr_rules:
+        if (
+            _is_name_in_slots(val.value, mod_set, table)
+            and val.attr in allowed_attrs
+            and tgt_slot not in dest_set
+        ):
+            dest_set.add(tgt_slot)
+            changed = True
+    return changed
+
+
+def _propagate_slot_alias_step(table: _SlotAliasTable) -> bool:
+    """Propagates one fixed-point iteration across lexical alias candidates; returns True if changed."""
+    changed = False
+    slot_sets: Tuple[Set[_Slot], ...] = (
         table.exec_eval,
         table.setattr_delattr,
         table.getattr_fns,
@@ -414,132 +476,90 @@ def _propagate_alias_step(
         table.import_fns,
         table.importlib_mods,
         table.sys_mods,
+        table.type_object_refs,
     )
-    for tgt_name, raw_val in assign_pairs:
-        val = _unwrap_named_expr(raw_val)
+    scopes = table.graph.scopes
+    root_sid = table.graph.root_sid
+    for cand in table.graph.alias_candidates:
+        tgt_slot = _resolve_target_slot(
+            scopes, root_sid, cand.target_owner_sid, cand.target_name
+        )
+        val = _unwrap_named_expr(cand.rhs_node)
         if isinstance(val, ast.Name):
-            for alias_set in name_sets:
-                if val.id in alias_set and tgt_name not in alias_set:
-                    alias_set.add(tgt_name)
+            for slot_set in slot_sets:
+                if _is_name_in_slots(val, slot_set, table) and tgt_slot not in slot_set:
+                    slot_set.add(tgt_slot)
                     changed = True
         elif isinstance(val, ast.Attribute) and isinstance(val.value, ast.Name):
-            if val.value.id in table.builtins_mods:
-                if val.attr in _DYNAMIC_CODE_BUILTINS and tgt_name not in table.exec_eval:
-                    table.exec_eval.add(tgt_name)
-                    changed = True
-                elif (
-                    val.attr in _ATTR_MUTATION_BUILTINS
-                    and tgt_name not in table.setattr_delattr
-                ):
-                    table.setattr_delattr.add(tgt_name)
-                    changed = True
-            for mod_set, attr_name, dest_set in attr_targets:
-                if (
-                    val.value.id in mod_set
-                    and val.attr == attr_name
-                    and tgt_name not in dest_set
-                ):
-                    dest_set.add(tgt_name)
-                    changed = True
-        if _is_namespace_dict_expr(val, table) and tgt_name not in table.namespace_dicts:
-            table.namespace_dicts.add(tgt_name)
+            if _propagate_attr_alias(tgt_slot, val, table):
+                changed = True
+        if _is_namespace_dict_expr(val, table) and tgt_slot not in table.namespace_dicts:
+            table.namespace_dicts.add(tgt_slot)
             changed = True
-        if _is_builtins_namespace_expr(val, table) and tgt_name not in table.builtins_mods:
-            table.builtins_mods.add(tgt_name)
+        if _is_builtins_namespace_expr(val, table) and tgt_slot not in table.builtins_mods:
+            table.builtins_mods.add(tgt_slot)
             changed = True
         if (
             _resolve_attr_mutation_callee(val, table, allow_bound_dunder=False) is not None
-            and tgt_name not in table.setattr_delattr
+            and tgt_slot not in table.setattr_delattr
         ):
-            table.setattr_delattr.add(tgt_name)
+            table.setattr_delattr.add(tgt_slot)
             changed = True
     return changed
 
 
-def _collect_builtin_aliases(tree: ast.AST) -> _BuiltinAliasTable:
-    """Collects imported and assigned aliases for builtins, dynamic import helpers, and sys."""
-    table = _BuiltinAliasTable(
-        exec_eval=set(_DYNAMIC_CODE_BUILTINS),
-        setattr_delattr=set(_ATTR_MUTATION_BUILTINS),
-        getattr_fns={"getattr"},
-        vars_fns={"vars"},
-        globals_fns={"globals"},
+def _collect_builtin_slot_aliases(tree: ast.AST) -> _SlotAliasTable:
+    """Builds the scope graph and computes fixed-point lexical slot aliases for builtins."""
+    graph = _collect_scope_graph(tree)
+    root = graph.root_sid
+    table = _SlotAliasTable(
+        graph=graph,
+        exec_eval={(root, "exec"), (root, "eval")},
+        setattr_delattr={(root, "setattr"), (root, "delattr")},
+        getattr_fns={(root, "getattr")},
+        vars_fns={(root, "vars")},
+        globals_fns={(root, "globals")},
         namespace_dicts=set(),
-        builtins_mods={"builtins", "__builtins__"},
-        import_fns={"__import__"},
-        importlib_mods={"importlib"},
-        sys_mods={"sys"},
-        has_wildcard=False,
+        builtins_mods={(root, "builtins"), (root, "__builtins__")},
+        import_fns={(root, "__import__")},
+        importlib_mods={(root, "importlib")},
+        sys_mods={(root, "sys")},
+        type_object_refs={(root, "type"), (root, "object")},
     )
-    has_wildcard = False
-    assign_pairs: List[Tuple[str, ast.AST]] = []
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                bound = alias.asname or alias.name
-                if alias.name in ("builtins", "__builtins__"):
-                    table.builtins_mods.add(bound)
-                elif alias.name == "importlib":
-                    table.importlib_mods.add(bound)
-                elif alias.name == "sys":
-                    table.sys_mods.add(bound)
-        elif isinstance(node, ast.ImportFrom) and node.module in (
-            "builtins",
-            "__builtins__",
-            "importlib",
-        ):
-            for alias in node.names:
-                if alias.name == "*":
-                    has_wildcard = True
-                    continue
-                bound = alias.asname or alias.name
-                if node.module == "importlib":
-                    if alias.name == "import_module":
-                        table.import_fns.add(bound)
-                elif alias.name in _DYNAMIC_CODE_BUILTINS:
-                    table.exec_eval.add(bound)
-                elif alias.name in _ATTR_MUTATION_BUILTINS:
-                    table.setattr_delattr.add(bound)
-                elif alias.name == "getattr":
-                    table.getattr_fns.add(bound)
-                elif alias.name == "vars":
-                    table.vars_fns.add(bound)
-                elif alias.name == "globals":
-                    table.globals_fns.add(bound)
-                elif alias.name == "__import__":
-                    table.import_fns.add(bound)
-        elif isinstance(node, ast.Assign) and node.value is not None:
-            for tgt in node.targets:
-                if isinstance(tgt, ast.Name):
-                    assign_pairs.append((tgt.id, node.value))
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            if isinstance(node.target, ast.Name):
-                assign_pairs.append((node.target.id, node.value))
-        elif isinstance(node, ast.NamedExpr):
-            assign_pairs.append((node.target.id, node.value))
-
-    while _propagate_alias_step(assign_pairs, table):
+    kind_map: Dict[str, Set[_Slot]] = {
+        "exec_eval": table.exec_eval,
+        "setattr_delattr": table.setattr_delattr,
+        "getattr_fns": table.getattr_fns,
+        "vars_fns": table.vars_fns,
+        "globals_fns": table.globals_fns,
+        "builtins_mods": table.builtins_mods,
+        "import_fns": table.import_fns,
+        "importlib_mods": table.importlib_mods,
+        "sys_mods": table.sys_mods,
+        "type_object_refs": table.type_object_refs,
+    }
+    for b in graph.builtin_binds:
+        b_slot = _resolve_target_slot(graph.scopes, root, b.owner_sid, b.name)
+        kind_map[b.alias_kind].add(b_slot)
+    while _propagate_slot_alias_step(table):
         pass
-
-    return table._replace(has_wildcard=has_wildcard)
+    return table
 
 
 def _is_builtins_attr(
-    node: ast.AST, builtins_mod_aliases: AbstractSet[str], allowed_attrs: AbstractSet[str]
+    node: ast.AST, table: _SlotAliasTable, allowed_attrs: AbstractSet[str]
 ) -> bool:
-    """Returns True when node is ``<builtins_or_alias>.<attr>`` for an attr in allowed_attrs."""
+    """Returns True when node is ``<builtins_or_alias>.<attr>`` in allowed_attrs."""
     return (
         isinstance(node, ast.Attribute)
-        and isinstance(node.value, ast.Name)
-        and node.value.id in builtins_mod_aliases
+        and _is_name_in_slots(node.value, table.builtins_mods, table)
         and node.attr in allowed_attrs
     )
 
 
 def _attr_mutation_call_info(
     node: ast.Call,
-    aliases: _BuiltinAliasTable,
+    table: _SlotAliasTable,
 ) -> Optional[Tuple[ast.AST, Optional[str]]]:
     """Returns ``(target_expr, literal_attr_name_or_None)`` for a setattr/delattr call, else None.
 
@@ -548,7 +568,7 @@ def _attr_mutation_call_info(
     and ``type.__setattr__`` / ``object.__setattr__``. Returns None when the call
     provably targets a literal attribute outside ``_EXIT_PROTOCOL_ATTRS | _STDLIB_FACTORY_ATTRS``.
     """
-    callee = _resolve_attr_mutation_callee(node.func, aliases)
+    callee = _resolve_attr_mutation_callee(node.func, table)
     if callee is None:
         return None
     target_idx = callee.target_arg_idx
@@ -582,16 +602,15 @@ _BUILTIN_NAMESPACE_ATTRS: frozenset[str] = frozenset({"vars", "globals", "__impo
 
 def _is_getattr_of_mutation_builtin(
     node: ast.Call,
-    aliases: _BuiltinAliasTable,
+    table: _SlotAliasTable,
 ) -> bool:
     """Returns True when node is getattr(..., '<mutation>') or getattr(<builtins>, dynamic_attr)."""
-    getattr_call = _is_getattr_call(node, aliases)
+    getattr_call = _is_getattr_call(node, table)
     if getattr_call is None or len(getattr_call.args) < 2:
         return False
-    target_is_builtins = (
-        isinstance(getattr_call.args[0], ast.Name)
-        and getattr_call.args[0].id in aliases.builtins_mods
-    ) or _is_builtins_namespace_expr(getattr_call.args[0], aliases)
+    target_is_builtins = _is_name_in_slots(
+        getattr_call.args[0], table.builtins_mods, table
+    ) or _is_builtins_namespace_expr(getattr_call.args[0], table)
     attr_arg = getattr_call.args[1]
     if isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):
         return attr_arg.value in _REF_TRIGGER_ATTRS or (
@@ -602,38 +621,34 @@ def _is_getattr_of_mutation_builtin(
 
 def _is_dynamic_builtins_lookup(
     node: ast.AST,
-    aliases: _BuiltinAliasTable,
+    table: _SlotAliasTable,
 ) -> bool:
     """Returns True for dynamic builtins, vars(builtins), globals()['__builtins__'], sys.modules['builtins'], or __builtins__[...] mutation lookups."""
-    if _is_builtins_namespace_expr(node, aliases):
+    if _is_builtins_namespace_expr(node, table):
         return True
     if isinstance(node, ast.Call):
         func = node.func
         if (
             isinstance(func, ast.Attribute)
             and func.attr == "get"
-            and _is_namespace_dict_expr(func.value, aliases)
+            and _is_namespace_dict_expr(func.value, table)
         ):
             key_arg = _extract_call_arg(node, 0, "key")
             return key_arg is not None and (
                 not isinstance(key_arg, ast.Constant)
                 or key_arg.value in _REF_TRIGGER_ATTRS
                 or key_arg.value in _BUILTIN_NAMESPACE_ATTRS
-                or key_arg.value in aliases.builtins_mods
+                or key_arg.value in _visible_builtins_mod_names(node, table)
             )
-    elif isinstance(node, ast.Subscript):
-        if isinstance(node.value, ast.Name) and node.value.id in aliases.builtins_mods:
-            return (
-                not isinstance(node.slice, ast.Constant)
-                or node.slice.value in _REF_TRIGGER_ATTRS
-                or node.slice.value in _BUILTIN_NAMESPACE_ATTRS
-            )
-        if _is_namespace_dict_expr(node.value, aliases):
-            return (
-                not isinstance(node.slice, ast.Constant)
-                or node.slice.value in _REF_TRIGGER_ATTRS
-                or node.slice.value in _BUILTIN_NAMESPACE_ATTRS
-            )
+    elif isinstance(node, ast.Subscript) and (
+        _is_name_in_slots(node.value, table.builtins_mods, table)
+        or _is_namespace_dict_expr(node.value, table)
+    ):
+        return (
+            not isinstance(node.slice, ast.Constant)
+            or node.slice.value in _REF_TRIGGER_ATTRS
+            or node.slice.value in _BUILTIN_NAMESPACE_ATTRS
+        )
     return False
 
 
@@ -651,10 +666,36 @@ _SCOPE_CONTAINER_TYPES = (
     ast.Lambda,
     *_COMPREHENSION_TYPES,
 )
-_PURE_DIRECT_ROOT: Tuple[int, str] = (-2, "")
-_ALL_TRACKED_BUILTIN_ATTRS: frozenset[str] = (
-    _REF_TRIGGER_ATTRS | _BUILTIN_NAMESPACE_ATTRS | frozenset({"getattr"})
-)
+_PURE_DIRECT_ROOT: _Slot = (-2, "")
+_FROM_BUILTIN_KIND: Mapping[Tuple[str, str], Tuple[str, bool]] = {
+    ("importlib", "import_module"): ("import_fns", False),
+    ("builtins", "exec"): ("exec_eval", False),
+    ("builtins", "eval"): ("exec_eval", False),
+    ("__builtins__", "exec"): ("exec_eval", False),
+    ("__builtins__", "eval"): ("exec_eval", False),
+    ("builtins", "setattr"): ("setattr_delattr", True),
+    ("builtins", "delattr"): ("setattr_delattr", True),
+    ("__builtins__", "setattr"): ("setattr_delattr", True),
+    ("__builtins__", "delattr"): ("setattr_delattr", True),
+    ("builtins", "getattr"): ("getattr_fns", False),
+    ("__builtins__", "getattr"): ("getattr_fns", False),
+    ("builtins", "vars"): ("vars_fns", False),
+    ("__builtins__", "vars"): ("vars_fns", False),
+    ("builtins", "globals"): ("globals_fns", False),
+    ("__builtins__", "globals"): ("globals_fns", False),
+    ("builtins", "__import__"): ("import_fns", False),
+    ("__builtins__", "__import__"): ("import_fns", False),
+    ("builtins", "type"): ("type_object_refs", False),
+    ("builtins", "object"): ("type_object_refs", False),
+    ("__builtins__", "type"): ("type_object_refs", False),
+    ("__builtins__", "object"): ("type_object_refs", False),
+}
+_IMPORT_MOD_KIND: Mapping[str, str] = {
+    "builtins": "builtins_mods",
+    "__builtins__": "builtins_mods",
+    "importlib": "importlib_mods",
+    "sys": "sys_mods",
+}
 
 
 def _extract_param_names(args: ast.arguments) -> List[str]:
@@ -707,14 +748,13 @@ def _split_scope_children(node: ast.AST) -> Tuple[List[ast.AST], List[ast.AST]]:
     return enc, list(raw_body)
 
 
-def _resolve_lexical_slot(
+def _resolve_decl_slot(
     scopes: Mapping[int, _ScopeRecord],
     root_sid: int,
-    scope_sid: int,
+    sc: _ScopeRecord,
     name: str,
-) -> Tuple[int, str]:
-    """Resolves a name reference in scope_sid to its defining (scope_id, name) slot."""
-    sc = scopes[scope_sid]
+) -> Optional[_Slot]:
+    """Resolves explicit global or nonlocal declarations for name in sc, else None."""
     if name in sc.globals_decl:
         return root_sid, name
     if name in sc.nonlocals_decl:
@@ -724,6 +764,20 @@ def _resolve_lexical_slot(
                 return curr, name
             curr = scopes[curr].parent_lexical_sid
         return root_sid, name
+    return None
+
+
+def _resolve_lexical_slot(
+    scopes: Mapping[int, _ScopeRecord],
+    root_sid: int,
+    scope_sid: int,
+    name: str,
+) -> _Slot:
+    """Resolves a name load in scope_sid to its defining (scope_id, name) lexical slot."""
+    sc = scopes[scope_sid]
+    decl_slot = _resolve_decl_slot(scopes, root_sid, sc, name)
+    if decl_slot is not None:
+        return decl_slot
     if sc.kind != "class" and name in sc.local_names:
         return scope_sid, name
     curr = sc.parent_lexical_sid
@@ -732,6 +786,20 @@ def _resolve_lexical_slot(
             return curr, name
         curr = scopes[curr].parent_lexical_sid
     return root_sid, name
+
+
+def _resolve_target_slot(
+    scopes: Mapping[int, _ScopeRecord],
+    root_sid: int,
+    scope_sid: int,
+    name: str,
+) -> _Slot:
+    """Resolves a binding target in scope_sid to its owning (scope_id, name) slot."""
+    sc = scopes[scope_sid]
+    decl_slot = _resolve_decl_slot(scopes, root_sid, sc, name)
+    if decl_slot is not None:
+        return decl_slot
+    return scope_sid, name
 
 
 def _make_scope_record(
@@ -776,26 +844,33 @@ def _record_import_in_scope(
     curr_sid: int,
     graph: _CollectedScopeGraph,
 ) -> None:
-    """Records imported bindings as builtin binds or non-alias writes in curr_sid."""
+    """Records imported bindings as builtin binds or non-alias writes and marks function locals."""
+    sc = graph.scopes[curr_sid]
     if isinstance(curr, ast.Import):
         for alias in curr.names:
             bound = alias.asname or alias.name.split(".", 1)[0]
-            if alias.name in ("builtins", "__builtins__", "importlib", "sys"):
-                graph.builtin_binds.append(_BuiltinBindRecord(curr_sid, bound, False))
+            if sc.kind == "function":
+                sc.local_names.add(bound)
+            kind = _IMPORT_MOD_KIND.get(alias.name)
+            if kind is not None:
+                graph.builtin_binds.append(_BuiltinBindRecord(curr_sid, bound, kind, False))
             else:
                 graph.non_alias_writes.append((curr_sid, bound, True))
         return
-    is_builtin_mod = curr.module in ("builtins", "__builtins__", "importlib")
+    mod = curr.module if getattr(curr, "level", 0) == 0 else None
     for alias in curr.names:
         if alias.name == "*":
+            if mod in ("builtins", "__builtins__", "importlib"):
+                graph.wildcard_sids.add(curr_sid)
             continue
         bound = alias.asname or alias.name
-        if is_builtin_mod:
-            is_pure_sa = (
-                curr.module in ("builtins", "__builtins__")
-                and alias.name in _ATTR_MUTATION_BUILTINS
+        if sc.kind == "function":
+            sc.local_names.add(bound)
+        entry = _FROM_BUILTIN_KIND.get((mod, alias.name)) if mod is not None else None
+        if entry is not None:
+            graph.builtin_binds.append(
+                _BuiltinBindRecord(curr_sid, bound, entry[0], entry[1])
             )
-            graph.builtin_binds.append(_BuiltinBindRecord(curr_sid, bound, is_pure_sa))
         else:
             graph.non_alias_writes.append((curr_sid, bound, True))
 
@@ -804,7 +879,6 @@ def _record_assign_candidate(
     curr: ast.AST,
     curr_sid: int,
     graph: _CollectedScopeGraph,
-    call_func_ids: AbstractSet[int],
 ) -> bool:
     """Records Assign, AnnAssign, and NamedExpr bindings; returns True if curr matched."""
     sc_kind = graph.scopes[curr_sid].kind
@@ -813,7 +887,7 @@ def _record_assign_candidate(
             curr.value is not None
             and curr.targets
             and all(isinstance(t, ast.Name) for t in curr.targets)
-            and sc_kind in ("module", "function")
+            and sc_kind in ("module", "function", "class")
         ):
             for tgt in curr.targets:
                 graph.alias_candidates.append(
@@ -828,7 +902,7 @@ def _record_assign_candidate(
         if (
             curr.value is not None
             and isinstance(curr.target, ast.Name)
-            and sc_kind in ("module", "function")
+            and sc_kind in ("module", "function", "class")
         ):
             graph.alias_candidates.append(
                 _AliasCandidate(curr_sid, curr.target.id, curr.value, curr_sid)
@@ -843,11 +917,12 @@ def _record_assign_candidate(
             if sc_kind in ("module", "function")
             else graph.scopes[curr_sid].parent_non_comp_sid
         )
-        if id(curr) in call_func_ids:
-            graph.alias_candidates.append(
-                _AliasCandidate(owner_sid, curr.target.id, curr.value, curr_sid)
-            )
-        else:
+        if graph.scopes[owner_sid].kind == "function":
+            graph.scopes[owner_sid].local_names.add(curr.target.id)
+        graph.alias_candidates.append(
+            _AliasCandidate(owner_sid, curr.target.id, curr.value, curr_sid)
+        )
+        if id(curr) not in graph.call_func_ids:
             graph.non_alias_writes.append((owner_sid, curr.target.id, True))
         return True
     return False
@@ -888,15 +963,23 @@ def _record_non_assign_node(
             graph.non_alias_writes.append((curr_sid, bound, False))
 
 
-def _collect_scope_graph(
-    tree: ast.AST,
-    call_func_ids: AbstractSet[int],
-) -> _CollectedScopeGraph:
-    """Iteratively collects lexical scopes, bindings, and load nodes across tree."""
+def _collect_scope_graph(tree: ast.AST) -> _CollectedScopeGraph:
+    """Iteratively collects lexical scopes, bindings, load nodes, and call targets across tree."""
     is_mod = isinstance(tree, ast.Module)
     root_sid = id(tree) if is_mod else -1
     root_sc = _ScopeRecord(root_sid, "module", None, root_sid, set(), set(), set())
-    graph = _CollectedScopeGraph(root_sid, {root_sid: root_sc}, [], [], [], [])
+    graph = _CollectedScopeGraph(
+        root_sid=root_sid,
+        scopes={root_sid: root_sc},
+        node_sids={},
+        nodes=[],
+        call_func_ids=set(),
+        wildcard_sids=set(),
+        alias_candidates=[],
+        non_alias_writes=[],
+        builtin_binds=[],
+        load_records=[],
+    )
     stack: List[Tuple[ast.AST, int]] = (
         [(ch, root_sid) for ch in reversed(tree.body)]
         if isinstance(tree, ast.Module)
@@ -904,6 +987,8 @@ def _collect_scope_graph(
     )
     while stack:
         curr, curr_sid = stack.pop()
+        graph.node_sids[id(curr)] = curr_sid
+        graph.nodes.append(curr)
         if isinstance(curr, _SCOPE_CONTAINER_TYPES) and not isinstance(curr, ast.Module):
             if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 graph.non_alias_writes.append((curr_sid, curr.name, True))
@@ -926,139 +1011,118 @@ def _collect_scope_graph(
             stack.extend((ch, child_sid) for ch in reversed(own))
             stack.extend((ch, curr_sid) for ch in reversed(enc))
             continue
-        if not _record_assign_candidate(curr, curr_sid, graph, call_func_ids):
+        if isinstance(curr, ast.Call):
+            graph.call_func_ids.add(id(curr.func))
+        if not _record_assign_candidate(curr, curr_sid, graph):
             _record_non_assign_node(curr, curr_sid, graph)
         stack.extend((ch, curr_sid) for ch in reversed(list(ast.iter_child_nodes(curr))))
     return graph
 
 
-def _compute_builtin_slots(
-    graph: _CollectedScopeGraph,
-    aliases: _BuiltinAliasTable,
-) -> Set[Tuple[int, str]]:
-    """Computes local/enclosing variable slots that may receive a builtin or dynamic alias."""
-    all_alias_names = (
-        aliases.exec_eval
-        | aliases.setattr_delattr
-        | aliases.getattr_fns
-        | aliases.vars_fns
-        | aliases.globals_fns
-        | aliases.namespace_dicts
-        | aliases.builtins_mods
-        | aliases.import_fns
-        | aliases.importlib_mods
-        | aliases.sys_mods
-    )
-    builtin_slots: Set[Tuple[int, str]] = {
-        _resolve_lexical_slot(graph.scopes, graph.root_sid, b.owner_sid, b.name)
-        for b in graph.builtin_binds
-    }
-    direct_name_edges: List[Tuple[Tuple[int, str], Tuple[int, str]]] = []
-    for cand in graph.alias_candidates:
-        tgt_slot = _resolve_lexical_slot(
-            graph.scopes, graph.root_sid, cand.target_owner_sid, cand.target_name
-        )
-        rhs = _unwrap_named_expr(cand.rhs_node)
-        if isinstance(rhs, ast.Name):
-            src_slot = _resolve_lexical_slot(
-                graph.scopes, graph.root_sid, cand.rhs_eval_sid, rhs.id
-            )
-            if src_slot[0] == graph.root_sid and rhs.id in all_alias_names:
-                builtin_slots.add(tgt_slot)
-            else:
-                direct_name_edges.append((tgt_slot, src_slot))
-        elif (
-            _is_builtins_attr(rhs, aliases.builtins_mods, _ALL_TRACKED_BUILTIN_ATTRS)
-            or (
-                isinstance(rhs, ast.Attribute)
-                and isinstance(rhs.value, ast.Name)
-                and rhs.value.id in ("type", "object")
-                and rhs.attr in _ATTR_MUTATION_DUNDERS
-            )
-            or _is_builtins_namespace_expr(rhs, aliases)
-            or _is_dynamic_builtins_lookup(rhs, aliases)
-            or _is_namespace_dict_expr(rhs, aliases)
-            or _resolve_attr_mutation_callee(rhs, aliases, allow_bound_dunder=False) is not None
-        ):
-            builtin_slots.add(tgt_slot)
-    changed = True
-    while changed:
-        changed = False
-        for tgt_slot, src_slot in direct_name_edges:
-            if src_slot in builtin_slots and tgt_slot not in builtin_slots:
-                builtin_slots.add(tgt_slot)
-                changed = True
-    return builtin_slots
-
-
 def _resolve_pure_setattr_rhs_dep(
     cand: _AliasCandidate,
-    graph: _CollectedScopeGraph,
-    aliases: _BuiltinAliasTable,
-    builtin_slots: AbstractSet[Tuple[int, str]],
-) -> Optional[Tuple[int, str]]:
+    table: _SlotAliasTable,
+) -> Optional[_Slot]:
     """Returns _PURE_DIRECT_ROOT or source variable slot for a pure setattr/delattr RHS."""
+    graph = table.graph
     rhs = _unwrap_named_expr(cand.rhs_node)
     if isinstance(rhs, ast.Name):
         return _resolve_lexical_slot(
             graph.scopes, graph.root_sid, cand.rhs_eval_sid, rhs.id
         )
-    if (
-        isinstance(rhs, ast.Attribute)
-        and isinstance(rhs.value, ast.Name)
-        and _is_builtins_attr(rhs, aliases.builtins_mods, _ATTR_MUTATION_BUILTINS)
-    ):
-        mod_slot = _resolve_lexical_slot(
-            graph.scopes, graph.root_sid, cand.rhs_eval_sid, rhs.value.id
+    if isinstance(rhs, ast.Attribute) and any(
+        rhs.attr in attrs and _is_name_in_slots(rhs.value, slots, table)
+        for attrs, slots in (
+            (_ATTR_MUTATION_BUILTINS, table.builtins_mods),
+            (_ATTR_MUTATION_DUNDERS, table.type_object_refs),
         )
-        if mod_slot[0] == graph.root_sid or mod_slot in builtin_slots:
-            return _PURE_DIRECT_ROOT
-        return None
-    if (
-        isinstance(rhs, ast.Attribute)
-        and isinstance(rhs.value, ast.Name)
-        and rhs.value.id in ("type", "object")
-        and rhs.attr in _ATTR_MUTATION_DUNDERS
     ):
-        ty_slot = _resolve_lexical_slot(
-            graph.scopes, graph.root_sid, cand.rhs_eval_sid, rhs.value.id
-        )
-        if ty_slot[0] == graph.root_sid:
-            return _PURE_DIRECT_ROOT
+        return _PURE_DIRECT_ROOT
     return None
 
 
-def _compute_pure_setattr_slots(
-    graph: _CollectedScopeGraph,
-    aliases: _BuiltinAliasTable,
-    builtin_slots: AbstractSet[Tuple[int, str]],
-    call_func_ids: AbstractSet[int],
-) -> Tuple[Set[Tuple[int, str]], Dict[int, Set[Tuple[int, str]]]]:
-    """Computes pure call-only setattr/delattr alias slots and RHS node target mappings."""
-    disqualified: Set[Tuple[int, str]] = {
+def _is_pure_setattr_dep(
+    dep: Optional[_Slot],
+    root_sid: int,
+    pure_imported_slots: AbstractSet[_Slot],
+    pure_slots: AbstractSet[_Slot],
+) -> bool:
+    """Returns True when dep resolves cleanly to builtin/imported/pure setattr or delattr."""
+    if dep is None:
+        return False
+    return (
+        dep == _PURE_DIRECT_ROOT
+        or (dep[0] == root_sid and dep[1] in _ATTR_MUTATION_BUILTINS)
+        or dep in pure_imported_slots
+        or dep in pure_slots
+    )
+
+
+def _prune_escaped_pure_setattr_slots(
+    table: _SlotAliasTable,
+    pure_imported_slots: AbstractSet[_Slot],
+    cands_by_slot: Mapping[_Slot, List[Tuple[int, Optional[_Slot]]]],
+    all_tgts_per_rhs: Mapping[int, Set[_Slot]],
+    pure_slots: Set[_Slot],
+) -> None:
+    """Iteratively removes slots whose loads escape uncalled or whose dependencies break."""
+    graph = table.graph
+    loads_by_slot: Dict[_Slot, List[int]] = {}
+    for load_node, eval_sid in graph.load_records:
+        l_slot = _resolve_lexical_slot(
+            graph.scopes, graph.root_sid, eval_sid, load_node.id
+        )
+        loads_by_slot.setdefault(l_slot, []).append(id(load_node))
+
+    changed = True
+    while changed:
+        changed = False
+        for slot in list(pure_slots):
+            has_escape = any(
+                lid not in graph.call_func_ids
+                and not (
+                    lid in all_tgts_per_rhs and all_tgts_per_rhs[lid].issubset(pure_slots)
+                )
+                for lid in loads_by_slot.get(slot, ())
+            )
+            has_broken_dep = any(
+                not _is_pure_setattr_dep(
+                    dep, graph.root_sid, pure_imported_slots, pure_slots
+                )
+                for _, dep in cands_by_slot[slot]
+            )
+            if has_escape or has_broken_dep:
+                pure_slots.remove(slot)
+                changed = True
+
+
+def _collect_pure_setattr_rhs_ids(table: _SlotAliasTable) -> Set[int]:
+    """Returns RHS AST node ids of assignments forming call-only setattr/delattr aliases."""
+    graph = table.graph
+    disqualified: Set[_Slot] = {
         (
-            _resolve_lexical_slot(graph.scopes, graph.root_sid, sid, name)
+            _resolve_target_slot(graph.scopes, graph.root_sid, sid, name)
             if resolve_lex
             else (sid, name)
         )
         for sid, name, resolve_lex in graph.non_alias_writes
     }
-    pure_imported_slots: Set[Tuple[int, str]] = set()
+    pure_imported_slots: Set[_Slot] = set()
     for b in graph.builtin_binds:
-        b_slot = _resolve_lexical_slot(graph.scopes, graph.root_sid, b.owner_sid, b.name)
+        b_slot = _resolve_target_slot(graph.scopes, graph.root_sid, b.owner_sid, b.name)
         if b.is_pure_setattr_import:
             pure_imported_slots.add(b_slot)
         else:
             disqualified.add(b_slot)
     pure_imported_slots -= disqualified
 
-    cands_by_slot: Dict[Tuple[int, str], List[Tuple[int, Optional[Tuple[int, str]]]]] = {}
-    all_tgts_per_rhs: Dict[int, Set[Tuple[int, str]]] = {}
+    cands_by_slot: Dict[_Slot, List[Tuple[int, Optional[_Slot]]]] = {}
+    all_tgts_per_rhs: Dict[int, Set[_Slot]] = {}
     for cand in graph.alias_candidates:
-        tgt_slot = _resolve_lexical_slot(
+        tgt_slot = _resolve_target_slot(
             graph.scopes, graph.root_sid, cand.target_owner_sid, cand.target_name
         )
-        dep = _resolve_pure_setattr_rhs_dep(cand, graph, aliases, builtin_slots)
+        dep = _resolve_pure_setattr_rhs_dep(cand, table)
         if (
             dep is None
             or graph.scopes[tgt_slot[0]].kind not in ("module", "function")
@@ -1068,7 +1132,7 @@ def _compute_pure_setattr_slots(
         cands_by_slot.setdefault(tgt_slot, []).append((id(cand.rhs_node), dep))
         all_tgts_per_rhs.setdefault(id(cand.rhs_node), set()).add(tgt_slot)
 
-    pure_slots: Set[Tuple[int, str]] = set()
+    pure_slots: Set[_Slot] = set()
     changed = True
     while changed:
         changed = False
@@ -1076,100 +1140,51 @@ def _compute_pure_setattr_slots(
             if slot in disqualified or slot in pure_slots:
                 continue
             if all(
-                dep is not None
-                and (
-                    dep == _PURE_DIRECT_ROOT
-                    or (dep[0] == graph.root_sid and dep[1] in _ATTR_MUTATION_BUILTINS)
-                    or dep in pure_imported_slots
-                    or dep in pure_slots
-                )
+                _is_pure_setattr_dep(dep, graph.root_sid, pure_imported_slots, pure_slots)
                 for _, dep in pairs
             ):
                 pure_slots.add(slot)
                 changed = True
 
-    loads_by_slot: Dict[Tuple[int, str], List[int]] = {}
-    for load_node, eval_sid in graph.load_records:
-        l_slot = _resolve_lexical_slot(graph.scopes, graph.root_sid, eval_sid, load_node.id)
-        loads_by_slot.setdefault(l_slot, []).append(id(load_node))
-
-    changed = True
-    while changed:
-        changed = False
-        for slot in list(pure_slots):
-            has_escape = any(
-                lid not in call_func_ids
-                and not (
-                    lid in all_tgts_per_rhs and all_tgts_per_rhs[lid].issubset(pure_slots)
-                )
-                for lid in loads_by_slot.get(slot, ())
-            )
-            has_broken_dep = any(
-                dep is None
-                or (
-                    dep != _PURE_DIRECT_ROOT
-                    and not (dep[0] == graph.root_sid and dep[1] in _ATTR_MUTATION_BUILTINS)
-                    and dep not in pure_imported_slots
-                    and dep not in pure_slots
-                )
-                for _, dep in cands_by_slot[slot]
-            )
-            if has_escape or has_broken_dep:
-                pure_slots.remove(slot)
-                changed = True
-    return pure_slots, all_tgts_per_rhs
-
-
-def _collect_exempted_uncalled_ref_ids(
-    tree: ast.AST,
-    aliases: _BuiltinAliasTable,
-    call_func_ids: AbstractSet[int],
-) -> Set[int]:
-    """Returns AST node ids of uncalled loads safely shadowed or held only in benign setattr aliases."""
-    graph = _collect_scope_graph(tree, call_func_ids)
-    builtin_slots = _compute_builtin_slots(graph, aliases)
-    ref_trigger_names = aliases.exec_eval | aliases.setattr_delattr
-    exempt_ids: Set[int] = set()
-    for load_node, eval_sid in graph.load_records:
-        if load_node.id not in ref_trigger_names:
-            continue
-        slot = _resolve_lexical_slot(graph.scopes, graph.root_sid, eval_sid, load_node.id)
-        if (
-            slot[0] != graph.root_sid
-            and graph.scopes[slot[0]].kind in ("function", "comp")
-            and slot not in builtin_slots
-        ):
-            exempt_ids.add(id(load_node))
-    pure_slots, all_tgts_per_rhs = _compute_pure_setattr_slots(
-        graph, aliases, builtin_slots, call_func_ids
+    _prune_escaped_pure_setattr_slots(
+        table, pure_imported_slots, cands_by_slot, all_tgts_per_rhs, pure_slots
     )
-    for rhs_id, tgts in all_tgts_per_rhs.items():
-        if tgts and tgts.issubset(pure_slots):
-            exempt_ids.add(rhs_id)
-    return exempt_ids
+    return {
+        rhs_id
+        for rhs_id, tgts in all_tgts_per_rhs.items()
+        if tgts and tgts.issubset(pure_slots)
+    }
+
+
+def _is_uncalled_patch_ref(
+    node: ast.AST,
+    table: _SlotAliasTable,
+    ref_trigger_slots: AbstractSet[_Slot],
+) -> bool:
+    """Returns True when node is an uncalled load of dynamic code or attr mutation builtins."""
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+        return _is_name_in_slots(node, ref_trigger_slots, table)
+    if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+        return _is_builtins_attr(node, table, _REF_TRIGGER_ATTRS) or (
+            node.attr in _ATTR_MUTATION_DUNDERS
+            and _is_name_in_slots(node.value, table.type_object_refs, table)
+        )
+    return False
 
 
 def _scan_exit_protocol_patches_uncached(tree: ast.AST) -> ExitProtocolPatchScan:
     """Walks every scope of tree collecting exit-protocol and stdlib-factory patch targets."""
-    aliases = _collect_builtin_aliases(tree)
-    ref_trigger_names = aliases.exec_eval | aliases.setattr_delattr
+    table = _collect_builtin_slot_aliases(tree)
+    graph = table.graph
+    ref_trigger_slots = table.exec_eval | table.setattr_delattr
     patched: Set[str] = set()
     rebound_attrs: Set[Tuple[Optional[str], Optional[str]]] = set()
-    has_patch = aliases.has_wildcard
-    if aliases.has_wildcard:
+    has_patch = bool(graph.wildcard_sids)
+    if has_patch:
         rebound_attrs.add((None, None))
-    call_func_ids: Set[int] = set()
-    stack: List[ast.AST] = [tree]
-    nodes_list: List[ast.AST] = []
-    while stack:
-        node = stack.pop()
-        if isinstance(node, ast.Call):
-            call_func_ids.add(id(node.func))
-        nodes_list.append(node)
-        stack.extend(ast.iter_child_nodes(node))
-    exempted_ref_ids = _collect_exempted_uncalled_ref_ids(tree, aliases, call_func_ids)
-    for node in nodes_list:
-        if _is_dynamic_builtins_lookup(node, aliases):
+    pure_setattr_rhs_ids = _collect_pure_setattr_rhs_ids(table)
+    for node in graph.nodes:
+        if _is_dynamic_builtins_lookup(node, table):
             has_patch = True
             rebound_attrs.add((None, None))
             continue
@@ -1180,19 +1195,21 @@ def _scan_exit_protocol_patches_uncached(tree: ast.AST) -> ExitProtocolPatchScan
                 has_patch = True
                 if isinstance(node.value, ast.Name):
                     patched.add(node.value.id)
-            elif node.attr in _STDLIB_FACTORY_ATTRS and isinstance(node.value, ast.Name):
+            elif node.attr in _STDLIB_FACTORY_ATTRS and isinstance(
+                node.value, ast.Name
+            ):
                 rebound_attrs.add((node.value.id, node.attr))
         elif isinstance(node, ast.Call):
             func = _unwrap_named_expr(node.func)
             if (
-                (isinstance(func, ast.Name) and func.id in aliases.exec_eval)
-                or _is_builtins_attr(func, aliases.builtins_mods, _DYNAMIC_CODE_BUILTINS)
-                or _is_getattr_of_mutation_builtin(node, aliases)
+                _is_name_in_slots(func, table.exec_eval, table)
+                or _is_builtins_attr(func, table, _DYNAMIC_CODE_BUILTINS)
+                or _is_getattr_of_mutation_builtin(node, table)
             ):
                 has_patch = True
                 rebound_attrs.add((None, None))
                 continue
-            mut_info = _attr_mutation_call_info(node, aliases)
+            mut_info = _attr_mutation_call_info(node, table)
             if mut_info is None:
                 continue
             target_expr, literal_attr = mut_info
@@ -1211,25 +1228,13 @@ def _scan_exit_protocol_patches_uncached(tree: ast.AST) -> ExitProtocolPatchScan
                         rebound_attrs.add((target_expr.id, None))
                 else:
                     rebound_attrs.add((None, None))
-        elif id(node) not in call_func_ids and id(node) not in exempted_ref_ids:
-            if (
-                isinstance(node, ast.Name)
-                and isinstance(node.ctx, ast.Load)
-                and node.id in ref_trigger_names
-            ) or (
-                isinstance(node, ast.Attribute)
-                and isinstance(node.ctx, ast.Load)
-                and (
-                    _is_builtins_attr(node, aliases.builtins_mods, _REF_TRIGGER_ATTRS)
-                    or (
-                        isinstance(node.value, ast.Name)
-                        and node.value.id in ("type", "object")
-                        and node.attr in _ATTR_MUTATION_DUNDERS
-                    )
-                )
-            ):
-                has_patch = True
-                rebound_attrs.add((None, None))
+        elif (
+            id(node) not in graph.call_func_ids
+            and id(node) not in pure_setattr_rhs_ids
+            and _is_uncalled_patch_ref(node, table, ref_trigger_slots)
+        ):
+            has_patch = True
+            rebound_attrs.add((None, None))
     if not has_patch and not rebound_attrs:
         return _NO_PATCH_SCAN
     return ExitProtocolPatchScan(

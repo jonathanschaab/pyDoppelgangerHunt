@@ -1973,6 +1973,34 @@ def _unit_source_code_matches_tree(
     return False
 
 
+def _is_single_line_col_span(
+    unit: Dict[str, Any],
+    unit_code_lines: Sequence[str],
+    is_placeholder_origin: bool,
+) -> bool:
+    """Returns True if unit spans a single physical line."""
+    if not is_placeholder_origin and unit_code_lines:
+        return len(unit_code_lines) == 1
+    s_raw = unit.get("start") if unit.get("start") is not None else unit.get("lineno")
+    e_raw = unit.get("end") if unit.get("end") is not None else unit.get("end_lineno")
+    if s_raw is not None:
+        try:
+            s_val = parse_unit_coord({"start": s_raw}, "start", default=None)
+            e_val = (
+                parse_unit_coord({"end": e_raw}, "end", default=None)
+                if e_raw is not None
+                else s_val
+            )
+            if s_val is not None and e_val is not None:
+                return s_val == e_val
+        except (ValueError, TypeError, AttributeError):
+            pass
+    src_code = unit.get("source_code")
+    if isinstance(src_code, str) and src_code.strip():
+        return len(split_source_lines(src_code.strip())) == 1
+    return True
+
+
 def _has_out_of_bounds_unit_cols(
     unit: Dict[str, Any],
     unit_code_lines: Sequence[str],
@@ -1990,20 +2018,17 @@ def _has_out_of_bounds_unit_cols(
     )
     if raw_s_col == -1 or raw_e_col == -1:
         return True
-    if (
-        is_placeholder_origin
-        or not unit_code_lines
-        or (raw_s_col is None and raw_e_col is None)
-    ):
+    if raw_s_col is None and raw_e_col is None:
         return False
-    is_single_line = len(unit_code_lines) == 1
-    if explicit_col_sliced:
-        return bool(
-            is_single_line
-            and raw_s_col is not None
-            and raw_e_col is not None
-            and raw_s_col >= raw_e_col
-        )
+    is_single_line = _is_single_line_col_span(
+        unit, unit_code_lines, is_placeholder_origin
+    )
+    eff_s_col = 0 if raw_s_col is None else raw_s_col
+    order_ok = not is_single_line or raw_e_col is None or eff_s_col < raw_e_col
+    if not order_ok:
+        return True
+    if is_placeholder_origin or not unit_code_lines or explicit_col_sliced:
+        return False
     first_b = len(unit_code_lines[0].rstrip("\r\n").encode("utf-8"))
     last_b = len(unit_code_lines[-1].rstrip("\r\n").encode("utf-8"))
     s_in_bounds = raw_s_col is None or (
@@ -2012,13 +2037,7 @@ def _has_out_of_bounds_unit_cols(
         else raw_s_col == 0
     )
     e_in_bounds = raw_e_col is None or (0 <= raw_e_col <= last_b)
-    eff_s_col = 0 if raw_s_col is None else raw_s_col
-    order_ok = (
-        not is_single_line
-        or raw_e_col is None
-        or eff_s_col < raw_e_col
-    )
-    if s_in_bounds and e_in_bounds and order_ok:
+    if s_in_bounds and e_in_bounds:
         return False
     del is_pre_sliced
     return True

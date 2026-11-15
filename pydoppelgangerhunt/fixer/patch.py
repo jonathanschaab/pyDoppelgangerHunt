@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import builtins
 from collections import defaultdict
+import copy
 import difflib
 import functools
 import hashlib
@@ -79,7 +80,7 @@ from pydoppelgangerhunt.fixer.scope import (
     _extract_arg_names,
     _normalize_receiver_attrs,
     analyze_unit_variable_scope,
-    inspect_single_unit_scope,
+    ensure_unit_scope_closure_mode,
 )
 
 from pydoppelgangerhunt.fixer.source import (
@@ -3600,8 +3601,30 @@ def generate_refactoring_patch(
             )
             if merged_non_sup2 or "non_suppressing_ctx_managers" in u2_eff:
                 u2_eff["non_suppressing_ctx_managers"] = list(merged_non_sup2)
-            s1 = inspect_single_unit_scope(u1_eff, repo_root=str(root), tree=tree1)
-            s2 = inspect_single_unit_scope(u2_eff, repo_root=str(root), tree=tree2)
+            s1 = copy.deepcopy(
+                ensure_unit_scope_closure_mode(
+                    u1_eff,
+                    u1_eff.get("scope") if isinstance(u1_eff.get("scope"), dict) else None,
+                    pair_flags.effective_skip_pre_unit_closures,
+                    strict_with_suppression=pair_flags.effective_strict_with_suppression,
+                    non_suppressing_ctx_managers=merged_non_sup1,
+                    source_text=orig_text,
+                    tree=tree1,
+                    repo_root=str(root),
+                )
+            )
+            s2 = copy.deepcopy(
+                ensure_unit_scope_closure_mode(
+                    u2_eff,
+                    u2_eff.get("scope") if isinstance(u2_eff.get("scope"), dict) else None,
+                    pair_flags.effective_skip_pre_unit_closures,
+                    strict_with_suppression=pair_flags.effective_strict_with_suppression,
+                    non_suppressing_ctx_managers=merged_non_sup2,
+                    source_text=f2_text,
+                    tree=tree2,
+                    repo_root=str(root),
+                )
+            )
             if u1_eff.get("kind") in ("comprehension", "complex_expr") or u2_eff.get(
                 "kind"
             ) in ("comprehension", "complex_expr"):

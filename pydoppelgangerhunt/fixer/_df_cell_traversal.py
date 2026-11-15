@@ -1934,12 +1934,66 @@ def _extract_receiver_root_attr(expr: ast.AST, rec_param: str) -> Optional[str]:
     return None
 
 
+def _record_receiver_call_mutation(
+    curr: ast.Call,
+    rec_param: str,
+    stored_attrs: Set[str],
+    attr_val_ids: Optional[Set[int]] = None,
+) -> bool:
+    """Records receiver attribute mutations from mutating calls; returns True on dynamic bare-receiver mutation."""
+    if isinstance(curr.func, ast.Attribute):
+        if (
+            curr.func.attr in ("__setattr__", "__delattr__")
+            and isinstance(curr.func.value, ast.Name)
+            and curr.func.value.id == rec_param
+        ):
+            if (
+                not curr.keywords
+                and curr.args
+                and isinstance(curr.args[0], ast.Constant)
+                and isinstance(curr.args[0].value, str)
+            ):
+                stored_attrs.add(curr.args[0].value)
+                return False
+            return True
+        if curr.func.attr in _RECEIVER_MUTATING_METHODS:
+            call_attr = _extract_receiver_root_attr(curr.func.value, rec_param)
+            if call_attr is not None:
+                stored_attrs.add(call_attr)
+        return False
+    if (
+        isinstance(curr.func, ast.Name)
+        and curr.func.id in ("setattr", "delattr")
+        and curr.args
+    ):
+        target_arg = curr.args[0]
+        if isinstance(target_arg, ast.Name) and target_arg.id == rec_param:
+            if (
+                not curr.keywords
+                and len(curr.args) >= 2
+                and not any(isinstance(a, ast.Starred) for a in curr.args[:2])
+                and isinstance(curr.args[1], ast.Constant)
+                and isinstance(curr.args[1].value, str)
+            ):
+                stored_attrs.add(curr.args[1].value)
+                if attr_val_ids is not None:
+                    attr_val_ids.add(id(target_arg))
+            else:
+                return True
+        else:
+            call_attr = _extract_receiver_root_attr(target_arg, rec_param)
+            if call_attr is not None:
+                stored_attrs.add(call_attr)
+    return False
+
+
 def _record_receiver_container_mutations(
     curr: ast.AST,
     rec_param: str,
     loaded_attrs: Set[str],
     stored_attrs: Set[str],
-) -> None:
+    attr_val_ids: Optional[Set[int]] = None,
+) -> bool:
     """Records rec_param root attribute mutations across AugAssign, nested targets, and mutating calls."""
     if isinstance(curr, ast.AugAssign) and isinstance(
         curr.target, (ast.Attribute, ast.Subscript)
@@ -1948,31 +2002,19 @@ def _record_receiver_container_mutations(
         if aug_attr is not None:
             loaded_attrs.add(aug_attr)
             stored_attrs.add(aug_attr)
-        return
+        return False
     if isinstance(curr, (ast.Attribute, ast.Subscript)) and isinstance(
         curr.ctx, (ast.Store, ast.Del)
     ):
         mut_attr = _extract_receiver_root_attr(curr, rec_param)
         if mut_attr is not None:
             stored_attrs.add(mut_attr)
-        return
+        return False
     if isinstance(curr, ast.Call):
-        mut_target: Optional[ast.AST] = None
-        if (
-            isinstance(curr.func, ast.Attribute)
-            and curr.func.attr in _RECEIVER_MUTATING_METHODS
-        ):
-            mut_target = curr.func.value
-        elif (
-            isinstance(curr.func, ast.Name)
-            and curr.func.id in ("setattr", "delattr")
-            and curr.args
-        ):
-            mut_target = curr.args[0]
-        if mut_target is not None:
-            call_attr = _extract_receiver_root_attr(mut_target, rec_param)
-            if call_attr is not None:
-                stored_attrs.add(call_attr)
+        return _record_receiver_call_mutation(
+            curr, rec_param, stored_attrs, attr_val_ids
+        )
+    return False
 
 
 def _extract_receiver_usage_in_method(
@@ -2013,7 +2055,10 @@ def _extract_receiver_usage_in_method(
                 if curr.generators:
                     stack.append(curr.generators[0].iter)
                 continue
-        _record_receiver_container_mutations(curr, rec_param, loaded_attrs, stored_attrs)
+        if _record_receiver_container_mutations(
+            curr, rec_param, loaded_attrs, stored_attrs, attr_val_ids
+        ):
+            bare_escape = True
         if (
             isinstance(curr, ast.Attribute)
             and isinstance(curr.value, ast.Name)
@@ -2133,6 +2178,10 @@ def _collect_method_receiver_sibling_closures(
         else:
             method_usages[id(m)] = (frozenset(), frozenset(), False)
     attr_entries = _collect_class_attr_closure_entries(cls_node, info_sibling_closures)
+    if any(m_bare for _ml, _ms, m_bare in method_usages.values()) or any(
+        entry.rec_bare_escape for entry in attr_entries
+    ):
+        bare_escape = True
     reachable_attrs: Set[str] = set(loaded_attrs)
     reachable_method_ids: Set[int] = set()
     reachable_attr_idxs: Set[int] = set()
