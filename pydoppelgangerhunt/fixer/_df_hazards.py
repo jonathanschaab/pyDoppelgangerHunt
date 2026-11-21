@@ -11,6 +11,7 @@ import builtins
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from pydoppelgangerhunt.fixer._ast_compat import is_try_or_trystar_node
 from pydoppelgangerhunt.fixer._df_cache import (
     _MAX_DOWNSTREAM_CACHE_SIZE,
     _build_downstream_cache_key,
@@ -31,10 +32,12 @@ from pydoppelgangerhunt.fixer._df_cache import (
 )
 from pydoppelgangerhunt.fixer._df_closures import (
     _collect_pre_unit_closures,
+    _extract_scope_escaping_bindings,
     _extract_scope_local_names,
     _extract_single_node_local_names,
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
+    _MAX_AST_RECURSION_DEPTH,
     _DownstreamReadVisitor,
     _StrictPostLineVisitor,
     _VisitorPassMode,
@@ -96,35 +99,36 @@ def _find_enclosing_loops(
     ]
 
 
-def _stmt_definitely_terminates(stmt: ast.stmt) -> bool:
+def _stmt_definitely_terminates(stmt: ast.stmt, *, _depth: int = 0) -> bool:
     """Checks whether an AST statement unconditionally exits execution."""
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return False
     if isinstance(stmt, (ast.Return, ast.Raise)):
         return True
     if isinstance(stmt, ast.If):
         return (
             bool(stmt.orelse)
-            and _block_definitely_terminates(stmt.body)
-            and _block_definitely_terminates(stmt.orelse)
+            and _block_definitely_terminates(stmt.body, _depth=_depth + 1)
+            and _block_definitely_terminates(stmt.orelse, _depth=_depth + 1)
         )
-    if isinstance(stmt, ast.Try):
-        if stmt.finalbody and _block_definitely_terminates(stmt.finalbody):
-            return True
-        if stmt.handlers and _block_definitely_terminates(stmt.body):
-            return all(_block_definitely_terminates(h.body) for h in stmt.handlers)
-    if type(stmt).__name__ == "TryStar":
+    if is_try_or_trystar_node(stmt):
         finalbody = getattr(stmt, "finalbody", None)
-        if finalbody and _block_definitely_terminates(finalbody):
+        if finalbody and _block_definitely_terminates(finalbody, _depth=_depth + 1):
             return True
-        handlers = getattr(stmt, "handlers", [])
-        body = getattr(stmt, "body", [])
-        if handlers and _block_definitely_terminates(body):
-            return all(_block_definitely_terminates(h.body) for h in handlers)
+        handlers = getattr(stmt, "handlers", ())
+        body = getattr(stmt, "body", ())
+        if handlers and _block_definitely_terminates(body, _depth=_depth + 1):
+            return all(
+                _block_definitely_terminates(h.body, _depth=_depth + 1) for h in handlers
+            )
     return False
 
 
-def _block_definitely_terminates(stmts: Sequence[ast.stmt]) -> bool:
+def _block_definitely_terminates(stmts: Sequence[ast.stmt], *, _depth: int = 0) -> bool:
     """Checks whether any statement in a sequence unconditionally terminates execution."""
-    return any(_stmt_definitely_terminates(s) for s in stmts)
+    if _depth > _MAX_AST_RECURSION_DEPTH:
+        return False
+    return any(_stmt_definitely_terminates(s, _depth=_depth) for s in stmts)
 
 
 def _stmts_enclose_unit(stmts: Sequence[ast.stmt], u_start: int, u_end: int) -> bool:
@@ -172,10 +176,7 @@ def _get_scope_try_and_with_blocks(
         for node in ast.walk(scope_node):
             if node is scope_node:
                 continue
-            if (
-                isinstance(node, (ast.Try, ast.With, ast.AsyncWith))
-                or type(node).__name__ == "TryStar"
-            ):
+            if isinstance(node, (ast.With, ast.AsyncWith)) or is_try_or_trystar_node(node):
                 blocks.append(node)
         return blocks
 
@@ -219,11 +220,24 @@ def _scope_reads_outputs_after_line(
     outputs: Set[str],
     end_col: Optional[int] = None,
     start_line: Optional[int] = None,
+    start_col: Optional[int] = None,
 ) -> bool:
     """Checks whether any statement in the scope loads outputs after the given line,
     including loop-carried reads if the statement sits inside an enclosing loop."""
+    output_set = (
+        outputs if isinstance(outputs, (set, frozenset)) else set(outputs)
+    )
     stmt_start = start_line if start_line is not None else line
     stmt_end = line
+    escaping_bindings = _extract_scope_escaping_bindings(
+        scope_node,
+        stmt_start,
+        stmt_end,
+        u_start_col=start_col,
+        u_end_col=end_col,
+    )
+    if not output_set.isdisjoint(escaping_bindings):
+        return True
     enclosing_loops = _find_enclosing_loops(scope_node, stmt_start, stmt_end)
     is_module = isinstance(scope_node, ast.Module)
 
@@ -233,12 +247,12 @@ def _scope_reads_outputs_after_line(
         stmt_end,
         stmt_end,
         end_col,
-        outputs,
+        output_set,
         enclosing_loops,
         _VisitorPassMode.AFTER_UNIT,
         is_module,
     )
-    if not outputs.isdisjoint(after_reads):
+    if not output_set.isdisjoint(after_reads):
         return True
 
     if enclosing_loops:
@@ -246,7 +260,7 @@ def _scope_reads_outputs_after_line(
             stmt_start,
             stmt_end,
             end_col,
-            candidates=outputs,
+            candidates=output_set,
             enclosing_loops=enclosing_loops,
             pass_mode=_VisitorPassMode.LOOP_CARRIED,
             is_module_scope=is_module,
@@ -256,7 +270,7 @@ def _scope_reads_outputs_after_line(
         )
         for stmt in _extract_scope_stmts(scope_node):
             loop_visitor.visit(stmt)
-        if not outputs.isdisjoint(loop_visitor.loaded):
+        if not output_set.isdisjoint(loop_visitor.loaded):
             return True
         if loop_visitor.has_dynamic_read:
             return True
@@ -265,14 +279,14 @@ def _scope_reads_outputs_after_line(
             stmt_start,
             stmt_end,
             end_col,
-            candidates=outputs,
+            candidates=output_set,
         )
         loop_killed = (
             loop_visitor.unit_entry_killed
             if loop_visitor.unit_entry_killed is not None
             else set()
         )
-        if not outputs.isdisjoint(live_ins - loop_killed):
+        if not output_set.isdisjoint(live_ins - loop_killed):
             return True
 
     return False
@@ -287,6 +301,7 @@ def _compound_stmt_reads_outputs_after(
     """Checks whether outputs are read downstream of an enclosing compound statement."""
     end_raw = getattr(node, "end_lineno", None)
     end_col_raw = getattr(node, "end_col_offset", None)
+    start_col_raw = getattr(node, "col_offset", None)
     b_end = max(
         (
             int(getattr(s, "end_lineno", None) or getattr(s, "lineno", 0) or 0)
@@ -297,8 +312,14 @@ def _compound_stmt_reads_outputs_after(
     s_start = getattr(node, "lineno", None) or 1
     s_end = end_raw if isinstance(end_raw, int) else b_end
     s_end_col = end_col_raw if isinstance(end_col_raw, int) else None
+    s_start_col = start_col_raw if isinstance(start_col_raw, int) else None
     return _scope_reads_outputs_after_line(
-        scope_node, s_end, outputs, end_col=s_end_col, start_line=s_start
+        scope_node,
+        s_end,
+        outputs,
+        end_col=s_end_col,
+        start_line=s_start,
+        start_col=s_start_col,
     )
 
 
@@ -330,7 +351,7 @@ def _enclosing_try_reads_outputs(
                         return True
                 continue
 
-            if isinstance(node, ast.Try) or type(node).__name__ == "TryStar":
+            if is_try_or_trystar_node(node):
                 body_nodes = getattr(node, "body", [])
                 orelse_nodes = getattr(node, "orelse", [])
                 handlers = getattr(node, "handlers", [])
@@ -595,6 +616,18 @@ def collect_downstream_read_names(
                             loaded.add(subnode.id)
 
         _merge_pre_unit_closure_reads(loaded, pre_unit_captured_reads, candidates)
+        escaping_bindings = _extract_scope_escaping_bindings(
+            scope_node,
+            u_start,
+            u_end,
+            u_end_col=u_end_col,
+            u_start_col=u_start_col,
+        )
+        if escaping_bindings:
+            if candidates is not None:
+                loaded.update(escaping_bindings & candidates)
+            else:
+                loaded.update(escaping_bindings - _BUILTIN_NAMES)
 
         _store_lru_cache_entry(
             _downstream_reads_cache,

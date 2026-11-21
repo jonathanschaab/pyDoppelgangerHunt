@@ -6,10 +6,12 @@ import ast
 import difflib
 import re
 import typing
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import AbstractSet, Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
-from pydoppelgangerhunt.config import normalize_path_string
-from pydoppelgangerhunt.reporters import extract_unit_source_code
+from pydoppelgangerhunt.config import (
+    normalize_path_string,
+    resolve_pair_closure_flags,
+)
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
     _has_receiver_reference,
@@ -19,10 +21,14 @@ from pydoppelgangerhunt.fixer.binding import (
     _prune_unshared_receivers,
     _resolve_effective_binding,
 )
-from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
+from pydoppelgangerhunt.fixer._ast_compat import is_type_alias_node
+from pydoppelgangerhunt.fixer._df_cache import (
+    _get_or_parse_tree,
+)
 from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor
 from pydoppelgangerhunt.fixer.dataflow import (
     _load_unit_file_text,
+    allows_u2_source_placeholder,
     has_async_generator_delegation_hazard,
     resolve_clone_pair_outputs,
 )
@@ -32,14 +38,16 @@ from pydoppelgangerhunt.fixer.scope import (
     _rank_param_kind,
     _unfold_receiver_attribute,
     analyze_unit_variable_scope,
-    inspect_single_unit_scope,
+    ensure_unit_scope_closure_mode,
     is_subroutine_unit,
+    resolve_unit_inferred_col_bounds,
+    scope_matches_closure_mode,
 )
 from pydoppelgangerhunt.fixer.source import (
     _detect_indent_step,
-    _extract_unit_body_lines,
+    _extract_unit_token_lines_with_state,
     _find_multiline_string_continuation_lines,
-    _slice_unit_token_lines,
+    validate_unit_schema,
     dedent_source_text,
     extract_unit_comments_and_pragmas,
     split_source_lines,
@@ -142,7 +150,13 @@ def _is_subline_unit(unit: Dict[str, Any]) -> bool:
     """Returns True if the unit represents a sub-line token span rather than a whole statement."""
     return any(
         unit.get(k) is not None
-        for k in ("start_col", "end_col", "start_col_offset", "end_col_offset")
+        for k in (
+            "start_col",
+            "end_col",
+            "start_col_offset",
+            "col_offset",
+            "end_col_offset",
+        )
     )
 
 
@@ -154,8 +168,10 @@ def _align_pair_expr_kinds(u1: Dict[str, Any], u2: Dict[str, Any]) -> bool:
         if u1.get("kind") and u2.get("kind"):
             return False
         eff_expr_kind = u1.get("kind") if k1_expr else u2.get("kind")
-        u1.setdefault("kind", eff_expr_kind)
-        u2.setdefault("kind", eff_expr_kind)
+        if not u1.get("kind"):
+            u1["kind"] = eff_expr_kind
+        if not u2.get("kind"):
+            u2["kind"] = eff_expr_kind
     return True
 
 
@@ -792,7 +808,9 @@ def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
             params_part = params_part[1:-1].strip()
         ret_part = parts[1].strip()
         try:
-            tree = ast.parse(f"def _sig_wrapper({params_part}) -> {ret_part}: pass")
+            tree = ast.parse(
+                f"def _sig_wrapper({params_part}) -> {ret_part}: pass"
+            )
         except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
             pass
 
@@ -808,7 +826,7 @@ def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
 
     has_defs = any(
         isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.AnnAssign))
-        or type(n).__name__ == "TypeAlias"
+        or is_type_alias_node(n)
         for n in ast.walk(tree)
     )
     needed: Set[str] = set()
@@ -837,7 +855,7 @@ def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
         elif isinstance(node, ast.AnnAssign):
             if node.annotation is not None:
                 annotations.append(node.annotation)
-        elif type(node).__name__ == "TypeAlias":
+        elif is_type_alias_node(node):
             alias_val = getattr(node, "value", None)
             if isinstance(alias_val, ast.AST):
                 annotations.append(alias_val)
@@ -1278,6 +1296,37 @@ def _extract_probe_active_idents(probe_src: str, return_type: str) -> Set[str]:
     } | set(re.findall(r"\b[A-Za-z_]\w*\b", f"{return_type}\n{str_ann_text}"))
 
 
+_SYNTHESIS_DISALLOWED_HAZARDS: frozenset[str] = frozenset(
+    {
+        "type_param_closure_capture",
+        "pathological_ast",
+        "stale_source_code",
+        "invalid_unit_columns",
+        "deleted_output",
+        "severed_closure_cell",
+        "unavailable_source_for_closure_mode",
+    }
+)
+
+
+def _has_blocking_synthesis_hazards(
+    hazards1: AbstractSet[str],
+    hazards2: AbstractSet[str],
+    *,
+    u2_allows_placeholder: bool,
+    extra_hazards: Iterable[str] = (),
+) -> bool:
+    """Returns True when unit or pair hazards block helper synthesis."""
+    if "unavailable_source_placeholder" in hazards1 or (
+        "unavailable_source_placeholder" in hazards2 and not u2_allows_placeholder
+    ):
+        return True
+    return any(
+        h in _SYNTHESIS_DISALLOWED_HAZARDS
+        for h in (*hazards1, *hazards2, *extra_hazards)
+    )
+
+
 def synthesize_shared_helper_code(
     u1: Dict[str, Any],
     u2: Dict[str, Any],
@@ -1295,8 +1344,9 @@ def synthesize_shared_helper_code(
     source_text2: Optional[str] = None,
     tree1: Optional[ast.AST] = None,
     tree2: Optional[ast.AST] = None,
-    skip_pre_unit_closures: bool = False,
+    skip_pre_unit_closures: Optional[bool] = None,
     closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
     outputs: Optional[List[str]] = None,
     outputs2: Optional[List[str]] = None,
     scope1: Optional[Dict[str, Any]] = None,
@@ -1324,23 +1374,31 @@ def synthesize_shared_helper_code(
         repo_root: Optional root directory of the repository for relative path resolution.
         helper_name: Optional custom helper name override.
         skip_pre_unit_closures: Whether to bypass scanning pre-unit AST closures.
-        closure_strictness: Closure isolation strictness ("strict" / "fail_closed" vs
-            "lenient" / "fast" / "skip").
+        closure_strictness: Closure isolation strictness ("strict", "pedantic",
+            or "lenient").
         outputs: Optional pre-resolved output variable names for u1.
         outputs2: Optional pre-resolved output variable names for u2.
     """
+    validate_unit_schema(u1)
+    validate_unit_schema(u2)
     u1 = dict(u1)
     u2 = dict(u2)
+    for u_target, src_override in ((u1, source_text1), (u2, source_text2)):
+        if src_override is not None and (
+            not isinstance(u_target.get("source_text"), str)
+            or not u_target["source_text"].strip()
+        ):
+            u_target["source_text"] = src_override
     if not _align_pair_expr_kinds(u1, u2):
         return ""
-    lines1 = _slice_unit_token_lines(
-        u1,
-        _extract_unit_body_lines(u1, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u1, repo_root=repo_root)]),
-    )
-    lines2 = _slice_unit_token_lines(
-        u2,
-        _extract_unit_body_lines(u2, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u2, repo_root=repo_root)]),
-    )
+    u1 = resolve_unit_inferred_col_bounds(u1, repo_root=repo_root).unit
+    u2 = resolve_unit_inferred_col_bounds(u2, repo_root=repo_root).unit
+    tok1 = _extract_unit_token_lines_with_state(u1, repo_root=repo_root)
+    tok2 = _extract_unit_token_lines_with_state(u2, repo_root=repo_root)
+    if tok1.lines is None or tok2.lines is None or tok1.is_placeholder:
+        return ""
+    lines1 = tok1.lines
+    lines2 = tok2.lines
 
     base_name1 = _base_unit_name(u1)
     base_name2 = _base_unit_name(u2)
@@ -1382,6 +1440,38 @@ def synthesize_shared_helper_code(
     if preserve_pragmas:
         common_lines = _attach_pragmas(common_lines, pragmas1 + pragmas2)
 
+    # Variable scope analysis for concrete parameter signatures.
+    pair_flags = resolve_pair_closure_flags(
+        u1,
+        u2,
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+    )
+    eff_non_sup1 = pair_flags.unit1.non_suppressing_ctx_managers
+    eff_non_sup2 = pair_flags.unit2.non_suppressing_ctx_managers
+    effective_skip_closures = pair_flags.effective_skip_pre_unit_closures
+    effective_strict_with = pair_flags.effective_strict_with_suppression
+    has_precomputed_scopes = (
+        scope_matches_closure_mode(
+            scope1,
+            effective_skip_closures,
+            strict_with_suppression=effective_strict_with,
+            non_suppressing_ctx_managers=eff_non_sup1,
+        )
+        and scope_matches_closure_mode(
+            scope2,
+            effective_skip_closures,
+            strict_with_suppression=effective_strict_with,
+            non_suppressing_ctx_managers=eff_non_sup2,
+        )
+        and scope_matches_closure_mode(
+            scope,
+            effective_skip_closures,
+            strict_with_suppression=effective_strict_with,
+            non_suppressing_ctx_managers=sorted(set(eff_non_sup1) & set(eff_non_sup2)),
+        )
+    )
     def _resolve_tree(
         given_tree: Optional[ast.AST],
         given_src: Optional[str],
@@ -1396,31 +1486,66 @@ def synthesize_shared_helper_code(
 
     tree1 = _resolve_tree(tree1, source_text1, u1)
     tree2 = _resolve_tree(tree2, source_text2, u2)
-
-    # Variable scope analysis for concrete parameter signatures.
-    has_precomputed_scopes = (
-        scope1 is not None and scope2 is not None and scope is not None
-    )
     scopes: List[Dict[str, Any]] = []
-    for u_item, s_text, t_item, pre_s in (
-        (u1, source_text1, tree1, scope1),
-        (u2, source_text2, tree2, scope2),
+    for u_item, s_text, t_item, pre_s, eff_sk, eff_sw, eff_ns in (
+        (
+            u1,
+            source_text1,
+            tree1,
+            scope1,
+            effective_skip_closures,
+            effective_strict_with,
+            eff_non_sup1,
+        ),
+        (
+            u2,
+            source_text2,
+            tree2,
+            scope2,
+            effective_skip_closures,
+            effective_strict_with,
+            eff_non_sup2,
+        ),
     ):
-        if s_text is not None:
-            u_item.setdefault("source_text", s_text)
         _populate_unit_receiver_metadata(
             u_item, repo_root=repo_root, source_text=s_text, tree=t_item
         )
-        s_item = (
-            dict(pre_s)
-            if pre_s is not None
-            else inspect_single_unit_scope(u_item, repo_root=repo_root, tree=t_item)
+        s_item = dict(
+            ensure_unit_scope_closure_mode(
+                u_item,
+                pre_s,
+                eff_sk,
+                strict_with_suppression=eff_sw,
+                non_suppressing_ctx_managers=eff_ns,
+                source_text=s_text,
+                tree=t_item,
+                repo_root=repo_root,
+            )
         )
         if u_item.get("enclosing_is_async") and s_item.get("has_yield"):
             s_item["is_async"] = True
             u_item["is_async"] = True
         scopes.append(s_item)
     scope1, scope2 = scopes[0], scopes[1]
+    is_sub1 = is_subroutine_unit(u1, source_text=source_text1, tree=tree1)
+    is_sub2 = is_subroutine_unit(u2, source_text=source_text2, tree=tree2)
+    if is_sub1 != is_sub2:
+        return ""
+    is_sub = is_sub1
+    hazards1 = set(scope1.get("control_flow_hazards", ()))
+    hazards2 = set(scope2.get("control_flow_hazards", ()))
+    u2_allows_placeholder = allows_u2_source_placeholder(
+        is_subroutine=is_sub,
+        requires_u2_edit=False,
+        source_text2=source_text2,
+    )
+    if (
+        (tok2.is_placeholder and not u2_allows_placeholder)
+        or _has_blocking_synthesis_hazards(
+            hazards1, hazards2, u2_allows_placeholder=u2_allows_placeholder
+        )
+    ):
+        return ""
     if (
         has_precomputed_scopes
         and scope is not None
@@ -1448,7 +1573,17 @@ def synthesize_shared_helper_code(
             tree2=tree2,
             scope1=scope1,
             scope2=scope2,
+            skip_pre_unit_closures=skip_pre_unit_closures,
+            closure_strictness=closure_strictness,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
         )
+    if _has_blocking_synthesis_hazards(
+        hazards1,
+        hazards2,
+        u2_allows_placeholder=u2_allows_placeholder,
+        extra_hazards=scope.get("control_flow_hazards", ()),
+    ):
+        return ""
 
     if scope1.get("is_async") or scope2.get("is_async"):
         scope["is_async"] = True
@@ -1507,11 +1642,6 @@ def synthesize_shared_helper_code(
     if has_async_generator_delegation_hazard(scope1, scope2, scope):
         return ""
     if scope1.get("nonlocals") or scope2.get("nonlocals") or scope.get("nonlocals"):
-        return ""
-    if any(
-        h in scope.get("control_flow_hazards", [])
-        for h in ("type_param_closure_capture", "pathological_ast", "deleted_output")
-    ):
         return ""
     if not is_same_class and not _is_same_file_path(f1, f2, repo_root=repo_root) and (
         scope1.get("globals") or scope2.get("globals") or scope.get("globals")
@@ -1599,11 +1729,6 @@ def synthesize_shared_helper_code(
     r1 = scope1.get("return_type")
     r2 = scope2.get("return_type")
     resolved_ret = _merge_types(r1, r2, type_merge_strategy)
-    is_sub1 = is_subroutine_unit(u1, source_text=source_text1, tree=tree1)
-    is_sub2 = is_subroutine_unit(u2, source_text=source_text2, tree=tree2)
-    if is_sub1 != is_sub2:
-        return ""
-    is_sub = is_sub1
 
     eff_outputs: List[str]
     if outputs is not None and outputs2 is not None:
@@ -1621,6 +1746,7 @@ def synthesize_shared_helper_code(
             repo_root=repo_root,
             skip_pre_unit_closures=skip_pre_unit_closures,
             closure_strictness=closure_strictness,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
             require_pairing=False,
         )
         if resolved_outs is None:

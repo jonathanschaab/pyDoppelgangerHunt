@@ -17,6 +17,7 @@ from unittest import mock
 import pytest
 
 from pydoppelgangerhunt import (
+    SCOPE_SCHEMA_VERSION,
     generate_refactoring_patch,
     synthesize_shared_helper_code,
 )
@@ -956,8 +957,20 @@ def test_resolve_clone_generator_subroutine_outputs_precomputed_and_fallback(
         "start": 2,
         "end": 2,
     }
-    s1 = {"definite_stores": ["a"], "globals": ["b"], "nonlocals": []}
-    s2 = {"definite_stores": ["x"], "globals": [], "nonlocals": ["y"]}
+    s1 = {
+        "definite_stores": ["a"],
+        "globals": ["b"],
+        "nonlocals": [],
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
+    }
+    s2 = {
+        "definite_stores": ["x"],
+        "globals": [],
+        "nonlocals": ["y"],
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
+    }
     res = resolve_clone_generator_subroutine_outputs(u1_pre, u2_pre, s1, s2)
     assert res is not None
     outs1, outs2 = res
@@ -1891,13 +1904,28 @@ def test_resolve_clone_generator_subroutine_outputs_precomputed_definite_stores(
         "end": 2,
     }
     # Scope 1 only definitely assigns x, leaving unassigned lacking definite store
-    s1 = {"definite_stores": ["x"], "inputs": []}
-    s2 = {"definite_stores": ["a", "b"], "inputs": []}
+    s1 = {
+        "definite_stores": ["x"],
+        "inputs": [],
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
+    }
+    s2 = {
+        "definite_stores": ["a", "b"],
+        "inputs": [],
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
+    }
     res_rejected = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
     assert res_rejected is None
 
     # When both sides definitely assign all precomputed outputs, pairing succeeds
-    s1_valid = {"definite_stores": ["x", "unassigned"], "inputs": []}
+    s1_valid = {
+        "definite_stores": ["x", "unassigned"],
+        "inputs": [],
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
+    }
     res_valid = resolve_clone_generator_subroutine_outputs(u1, u2, s1_valid, s2)
     assert res_valid == (["x", "unassigned"], ["a", "b"])
 
@@ -2212,8 +2240,14 @@ def test_generator_subroutine_outputs_mocked_scope_fails_closed() -> None:
     u1 = {"outputs": ["val"], "source_text": "def f():\n    val = 1\n"}
     u2 = {"outputs": ["val"], "source_text": "def g():\n    val = 2\n"}
     # Scope dict missing both definite_stores and inputs
-    s1: Dict[str, Any] = {"globals": [], "nonlocals": []}
-    s2: Dict[str, Any] = {"globals": [], "nonlocals": []}
+    s1: Dict[str, Any] = {
+        "globals": [],
+        "nonlocals": [],
+    }
+    s2: Dict[str, Any] = {
+        "globals": [],
+        "nonlocals": [],
+    }
     res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
     assert res is None
 
@@ -2453,8 +2487,9 @@ def test_set_valued_outputs_inverting_semantic_order_rejected() -> None:
     res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
     assert res is None
 
-    # 3. Helper synthesis fails closed on multi-item set outputs
-    assert synthesize_shared_helper_code(u1, u2) == ""
+    # 3. Helper synthesis rejects unordered set-valued outputs at entry-point schema validation
+    with pytest.raises(ValueError, match="outputs"):
+        synthesize_shared_helper_code(u1, u2)
 
 
 def test_resolve_clone_generator_subroutine_outputs_side2_zero_coords_rejected() -> None:
@@ -2656,8 +2691,18 @@ def test_resolve_clone_pair_outputs_clean_pair() -> None:
     """Verifies that resolve_clone_pair_outputs successfully pairs matching outputs."""
     u1 = {"kind": "function", "outputs": ["a", "b"]}
     u2 = {"kind": "function", "outputs": ["x", "y"]}
-    s1: Dict[str, Any] = {"inputs": [], "definite_stores": ["a", "b"]}
-    s2: Dict[str, Any] = {"inputs": [], "definite_stores": ["x", "y"]}
+    s1: Dict[str, Any] = {
+        "inputs": [],
+        "definite_stores": ["a", "b"],
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
+    }
+    s2: Dict[str, Any] = {
+        "inputs": [],
+        "definite_stores": ["x", "y"],
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
+    }
 
     res = resolve_clone_pair_outputs(u1, u2, s1, s2)
     assert res == (["a", "b"], ["x", "y"])
@@ -2923,8 +2968,8 @@ def test_scope_parent_map_excludes_scope_node_and_stays_bounded() -> None:
 
 
 def test_load_unit_file_text_fails_closed_on_notebook(tmp_path: Path) -> None:
-    """Verifies that _load_unit_file_text restricts disk fallback to .py files and fails closed
-    (returns None) for Jupyter notebooks (.ipynb) to prevent unsafe patch synthesis."""
+    """Verifies that _load_unit_file_text fails closed (returns None) for unanchored
+    or invalid Jupyter notebook (.ipynb) paths rather than returning raw nbformat JSON."""
     nb_file = tmp_path / "notebook.ipynb"
     nb_file.write_text('{"cells": []}', encoding="utf-8")
 
@@ -3155,7 +3200,7 @@ def test_clear_downstream_reads_cache_resets_closure_warning_cache() -> None:
 
     clear_closure_warning_cache()
     resolve_closure_strictness_mode("unrecognized_mode_foo")
-    assert "unrecognized_mode_foo" in _warned_closure_strictness_values
+    assert "unrecognized_strictness:unrecognized_mode_foo" in _warned_closure_strictness_values
 
     _clear_downstream_reads_cache()
     assert len(_warned_closure_strictness_values) == 0
@@ -3914,8 +3959,20 @@ def test_resolve_clone_generator_subroutine_outputs_unflagged_sliced_lines() -> 
         "end": 12,
         "source_lines": ["    x = yield\n", "    total += x\n", "    yield total\n"],
     }
-    scope1 = {"inputs": ["total"], "outputs": ["total"], "definite_stores": ["total"]}
-    scope2 = {"inputs": ["total"], "outputs": ["total"], "definite_stores": ["total"]}
+    scope1 = {
+        "inputs": ["total"],
+        "outputs": ["total"],
+        "definite_stores": ["total"],
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
+    }
+    scope2 = {
+        "inputs": ["total"],
+        "outputs": ["total"],
+        "definite_stores": ["total"],
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
+    }
     # Sliced lines with len(source_lines) < end fail closed because full file text is unavailable
     res = resolve_clone_generator_subroutine_outputs(u1, u2, scope1, scope2)
     assert res is None

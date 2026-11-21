@@ -36,17 +36,19 @@ from pydoppelgangerhunt import (
     scan_target,
     synthesize_shared_helper_code,
 )
-from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
+from pydoppelgangerhunt.fixer._df_with_provenance import (  # pylint: disable=protected-access
     _analyze_block_assignment,
     _block_terminates,
-    _populate_unit_receiver_metadata,
     _walrus_assignment_in_expr,
+)
+from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=protected-access
+    _populate_unit_receiver_metadata,
 )
 
 
 def test_modular_pydoppelgangerhunt_exports() -> None:
     """Test that pydoppelgangerhunt package exports clean public API and metadata."""
-    assert pydoppelgangerhunt.__version__ == "1.0.0"
+    assert pydoppelgangerhunt.__version__ == "2.0.0"
     assert callable(pydoppelgangerhunt.main)
     assert callable(pydoppelgangerhunt.scan_target)
     assert callable(pydoppelgangerhunt.cluster_clone_families)
@@ -710,9 +712,9 @@ def test_defensive_unit_start_end_none_handling(tmp_path: Path) -> None:
 
 def test_batch_32_exhaustive_review_hardening(tmp_path: Path) -> None:
     """Tests Batch 32 edge case fixes across fixer, diff, baseline, and reporters."""
-    from pydoppelgangerhunt.fixer import (
-        _block_terminates,
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
         _analyze_block_assignment,
+        _block_terminates,
         _walrus_assignment_in_expr,
     )
     from pydoppelgangerhunt.git_diff import get_git_blame_info
@@ -837,10 +839,10 @@ def test_batch_38_windows_path_case_insensitivity_and_unicode_resilience(tmp_pat
         init_tool_configuration,
         paths_match_boundary,
     )
-    from pydoppelgangerhunt.fixer import (
+    from pydoppelgangerhunt.fixer import generate_refactoring_patch
+    from pydoppelgangerhunt.fixer.binding import (
         _is_same_file_path,
         _populate_unit_receiver_metadata,
-        generate_refactoring_patch,
     )
     from pydoppelgangerhunt.reporters import format_markdown_summary
 

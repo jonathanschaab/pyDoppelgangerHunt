@@ -2012,7 +2012,14 @@ def prune_baseline(
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+    except (
+        json.JSONDecodeError,
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+        TypeError,
+        RecursionError,
+    ):
         return PruneResult(0, 0, 0)
 
     if not isinstance(data, dict) or "fingerprints" not in data:

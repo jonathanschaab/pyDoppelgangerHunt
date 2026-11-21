@@ -9,13 +9,12 @@ orchestrating modular subcomponents:
 - `_df_pairing`: Clone output variable pairing and generator subroutine output resolution.
 
 Disk Fallback Scope:
-    While reporting utilities in `reporters.py` allow both `.py` and `.ipynb` files
-    for source inspection and visual diffing, dataflow analysis and patch generation
-    in `dataflow.py` intentionally restrict disk-fallback loading to standard Python
-    source files (`.py`). Refactoring patches cannot safely modify Jupyter notebooks
-    via raw text diffs without corrupting JSON structures and cell offsets. Therefore,
-    notebook units lacking embedded source text fail closed for generator subroutine
-    extractions.
+    Source inspection and dataflow helpers extract only the targeted Python code-cell
+    text for anchored notebook units (``<notebook>.ipynb#cell_N``) while failing closed
+    on unanchored ``.ipynb`` paths, malformed anchors, or non-code/corrupt cells so raw
+    nbformat JSON is never parsed as Python. Unified-diff patch generation in
+    ``patch.py`` independently restricts writable file targets to ``.py`` files so
+    refactoring patches never modify ``.ipynb`` JSON structures directly.
 """
 
 from __future__ import annotations
@@ -39,8 +38,11 @@ logger = logging.getLogger(__name__)
 hashlib = _hashlib
 
 # Public API exports
+allows_u2_source_placeholder = _df_pairing.allows_u2_source_placeholder
 GeneratorCloneSideData = _df_pairing.GeneratorCloneSideData
+PairSkipReason = _df_pairing.PairSkipReason
 clear_dataflow_cache = _df_cache.clear_dataflow_cache
+evict_tree_scopes = _df_cache.evict_tree_scopes
 collect_downstream_read_names = _df_hazards.collect_downstream_read_names
 has_async_generator_delegation_hazard = (
     _df_hazards.has_async_generator_delegation_hazard
@@ -56,12 +58,17 @@ resolve_generator_subroutine_outputs = (
     _df_pairing.resolve_generator_subroutine_outputs
 )
 CloneOutputResolution = _df_pairing.CloneOutputResolution
+SAFETY_PAIR_SKIP_REASONS = _df_pairing.SAFETY_PAIR_SKIP_REASONS
 
 __all__ = [
     "CloneOutputResolution",
     "GeneratorCloneSideData",
+    "PairSkipReason",
+    "SAFETY_PAIR_SKIP_REASONS",
+    "allows_u2_source_placeholder",
     "clear_dataflow_cache",
     "collect_downstream_read_names",
+    "evict_tree_scopes",
     "has_async_generator_delegation_hazard",
     "is_async_generator_with_return_value",
     "resolve_clone_generator_subroutine_outputs",

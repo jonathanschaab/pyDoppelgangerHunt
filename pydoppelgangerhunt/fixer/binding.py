@@ -14,11 +14,11 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _extract_unit_end_col,
     _get_or_parse_tree,
 )
+from pydoppelgangerhunt.fixer._df_closures import _get_tree_scope_intervals
 from pydoppelgangerhunt.fixer._df_visitors import _is_ast_node_within_unit_bounds
 from pydoppelgangerhunt.fixer.scope import analyze_unit_variable_scope
 from pydoppelgangerhunt.fixer.source import (
     _find_innermost_enclosing_node,
-    _get_tree_scope_intervals,
     _load_unit_file_text,
     is_subroutine_unit,
     parse_unit_coord,
@@ -448,7 +448,7 @@ def _populate_unit_receiver_metadata(
                     u_start = parse_unit_coord(unit, "start", default=1)
                     u_end = parse_unit_coord(unit, "end", default=u_start)
                     u_start_col = _extract_first_unit_coord(
-                        unit, ("start_col", "start_col_offset")
+                        unit, ("start_col", "start_col_offset", "col_offset")
                     )
                     u_end_col = _extract_unit_end_col(unit)
                     has_yield, has_await = _unit_ast_has_async_or_yield(

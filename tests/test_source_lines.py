@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -715,6 +716,8 @@ def test_scope_intervals_col_offset_sig_and_lru_shrink_and_decorated_pragma() ->
     """Verifies col_offset signature invalidation, dynamic LRU shrinkage, and decorated pragma leading scan."""
     from collections import OrderedDict  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=protected-access,import-outside-toplevel
+        _debug_ast_immutability,
+        _evict_tree_scopes,
         _store_lru_cache_entry,
     )
     from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=protected-access,import-outside-toplevel
@@ -729,9 +732,35 @@ def test_scope_intervals_col_offset_sig_and_lru_shrink_and_decorated_pragma() ->
     tree.body[0].end_lineno = tree.body[1].end_lineno = 1
     tree.body[0].col_offset = 0
     tree.body[1].col_offset = 15
-    intervals1 = _get_tree_scope_intervals(tree)
-    assert intervals1[0][3] is tree.body[1]
+    from pydoppelgangerhunt.fixer._df_cache import _debug_ast_immutability, evict_tree_scopes
+
+    # Production mode refreshes intervals on AST mutation rather than raising
+    intervals_prod = _get_tree_scope_intervals(tree)
+    assert intervals_prod[0][3] is tree.body[1]
     tree.body[0].col_offset = 30
+    intervals_prod_refreshed = _get_tree_scope_intervals(tree)
+    assert intervals_prod_refreshed[0][3] is tree.body[0]
+    evict_tree_scopes(tree)
+
+    # Debug mode raises RuntimeError when a cached AST node is mutated in place
+    tree.body[0].col_offset = 0
+    _debug_ast_immutability[0] = True
+    try:
+        intervals1 = _get_tree_scope_intervals(tree)
+        assert intervals1[0][3] is tree.body[1]
+        tree.body[0].col_offset = 30
+        with pytest.raises(RuntimeError, match="Cached AST node was mutated in-place"):
+            _get_tree_scope_intervals(tree)
+    finally:
+        _debug_ast_immutability[0] = False
+        evict_tree_scopes(tree)
+    prev_dbg = _debug_ast_immutability[0]
+    _debug_ast_immutability[0] = False
+    try:
+        assert _get_tree_scope_intervals(tree)[0][3] is tree.body[0]
+    finally:
+        _debug_ast_immutability[0] = prev_dbg
+    _evict_tree_scopes(tree)
     intervals2 = _get_tree_scope_intervals(tree)
     assert intervals2[0][3] is tree.body[0]
 
@@ -1187,6 +1216,7 @@ def test_positional_meta2_internal_nonlocal_and_global_type_param_bounds() -> No
     """Verifies positional meta2 lookup, internal nonlocal scoping, enclosing global PEP 695 bounds, and multiline end_col."""
     import sys  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=protected-access,import-outside-toplevel
+        _evict_tree_scopes,
         _get_or_parse_tree,
         _resolve_unit_ast_end_col,
     )
@@ -1260,10 +1290,12 @@ def test_positional_meta2_internal_nonlocal_and_global_type_param_bounds() -> No
     orig_col = cached_tree.body[0].col_offset  # type: ignore[attr-defined]
     try:
         cached_tree.body[0].col_offset = 99  # type: ignore[attr-defined]
+        _evict_tree_scopes(cached_tree)
         intervals2 = _get_tree_scope_intervals(cached_tree)
         assert intervals2 is not intervals1
     finally:
         cached_tree.body[0].col_offset = orig_col  # type: ignore[attr-defined]
+        _evict_tree_scopes(cached_tree)
 
     multi_stmt_tree = ast.parse("if True:\n    x = (\n        1 + 2\n    )\n")
     assert (
@@ -1407,85 +1439,99 @@ def test_multilevel_nonlocal_harvested_expr_receiver_and_delegation_indent(
     assert call_str.startswith("    y = _shared_run(x)")
 
 
-def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
-    tmp_path: Any,
+@pytest.mark.parametrize(
+    ("source", "target_fn_only", "unit", "expected"),
+    [
+        pytest.param("if cond:\n    x = 1\n    y = 2\n", False, {"start": 1, "end": 3, "start_col": 0}, 9, id="compound_if_end_col"),
+        pytest.param("if cond:\n    x = 1\n    y = 2\n", False, {"start": 1, "end": 3, "start_col": 4}, None, id="compound_if_mismatched_col"),
+        pytest.param("def f(x):\n    a = x + 1\n    b = a * 2\n", True, {"start": 2, "end": 3, "start_col": 4}, 13, id="multiline_sub_range"),
+        pytest.param("def f():\n    a = 1; b = (\n        2\n    )\n", True, {"start": 2, "end": 4, "start_col": 4}, 5, id="semicolon_multiline_tail"),
+    ],
+)
+def test_resolve_unit_ast_end_col_multiline_and_semicolon_cases(
+    source: str,
+    target_fn_only: bool,
+    unit: Dict[str, Any],
+    expected: Optional[int],
 ) -> None:
-    """Verify multi-line start_col end_col resolution, class walrus scope, and config top validation."""
-    import ast
-    import sys
-    from pydoppelgangerhunt.cli import main as cli_main
-    from pydoppelgangerhunt.config import load_tool_config
-    from pydoppelgangerhunt.fixer._df_cache import _resolve_unit_ast_end_col
+    """Verify _resolve_unit_ast_end_col handles multi-line blocks, sub-ranges, and semicolon continuations."""
+    tree = ast.parse(source)
+    target: ast.AST = tree.body[0] if target_fn_only else tree
+    assert _resolve_unit_ast_end_col(target, unit) == expected
+
+
+def test_extract_single_node_local_names_class_vs_function_walrus_and_bare_annotations() -> None:
+    """Verify ClassDef isolates comprehension walrus and bare AnnAssign while FunctionDef binds them."""
     from pydoppelgangerhunt.fixer._df_closures import _extract_single_node_local_names
 
-    # 1. Multi-line compound statement with start_col resolves leaf end_col_offset
-    compound_src = "if cond:\n    x = 1\n    y = 2\n"
-    compound_tree = ast.parse(compound_src)
-    assert (
-        _resolve_unit_ast_end_col(
-            compound_tree, {"start": 1, "end": 3, "start_col": 0}
-        )
-        == 9
+    cls_locals = _extract_single_node_local_names(
+        ast.parse("class C:\n    vals = [w := v for v in items]\n").body[0]
     )
-    assert (
-        _resolve_unit_ast_end_col(
-            compound_tree, {"start": 1, "end": 3, "start_col": 4}
-        )
-        is None
-    )
-
-    # 2. Class-body comprehension walrus target does not leak into ClassDef local bindings
-    cls_tree = ast.parse("class C:\n    vals = [w := v for v in items]\n")
-    cls_locals = _extract_single_node_local_names(cls_tree.body[0])
     assert "vals" in cls_locals
     assert "w" not in cls_locals
 
-    fn_tree = ast.parse("def f(items):\n    vals = [w := v for v in items]\n")
-    fn_locals = _extract_single_node_local_names(fn_tree.body[0])
+    fn_locals = _extract_single_node_local_names(
+        ast.parse("def f(items):\n    vals = [w := v for v in items]\n").body[0]
+    )
     assert "vals" in fn_locals
     assert "w" in fn_locals
 
-    # 3. 'top' in _CONFIG_KEY_NAMES and validated in main() when loaded from config (including float rejection)
+    ann_locals = _extract_single_node_local_names(
+        ast.parse("class C:\n    bare_x: int\n    assigned_y: int = 1\n").body[0]
+    )
+    assert "bare_x" not in ann_locals
+    assert "assigned_y" in ann_locals
+
+
+def test_toml_config_top_validation_and_headerless_multiline_arrays(tmp_path: Path) -> None:
+    """Verify CLI top config validation and zero-dependency TOML multiline array parsing."""
+    from pydoppelgangerhunt.cli import main as cli_main
+    from pydoppelgangerhunt.config import load_toml_section, load_tool_config
+
     cfg_file = tmp_path / "custom.toml"
     cfg_file.write_text("top = 5\n", encoding="utf-8")
-    loaded = load_tool_config(config_path=str(cfg_file))
-    assert loaded.get("top") == 5
+    assert load_tool_config(config_path=str(cfg_file)).get("top") == 5
 
     for invalid_top in ("0", "2.5"):
         bad_cfg = tmp_path / "bad_top.toml"
-        bad_cfg.write_text(
-            f"[tool.pydoppelgangerhunt]\ntop = {invalid_top}\n", encoding="utf-8"
-        )
+        bad_cfg.write_text(f"[tool.pydoppelgangerhunt]\ntop = {invalid_top}\n", encoding="utf-8")
         with pytest.raises(SystemExit):
             cli_main([str(tmp_path), "--config", str(bad_cfg)])
 
-    # 4. Class-scoped annotations on PEP 695 generic methods in _extract_helper_symbols
-    if sys.version_info >= (3, 12):
-        from pydoppelgangerhunt.fixer.patch import _extract_helper_symbols
-
-        generic_cls_code = (
-            "class _Helper:\n"
-            "    Attr = int\n"
-            "    def m[T: Attr](self, x: Attr) -> T:\n"
-            "        return x\n"
-        )
-        free_syms, _, _ = _extract_helper_symbols(ast.parse(generic_cls_code))
-        assert "Attr" not in free_syms
-        assert "T" not in free_syms
-
-    # 5. _OuterExprVisitor.visit_NamedExpr visits value without recording store target
-    from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor
-
-    outer_vis = _OuterExprVisitor()
-    outer_vis.visit(ast.parse("(w := val + 1)", mode="eval"))
-    assert outer_vis.ordered_names == ["val"]
-
-    # 6. Finding 1: Incremental class scope binding & comprehension walrus in _extract_helper_symbols
-    from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
-    from pydoppelgangerhunt.fixer.patch import (
-        _build_unit_delegation_call,
-        _extract_helper_symbols,
+    hdrless_toml = tmp_path / "headerless_arr.toml"
+    hdrless_toml.write_text('exclude = [\n  ["a", "b"]\n]\nthreshold = 0.85\n', encoding="utf-8")
+    sec_toml = tmp_path / "sec_multiline.toml"
+    sec_toml.write_text(
+        '[tool.other]\nmatrix = [\n  "[tool.pydoppelgangerhunt]"\n]\n'
+        '[tool.pydoppelgangerhunt]\nexclude = [\n  ["x", "y"]\n]\nthreshold = 0.91\n',
+        encoding="utf-8",
     )
+    orig_tomllib = sys.modules.get("tomllib")
+    orig_tomli = sys.modules.get("tomli")
+    try:
+        sys.modules["tomllib"] = None  # type: ignore[assignment]
+        sys.modules["tomli"] = None  # type: ignore[assignment]
+        parsed_hdrless = load_toml_section(str(hdrless_toml), "pydoppelgangerhunt")
+        parsed_sec = load_toml_section(str(sec_toml), "pydoppelgangerhunt")
+    finally:
+        if orig_tomllib is not None:
+            sys.modules["tomllib"] = orig_tomllib
+        else:
+            sys.modules.pop("tomllib", None)
+        if orig_tomli is not None:
+            sys.modules["tomli"] = orig_tomli
+        else:
+            sys.modules.pop("tomli", None)
+
+    assert parsed_hdrless.get("threshold") == 0.85
+    assert parsed_hdrless.get("exclude") == [["a", "b"]]
+    assert parsed_sec.get("exclude") == [["x", "y"]]
+    assert parsed_sec.get("threshold") == 0.91
+
+
+def test_extract_helper_symbols_class_walrus_globals_wildcards_and_del() -> None:
+    """Verify helper symbol extraction across class scoping, comprehension walrus, global, wildcard *, and del."""
+    from pydoppelgangerhunt.fixer.patch import _extract_helper_symbols
 
     cls_shadow_code = (
         "class _H:\n"
@@ -1500,61 +1546,208 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     assert "deco" in free_cls
     assert {"x", "outer_sym", "deco"} <= def_cls
 
-    comp_walrus_code = (
-        "def _h(items):\n"
-        "    vals = [w := v + 1 for v in items]\n"
-        "    return w, vals\n"
-    )
+    comp_walrus_code = "def _h(items):\n    vals = [w := v + 1 for v in items]\n    return w, vals\n"
     free_cw, _, _ = _extract_helper_symbols(ast.parse(comp_walrus_code))
     assert "w" not in free_cw
 
-    # 7. Finding 2: _DownstreamReadVisitor isolates class-attribute kills from method reads
-    cls_downstream_src = (
-        "def outer():\n"
-        "    x = 1\n"
-        "    class C:\n"
-        "        a = x + 1\n"
-        "        x = 99\n"
-        "        def m(self):\n"
-        "            return x\n"
-        "    return C\n"
+    global_helper_src = (
+        "def _shared_helper():\n"
+        "    def inner():\n"
+        "        return X\n"
+        "    global X\n"
+        "    X = 1\n"
+        "    return inner()\n"
     )
+    g_free, g_def, _ = _extract_helper_symbols(ast.parse(global_helper_src))
+    assert "X" in g_free
+    assert "X" not in g_def
+
+    star_free, star_def, star_imp = _extract_helper_symbols(
+        ast.parse("def _shared_fn():\n    from math import *\n    return 1\n")
+    )
+    assert "*" not in star_free
+    assert "*" not in star_def
+    assert "*" not in star_imp
+
+    del_free, _, _ = _extract_helper_symbols(ast.parse("def _shared_del():\n    del ExternalSym\n"))
+    assert "ExternalSym" in del_free
+
+
+@pytest.mark.skipif(sys.version_info < (3, 10), reason="Requires match/case statement syntax")
+def test_extract_helper_symbols_match_case_bindings_and_wildcards() -> None:
+    """Verify helper symbol extraction handles match/case bindings, '_' wildcard targets, and bare AnnAssign."""
+    from pydoppelgangerhunt.fixer.patch import _extract_helper_symbols
+
+    match_helper_src = (
+        "class C:\n"
+        "    bare_attr: OuterType\n"
+        "    val = bare_attr\n"
+        "    match cmd:\n"
+        "        case [first, *rest]:\n"
+        "            out = first + len(rest)\n"
+        "        case {'k': mapped, **extra}:\n"
+        "            out = mapped + len(extra)\n"
+    )
+    m_free, _, _ = _extract_helper_symbols(ast.parse(match_helper_src))
+    for bound in ("first", "rest", "mapped", "extra"):
+        assert bound not in m_free
+    assert "bare_attr" in m_free
+    assert "OuterType" in m_free
+
+    match_wc_tree = ast.parse(
+        "def _shared_match(val):\n"
+        "    match val:\n"
+        "        case {'k': x, **rest}:\n"
+        "            return _\n"
+    )
+    match_node = match_wc_tree.body[0].body[0]  # type: ignore[attr-defined]
+    match_node.cases[0].pattern.rest = "_"
+    wc_free, wc_def, _ = _extract_helper_symbols(match_wc_tree)
+    assert "_" in wc_free
+    assert "_" not in wc_def
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="Requires PEP 695 type parameter syntax")
+def test_extract_helper_symbols_pep695_generic_method_annotations() -> None:
+    """Verify class-scoped annotations and PEP 695 type params are bound inside generic methods."""
+    from pydoppelgangerhunt.fixer.patch import _extract_helper_symbols
+
+    generic_cls_code = (
+        "class _Helper:\n"
+        "    Attr = int\n"
+        "    def m[T: Attr](self, x: Attr) -> T:\n"
+        "        return x\n"
+    )
+    free_syms, _, _ = _extract_helper_symbols(ast.parse(generic_cls_code))
+    assert "Attr" not in free_syms
+    assert "T" not in free_syms
+
+
+def test_outer_expr_visitor_skips_walrus_store_targets() -> None:
+    """Verify _OuterExprVisitor visits walrus values without recording store targets as external reads."""
+    from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor
+
+    outer_vis = _OuterExprVisitor()
+    outer_vis.visit(ast.parse("(w := val + 1)", mode="eval"))
+    assert outer_vis.ordered_names == ["val"]
+
+    walrus_expr_v = _OuterExprVisitor()
+    walrus_expr_v.visit(ast.parse("((w := transform(x)) + w for x in items)").body[0])
+    assert "w" not in walrus_expr_v.names
+    assert walrus_expr_v.ordered_names == ["items", "transform"]
+
+
+@pytest.mark.parametrize(
+    ("source", "unit_span", "candidate_names"),
+    [
+        pytest.param(
+            "def outer():\n    x = 1\n    class C:\n        a = x + 1\n        x = 99\n"
+            "        def m(self):\n            return x\n    return C\n",
+            {"kind": "compound_block", "start": 4, "end": 4},
+            {"x", "a"},
+            id="class_attr_kill_before_method",
+        ),
+        pytest.param(
+            "def outer():\n    x = 1\n    class C:\n        a = x + 1\n        x = 99\n"
+            "        vals = [x for _ in range(1)]\n    return C\n",
+            {"kind": "compound_block", "start": 4, "end": 4},
+            {"x", "a"},
+            id="class_attr_kill_before_comp",
+        ),
+        pytest.param(
+            "def outer(x):\n    for _ in range(2):\n        class C:\n            x += 1\n"
+            "            x = 99\n            vals = [x for _ in range(1)]\n    return None\n",
+            {"kind": "compound_block", "start": 4, "end": 4},
+            {"x"},
+            id="outer_param_class_loop",
+        ),
+        pytest.param(
+            "def outer(x):\n    for _ in range(2):\n        class C:\n            vals = [x for _ in range(1)]\n"
+            "            x = 99\n        x += 1\n",
+            {"kind": "compound_block", "start": 6, "end": 6},
+            {"x"},
+            id="loop_carried_class_read",
+        ),
+        pytest.param(
+            "def outer(x):\n    x = x + 1\n    class C:\n        for x in x:\n            pass\n    return C\n",
+            {"start": 2, "end": 2},
+            {"x"},
+            id="class_for_iter_reads_outer",
+        ),
+        pytest.param(
+            "def outer(x):\n    x = x + 1\n    class C:\n        x: int\n        z = x\n    return C\n",
+            {"start": 2, "end": 2},
+            {"x"},
+            id="class_bare_annotation_not_kill",
+        ),
+    ],
+)
+def test_downstream_read_visitor_isolates_class_attributes_and_loops(
+    source: str,
+    unit_span: Dict[str, Any],
+    candidate_names: set[str],
+) -> None:
+    """Verify downstream read tracking isolates class-attribute kills from outer/method/comprehension reads."""
     ds_reads = collect_downstream_read_names(
-        cls_downstream_src, {"kind": "compound_block", "start": 4, "end": 4}, {"x", "a"}
+        source, unit_span, candidate_names, tree=ast.parse(source)
     )
     assert ds_reads is not None and "x" in ds_reads
 
-    # 8. Finding 3: _extract_probe_active_idents retains cast("T", ...) type parameter
-    from pydoppelgangerhunt.fixer.synthesis import _extract_probe_active_idents
 
-    cast_idents = _extract_probe_active_idents(
-        'def _probe(x: Any) -> Any:\n    return typing.cast("T", x)\n', "Any"
-    )
-    assert "T" in cast_idents
-
-    # 9. Finding 4: _build_unit_delegation_call on whole-line expr preserves inline pragma without duplicating leading comments
-    expr_src = "# leading note\nres = [x + 1 for x in items]  # type: ignore\n"
-    expr_call = _build_unit_delegation_call(
-        {"kind": "comprehension", "start": 2, "end": 2},
-        expr_src,
-        expr_src.splitlines(keepends=True),
-        effective_binding="module",
-        helper_name="_shared_comp",
-        inputs=["items"],
-        outputs=[],
-        scope={"param_details": []},
-        preserve_boundary_pragmas=True,
-    )
-    assert expr_call == "res = _shared_comp(items)  # type: ignore\n"
-
-    # 10. Finding 5: Class-body comprehension walrus target does not mask subsequent class-body loads in _ScopeVisitor
+def test_branch_aware_deleted_outputs_and_pair_resolution(tmp_path: Path) -> None:
+    """Verify branch-symmetric del propagation marks deleted_output and blocks unsafe pairing."""
+    from pydoppelgangerhunt.fixer._df_pairing import resolve_clone_pair_outputs
     from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope
 
-    cls_unit_src = (
-        "class Box:\n"
-        "    vals = [w := v for v in items]\n"
-        "    after = w\n"
+    del_branch_a = (
+        "def f(cond):\n    if cond:\n        x = 1\n        del x\n    else:\n        x = 2\n    return 0\n"
     )
+    del_branch_b = (
+        "def f(cond):\n    if not cond:\n        x = 2\n    else:\n        x = 1\n        del x\n    return 0\n"
+    )
+    del_file_a = tmp_path / "del_a.py"
+    del_file_b = tmp_path / "del_b.py"
+    del_file_a.write_text(del_branch_a, encoding="utf-8")
+    del_file_b.write_text(del_branch_b, encoding="utf-8")
+    u_del_a = {"kind": "if_block", "start": 2, "end": 6, "file": str(del_file_a)}
+    u_del_b = {"kind": "if_block", "start": 2, "end": 6, "file": str(del_file_b)}
+    sc_del_a = inspect_single_unit_scope(u_del_a, repo_root=str(tmp_path), tree=ast.parse(del_branch_a))
+    sc_del_b = inspect_single_unit_scope(u_del_b, repo_root=str(tmp_path), tree=ast.parse(del_branch_b))
+    assert sc_del_a["outputs"] == sc_del_b["outputs"] == ["x"]
+    assert sc_del_a["conditional_outputs"] == sc_del_b["conditional_outputs"] == ["x"]
+    assert "deleted_output" in sc_del_a["control_flow_hazards"]
+    assert "deleted_output" in sc_del_b["control_flow_hazards"]
+    assert not sc_del_a["is_control_flow_safe"]
+    assert not sc_del_b["is_control_flow_safe"]
+    assert resolve_clone_pair_outputs(u_del_a, u_del_b, sc_del_a, sc_del_b, del_branch_a, del_branch_b) is None
+
+    del_input_a = "def g(x, cond):\n    if cond:\n        del x\n    else:\n        x = 2\n"
+    del_input_b = "def g(x, cond):\n    if not cond:\n        x = 2\n    else:\n        del x\n"
+    del_in_fa = tmp_path / "del_in_a.py"
+    del_in_fb = tmp_path / "del_in_b.py"
+    del_in_fa.write_text(del_input_a, encoding="utf-8")
+    del_in_fb.write_text(del_input_b, encoding="utf-8")
+    sc_in_a = inspect_single_unit_scope(
+        {"kind": "if_block", "start": 2, "end": 5, "file": str(del_in_fa)},
+        repo_root=str(tmp_path),
+        tree=ast.parse(del_input_a),
+    )
+    sc_in_b = inspect_single_unit_scope(
+        {"kind": "if_block", "start": 2, "end": 5, "file": str(del_in_fb)},
+        repo_root=str(tmp_path),
+        tree=ast.parse(del_input_b),
+    )
+    assert "x" in sc_in_a["inputs"] and "x" in sc_in_b["inputs"]
+    assert "x" in sc_in_a["conditional_outputs"] and "x" in sc_in_b["conditional_outputs"]
+    assert not sc_in_a["is_control_flow_safe"] and not sc_in_b["is_control_flow_safe"]
+
+
+def test_scope_visitor_nonlocals_annotations_loops_and_read_before_write(tmp_path: Path) -> None:
+    """Verify scope analysis for class walrus, nested/forward nonlocals, bare annotations, for iter, and AugAssign."""
+    from pydoppelgangerhunt.fixer._df_visitors import _extract_nested_scope_free_reads_with_nodes
+    from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope
+
+    cls_unit_src = "class Box:\n    vals = [w := v for v in items]\n    after = w\n"
     box_file = tmp_path / "box.py"
     box_file.write_text(cls_unit_src, encoding="utf-8")
     cls_scope = inspect_single_unit_scope(
@@ -1564,22 +1757,6 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     )
     assert "w" in cls_scope["inputs"]
 
-    # 11. Class-body comprehension reads outer local after same-named class attribute store
-    cls_comp_src = (
-        "def outer():\n"
-        "    x = 1\n"
-        "    class C:\n"
-        "        a = x + 1\n"
-        "        x = 99\n"
-        "        vals = [x for _ in range(1)]\n"
-        "    return C\n"
-    )
-    ds_comp_reads = collect_downstream_read_names(
-        cls_comp_src, {"kind": "compound_block", "start": 4, "end": 4}, {"x", "a"}
-    )
-    assert ds_comp_reads is not None and "x" in ds_comp_reads
-
-    # 12. Nested nonlocal declared before assignment in intermediate nested function
     nested_nl_src = (
         "def f1():\n"
         "    def inner():\n"
@@ -1600,207 +1777,7 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     )
     assert "x" not in nl_scope["nonlocals"]
 
-    # 13. Single-line unclosed string does not mark remaining lines as multiline continuations
-    from pydoppelgangerhunt.fixer.source import _find_multiline_string_continuation_lines
-
-    unclosed_single = 'x = "unclosed\ny = 1\nz = 2\n'
-    assert _find_multiline_string_continuation_lines(unclosed_single) == set()
-    unclosed_triple = 'x = """unclosed\ny = 1\nz = 2\n'
-    assert _find_multiline_string_continuation_lines(unclosed_triple) == {2, 3}
-
-    # 14. Headerless TOML fallback with multiline array element starting with '['
-    from pydoppelgangerhunt.config import load_toml_section
-
-    hdrless_toml = tmp_path / "headerless_arr.toml"
-    hdrless_toml.write_text(
-        'exclude = [\n  ["a", "b"]\n]\nthreshold = 0.85\n', encoding="utf-8"
-    )
-    orig_tomllib = sys.modules.get("tomllib")
-    orig_tomli = sys.modules.get("tomli")
-    try:
-        sys.modules["tomllib"] = None  # type: ignore[assignment]
-        sys.modules["tomli"] = None  # type: ignore[assignment]
-        parsed_hdrless = load_toml_section(str(hdrless_toml), "pydoppelgangerhunt")
-    finally:
-        if orig_tomllib is not None:
-            sys.modules["tomllib"] = orig_tomllib
-        else:
-            sys.modules.pop("tomllib", None)
-        if orig_tomli is not None:
-            sys.modules["tomli"] = orig_tomli
-        else:
-            sys.modules.pop("tomli", None)
-    assert parsed_hdrless.get("threshold") == 0.85
-
-    # 15. Finding 1.1: collect_downstream_read_names initializes outer_bound across outer parameters,
-    # enclosing functions, and loop-carried passes.
-    outer_param_cls_src = (
-        "def outer(x):\n"
-        "    for _ in range(2):\n"
-        "        class C:\n"
-        "            x += 1\n"
-        "            x = 99\n"
-        "            vals = [x for _ in range(1)]\n"
-        "    return None\n"
-    )
-    ds_outer_param = collect_downstream_read_names(
-        outer_param_cls_src, {"kind": "compound_block", "start": 4, "end": 4}, {"x"}
-    )
-    assert ds_outer_param is not None and "x" in ds_outer_param
-
-    loop_carried_cls_src = (
-        "def outer(x):\n"
-        "    for _ in range(2):\n"
-        "        class C:\n"
-        "            vals = [x for _ in range(1)]\n"
-        "            x = 99\n"
-        "        x += 1\n"
-    )
-    ds_loop_carried = collect_downstream_read_names(
-        loop_carried_cls_src, {"kind": "compound_block", "start": 6, "end": 6}, {"x"}
-    )
-    assert ds_loop_carried is not None and "x" in ds_loop_carried
-
-    # 16. Finding 1.2: Branch-aware deleted_names symmetry and deleted_output hazard
-    from pydoppelgangerhunt.fixer._df_pairing import resolve_clone_pair_outputs
-
-    del_branch_a = (
-        "def f(cond):\n"
-        "    if cond:\n"
-        "        x = 1\n"
-        "        del x\n"
-        "    else:\n"
-        "        x = 2\n"
-        "    return 0\n"
-    )
-    del_branch_b = (
-        "def f(cond):\n"
-        "    if not cond:\n"
-        "        x = 2\n"
-        "    else:\n"
-        "        x = 1\n"
-        "        del x\n"
-        "    return 0\n"
-    )
-    del_file_a = tmp_path / "del_a.py"
-    del_file_b = tmp_path / "del_b.py"
-    del_file_a.write_text(del_branch_a, encoding="utf-8")
-    del_file_b.write_text(del_branch_b, encoding="utf-8")
-    u_del_a = {"kind": "if_block", "start": 2, "end": 6, "file": str(del_file_a)}
-    u_del_b = {"kind": "if_block", "start": 2, "end": 6, "file": str(del_file_b)}
-    sc_del_a = inspect_single_unit_scope(
-        u_del_a, repo_root=str(tmp_path), tree=ast.parse(del_branch_a)
-    )
-    sc_del_b = inspect_single_unit_scope(
-        u_del_b, repo_root=str(tmp_path), tree=ast.parse(del_branch_b)
-    )
-    assert sc_del_a["outputs"] == sc_del_b["outputs"] == ["x"]
-    assert sc_del_a["conditional_outputs"] == sc_del_b["conditional_outputs"] == ["x"]
-    assert "deleted_output" in sc_del_a["control_flow_hazards"]
-    assert "deleted_output" in sc_del_b["control_flow_hazards"]
-    assert not sc_del_a["is_control_flow_safe"]
-    assert not sc_del_b["is_control_flow_safe"]
-    assert (
-        resolve_clone_pair_outputs(
-            u_del_a, u_del_b, sc_del_a, sc_del_b, del_branch_a, del_branch_b
-        )
-        is None
-    )
-
-    del_input_a = (
-        "def g(x, cond):\n"
-        "    if cond:\n"
-        "        del x\n"
-        "    else:\n"
-        "        x = 2\n"
-    )
-    del_input_b = (
-        "def g(x, cond):\n"
-        "    if not cond:\n"
-        "        x = 2\n"
-        "    else:\n"
-        "        del x\n"
-    )
-    del_in_fa = tmp_path / "del_in_a.py"
-    del_in_fb = tmp_path / "del_in_b.py"
-    del_in_fa.write_text(del_input_a, encoding="utf-8")
-    del_in_fb.write_text(del_input_b, encoding="utf-8")
-    u_in_a = {"kind": "if_block", "start": 2, "end": 5, "file": str(del_in_fa)}
-    u_in_b = {"kind": "if_block", "start": 2, "end": 5, "file": str(del_in_fb)}
-    sc_in_a = inspect_single_unit_scope(
-        u_in_a, repo_root=str(tmp_path), tree=ast.parse(del_input_a)
-    )
-    sc_in_b = inspect_single_unit_scope(
-        u_in_b, repo_root=str(tmp_path), tree=ast.parse(del_input_b)
-    )
-    assert "x" in sc_in_a["inputs"] and "x" in sc_in_b["inputs"]
-    assert "x" in sc_in_a["conditional_outputs"] and "x" in sc_in_b["conditional_outputs"]
-    assert not sc_in_a["is_control_flow_safe"] and not sc_in_b["is_control_flow_safe"]
-
-    # 17. Finding 1.3: _extract_helper_symbols handles match/case bindings and bare AnnAssign
-    if sys.version_info >= (3, 10):
-        match_helper_src = (
-            "class C:\n"
-            "    bare_attr: OuterType\n"
-            "    val = bare_attr\n"
-            "    match cmd:\n"
-            "        case [first, *rest]:\n"
-            "            out = first + len(rest)\n"
-            "        case {'k': mapped, **extra}:\n"
-            "            out = mapped + len(extra)\n"
-        )
-        m_free, _, _ = _extract_helper_symbols(ast.parse(match_helper_src))
-        assert "first" not in m_free
-        assert "rest" not in m_free
-        assert "mapped" not in m_free
-        assert "extra" not in m_free
-        assert "bare_attr" in m_free
-        assert "OuterType" in m_free
-
-    # 18. Finding 1.4: Interior line pragmas preserved on multi-line expression units
-    from pydoppelgangerhunt.fixer.patch import (
-        _build_unit_delegation_call,
-        refactor_module_units,
-    )
-
-    expr_pragma_src = (
-        "def compute(items):\n"
-        "    res = [\n"
-        "        x + 1  # type: ignore[operator]\n"
-        "        for x in items\n"
-        "    ]\n"
-        "    return res\n"
-    )
-    expr_unit_full = {"kind": "comprehension", "start": 2, "end": 5}
-    deleg_call = _build_unit_delegation_call(
-        expr_unit_full,
-        expr_pragma_src,
-        expr_pragma_src.splitlines(keepends=True),
-        effective_binding="module",
-        helper_name="_shared_comp",
-        inputs=["items"],
-        outputs=[],
-        scope={"param_details": []},
-    )
-    assert "# type: ignore[operator]" in deleg_call
-    expr_unit_col = {
-        "kind": "comprehension",
-        "start": 2,
-        "end": 5,
-        "start_col": 10,
-        "end_col": 5,
-    }
-    refactored_expr = refactor_module_units(
-        expr_pragma_src, [(expr_unit_col, "_shared_comp(items)")]
-    )
-    assert "# type: ignore[operator]" in refactored_expr
-
-    # 19. Finding 1.1: ast.For / ast.AsyncFor visits iter before target in _ScopeVisitor and _ClassScopeVisitor
-    for_self_ref_src = (
-        "def walk(node):\n"
-        "    for node in node.children:\n"
-        "        process(node)\n"
-    )
+    for_self_ref_src = "def walk(node):\n    for node in node.children:\n        process(node)\n"
     for_scope = inspect_single_unit_scope(
         {
             "kind": "loop_body",
@@ -1813,20 +1790,97 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     )
     assert "node" in for_scope["inputs"]
 
-    cls_for_src = (
-        "def outer(x):\n"
-        "    x = x + 1\n"
-        "    class C:\n"
-        "        for x in x:\n"
-        "            pass\n"
-        "    return C\n"
+    bare_attr_sub_src = "self.value: int\narr[idx]: str\n"
+    bare_attr_scope = inspect_single_unit_scope(
+        {"kind": "compound_block", "start": 1, "end": 2, "source_text": bare_attr_sub_src, "source_code": bare_attr_sub_src},
+        tree=ast.parse(bare_attr_sub_src),
     )
-    cls_for_reads = collect_downstream_read_names(
-        cls_for_src, {"start": 2, "end": 2}, {"x"}, tree=ast.parse(cls_for_src)
-    )
-    assert cls_for_reads is not None and "x" in cls_for_reads
+    assert {"self", "arr", "idx"} <= set(bare_attr_scope["inputs"])
+    assert bare_attr_scope["binding_kind"] == "instance"
 
-    # 20. Finding 1.2: Live-in reads after conditional stores in _inspect_unit_scope and collect_downstream_read_names
+    fwd_nl_fn_src = (
+        "def compute(a: int) -> int:\n"
+        "    def step(d: int) -> None:\n"
+        "        nonlocal acc\n"
+        "        acc += d\n"
+        "    acc = a\n"
+        "    step(5)\n"
+        "    return acc\n"
+    )
+    fwd_nl_fn_scope = inspect_single_unit_scope(
+        {"kind": "function", "start": 1, "end": 7, "source_text": fwd_nl_fn_src, "source_code": fwd_nl_fn_src},
+        tree=ast.parse(fwd_nl_fn_src),
+    )
+    assert fwd_nl_fn_scope["nonlocals"] == []
+    assert fwd_nl_fn_scope["inputs"] == ["a"]
+
+    fwd_nl_sub_scope = inspect_single_unit_scope(
+        {
+            "kind": "compound_block",
+            "start": 2,
+            "end": 6,
+            "source_text": fwd_nl_fn_src,
+            "source_code": "def step(d: int) -> None:\n    nonlocal acc\n    acc += d\nacc = a\nstep(5)\n",
+        },
+        tree=ast.parse(fwd_nl_fn_src),
+    )
+    assert fwd_nl_sub_scope["nonlocals"] == []
+    assert fwd_nl_sub_scope["inputs"] == ["a"]
+
+    cls_rbw_src = "def build() -> type:\n    class C:\n        val = x + 1\n    x = 0\n    return C\n"
+    cls_rbw_scope = inspect_single_unit_scope(
+        {"kind": "closure", "start": 1, "end": 5, "source_text": cls_rbw_src, "source_code": cls_rbw_src},
+        tree=ast.parse(cls_rbw_src),
+    )
+    assert "x" in cls_rbw_scope["inputs"]
+
+    bare_nl_fn_src = (
+        "def compute(a: int) -> int:\n"
+        "    acc: int\n"
+        "    def init() -> None:\n"
+        "        nonlocal acc\n"
+        "        acc = a\n"
+        "    init()\n"
+        "    return acc\n"
+    )
+    bare_nl_fn_scope = inspect_single_unit_scope(
+        {"kind": "function", "start": 1, "end": 7, "source_text": bare_nl_fn_src, "source_code": bare_nl_fn_src},
+        tree=ast.parse(bare_nl_fn_src),
+    )
+    assert bare_nl_fn_scope["nonlocals"] == []
+    assert bare_nl_fn_scope["inputs"] == ["a"]
+
+    bare_nl_sub_scope = inspect_single_unit_scope(
+        {
+            "kind": "compound_block",
+            "start": 2,
+            "end": 6,
+            "source_text": bare_nl_fn_src,
+            "source_code": "acc: int\ndef init() -> None:\n    nonlocal acc\n    acc = a\ninit()\n",
+        },
+        tree=ast.parse(bare_nl_fn_src),
+    )
+    assert bare_nl_sub_scope["nonlocals"] == []
+    assert bare_nl_sub_scope["inputs"] == ["a"]
+    assert "acc" in bare_nl_sub_scope["outputs"]
+
+    nl_aug_fn = ast.parse(
+        "def inner():\n    nonlocal z_val, a_val\n    z_val += 1\n    a_val += 2\n"
+    ).body[0]
+    assert isinstance(nl_aug_fn, ast.FunctionDef)
+    nl_aug_reads, nl_aug_nodes = _extract_nested_scope_free_reads_with_nodes(nl_aug_fn)
+    assert nl_aug_reads == {"z_val", "a_val"}
+    assert [n.id for n in nl_aug_nodes] == ["z_val", "a_val"]
+
+
+def test_scope_conditional_live_in_and_pre_bound_isolation() -> None:
+    """Verify conditional live-in promotion requires prior bindings and isolates inner scopes/dels/TypeAlias."""
+    from pydoppelgangerhunt.fixer.scope import (
+        _analyze_block_assignment,
+        _find_enclosing_pre_bound_names,
+        inspect_single_unit_scope,
+    )
+
     cond_reset_src = (
         "def gen(acc, reset_batch, step):\n"
         "    if reset_batch:\n"
@@ -1874,68 +1928,6 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     )
     assert loop_cond_reads is not None and "acc" in loop_cond_reads
 
-    # 21. Finding 1.3: Bare ast.AnnAssign in ClassDef not treated as runtime store
-    from pydoppelgangerhunt.fixer._df_closures import _extract_single_node_local_names
-
-    cls_ann_tree = ast.parse("class C:\n    bare_x: int\n    assigned_y: int = 1\n")
-    cls_node = cls_ann_tree.body[0]
-    cls_locals = _extract_single_node_local_names(cls_node)
-    assert "bare_x" not in cls_locals
-    assert "assigned_y" in cls_locals
-
-    cls_ann_ds_src = (
-        "def outer(x):\n"
-        "    x = x + 1\n"
-        "    class C:\n"
-        "        x: int\n"
-        "        z = x\n"
-        "    return C\n"
-    )
-    cls_ann_ds_reads = collect_downstream_read_names(
-        cls_ann_ds_src, {"start": 2, "end": 2}, {"x"}, tree=ast.parse(cls_ann_ds_src)
-    )
-    assert cls_ann_ds_reads is not None and "x" in cls_ann_ds_reads
-
-    # 22. Finding 1.4: Bare non-Name AnnAssign targets visited in _ScopeVisitor
-    bare_attr_sub_src = "self.value: int\narr[idx]: str\n"
-    bare_attr_scope = inspect_single_unit_scope(
-        {
-            "kind": "compound_block",
-            "start": 1,
-            "end": 2,
-            "source_text": bare_attr_sub_src,
-            "source_code": bare_attr_sub_src,
-        },
-        tree=ast.parse(bare_attr_sub_src),
-    )
-    assert "self" in bare_attr_scope["inputs"]
-    assert "arr" in bare_attr_scope["inputs"]
-    assert "idx" in bare_attr_scope["inputs"]
-    assert bare_attr_scope["binding_kind"] == "instance"
-
-    # 23. Finding 1.5: _extract_helper_symbols respects global/nonlocal in _collect_direct_bindings
-    global_helper_src = (
-        "def _shared_helper():\n"
-        "    def inner():\n"
-        "        return X\n"
-        "    global X\n"
-        "    X = 1\n"
-        "    return inner()\n"
-    )
-    g_free, g_def, _ = _extract_helper_symbols(ast.parse(global_helper_src))
-    assert "X" in g_free
-    assert "X" not in g_def
-
-    # 24. Finding 1.6: _validate_helper_compilation catches RecursionError
-    from pydoppelgangerhunt.fixer.patch import _validate_helper_compilation
-
-    deep_expr = "(" * 5000 + "1" + ")" * 5000
-    assert _validate_helper_compilation(deep_expr) is False
-    assert _validate_helper_compilation("    " + deep_expr) is False
-    assert _validate_helper_compilation("import os\n\n\n" + deep_expr) is False
-
-    # 25. Finding 1.1: Comprehension targets, lambda locals, closed ExceptHandlers, and enclosing class attrs
-    # do not leak into _find_enclosing_pre_bound_names.
     leak_src = (
         "class Box:\n"
         "    CLASS_CONST = 1\n"
@@ -1960,11 +1952,7 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
             "end": 14,
             "source_text": leak_src,
             "source_code": (
-                "if flag:\n"
-                "    k = 10\n"
-                "    err = 20\n"
-                "    CLASS_CONST = 30\n"
-                "res = (k, err, CLASS_CONST)\n"
+                "if flag:\n    k = 10\n    err = 20\n    CLASS_CONST = 30\nres = (k, err, CLASS_CONST)\n"
             ),
         },
         tree=ast.parse(leak_src),
@@ -1974,113 +1962,6 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     assert "CLASS_CONST" not in leak_scope["inputs"]
     assert {"k", "err", "CLASS_CONST"} <= set(leak_scope["conditional_outputs"])
 
-    # 26. Finding 1.2: Zero-dependency TOML fallback tracks multiline arrays across non-target sections
-    assert parsed_hdrless.get("exclude") == [["a", "b"]]
-    sec_toml = tmp_path / "sec_multiline.toml"
-    sec_toml.write_text(
-        '[tool.other]\nmatrix = [\n  "[tool.pydoppelgangerhunt]"\n]\n'
-        '[tool.pydoppelgangerhunt]\nexclude = [\n  ["x", "y"]\n]\nthreshold = 0.91\n',
-        encoding="utf-8",
-    )
-    try:
-        sys.modules["tomllib"] = None  # type: ignore[assignment]
-        sys.modules["tomli"] = None  # type: ignore[assignment]
-        parsed_sec = load_toml_section(str(sec_toml), "pydoppelgangerhunt")
-    finally:
-        if orig_tomllib is not None:
-            sys.modules["tomllib"] = orig_tomllib
-        else:
-            sys.modules.pop("tomllib", None)
-        if orig_tomli is not None:
-            sys.modules["tomli"] = orig_tomli
-        else:
-            sys.modules.pop("tomli", None)
-    assert parsed_sec.get("exclude") == [["x", "y"]]
-    assert parsed_sec.get("threshold") == 0.91
-
-    # 27. Finding 1: Forward-referenced nonlocal bindings in whole functions and subroutines
-    fwd_nl_fn_src = (
-        "def compute(a: int) -> int:\n"
-        "    def step(d: int) -> None:\n"
-        "        nonlocal acc\n"
-        "        acc += d\n"
-        "    acc = a\n"
-        "    step(5)\n"
-        "    return acc\n"
-    )
-    fwd_nl_fn_scope = inspect_single_unit_scope(
-        {
-            "kind": "function",
-            "start": 1,
-            "end": 7,
-            "source_text": fwd_nl_fn_src,
-            "source_code": fwd_nl_fn_src,
-        },
-        tree=ast.parse(fwd_nl_fn_src),
-    )
-    assert fwd_nl_fn_scope["nonlocals"] == []
-    assert fwd_nl_fn_scope["inputs"] == ["a"]
-
-    fwd_nl_sub_code = (
-        "def step(d: int) -> None:\n"
-        "    nonlocal acc\n"
-        "    acc += d\n"
-        "acc = a\n"
-        "step(5)\n"
-    )
-    fwd_nl_sub_scope = inspect_single_unit_scope(
-        {
-            "kind": "compound_block",
-            "start": 2,
-            "end": 6,
-            "source_text": fwd_nl_fn_src,
-            "source_code": fwd_nl_sub_code,
-        },
-        tree=ast.parse(fwd_nl_fn_src),
-    )
-    assert fwd_nl_sub_scope["nonlocals"] == []
-    assert fwd_nl_sub_scope["inputs"] == ["a"]
-
-    # 28. Finding 2: Immediate ClassDef body execution records read_before_write before outer store
-    cls_rbw_src = (
-        "def build() -> type:\n"
-        "    class C:\n"
-        "        val = x + 1\n"
-        "    x = 0\n"
-        "    return C\n"
-    )
-    cls_rbw_scope = inspect_single_unit_scope(
-        {
-            "kind": "closure",
-            "start": 1,
-            "end": 5,
-            "source_text": cls_rbw_src,
-            "source_code": cls_rbw_src,
-        },
-        tree=ast.parse(cls_rbw_src),
-    )
-    assert "x" in cls_rbw_scope["inputs"]
-
-    # 29. Finding 3: Intra-expression walrus target reads in _OuterExprVisitor
-    from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor
-
-    walrus_expr_v = _OuterExprVisitor()
-    walrus_expr_v.visit(ast.parse("((w := transform(x)) + w for x in items)").body[0])
-    assert "w" not in walrus_expr_v.names
-    assert walrus_expr_v.ordered_names == ["items", "transform"]
-
-    # 30. Finding 4: Multi-statement multi-line units with start_col in _resolve_unit_ast_end_col
-    from pydoppelgangerhunt.fixer._df_cache import _resolve_unit_ast_end_col
-
-    ms_tree = ast.parse("def f(x):\n    a = x + 1\n    b = a * 2\n")
-    assert (
-        _resolve_unit_ast_end_col(
-            ms_tree.body[0], {"start": 2, "end": 3, "start_col": 4}
-        )
-        == 13
-    )
-
-    # 31. Issue 2.1: Nested function body free reads after conditional store in subroutine
     nested_cond_full = (
         "def outer(x: int, flag: bool) -> int:\n"
         "    if flag:\n"
@@ -2089,26 +1970,18 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
         "        return x + y\n"
         "    return helper(1)\n"
     )
-    nested_cond_sub = (
-        "if flag:\n"
-        "    x = 0\n"
-        "def helper(y: int) -> int:\n"
-        "    return x + y\n"
-        "return helper(1)\n"
-    )
     nested_cond_scope = inspect_single_unit_scope(
         {
             "kind": "compound_block",
             "start": 2,
             "end": 6,
             "source_text": nested_cond_full,
-            "source_code": nested_cond_sub,
+            "source_code": "if flag:\n    x = 0\ndef helper(y: int) -> int:\n    return x + y\nreturn helper(1)\n",
         },
         tree=ast.parse(nested_cond_full),
     )
     assert "x" in nested_cond_scope["inputs"]
 
-    # 32. Finding 1: Conditional live-in promotion requires prior binding (no false promotion from def_assigned or loop)
     uninit_def_src = (
         "def compute(flag: bool) -> tuple[int, int]:\n"
         "    if flag:\n"
@@ -2152,7 +2025,6 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     assert "k" not in uninit_loop_scope["inputs"]
     assert "k" in uninit_loop_scope["conditional_outputs"]
 
-    # 33. Finding 2: Transitive deferred live-in tracking for caller-before-callee nested functions
     caller_callee_src = (
         "def outer(x):\n"
         "    def caller():\n"
@@ -2163,28 +2035,17 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
         "    x = 10\n"
         "    return res, x\n"
     )
-    caller_callee_sub = (
-        "def caller():\n"
-        "    return callee()\n"
-        "def callee():\n"
-        "    return x\n"
-        "res = caller()\n"
-        "x = 10\n"
-    )
     caller_callee_scope = inspect_single_unit_scope(
         {
             "kind": "compound_block",
             "start": 2,
             "end": 7,
             "source_text": caller_callee_src,
-            "source_code": caller_callee_sub,
+            "source_code": "def caller():\n    return callee()\ndef callee():\n    return x\nres = caller()\nx = 10\n",
         },
         tree=ast.parse(caller_callee_src),
     )
     assert "x" in caller_callee_scope["inputs"]
-
-    # 34. Finding 3: _find_enclosing_pre_bound_names discards prior del and skips wildcard "*" imports
-    from pydoppelgangerhunt.fixer.scope import _find_enclosing_pre_bound_names
 
     del_star_src = (
         "from math import *\n"
@@ -2212,46 +2073,11 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     assert "x" not in del_star_scope["inputs"]
     assert "x" in del_star_scope["conditional_outputs"]
 
-    # 35. Finding 4: _extract_helper_symbols ignores "*" on wildcard imports
-    star_helper_tree = ast.parse("def _shared_fn():\n    from math import *\n    return 1\n")
-    star_free, star_def, star_imp = _extract_helper_symbols(star_helper_tree)
-    assert "*" not in star_free
-    assert "*" not in star_def
-    assert "*" not in star_imp
-
-    # 36. Multi-statement semicolon line ending in a multi-line statement in _resolve_unit_ast_end_col
-    semi_ml_tree = ast.parse("def f():\n    a = 1; b = (\n        2\n    )\n")
-    assert (
-        _resolve_unit_ast_end_col(
-            semi_ml_tree.body[0], {"start": 2, "end": 4, "start_col": 4}
-        )
-        == 5
-    )
-
-    # 37. Wildcard "_" pattern target ignored in _extract_helper_symbols
-    if sys.version_info >= (3, 10):
-        match_wc_tree = ast.parse(
-            "def _shared_match(val):\n"
-            "    match val:\n"
-            "        case {'k': x, **rest}:\n"
-            "            return _\n"
-        )
-        match_node = match_wc_tree.body[0].body[0]  # type: ignore[attr-defined]
-        match_node.cases[0].pattern.rest = "_"
-        wc_free, wc_def, _ = _extract_helper_symbols(match_wc_tree)
-        assert "_" in wc_free
-        assert "_" not in wc_def
-
-    # 38. Finding 1: ast.For target traversal in _analyze_block_assignment only records Store names
-    from pydoppelgangerhunt.fixer.scope import _analyze_block_assignment
-
-    for_sub_stmts = ast.parse("for arr[idx] in items:\n    pass\n").body
-    for_def, for_cond = _analyze_block_assignment(for_sub_stmts)
+    for_def, for_cond = _analyze_block_assignment(ast.parse("for arr[idx] in items:\n    pass\n").body)
     assert "arr" not in for_cond
     assert "idx" not in for_cond
     assert "arr" not in for_def
 
-    # 39. Finding 2: Branch-nested del in _find_enclosing_pre_bound_names keeps pre-bound name
     branch_del_src = (
         "def f(flag, cond):\n"
         "    x = 1\n"
@@ -2262,12 +2088,9 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
         "    y = x if flag else 0\n"
         "    return y\n"
     )
-    pre_bound_branch_del, _ = _find_enclosing_pre_bound_names(
-        ast.parse(branch_del_src), 5, 7
-    )
+    pre_bound_branch_del, _ = _find_enclosing_pre_bound_names(ast.parse(branch_del_src), 5, 7)
     assert "x" in pre_bound_branch_del
 
-    # 40. Finding 3: PEP 695 TypeAlias binding in _find_enclosing_pre_bound_names isolates lazy walrus
     if sys.version_info >= (3, 12):
         ta_pre_src = (
             "def f(flag):\n"
@@ -2280,76 +2103,72 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
         assert "MyAlias" in pre_bound_ta
         assert "lazy_w" not in pre_bound_ta
 
-    # 41. Finding 4: _extract_helper_symbols records ast.Del target reads for unbound del
-    del_free, _, _ = _extract_helper_symbols(
-        ast.parse("def _shared_del():\n    del ExternalSym\n")
-    )
-    assert "ExternalSym" in del_free
 
-    # 42. Finding 1: Bare ast.AnnAssign initialized via nested nonlocal in whole functions and subroutines
-    bare_nl_fn_src = (
-        "def compute(a: int) -> int:\n"
-        "    acc: int\n"
-        "    def init() -> None:\n"
-        "        nonlocal acc\n"
-        "        acc = a\n"
-        "    init()\n"
-        "    return acc\n"
+def test_source_continuation_lines_and_boundary_pragmas() -> None:
+    """Verify multiline string continuations, pragma preservation, cast probe idents, recursion guard, and super() pruning."""
+    from pydoppelgangerhunt.fixer.patch import (
+        _build_unit_delegation_call,
+        _validate_helper_compilation,
+        refactor_module_units,
     )
-    bare_nl_fn_scope = inspect_single_unit_scope(
-        {
-            "kind": "function",
-            "start": 1,
-            "end": 7,
-            "source_text": bare_nl_fn_src,
-            "source_code": bare_nl_fn_src,
-        },
-        tree=ast.parse(bare_nl_fn_src),
-    )
-    assert bare_nl_fn_scope["nonlocals"] == []
-    assert bare_nl_fn_scope["inputs"] == ["a"]
-
-    bare_nl_sub_code = (
-        "acc: int\n"
-        "def init() -> None:\n"
-        "    nonlocal acc\n"
-        "    acc = a\n"
-        "init()\n"
-    )
-    bare_nl_sub_scope = inspect_single_unit_scope(
-        {
-            "kind": "compound_block",
-            "start": 2,
-            "end": 6,
-            "source_text": bare_nl_fn_src,
-            "source_code": bare_nl_sub_code,
-        },
-        tree=ast.parse(bare_nl_fn_src),
-    )
-    assert bare_nl_sub_scope["nonlocals"] == []
-    assert bare_nl_sub_scope["inputs"] == ["a"]
-    assert "acc" in bare_nl_sub_scope["outputs"]
-
-    # 43. Finding 2: _FuncScopeVisitor.visit_AugAssign records nonlocal target load_nodes in source order
-    from pydoppelgangerhunt.fixer._df_visitors import (
-        _extract_nested_scope_free_reads_with_nodes,
+    from pydoppelgangerhunt.fixer.source import _find_multiline_string_continuation_lines
+    from pydoppelgangerhunt.fixer.synthesis import (
+        _extract_probe_active_idents,
+        _prune_unreferenced_lhs_scope,
     )
 
-    nl_aug_fn = ast.parse(
-        "def inner():\n"
-        "    nonlocal z_val, a_val\n"
-        "    z_val += 1\n"
-        "    a_val += 2\n"
-    ).body[0]
-    assert isinstance(nl_aug_fn, ast.FunctionDef)
-    nl_aug_reads, nl_aug_nodes = _extract_nested_scope_free_reads_with_nodes(nl_aug_fn)
-    assert nl_aug_reads == {"z_val", "a_val"}
-    assert [n.id for n in nl_aug_nodes] == ["z_val", "a_val"]
+    cast_idents = _extract_probe_active_idents(
+        'def _probe(x: Any) -> Any:\n    return typing.cast("T", x)\n', "Any"
+    )
+    assert "T" in cast_idents
 
-    # 44. Finding 3: _prune_unreferenced_lhs_scope preserves receiver binding when RHS uses super()
-    from pydoppelgangerhunt.fixer.synthesis import _prune_unreferenced_lhs_scope
+    expr_src = "# leading note\nres = [x + 1 for x in items]  # type: ignore\n"
+    expr_call = _build_unit_delegation_call(
+        {"kind": "comprehension", "start": 2, "end": 2},
+        expr_src,
+        expr_src.splitlines(keepends=True),
+        effective_binding="module",
+        helper_name="_shared_comp",
+        inputs=["items"],
+        outputs=[],
+        scope={"param_details": []},
+        preserve_boundary_pragmas=True,
+    )
+    assert expr_call == "res = _shared_comp(items)  # type: ignore\n"
 
-    super_rhs_lines = ["self.res = [super().transform(x) for x in items]\n"]
+    assert _find_multiline_string_continuation_lines('x = "unclosed\ny = 1\nz = 2\n') == set()
+    assert _find_multiline_string_continuation_lines('x = """unclosed\ny = 1\nz = 2\n') == {2, 3}
+
+    expr_pragma_src = (
+        "def compute(items):\n"
+        "    res = [\n"
+        "        x + 1  # type: ignore[operator]\n"
+        "        for x in items\n"
+        "    ]\n"
+        "    return res\n"
+    )
+    deleg_call = _build_unit_delegation_call(
+        {"kind": "comprehension", "start": 2, "end": 5},
+        expr_pragma_src,
+        expr_pragma_src.splitlines(keepends=True),
+        effective_binding="module",
+        helper_name="_shared_comp",
+        inputs=["items"],
+        outputs=[],
+        scope={"param_details": []},
+    )
+    assert "# type: ignore[operator]" in deleg_call
+    refactored_expr = refactor_module_units(
+        expr_pragma_src,
+        [({"kind": "comprehension", "start": 2, "end": 5, "start_col": 10, "end_col": 5}, "_shared_comp(items)")],
+    )
+    assert "# type: ignore[operator]" in refactored_expr
+
+    deep_expr = "(" * 5000 + "1" + ")" * 5000
+    assert _validate_helper_compilation(deep_expr) is False
+    assert _validate_helper_compilation("    " + deep_expr) is False
+    assert _validate_helper_compilation("import os\n\n\n" + deep_expr) is False
+
     super_unit: Dict[str, Any] = {
         "kind": "comprehension",
         "inputs": ["self", "items"],
@@ -2370,14 +2189,391 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
         "has_receiver_access": True,
         "binding_kind": "instance",
     }
-    _prune_unreferenced_lhs_scope(super_unit, super_scope, super_rhs_lines)
+    _prune_unreferenced_lhs_scope(
+        super_unit, super_scope, ["self.res = [super().transform(x) for x in items]\n"]
+    )
     assert "self" in super_scope["inputs"]
     assert super_scope["has_instance_binding"] is True
     assert super_scope["binding_kind"] == "instance"
 
 
+def test_sequence_source_lines_without_slice_support_and_string_controls(
+    tmp_path: Path,
+) -> None:
+    """Verifies arbitrary Sequence[str] objects work without slice support and strings are rejected."""
+    from collections import UserList
+    from collections.abc import Sequence
+
+    from pydoppelgangerhunt.fixer.source import is_subroutine_unit, validate_unit_schema
+    from pydoppelgangerhunt.source_lines import (
+        SourceLinesOrigin,
+        extract_unit_source_lines_with_state,
+        is_non_string_sequence,
+    )
+
+    class _IndexOnlyLines(Sequence[str]):
+        def __init__(self, items: list[str]) -> None:
+            self._items = items
+
+        def __len__(self) -> int:
+            return len(self._items)
+
+        def __getitem__(self, index: int | slice) -> Any:
+            if isinstance(index, slice):
+                raise TypeError("slicing is intentionally unsupported")
+            return self._items[index]
+
+    sample_lines = ["def add(a, b):\n", "    return a + b\n"]
+    seq_variants: tuple[Sequence[str], ...] = (
+        tuple(sample_lines),
+        UserList(sample_lines),
+        _IndexOnlyLines(sample_lines),
+    )
+    for seq in seq_variants:
+        assert is_non_string_sequence(seq) is True
+        unit: dict[str, Any] = {
+            "file": str(tmp_path / "mod.py"),
+            "start": 2,
+            "end": 2,
+            "source_lines": seq,
+        }
+        validate_unit_schema(unit)
+        assert is_subroutine_unit(unit) is True
+        lines, origin = extract_unit_source_lines_with_state(unit)
+        assert origin == SourceLinesOrigin.FULL_BUFFER
+        assert lines == [sample_lines[1]]
+
+    for bad_seq in ("def f(): pass\n", b"def f(): pass\n", bytearray(b"abc")):
+        assert is_non_string_sequence(bad_seq) is False
+        with pytest.raises(ValueError, match="ordered sequence of str"):
+            validate_unit_schema(
+                {"file": "a.py", "start": 1, "end": 1, "source_lines": bad_seq}
+            )
 
 
+def test_extract_unit_source_lines_disk_out_of_range_and_lf_normalization(
+    tmp_path: Path,
+) -> None:
+    """Verifies disk out-of-range slices return PLACEHOLDER origin and in-range slices normalize LF."""
+    from pydoppelgangerhunt.source_lines import (
+        SourceLinesOrigin,
+        extract_unit_source_lines_with_state,
+    )
+
+    target = tmp_path / "no_trailing_nl.py"
+    target.write_text("a = 1\nb = 2", encoding="utf-8")
+
+    valid_lines, valid_origin = extract_unit_source_lines_with_state(
+        {"file": str(target), "start": 1, "end": 2, "kind": "block"},
+        repo_root=str(tmp_path),
+    )
+    assert valid_origin == SourceLinesOrigin.DISK
+    assert valid_lines == ["a = 1\n", "b = 2\n"]
+
+    oob_lines, oob_origin = extract_unit_source_lines_with_state(
+        {"file": str(target), "start": 10, "end": 12, "kind": "block"},
+        repo_root=str(tmp_path),
+    )
+    assert oob_origin == SourceLinesOrigin.PLACEHOLDER
+    assert oob_lines == ["# Source for unit lines 10-12\n"]
 
 
+def test_non_str_source_lines_fail_closed_to_placeholder(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies non-string items inside source_lines are rejected by validate_unit_schema and fail closed to PLACEHOLDER."""
+    from pydoppelgangerhunt.fixer.source import validate_unit_schema
+    from pydoppelgangerhunt.source_lines import (
+        SourceLinesOrigin,
+        extract_unit_source_lines_with_state,
+    )
 
+    bad_units = [
+        {"name": "bad_int", "start": 1, "end": 2, "source_lines": [123, "x = 1\n"]},
+        {"name": "bad_none", "start": 1, "end": 2, "source_lines": [None]},
+    ]
+    for bad_unit in bad_units:
+        with pytest.raises(ValueError, match="ordered sequence of str"):
+            validate_unit_schema(bad_unit)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            lines, origin = extract_unit_source_lines_with_state(bad_unit)
+        assert origin is SourceLinesOrigin.PLACEHOLDER
+        assert origin.is_placeholder is True
+        assert origin.has_real_source is False
+        assert lines == [f"# Source for {bad_unit['name']} lines 1-2\n"]
+        assert "Rejecting non-string source_lines entry" in caplog.text
+
+
+def test_notebook_cache_recursion_error_and_lru_eviction_reuse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies read_notebook_cell_lines_cached handles RecursionError and enforces bounded LRU reuse/eviction."""
+    import pydoppelgangerhunt.source_lines as sl_mod
+    from pydoppelgangerhunt.source_lines import (
+        _MAX_NOTEBOOK_CACHE_ENTRIES,
+        _NOTEBOOK_CELLS_CACHE,
+        clear_notebook_cache,
+        read_notebook_cell_lines_cached,
+    )
+
+    clear_notebook_cache()
+    deep_nb = tmp_path / "deep.ipynb"
+    deep_nb.write_text('{"cells": [{"cell_type": "code", "source": ["x = 1"]}]}', encoding="utf-8")
+    with monkeypatch.context() as mp:
+        mp.setattr(sl_mod.json, "loads", lambda *_a, **_kw: (_ for _ in ()).throw(RecursionError("deep json")))
+        assert read_notebook_cell_lines_cached(deep_nb, 0) is None
+
+    clear_notebook_cache()
+    parse_calls = 0
+    real_loads = json.loads
+
+    def _counting_loads(text: str, *args: Any, **kwargs: Any) -> Any:
+        nonlocal parse_calls
+        parse_calls += 1
+        return real_loads(text, *args, **kwargs)
+
+    nb_paths: list[Path] = []
+    for idx in range(_MAX_NOTEBOOK_CACHE_ENTRIES + 2):
+        nb_p = tmp_path / f"nb_{idx}.ipynb"
+        nb_p.write_text(
+            json.dumps({"cells": [{"cell_type": "code", "source": [f"val_{idx} = {idx}\n"]}]}),
+            encoding="utf-8",
+        )
+        nb_paths.append(nb_p)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(sl_mod.json, "loads", _counting_loads)
+        # Fill cache cleanly
+        for idx in range(_MAX_NOTEBOOK_CACHE_ENTRIES):
+            assert read_notebook_cell_lines_cached(nb_paths[idx], 0) == [f"val_{idx} = {idx}\n"]
+        assert parse_calls == _MAX_NOTEBOOK_CACHE_ENTRIES
+
+        # Repeated read of nb_0 reuses cache (moves to MRU) without calling json.loads again
+        assert read_notebook_cell_lines_cached(nb_paths[0], 0) == ["val_0 = 0\n"]
+        assert parse_calls == _MAX_NOTEBOOK_CACHE_ENTRIES
+
+        # Adding 2 more notebooks evicts nb_1 and nb_2 (the LRU entries), keeping cache size bounded
+        assert read_notebook_cell_lines_cached(nb_paths[-2], 0) == [
+            f"val_{_MAX_NOTEBOOK_CACHE_ENTRIES} = {_MAX_NOTEBOOK_CACHE_ENTRIES}\n"
+        ]
+        assert read_notebook_cell_lines_cached(nb_paths[-1], 0) == [
+            f"val_{_MAX_NOTEBOOK_CACHE_ENTRIES + 1} = {_MAX_NOTEBOOK_CACHE_ENTRIES + 1}\n"
+        ]
+        assert len(_NOTEBOOK_CELLS_CACHE) == _MAX_NOTEBOOK_CACHE_ENTRIES
+        cached_paths = {key[0] for key in _NOTEBOOK_CELLS_CACHE}
+        assert str(nb_paths[0]) in cached_paths
+        assert str(nb_paths[1]) not in cached_paths
+        assert str(nb_paths[2]) not in cached_paths
+    clear_notebook_cache()
+
+
+@pytest.mark.parametrize(
+    ("case_id", "unit_overrides"),
+    [
+        pytest.param(
+            "malformed_cell_0_with_source_lines",
+            {
+                "file": "analysis.ipynb#cell_0",
+                "start": 1,
+                "end": 2,
+                "source_lines": ["def example():\n", "    return 42\n"],
+            },
+            id="malformed_cell_0_with_source_lines",
+        ),
+        pytest.param(
+            "malformed_negative_cell_with_source_text",
+            {
+                "file": "analysis.ipynb#cell_-1",
+                "start": 1,
+                "end": 2,
+                "source_text": "def example():\n    return 42\n",
+            },
+            id="malformed_negative_cell_with_source_text",
+        ),
+        pytest.param(
+            "malformed_non_cell_fragment_with_file_source",
+            {
+                "file": "analysis.ipynb#bad_anchor",
+                "start": 1,
+                "end": 2,
+                "file_source": "def example():\n    return 42\n",
+            },
+            id="malformed_non_cell_fragment_with_file_source",
+        ),
+        pytest.param(
+            "malformed_empty_fragment_with_source_lines",
+            {
+                "file": "analysis.ipynb#",
+                "start": 1,
+                "end": 1,
+                "source_lines": ["x = 1\n"],
+            },
+            id="malformed_empty_fragment_with_source_lines",
+        ),
+        pytest.param(
+            "out_of_range_cell_999_against_nbformat_file_source_even_with_source_lines",
+            {
+                "file": "analysis.ipynb#cell_999",
+                "start": 1,
+                "end": 2,
+                "source_lines": ["def example():\n", "    return 42\n"],
+                "file_source": json.dumps(
+                    {
+                        "nbformat": 4,
+                        "cells": [{"cell_type": "code", "source": ["def a():\n", "    return 1\n"]}],
+                    }
+                ),
+            },
+            id="out_of_range_cell_999_with_nbformat_file_source",
+        ),
+        pytest.param(
+            "out_of_range_cell_999_against_nbformat_source_text",
+            {
+                "file": "analysis.ipynb#cell_999",
+                "start": 1,
+                "end": 2,
+                "source_text": json.dumps(
+                    {"cells": [{"cell_type": "code", "source": ["def a():\n", "    return 1\n"]}]}
+                ),
+            },
+            id="out_of_range_cell_999_with_nbformat_source_text",
+        ),
+        pytest.param(
+            "markdown_cell_in_nbformat_file_source",
+            {
+                "file": "analysis.ipynb#cell_1",
+                "start": 1,
+                "end": 1,
+                "file_source": json.dumps(
+                    {
+                        "cells": [
+                            {"cell_type": "markdown", "source": ["# Heading\n"]},
+                            {"cell_type": "code", "source": ["def c():\n", "    return 2\n"]},
+                        ]
+                    }
+                ),
+            },
+            id="markdown_cell_in_nbformat_file_source",
+        ),
+        pytest.param(
+            "corrupt_json_in_nb_file_source",
+            {
+                "file": "analysis.ipynb#cell_1",
+                "start": 1,
+                "end": 1,
+                "source_lines": ["x = 1\n"],
+                "file_source": "{corrupt json",
+            },
+            id="corrupt_json_in_nb_file_source",
+        ),
+        pytest.param(
+            "corrupt_nbformat_json_in_source_text",
+            {
+                "file": "analysis.ipynb#cell_1",
+                "start": 1,
+                "end": 1,
+                "source_text": '{"cells": [{"cell_type": "code"',
+            },
+            id="corrupt_nbformat_json_in_source_text",
+        ),
+        pytest.param(
+            "raw_nbformat_json_in_source_lines_wrong_cell",
+            {
+                "file": "analysis.ipynb#cell_2",
+                "start": 1,
+                "end": 1,
+                "source_lines": [
+                    '{"cells": [{"cell_type": "code", "source": ["x = 1\\n"]}]}'
+                ],
+            },
+            id="raw_nbformat_json_in_source_lines_wrong_cell",
+        ),
+    ],
+)
+def test_extract_unit_source_lines_in_memory_notebook_anchors_fail_closed(
+    case_id: str, unit_overrides: dict[str, Any]
+) -> None:
+    """Verifies malformed anchors and invalid/out-of-range in-memory nbformat buffers fail closed as PLACEHOLDER."""
+    from pydoppelgangerhunt.source_lines import (
+        SourceLinesOrigin,
+        extract_unit_source_lines_with_state,
+    )
+
+    unit = {"name": case_id, **unit_overrides}
+    lines, origin = extract_unit_source_lines_with_state(unit)
+    assert lines == [], case_id
+    assert origin is SourceLinesOrigin.PLACEHOLDER, case_id
+
+
+def test_extract_unit_source_lines_in_memory_nbformat_and_unsaved_cell_buffers(
+    tmp_path: Path,
+) -> None:
+    """Verifies in-memory nbformat extraction vs authoritative plain-Python unsaved notebook cell buffers."""
+    from pydoppelgangerhunt.source_lines import (
+        SourceLinesOrigin,
+        extract_unit_source_lines_with_state,
+    )
+
+    nb_json = json.dumps(
+        {
+            "nbformat": 4,
+            "cells": [
+                {"cell_type": "markdown", "source": ["# Notes\n"]},
+                {"cell_type": "code", "source": ["def cell_two(x):\n", "    return x + 2\n"]},
+            ],
+        }
+    )
+
+    # 1. Valid nbformat JSON in file_source extracts the anchored code cell's Python lines
+    lines_fs, origin_fs = extract_unit_source_lines_with_state(
+        {"file": "nb.ipynb#cell_2", "start": 1, "end": 2, "file_source": nb_json}
+    )
+    assert lines_fs == ["def cell_two(x):\n", "    return x + 2\n"]
+    assert origin_fs is SourceLinesOrigin.FULL_BUFFER
+
+    # 2. Out-of-range line bounds inside a valid JSON code cell fail closed
+    lines_oob, origin_oob = extract_unit_source_lines_with_state(
+        {"file": "nb.ipynb#cell_2", "start": 10, "end": 12, "source_text": nb_json}
+    )
+    assert lines_oob == []
+    assert origin_oob is SourceLinesOrigin.PLACEHOLDER
+
+    # 3. Plain-Python cell buffers with syntactically valid #cell_N override disk .ipynb lookup
+    disk_nb = tmp_path / "nb.ipynb"
+    disk_nb.write_text(
+        json.dumps({"cells": [{"cell_type": "code", "source": ["disk_only = 0\n"]}]}),
+        encoding="utf-8",
+    )
+    lines_unsaved, origin_unsaved = extract_unit_source_lines_with_state(
+        {
+            "file": "nb.ipynb#cell_2",
+            "start": 1,
+            "end": 2,
+            "source_lines": ["def unsaved():\n", "    return 7\n"],
+        },
+        repo_root=str(tmp_path),
+    )
+    assert lines_unsaved == ["def unsaved():\n", "    return 7\n"]
+    assert origin_unsaved is SourceLinesOrigin.PRE_SLICED
+
+    # 4. Plain-Python dict literal in source_text is not misclassified as nbformat JSON
+    lines_dict, origin_dict = extract_unit_source_lines_with_state(
+        {"file": "nb.ipynb#cell_1", "start": 1, "end": 1, "source_text": '{"k": 1}\n'}
+    )
+    assert lines_dict == ['{"k": 1}\n']
+    assert origin_dict is SourceLinesOrigin.FULL_BUFFER
+
+    # 5. Plain-Python unsaved source_lines overrides valid nbformat file_source when cell anchor exists
+    lines_edit, origin_edit = extract_unit_source_lines_with_state(
+        {
+            "file": "nb.ipynb#cell_2",
+            "start": 1,
+            "end": 2,
+            "source_lines": ["def edited():\n", "    return 99\n"],
+            "file_source": nb_json,
+        }
+    )
+    assert lines_edit == ["def edited():\n", "    return 99\n"]
+    assert origin_edit is SourceLinesOrigin.PRE_SLICED
