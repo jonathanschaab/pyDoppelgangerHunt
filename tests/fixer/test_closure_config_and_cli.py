@@ -7,7 +7,7 @@ import contextvars
 from pathlib import Path
 import sys
 import threading
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
@@ -190,7 +190,7 @@ def test_closure_strictness_precedence_ctx_managers_and_global_pure_builtins(
     assert _is_ordered_contiguous_source_match(["a = 1"], ["x = 0; a = 1; y = 2"])
     assert _is_ordered_contiguous_source_match(["(a + b)"], ["res = (a + b) * 2"])
 
-    # 6. _slice_unit_token_lines honors explicit is_pre_sliced=False even on column-0 expressions
+    # 6. _slice_unit_token_lines honors explicit_col_sliced=False even on column-0 expressions
     col0_lines = ["(a + b) + c\n"]
     sliced_col0 = _slice_unit_token_lines(
         {
@@ -201,7 +201,7 @@ def test_closure_strictness_precedence_ctx_managers_and_global_pure_builtins(
             "kind": "complex_expr",
         },
         col0_lines,
-        is_pre_sliced=False,
+        explicit_col_sliced=False,
     )
     assert sliced_col0 == ["(a + b)"]
     presliced_col0 = _slice_unit_token_lines(
@@ -1084,9 +1084,21 @@ def test_heuristic_ctx_manager_summary_logged_once_at_batch_boundary(
     clear_closure_warning_cache()
     caplog.clear()
     with caplog.at_level(logging.INFO, logger="pydoppelgangerhunt.config"):
+        default_patch = generate_refactoring_patch(
+            [(1.0, dict(ua1), dict(ua2)), (1.0, dict(ub1), dict(ub2))],
+            repo_root=str(tmp_path),
+        )
+    assert "def _shared_" in default_patch
+    assert "    v = None" in default_patch
+    assert [r for r in caplog.records if "Summary:" in r.message] == []
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="pydoppelgangerhunt.config"):
         patch = generate_refactoring_patch(
             [(1.0, dict(ua1), dict(ua2)), (1.0, dict(ub1), dict(ub2))],
             repo_root=str(tmp_path),
+            closure_strictness="strict",
         )
     assert "def _shared_" in patch
     patch_summaries = [r for r in caplog.records if "Summary:" in r.message]
@@ -1458,15 +1470,10 @@ def test_public_entrypoints_configuration_consistency_matrix(
         assert "severed closure cell" in suggestion.lower()
 
 
-def test_docs_sync_with_suspicious_suppress_substrings_and_local_accumulator_strict_vs_pedantic() -> (
-    None
-):
-    """Verifies README matches _SUSPICIOUS_SUPPRESS_SUBSTRINGS and _STDLIB_NON_SUPPRESSING_MODULES, CHANGELOG stays clean of private internals, and local primitive accumulators work in strict mode."""
-    import re
-    from pydoppelgangerhunt.fixer._df_cache import (
-        _is_ephemeral_unit_ast,
-        _mark_ephemeral_unit_ast,
-    )
+def test_docs_sync_with_suspicious_suppress_substrings_and_public_exports() -> None:
+    """Verifies README matches suppression heuristics and public package exports omit private symbols."""
+    import pydoppelgangerhunt as pkg
+    import pydoppelgangerhunt.fixer as fixer_pkg
     from pydoppelgangerhunt.fixer._df_with_provenance import (
         _STDLIB_NON_SUPPRESSING_MODULES,
         _SUSPICIOUS_SUPPRESS_SUBSTRINGS,
@@ -1474,26 +1481,29 @@ def test_docs_sync_with_suspicious_suppress_substrings_and_local_accumulator_str
 
     repo_root = Path(__file__).resolve().parents[2]
     readme_text = (repo_root / "README.md").read_text(encoding="utf-8")
-    changelog_text = (repo_root / "CHANGELOG.md").read_text(encoding="utf-8")
     assert len(_SUSPICIOUS_SUPPRESS_SUBSTRINGS) == 41
     for sub in _SUSPICIOUS_SUPPRESS_SUBSTRINGS:
         assert f"`{sub}`" in readme_text, sub
     for mod_name, attrs in _STDLIB_NON_SUPPRESSING_MODULES.items():
         for attr in attrs:
             assert f"{mod_name}.{attr}" in readme_text, f"{mod_name}.{attr}"
+    assert "*.lock" not in readme_text
     assert "--closure-strictness {strict,pedantic,lenient,fail_closed" not in readme_text
-    assert "--closure-strictness {strict,pedantic,lenient,fail_closed" not in changelog_text
-    assert "## [2.0.0]" in changelog_text
-    latest_section = changelog_text.split("## [1.0.0]", 1)[0]
-    private_tokens = [
-        tok
-        for tok in re.findall(r"`(_[A-Za-z0-9_]+)`", latest_section)
-        if not (tok.startswith("__") and tok.endswith("__"))
-        and tok not in ("_common", "_item")
+    assert not [
+        name
+        for name in pkg.__all__
+        if name.startswith("_") and not (name.startswith("__") and name.endswith("__"))
     ]
-    assert private_tokens == [], f"Unexpected private symbols in CHANGELOG: {private_tokens}"
+    assert not [
+        name
+        for name in fixer_pkg.__all__
+        if name.startswith("_") and not (name.startswith("__") and name.endswith("__"))
+    ]
+    assert "is_subroutine_unit" in fixer_pkg.__all__
 
-    # Local primitive-initialized accumulator in a global-reading unit is permitted in strict mode and rejected in pedantic mode
+
+def test_local_accumulator_in_global_unit_allowed_in_strict_and_rejected_in_pedantic() -> None:
+    """Verifies a primitive-initialized local accumulator in a global unit passes in strict and fails in pedantic."""
     acc_src = (
         "SCALE = 3\n"
         "def sum_scaled(items):\n"
@@ -1530,7 +1540,14 @@ def test_docs_sync_with_suspicious_suppress_substrings_and_local_accumulator_str
     assert sc_pedantic["is_control_flow_safe"] is False
     assert "global_escape" in sc_pedantic["closure_hazard_reasons"]
 
-    # Ephemeral AST tracking uses weakref set rather than setting ad hoc attributes on ast.AST
+
+def test_ephemeral_unit_ast_tracking_uses_weakref_without_mutating_node_attrs() -> None:
+    """Verifies ephemeral AST tracking stores membership externally without attaching attributes to ast.AST."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _is_ephemeral_unit_ast,
+        _mark_ephemeral_unit_ast,
+    )
+
     ephem_mod = ast.Module(body=[], type_ignores=[])
     assert _is_ephemeral_unit_ast(ephem_mod) is False
     _mark_ephemeral_unit_ast(ephem_mod)
@@ -1960,10 +1977,13 @@ def test_replace_clones_defaults_to_pedantic_in_api_and_cli(tmp_path: Path) -> N
     u1 = {"name": "work_a:blk", "file": str(mod_file), "start": 6, "end": 12, "kind": "compound_block"}
     u2 = {"name": "work_b:blk", "file": str(mod_file), "start": 21, "end": 27, "kind": "compound_block"}
 
-    # replace_clones=True defaults to pedantic -> rejects unproven Guard()
+    # replace_clones=True and replace_clones=False both default to pedantic -> reject unproven Guard()
     assert generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(repo), replace_clones=True) == ""
-    # replace_clones=False preview defaults to strict -> emits helper preview with advisory # Note:
-    preview_patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(repo), replace_clones=False)
+    assert generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(repo), replace_clones=False) == ""
+    # Explicit closure_strictness="strict" allows preview and rewrite patches with advisory # Note:
+    preview_patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(repo), replace_clones=False, closure_strictness="strict"
+    )
     assert "def _shared_" in preview_patch
     assert "# Note: 1 unproven context manager(s) ('myguard.Guard') were treated as non-suppressing via name heuristic in strict mode" in preview_patch
     # Explicit closure_strictness="strict" or non_suppressing_ctx_managers=["Guard"] allows replace_clones=True
@@ -2019,10 +2039,10 @@ def test_pyproject_skip_pre_unit_closures_false_treated_as_unset(tmp_path: Path)
             assert kwargs_preview.get("skip_pre_unit_closures") is None
 
 
-def test_heuristic_session_over_1024_live_threads_mid_session_clear_and_intra_unit_with(
+def test_heuristic_session_high_volume_workers_mid_session_clear_and_intra_unit_with(
     tmp_path: Path,
 ) -> None:
-    """Verifies >1024 live threads retain all heuristic names, mid-session clear preserves session_depth, pre-session worker entries do not leak, and intra-unit with emits # Note:."""
+    """Verifies >1024 concurrent worker submissions retain all heuristic names without OS thread exhaustion, per-thread fallback buckets stay isolated, mid-session clear preserves session_depth, pre-session worker entries do not leak, and intra-unit with emits # Note:."""
     import concurrent.futures
     from pydoppelgangerhunt.config import (
         clear_closure_warning_cache,
@@ -2032,35 +2052,43 @@ def test_heuristic_session_over_1024_live_threads_mid_session_clear_and_intra_un
         record_heuristic_non_suppressing_ctx_manager,
     )
 
-    # 1. > 1024 live threads kept alive simultaneously never drop any recorded manager name
+    # 1a. > 1024 heuristic names recorded across a bounded worker pool never drop any name
     clear_closure_warning_cache()
-    release_evt = threading.Event()
-    ready_sem = threading.Semaphore(0)
-    thread_count = 1050
-    threads: list[threading.Thread] = []
-
-    def _hold_worker(idx: int) -> None:
-        record_heuristic_non_suppressing_ctx_manager(f"LiveWorkerMgr_{idx:04d}")
-        ready_sem.release()
-        release_evt.wait(timeout=10.0)
+    item_count = 1050
 
     with heuristic_ctx_manager_session():
-        try:
-            for idx in range(thread_count):
-                worker_ctx = contextvars.copy_context()
-                t = threading.Thread(
-                    target=worker_ctx.run, args=(_hold_worker, idx)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            futs = [
+                pool.submit(
+                    contextvars.copy_context().run,
+                    record_heuristic_non_suppressing_ctx_manager,
+                    f"LiveWorkerMgr_{idx:04d}",
                 )
-                t.start()
-                threads.append(t)
-            for _ in range(thread_count):
-                assert ready_sem.acquire(timeout=10.0)
-            harvested_all = log_heuristic_ctx_manager_summary()
-        finally:
-            release_evt.set()
-            for t in threads:
-                t.join(timeout=5.0)
-    assert len(harvested_all) == thread_count
+                for idx in range(item_count)
+            ]
+            for fut in futs:
+                fut.result()
+        harvested_all = log_heuristic_ctx_manager_summary()
+    assert len(harvested_all) == item_count
+
+    # 1b. Concurrent live threads outside a session isolate their per-thread fallback buckets
+    clear_closure_warning_cache()
+    live_count = 16
+    barrier = threading.Barrier(live_count)
+
+    def _isolated_thread_worker(idx: int) -> tuple[str, ...]:
+        mgr_name = f"ThreadOnlyMgr_{idx:02d}"
+        record_heuristic_non_suppressing_ctx_manager(mgr_name)
+        barrier.wait(timeout=10.0)
+        return peek_heuristic_non_suppressing_ctx_managers()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=live_count) as live_pool:
+        live_futs = [
+            live_pool.submit(_isolated_thread_worker, idx)
+            for idx in range(live_count)
+        ]
+        for idx, live_fut in enumerate(live_futs):
+            assert live_fut.result() == (f"ThreadOnlyMgr_{idx:02d}",)
 
     # 2. Mid-session clear_closure_warning_cache() preserves active session tracking and cleans up on exit
     with heuristic_ctx_manager_session():
@@ -2068,7 +2096,7 @@ def test_heuristic_session_over_1024_live_threads_mid_session_clear_and_intra_un
         clear_closure_warning_cache()
         record_heuristic_non_suppressing_ctx_manager("AfterMidClearMgr")
         harvested_mid = log_heuristic_ctx_manager_summary()
-    assert harvested_mid == ("AfterMidClearMgr",)
+    assert harvested_mid == ("AfterMidClearMgr", "BeforeMidClearMgr")
     assert peek_heuristic_non_suppressing_ctx_managers() == ()
 
     # 3. Persistent worker thread records outside copied session context remain isolated
@@ -2265,7 +2293,7 @@ def test_report_boundary_isolates_malformed_clone_pair_without_aborting_run(
             ):
                 exit_code = main([str(tmp_path), "--suggest", "--diff", "--no-color"])
     captured = capsys.readouterr()
-    assert exit_code == 2
+    assert exit_code == 4
     assert (
         "[REFACTOR SUGGESTION] Diagnostic: suggestion skipped due to TypeError: synthetic AST defect"
         in captured.out
@@ -2306,8 +2334,18 @@ def test_patch_replace_clones_pedantic_default_blocks_conditional_outputs(
     assert "extra" in sc_ped["conditional_outputs"]
     assert "extra" not in sc_ped["definite_stores"]
 
+    assert (
+        generate_refactoring_patch(
+            [(1.0, dict(u1), dict(u2))], repo_root=str(tmp_path), replace_clones=False
+        )
+        == ""
+    )
+
     preview_patch = generate_refactoring_patch(
-        [(1.0, dict(u1), dict(u2))], repo_root=str(tmp_path), replace_clones=False
+        [(1.0, dict(u1), dict(u2))],
+        repo_root=str(tmp_path),
+        replace_clones=False,
+        closure_strictness="strict",
     )
     assert "def _shared_" in preview_patch
 
@@ -2403,10 +2441,10 @@ def test_notebook_cell_anchor_coordinates_across_diff_suggest_and_html(
     assert "def _shared_score_items" in html_direct
 
 
-def test_heuristic_summary_log_level_info_by_default_and_warning_under_replace_clones(
+def test_heuristic_summary_log_level_respects_warn_flag_and_replace_clones(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Verifies heuristic summary logs at INFO by default and escalates to WARNING under replace_clones."""
+    """Verifies heuristic summary logs at INFO when warn=False and WARNING when warn=True or under replace_clones."""
     import logging
     from pydoppelgangerhunt.config import (
         clear_closure_warning_cache,
@@ -2721,13 +2759,8 @@ def test_unrecognized_closure_strictness_falls_back_to_boolean_flags(
         f"strict_with_suppression = {'true' if strict_with_flag else 'false'}\n",
         encoding="utf-8",
     )
-    loaded = load_tool_config(repo_root=str(tmp_path))
-    cfg_mode, cfg_skip = resolve_closure_strictness_mode(
-        closure_strictness=loaded.get("closure_strictness"),
-        skip_pre_unit_closures=bool(loaded.get("skip_pre_unit_closures", False)),
-        strict_with_suppression=loaded.get("strict_with_suppression"),
-    )
-    assert (cfg_mode, cfg_skip) == (expected_mode, expected_skip)
+    with pytest.raises(ValueError, match="Invalid closure_strictness"):
+        load_tool_config(repo_root=str(tmp_path))
 
 
 _HEURISTIC_TX_CLONE_SRC = (
@@ -2762,9 +2795,10 @@ def test_suggestion_and_html_report_record_strict_heuristic_ctx_manager_assumpti
 ) -> None:
     """Verifies --suggest and --html record neutrally named managers assumed non-suppressing in strict mode only.
 
-    The assumption is disclosed through heuristic diagnostics (stderr/logging), never in the
-    report body, so pedantic and allowlisted runs must record nothing while strict runs record
-    the manager and assumed-safe rationale and still synthesize the helper (documented fail-open behavior).
+    The assumption is disclosed through heuristic diagnostics (stderr/logging) and advisory
+    inline `# Note:` / HTML helper notes, so pedantic and allowlisted runs must record nothing
+    while strict runs record the manager and assumed-safe rationale and still synthesize the
+    helper (documented fail-open behavior).
     """
     import logging
 
@@ -2845,7 +2879,7 @@ def test_cli_surfaces_internal_diagnostic_error_count_to_stderr(
     monkeypatch.setattr("pydoppelgangerhunt.reporters.synthesize_refactoring_suggestion", _boom)
     html_out = tmp_path / "report.html"
     exit_code = main([str(target), "--min-lines", "3", "--suggest", "--html", str(html_out)])
-    assert exit_code == 2
+    assert exit_code == 4
     captured = capsys.readouterr()
     assert "2 internal diagnostic error(s) occurred" in captured.err
 
@@ -2855,7 +2889,7 @@ def test_cli_replace_clones_config_opt_out_and_strict_conflict_warning(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Verifies invalid/false config keys do not opt out of --replace-clones pedantic default and CLI strict warns on strict_with_suppression=true."""
+    """Verifies invalid TOML config fails fast (exit 2), skip_pre_unit_closures=false keeps pedantic default, strict_with_suppression=false opts out, and strict warns on conflict."""
     import logging
     from pydoppelgangerhunt.cli import main
     from pydoppelgangerhunt.config import clear_closure_warning_cache
@@ -2875,9 +2909,26 @@ def test_cli_replace_clones_config_opt_out_and_strict_conflict_warning(
 
     monkeypatch.chdir(tmp_path)
 
-    for toml_body in (
+    (tmp_path / "pyproject.toml").write_text(
         '[tool.pydoppelgangerhunt]\nclosure_strictness = "bogus"\n',
-        "[tool.pydoppelgangerhunt]\nstrict_with_suppression = false\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                str(target),
+                "--min-lines",
+                "3",
+                "--replace-clones",
+                "--patch",
+                str(tmp_path / "out.patch"),
+            ]
+        )
+    assert exc_info.value.code == 2
+
+    for toml_body, expected_calls in (
+        ("[tool.pydoppelgangerhunt]\nskip_pre_unit_closures = false\n", [(True, None)]),
+        ("[tool.pydoppelgangerhunt]\nstrict_with_suppression = false\n", [(True, "strict")]),
     ):
         (tmp_path / "pyproject.toml").write_text(toml_body, encoding="utf-8")
         clear_closure_warning_cache()
@@ -2907,7 +2958,7 @@ def test_cli_replace_clones_config_opt_out_and_strict_conflict_warning(
                     ]
                 )
         assert exit_code == 1
-        assert recorded_calls == [(True, None)]
+        assert recorded_calls == expected_calls
 
     (tmp_path / "pyproject.toml").write_text(
         "[tool.pydoppelgangerhunt]\nstrict_with_suppression = true\n",
@@ -2966,7 +3017,7 @@ def test_cli_json_format_surfaces_internal_diagnostic_error_count(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Verifies --format json still surfaces internal diagnostic errors on stderr and exits 1."""
+    """Verifies --format json still surfaces internal diagnostic errors on stderr and exits 4."""
     from pydoppelgangerhunt.cli import main
 
     target = tmp_path / "dup.py"
@@ -2984,7 +3035,7 @@ def test_cli_json_format_surfaces_internal_diagnostic_error_count(
     exit_code = main(
         [str(target), "--min-lines", "3", "--format", "json", "--html", str(html_out)]
     )
-    assert exit_code == 2
+    assert exit_code == 4
     captured = capsys.readouterr()
     assert "1 internal diagnostic error(s) occurred" in captured.err
 
@@ -3166,3 +3217,728 @@ def test_generate_refactoring_patch_enforces_closure_mode_and_preserves_caller_s
         )
     assert blocked_missing_replace == ""
     assert any("unreadable file" in rec.message for rec in caplog.records)
+
+
+def test_wildcard_allowlist_name_only_accepts_suppressing_manager_and_notes(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Negative soundness test: '*.atomic' accepts an actually suppressing manager and surfaces # Note and Summary warnings including on cached scopes."""
+    import logging
+    from pydoppelgangerhunt.config import (
+        clear_closure_warning_cache,
+        collect_wildcard_ctx_managers,
+        heuristic_ctx_manager_session,
+        log_heuristic_ctx_manager_summary,
+    )
+    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    clear_dataflow_cache()
+    clear_closure_warning_cache()
+
+    src = (
+        "def run_a(db, items):\n"
+        "    with db.atomic():\n"
+        "        total = items[0] + items[1]\n"
+        "    cb = lambda: total\n"
+        "    return cb()\n\n"
+        "def run_b(db, items):\n"
+        "    with db.atomic():\n"
+        "        total = items[0] + items[1]\n"
+        "    cb = lambda: total\n"
+        "    return cb()\n"
+    )
+    mod_file = tmp_path / "wc_suppress.py"
+    mod_file.write_text(src, encoding="utf-8")
+    u1 = {"name": "run_a:blk", "file": str(mod_file), "start": 2, "end": 3, "kind": "compound_block"}
+    u2 = {"name": "run_b:blk", "file": str(mod_file), "start": 8, "end": 9, "kind": "compound_block"}
+
+    # Without allowlist, pedantic blocks the unproven db.atomic() manager
+    assert generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True) == ""
+
+    # Runtime suppressing manager whose method is literally named `atomic`
+    class _SuppressingAtomic:
+        def __enter__(self) -> "_SuppressingAtomic":
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+            return True
+
+    class _FakeDb:
+        def atomic(self) -> _SuppressingAtomic:
+            return _SuppressingAtomic()
+
+    # Pass 1 (cold scope) and Pass 2 (cached scope hit) both record wildcard notes & session warnings
+    for pass_idx in range(2):
+        clear_closure_warning_cache()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt.config"):
+            with collect_wildcard_ctx_managers() as matched_wc:
+                sug = synthesize_refactoring_suggestion(
+                    dict(u1),
+                    dict(u2),
+                    repo_root=str(tmp_path),
+                    closure_strictness="pedantic",
+                    non_suppressing_ctx_managers=["*.atomic"],
+                )
+            patch_txt = generate_refactoring_patch(
+                [(1.0, dict(u1), dict(u2))],
+                repo_root=str(tmp_path),
+                replace_clones=False,
+                closure_strictness="pedantic",
+                non_suppressing_ctx_managers=["*.atomic"],
+            )
+        assert ("*.atomic", "db.atomic") in matched_wc, pass_idx
+        assert "# Note: 1 context manager(s) matched wildcard allowlist pattern(s) ['*.atomic']: 'db.atomic' via '*.atomic'" in sug, pass_idx
+        assert "# Note: 1 context manager(s) matched wildcard allowlist pattern(s) ['*.atomic']: 'db.atomic' via '*.atomic'" in patch_txt, pass_idx
+        assert any(
+            "Summary:" in rec.message and "*.atomic" in rec.message and "db.atomic" in rec.message
+            for rec in caplog.records
+        ), pass_idx
+
+    # Cached inspect_single_unit_scope within a session also emits wildcard summary warning
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt.config"):
+        with heuristic_ctx_manager_session(warn=True):
+            sc_cached = inspect_single_unit_scope(
+                dict(u1),
+                repo_root=str(tmp_path),
+                closure_strictness="pedantic",
+                non_suppressing_ctx_managers=["*.atomic"],
+            )
+            assert sc_cached["wildcard_ctx_managers"] == [ ["*.atomic", "db.atomic"] ] or [
+                list(pair) for pair in sc_cached["wildcard_ctx_managers"]
+            ] == [["*.atomic", "db.atomic"]]
+            log_heuristic_ctx_manager_summary()
+    assert any(
+        "Summary:" in rec.message and "*.atomic" in rec.message and "db.atomic" in rec.message
+        for rec in caplog.records
+    )
+
+    # Confirm an actually suppressing _FakeDb().atomic() violates normal exception propagation if refactored blindly
+    ns_orig: dict[str, Any] = {}
+    exec(compile(src, str(mod_file), "exec"), ns_orig)  # nosec B102
+    with pytest.raises(NameError):
+        ns_orig["run_a"](_FakeDb(), [])
+
+
+@pytest.mark.parametrize(
+    ("pattern", "expect_valid", "err_match"),
+    [
+        pytest.param("pkg.*.atomic", True, None, id="qualified_wildcard_valid"),
+        pytest.param(".atomic", True, None, id="relative_non_wildcard_valid"),
+        pytest.param("..atomic", True, None, id="double_dot_relative_valid"),
+        pytest.param("*.atomic", True, None, id="name_only_wildcard_valid"),
+        pytest.param("*", False, "only '\\*.attr' or '<module>.\\*.attr'", id="bare_star_rejected"),
+        pytest.param("*.*", False, "multiple '\\*' wildcards", id="star_dot_star_rejected"),
+        pytest.param("foo.*", False, "only '\\*.attr' or '<module>.\\*.attr'", id="trailing_star_rejected"),
+        pytest.param("pkg..atomic", False, "empty dotted segment", id="inner_double_dot_rejected"),
+        pytest.param("atomic.", False, "trailing or empty dot segment", id="trailing_dot_rejected"),
+        pytest.param("a.*.b.*", False, "multiple '\\*' wildcards", id="multiple_stars_rejected"),
+        pytest.param("foo*bar.atomic", False, "must occupy a full dotted segment", id="partial_star_rejected"),
+        pytest.param("123.*.atomic", False, "valid identifiers", id="invalid_identifier_rejected"),
+    ],
+)
+def test_wildcard_allowlist_pattern_validation(
+    pattern: str, expect_valid: bool, err_match: str | None
+) -> None:
+    """Verifies wildcard allowlist normalization accepts '*.atomic'/'pkg.*.atomic'/'.atomic' and rejects degenerate patterns."""
+    from pydoppelgangerhunt.config import normalize_non_suppressing_ctx_managers
+
+    if expect_valid:
+        assert normalize_non_suppressing_ctx_managers([pattern]) == (pattern,)
+    else:
+        assert err_match is not None
+        with pytest.raises(ValueError, match=err_match):
+            normalize_non_suppressing_ctx_managers([pattern])
+
+
+def test_wildcard_allowlist_qualified_module_star_attr_scoping(tmp_path: Path) -> None:
+    """Verifies 'pkg.*.atomic' allows resolvable pkg.pool.atomic() calls without allowing unrelated other.pool.atomic() calls."""
+    from pydoppelgangerhunt.config import clear_closure_warning_cache, collect_wildcard_ctx_managers
+    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch
+
+    clear_dataflow_cache()
+    clear_closure_warning_cache()
+
+    src_ok = (
+        "import pkg\n"
+        "def f1(items):\n"
+        "    with pkg.pool.atomic():\n"
+        "        val = sum(items)\n"
+        "    cb = lambda: val\n"
+        "    return cb()\n\n"
+        "def f2(items):\n"
+        "    with pkg.pool.atomic():\n"
+        "        val = sum(items)\n"
+        "    cb = lambda: val\n"
+        "    return cb()\n"
+    )
+    ok_file = tmp_path / "pkg_wc_ok.py"
+    ok_file.write_text(src_ok, encoding="utf-8")
+    u1_ok = {"name": "f1:blk", "file": str(ok_file), "start": 3, "end": 4, "kind": "compound_block"}
+    u2_ok = {"name": "f2:blk", "file": str(ok_file), "start": 9, "end": 10, "kind": "compound_block"}
+
+    with collect_wildcard_ctx_managers() as wc_hits:
+        ok_patch = generate_refactoring_patch(
+            [(1.0, u1_ok, u2_ok)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+            closure_strictness="pedantic",
+            non_suppressing_ctx_managers=["pkg.*.atomic"],
+        )
+    assert "def _shared_f1_f2" in ok_patch
+    assert ("pkg.*.atomic", "pkg.pool.atomic") in wc_hits
+
+    src_other = src_ok.replace("import pkg\n", "import other\n").replace("pkg.pool.atomic", "other.pool.atomic")
+    other_file = tmp_path / "pkg_wc_other.py"
+    other_file.write_text(src_other, encoding="utf-8")
+    u1_other = {"name": "f1:blk", "file": str(other_file), "start": 3, "end": 4, "kind": "compound_block"}
+    u2_other = {"name": "f2:blk", "file": str(other_file), "start": 9, "end": 10, "kind": "compound_block"}
+
+    blocked_patch = generate_refactoring_patch(
+        [(1.0, u1_other, u2_other)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        closure_strictness="pedantic",
+        non_suppressing_ctx_managers=["pkg.*.atomic"],
+    )
+    assert blocked_patch == ""
+
+
+@pytest.mark.parametrize(
+    ("mode_arg", "skip_arg", "strict_with_arg", "expected_mode", "expected_skip"),
+    [
+        pytest.param(None, None, None, "strict", False, id="all_unset_defaults_strict"),
+        pytest.param(None, False, None, "strict", False, id="explicit_skip_false_strict"),
+        pytest.param(None, True, None, "lenient", True, id="skip_true_lenient"),
+        pytest.param(None, None, True, "pedantic", False, id="strict_with_true_pedantic"),
+        pytest.param(None, True, True, "lenient", True, id="both_booleans_true_lenient_wins"),
+        pytest.param("strict", True, True, "strict", False, id="explicit_strict_overrides_booleans"),
+        pytest.param("pedantic", True, False, "pedantic", False, id="explicit_pedantic_overrides_booleans"),
+        pytest.param("lenient", False, True, "lenient", True, id="explicit_lenient_overrides_booleans"),
+        pytest.param("fast", None, None, "strict", False, id="unrecognized_fast_no_flags_falls_back_strict"),
+        pytest.param("fast", True, None, "lenient", True, id="unrecognized_fast_with_skip_falls_back_lenient"),
+        pytest.param("skip", None, True, "pedantic", False, id="unrecognized_skip_with_strict_with_falls_back_pedantic"),
+        pytest.param("fail_closed", False, False, "strict", False, id="unrecognized_fail_closed_falls_back_strict"),
+    ],
+)
+def test_closure_strictness_truth_table_all_boundaries(
+    tmp_path: Path,
+    mode_arg: str | None,
+    skip_arg: bool | None,
+    strict_with_arg: bool | None,
+    expected_mode: str,
+    expected_skip: bool,
+) -> None:
+    """Verifies resolve_closure_strictness_mode, pair monotonicity, and legacy rejection across CLI/pyproject/schema boundaries."""
+    from pydoppelgangerhunt.cli import main
+    from pydoppelgangerhunt.config import (
+        clear_closure_warning_cache,
+        load_tool_config,
+        resolve_closure_strictness_mode,
+        resolve_pair_closure_flags,
+    )
+    from pydoppelgangerhunt.fixer.source import validate_unit_schema
+
+    clear_closure_warning_cache()
+    assert (
+        resolve_closure_strictness_mode(
+            closure_strictness=mode_arg,
+            skip_pre_unit_closures=skip_arg,
+            strict_with_suppression=strict_with_arg,
+        )
+        == (expected_mode, expected_skip)
+    )
+
+    # Monotone pair resolution: skip_pre_unit_closures=True never weakens an explicit pedantic unit
+    flags = resolve_pair_closure_flags(
+        {"file": "a.py", "start": 1, "end": 2, "closure_strictness": "pedantic"},
+        {"file": "b.py", "start": 1, "end": 2, "closure_strictness": "lenient"},
+        skip_pre_unit_closures=True,
+    )
+    assert flags.unit1.skip_pre_unit_closures is False
+    assert flags.unit1.strict_with_suppression is True
+    assert flags.unit2.skip_pre_unit_closures is True
+    assert flags.effective_skip_pre_unit_closures is False
+
+    # All legacy/unrecognized strings fail strictly at CLI, pyproject.toml, and validate_unit_schema
+    if mode_arg is not None and mode_arg not in ("strict", "pedantic", "lenient"):
+        mod = tmp_path / f"cfg_{mode_arg}.py"
+        mod.write_text("x = 1\n", encoding="utf-8")
+        with pytest.raises(SystemExit) as exc_info:
+            main([str(mod), "--closure-strictness", mode_arg])
+        assert exc_info.value.code == 2
+
+        pyproject = tmp_path / f"pyproject_{mode_arg}.toml"
+        pyproject.write_text(
+            f'[tool.pydoppelgangerhunt]\nclosure_strictness = "{mode_arg}"\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="Invalid closure_strictness"):
+            load_tool_config(str(pyproject))
+
+        with pytest.raises(ValueError, match="Invalid closure_strictness"):
+            validate_unit_schema({"file": str(mod), "start": 1, "end": 1, "closure_strictness": mode_arg})
+
+
+def test_heuristic_ctx_manager_session_outliving_child_flushes_on_exit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies a copy_context() child session that outlives its parent flushes directly instead of dropping diagnostics."""
+    import logging
+    from pydoppelgangerhunt import config as config_mod
+    from pydoppelgangerhunt.config import (
+        clear_closure_warning_cache,
+        heuristic_ctx_manager_session,
+        record_heuristic_non_suppressing_ctx_manager,
+    )
+
+    clear_closure_warning_cache()
+
+    # 1. Normal control: child finishes before parent -> defers to parent flush
+    early_errors: list[BaseException] = []
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt"):
+        with heuristic_ctx_manager_session(warn=True):
+            def _early_child() -> None:
+                try:
+                    with heuristic_ctx_manager_session(warn=True):
+                        record_heuristic_non_suppressing_ctx_manager("early.child.lock")
+                except BaseException as exc:  # pragma: no cover
+                    early_errors.append(exc)
+
+            t_early = threading.Thread(
+                target=contextvars.copy_context().run, args=(_early_child,)
+            )
+            t_early.start()
+            t_early.join(timeout=5)
+            assert not t_early.is_alive()
+            assert not early_errors
+            # Child diagnostics must still be buffered inside parent session before parent exits
+            assert "early.child.lock" not in caplog.text
+    assert "early.child.lock" in caplog.text
+    assert config_mod._active_heuristic_sessions == {}
+
+    # 2. Outliving child: parent exits before child -> child promotes to flush and cleans up session
+    clear_closure_warning_cache()
+    caplog.clear()
+    child_entered = threading.Event()
+    parent_exited = threading.Event()
+    late_errors: list[BaseException] = []
+
+    def _late_child() -> None:
+        try:
+            with heuristic_ctx_manager_session(warn=True):
+                child_entered.set()
+                assert parent_exited.wait(timeout=5)
+                record_heuristic_non_suppressing_ctx_manager("late.outliving.lock")
+        except BaseException as exc:  # pragma: no cover
+            late_errors.append(exc)
+
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt"):
+        with heuristic_ctx_manager_session(warn=True):
+            t_late = threading.Thread(
+                target=contextvars.copy_context().run, args=(_late_child,)
+            )
+            t_late.start()
+            assert child_entered.wait(timeout=5)
+        parent_exited.set()
+        t_late.join(timeout=5)
+    assert not t_late.is_alive()
+    if late_errors:
+        raise late_errors[0]
+    assert "late.outliving.lock" in caplog.text
+    assert config_mod._active_heuristic_sessions == {}
+
+
+def test_resolve_unit_closure_flags_unrecognized_caller_preserves_explicit_unit_policy(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies unrecognized caller closure_strictness preserves unit policy instead of downgrading pedantic."""
+    import logging
+    from pydoppelgangerhunt.config import (
+        clear_closure_warning_cache,
+        resolve_unit_closure_flags,
+    )
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt"):
+        pedantic_flags = resolve_unit_closure_flags(
+            {"closure_strictness": "pedantic"}, closure_strictness="bogus"
+        )
+    assert pedantic_flags == (False, True)
+    assert "Unrecognized closure_strictness" in caplog.text
+    assert "pedantic" in caplog.text
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt"):
+        skip_flags = resolve_unit_closure_flags(
+            {"skip_pre_unit_closures": True}, closure_strictness="bogus"
+        )
+    assert skip_flags == (True, False)
+
+    # Control: recognized caller strictness still overrides explicit unit policy
+    override_flags = resolve_unit_closure_flags(
+        {"closure_strictness": "pedantic"}, closure_strictness="strict"
+    )
+    assert override_flags == (False, False)
+
+
+@pytest.mark.parametrize(
+    ("unit", "strictness", "skip_closures", "strict_with", "expected", "expect_conflict_warn"),
+    [
+        pytest.param(
+            {"skip_pre_unit_closures": True},
+            "strict",
+            None,
+            None,
+            (False, False),
+            False,
+            id="explicit_strict_override_over_unit_skip_no_spurious_warn",
+        ),
+        pytest.param(
+            {"strict_with_suppression": True},
+            "strict",
+            None,
+            None,
+            (False, False),
+            False,
+            id="explicit_strict_override_over_unit_strict_with_no_spurious_warn",
+        ),
+        pytest.param(
+            {"closure_strictness": "pedantic", "skip_pre_unit_closures": True},
+            "lenient",
+            None,
+            None,
+            (True, False),
+            False,
+            id="explicit_lenient_override_over_unit_mixed_no_spurious_warn",
+        ),
+        pytest.param(
+            {"strict_with_suppression": True},
+            "strict",
+            True,
+            None,
+            (False, False),
+            True,
+            id="explicit_conflicting_caller_skip_still_warns",
+        ),
+        pytest.param(
+            {"skip_pre_unit_closures": True},
+            "strict",
+            None,
+            True,
+            (False, False),
+            True,
+            id="explicit_conflicting_caller_strict_with_still_warns",
+        ),
+    ],
+)
+def test_resolve_unit_closure_flags_recognized_override_avoids_spurious_unit_warnings(
+    caplog: pytest.LogCaptureFixture,
+    unit: dict[str, Any],
+    strictness: str,
+    skip_closures: Optional[bool],
+    strict_with: Optional[bool],
+    expected: tuple[bool, bool],
+    expect_conflict_warn: bool,
+) -> None:
+    """Verifies recognized caller closure_strictness does not warn on overridden unit boolean flags unless caller passed conflicting booleans."""
+    import logging
+    from pydoppelgangerhunt.config import (
+        clear_closure_warning_cache,
+        resolve_unit_closure_flags,
+    )
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt"):
+        resolved = resolve_unit_closure_flags(
+            unit,
+            closure_strictness=strictness,
+            skip_pre_unit_closures=skip_closures,
+            strict_with_suppression=strict_with,
+        )
+    assert resolved == expected
+    has_conflict = any(
+        "Conflicting configuration" in rec.message for rec in caplog.records
+    )
+    assert has_conflict is expect_conflict_warn
+
+
+def test_cli_closure_strictness_overrides_pyproject_warns_symmetrically(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies --closure-strictness warns symmetrically when overriding differing pyproject closure settings."""
+    import logging
+    from unittest import mock
+    from pydoppelgangerhunt.cli import main
+    from pydoppelgangerhunt.config import clear_closure_warning_cache
+
+    repo = tmp_path / "cli_cfg_symmetry"
+    repo.mkdir()
+    target = repo / "sample.py"
+    target.write_text("x = 1\n", encoding="utf-8")
+
+    for toml_body, cli_mode, expected_substr in (
+        (
+            '[tool.pydoppelgangerhunt]\nclosure_strictness = "pedantic"\n',
+            "strict",
+            "overrides configured closure_strictness='pedantic'",
+        ),
+        (
+            "[tool.pydoppelgangerhunt]\nskip_pre_unit_closures = true\n",
+            "strict",
+            "overrides configured skip_pre_unit_closures=True",
+        ),
+    ):
+        (repo / "pyproject.toml").write_text(toml_body, encoding="utf-8")
+        clear_closure_warning_cache()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[]):
+                rc = main([str(target), "--closure-strictness", cli_mode])
+        assert rc == 0
+        assert any(expected_substr in rec.message for rec in caplog.records)
+
+    # Matching CLI mode and config strictness does not emit a conflict warning
+    (repo / "pyproject.toml").write_text(
+        '[tool.pydoppelgangerhunt]\nclosure_strictness = "pedantic"\n',
+        encoding="utf-8",
+    )
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[]):
+            rc = main([str(target), "--closure-strictness", "pedantic"])
+    assert rc == 0
+    assert not [r for r in caplog.records if "Conflicting configuration" in r.message]
+
+
+def test_nested_session_fallback_resolves_enclosing_outer_session_bucket(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies copied contexts from exited inner sessions resolve to an active outer ancestor bucket."""
+    import logging
+    from pydoppelgangerhunt import config as config_mod
+    from pydoppelgangerhunt.config import (
+        clear_closure_warning_cache,
+        heuristic_ctx_manager_session,
+        log_heuristic_ctx_manager_summary,
+        peek_heuristic_non_suppressing_ctx_managers,
+        record_heuristic_non_suppressing_ctx_manager,
+        record_wildcard_ctx_manager_match,
+    )
+
+    clear_closure_warning_cache()
+    caplog.clear()
+
+    def _run_in_thread(
+        ctx: contextvars.Context, fn: Any
+    ) -> None:
+        errors: list[BaseException] = []
+
+        def _entry() -> None:
+            try:
+                ctx.run(fn)
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+
+        worker = threading.Thread(target=_entry)
+        worker.start()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        if errors:
+            raise errors[0]
+
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt"):
+        with heuristic_ctx_manager_session(warn=True):
+            with heuristic_ctx_manager_session(warn=True):
+                captured_ctx = contextvars.copy_context()
+
+            # Inner session exited while outer session remains active.
+            def _direct_record() -> None:
+                record_heuristic_non_suppressing_ctx_manager("OuterTarget.lock")
+                record_wildcard_ctx_manager_match("*.tx", "OuterTarget.tx")
+                with config_mod._warned_closure_lock:
+                    assert (
+                        threading.current_thread()
+                        not in config_mod._default_thread_buckets
+                    )
+
+            _run_in_thread(captured_ctx, _direct_record)
+            assert "OuterTarget.lock" in peek_heuristic_non_suppressing_ctx_managers()
+
+            # Spawning a new nested session inside the stale inner context merges into outer.
+            def _nested_session_record() -> None:
+                with heuristic_ctx_manager_session(warn=True):
+                    record_heuristic_non_suppressing_ctx_manager(
+                        "NestedInExpiredCtx.lock"
+                    )
+
+            _run_in_thread(captured_ctx, _nested_session_record)
+            assert "OuterTarget.lock" not in caplog.text
+            assert "NestedInExpiredCtx.lock" not in caplog.text
+
+    assert "OuterTarget.lock" in caplog.text
+    assert "OuterTarget.tx" in caplog.text
+    assert "NestedInExpiredCtx.lock" in caplog.text
+    assert config_mod._active_heuristic_sessions == {}
+
+    # Negative control: once outer session also exits, recording uses per-thread fallback.
+    def _fallback_record() -> None:
+        record_heuristic_non_suppressing_ctx_manager("OrphanedFallback.lock")
+        with config_mod._warned_closure_lock:
+            assert threading.current_thread() in config_mod._default_thread_buckets
+        assert "OrphanedFallback.lock" in log_heuristic_ctx_manager_summary(warn=False)
+
+    _run_in_thread(captured_ctx, _fallback_record)
+
+
+@pytest.mark.parametrize(
+    ("toml_body", "cli_mode", "expected_substr", "forbidden_substr", "repeat_calls"),
+    [
+        pytest.param(
+            "[tool.pydoppelgangerhunt]\nstrict_with_suppression = true\n",
+            "strict",
+            "CLI flag --closure-strictness 'strict' overrides configured strict_with_suppression=True",
+            "takes precedence over strict_with_suppression=True",
+            2,
+            id="strict_overrides_configured_strict_with_suppression_repeatedly",
+        ),
+        pytest.param(
+            "[tool.pydoppelgangerhunt]\nstrict_with_suppression = true\n",
+            "lenient",
+            "CLI flag --closure-strictness 'lenient' overrides configured strict_with_suppression=True",
+            "takes precedence over strict_with_suppression=True",
+            1,
+            id="lenient_overrides_configured_strict_with_suppression",
+        ),
+        pytest.param(
+            '[tool.pydoppelgangerhunt]\nclosure_strictness = "pedantic"\nstrict_with_suppression = true\n',
+            "strict",
+            "CLI flag --closure-strictness 'strict' overrides configured closure_strictness='pedantic'",
+            "strict_with_suppression=True",
+            1,
+            id="strictness_conflict_takes_priority_without_duplicate_strict_with_warning",
+        ),
+        pytest.param(
+            "[tool.pydoppelgangerhunt]\nstrict_with_suppression = true\n",
+            "pedantic",
+            None,
+            "Conflicting configuration",
+            1,
+            id="control_matching_pedantic_emits_no_conflict_warning",
+        ),
+    ],
+)
+def test_cli_closure_strictness_overrides_strict_with_suppression_symmetrically(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    toml_body: str,
+    cli_mode: str,
+    expected_substr: Optional[str],
+    forbidden_substr: Optional[str],
+    repeat_calls: int,
+) -> None:
+    """Verifies --closure-strictness logs per-invocation CLI override warnings against configured strict_with_suppression."""
+    import logging
+    from unittest import mock
+    from pydoppelgangerhunt.cli import main
+    from pydoppelgangerhunt.config import clear_closure_warning_cache
+
+    repo = tmp_path / "cli_strict_with_symmetry"
+    repo.mkdir()
+    target = repo / "sample.py"
+    target.write_text("x = 1\n", encoding="utf-8")
+    (repo / "pyproject.toml").write_text(toml_body, encoding="utf-8")
+
+    clear_closure_warning_cache()
+    for _ in range(repeat_calls):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[]):
+                rc = main([str(target), "--closure-strictness", cli_mode])
+        assert rc == 0
+        messages = [rec.message for rec in caplog.records]
+        if expected_substr is not None:
+            assert any(expected_substr in msg for msg in messages), messages
+        if forbidden_substr is not None:
+            assert not any(forbidden_substr in msg for msg in messages), messages
+
+
+@pytest.mark.parametrize(
+    ("replace_clones", "skip_pre_unit_closures", "expected_fallback_mode", "expect_patch_emitted"),
+    [
+        pytest.param(
+            True,
+            None,
+            "pedantic",
+            False,
+            id="replace_clones_true_logs_pedantic_and_blocks_unproven_cm",
+        ),
+        pytest.param(
+            False,
+            None,
+            "strict",
+            True,
+            id="replace_clones_false_logs_strict_and_allows_neutral_cm",
+        ),
+        pytest.param(
+            True,
+            True,
+            "lenient",
+            True,
+            id="replace_clones_true_with_skip_true_logs_lenient",
+        ),
+    ],
+)
+def test_generate_refactoring_patch_unrecognized_strictness_fallback_log_matches_mode(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    replace_clones: bool,
+    skip_pre_unit_closures: Optional[bool],
+    expected_fallback_mode: str,
+    expect_patch_emitted: bool,
+) -> None:
+    """Verifies generate_refactoring_patch logs the exact fallback strictness mode actually enforced."""
+    import logging
+    from pydoppelgangerhunt.config import clear_closure_warning_cache
+    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch
+
+    src = (
+        "def run_a(Guard, compute):\n"
+        "    with Guard():\n"
+        "        v = compute()\n"
+        "    cb = lambda: v\n"
+        "    return cb()\n\n"
+        "def run_b(Guard, compute):\n"
+        "    with Guard():\n"
+        "        v = compute()\n"
+        "    cb = lambda: v\n"
+        "    return cb()\n"
+    )
+    mod_file = tmp_path / "fallback_mode.py"
+    mod_file.write_text(src, encoding="utf-8")
+    lines = src.splitlines()
+    cb_lines = [i + 1 for i, ln in enumerate(lines) if "cb = lambda: v" in ln]
+    u1 = {"name": "run_a:cb", "file": str(mod_file), "start": cb_lines[0], "end": cb_lines[0], "kind": "basic_block"}
+    u2 = {"name": "run_b:cb", "file": str(mod_file), "start": cb_lines[1], "end": cb_lines[1], "kind": "basic_block"}
+
+    clear_dataflow_cache()
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        patch_txt = generate_refactoring_patch(
+            [(1.0, u1, u2)],
+            repo_root=str(tmp_path),
+            replace_clones=replace_clones,
+            closure_strictness="bogus_mode",
+            skip_pre_unit_closures=skip_pre_unit_closures,
+        )
+    assert f"falling back to {expected_fallback_mode} mode" in caplog.text
+    assert bool(patch_txt) is expect_patch_emitted

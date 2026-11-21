@@ -2443,3 +2443,376 @@ def test_strict_primitive_accumulator_records_annassign_annotation_reads(
     assert sc["is_control_flow_safe"] is expect_safe_strict, case_id
     if not expect_safe_strict:
         assert "global_escape" in sc["closure_hazard_reasons"], case_id
+
+
+def test_ast_compat_match_and_trystar_predicates() -> None:
+    """Verifies _ast_compat handles MatchClass/match_case/MatchMapping/MatchAs/MatchStar and TryStar consistently."""
+    import sys
+    from pydoppelgangerhunt.fixer._ast_compat import is_match_class_node, is_try_or_trystar_node
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _extract_immediate_bool_test_exprs,
+        _extract_non_assign_bound_names,
+    )
+    from pydoppelgangerhunt.fixer._df_hazards import _stmt_definitely_terminates
+
+    match_src = (
+        "class Box:\n"
+        "    def __init__(self, x):\n"
+        "        self.x = x\n"
+        "def inspect_val(v):\n"
+        "    match v:\n"
+        "        case Box(x=a) if a > 0:\n"
+        "            return a\n"
+        "        case {'k': b, **rest}:\n"
+        "            return (b, rest)\n"
+        "        case [first, *tail]:\n"
+        "            return (first, tail)\n"
+    )
+    m_tree = ast.parse(match_src)
+    match_stmt = m_tree.body[1].body[0]  # type: ignore[attr-defined]
+    cases = match_stmt.cases
+    assert any(_extract_immediate_bool_test_exprs(c) for c in cases)
+    assert any(is_match_class_node(n) for n in ast.walk(cases[0].pattern))
+    bound: set[str] = set()
+    for c in cases:
+        for sub in ast.walk(c.pattern):
+            bound.update(_extract_non_assign_bound_names(sub))
+    assert {"a", "b", "rest", "first", "tail"} <= bound
+
+    if sys.version_info >= (3, 11):
+        ts_src = (
+            "try:\n"
+            "    return 1\n"
+            "except* ValueError:\n"
+            "    return 2\n"
+        )
+        ts_stmt = ast.parse(ts_src).body[0]
+        assert is_try_or_trystar_node(ts_stmt)
+        assert _stmt_definitely_terminates(ts_stmt) is True
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="type statement requires Python 3.12+")
+def test_type_alias_rebind_disqualifies_pedantic_primitive_and_accumulator() -> None:
+    """Verifies PEP 695 ast.TypeAlias targets are extracted as non-assign bindings and disqualify primitive status."""
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _collect_local_primitive_accumulators,
+        _collect_pedantic_primitive_env,
+        _extract_non_assign_bound_names,
+    )
+
+    with_alias_src = "x = 1\ny = 2\ntype x = int\n"
+    alias_stmts = ast.parse(with_alias_src).body
+    assert _extract_non_assign_bound_names(alias_stmts[2]) == {"x"}
+
+    prim_env = _collect_pedantic_primitive_env(
+        alias_stmts,
+        alias_stmts,
+        frozenset(),
+        effective_shadowed=frozenset(),
+        all_builtins_shadowed=False,
+    )
+    assert "x" not in prim_env.primitives
+    assert "y" in prim_env.primitives
+
+    acc = _collect_local_primitive_accumulators(alias_stmts, alias_stmts)
+    assert "x" not in acc
+    assert "y" in acc
+
+
+@pytest.mark.parametrize(
+    ("fn_body", "expect_hazard"),
+    [
+        pytest.param(
+            "    return (log.append(x) for x in items)\n",
+            False,
+            id="direct_returned_genexp_defers_body_calls",
+        ),
+        pytest.param(
+            "    gen = (log.append(x) for x in items)\n    return gen\n",
+            False,
+            id="single_return_local_genexp_defers_body_calls",
+        ),
+        pytest.param(
+            "    return {'g': [(log.append(x) for x in items)]}\n",
+            False,
+            id="literal_container_returned_genexp_defers_body_calls",
+        ),
+        pytest.param(
+            "    return sum((log.append(x) or 0 for x in items))\n",
+            True,
+            id="adversarial_consumed_genexp_in_sum_still_flagged",
+        ),
+        pytest.param(
+            "    return [y for y in (log.append(x) for x in items)]\n",
+            True,
+            id="adversarial_consumed_genexp_in_listcomp_still_flagged",
+        ),
+        pytest.param(
+            "    return [*(log.append(x) for x in items)]\n",
+            True,
+            id="adversarial_consumed_genexp_in_starred_still_flagged",
+        ),
+        pytest.param(
+            "    gen = (log.append(x) for x in items)\n    res = [*gen]\n    return (gen, res)\n",
+            True,
+            id="adversarial_local_genexp_consumed_before_return_still_flagged",
+        ),
+        pytest.param(
+            "    return (x for x in get_bad_items())\n",
+            True,
+            id="adversarial_eager_genexp_iter_call_still_flagged",
+        ),
+        pytest.param(
+            "    gen = ({'k': log.append(x)} for x in items)\n    return {**gen}\n",
+            True,
+            id="adversarial_dict_double_star_unpack_still_flagged",
+        ),
+    ],
+)
+def test_unconsumed_genexp_defers_body_calls_while_guarding_consumed_or_eager_iter(
+    fn_body: str,
+    expect_hazard: bool,
+) -> None:
+    """Verifies unconsumed returned GeneratorExps defer body calls while consumed/eager iterators stay guarded."""
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _unit_has_global_mutating_call,
+    )
+
+    direct_stmts = ast.parse(
+        "def make_items(items):\n"
+        f"{fn_body}\n"
+    ).body[0].body  # type: ignore[attr-defined]
+    assert _unit_has_global_mutating_call(direct_stmts, frozenset()) is expect_hazard
+
+    e2e_body = "\n".join(f"    {line}" for line in fn_body.splitlines())
+    src = (
+        "g_val = [1, 2, 3]\n"
+        "log = []\n"
+        "def get_bad_items():\n"
+        "    log.append(1)\n"
+        "    return [1]\n"
+        "def outer(items):\n"
+        "    global g_val\n"
+        "    if items:\n"
+        "        out = g_val\n"
+        f"{e2e_body}\n"
+    )
+    lines = src.splitlines()
+    block_start = next(
+        idx for idx, ln in enumerate(lines, start=1) if "if items:" in ln
+    )
+    clear_dataflow_cache()
+    sc = inspect_single_unit_scope(
+        {
+            "name": "genexp_block",
+            "kind": "compound_block",
+            "start": block_start,
+            "end": len(lines),
+            "source_text": src,
+            "closure_strictness": "strict",
+        },
+        tree=ast.parse(src),
+    )
+    assert ("severed_closure_cell" in sc["control_flow_hazards"]) is expect_hazard, sc
+    assert ("global_escape" in sc["closure_hazard_reasons"]) is expect_hazard, sc
+
+
+@pytest.mark.parametrize(
+    ("unit_lines", "reads_global", "expect_strict_hazard", "expect_pedantic_hazard"),
+    [
+        pytest.param(
+            ["    import side_effect_mod\n", "    v = G + 1\n"],
+            True,
+            True,
+            True,
+            id="immediate_import_in_global_reading_unit",
+        ),
+        pytest.param(
+            ["    from side_effect_mod import helper\n", "    v = G + 1\n"],
+            True,
+            True,
+            True,
+            id="immediate_from_import_in_global_reading_unit",
+        ),
+        pytest.param(
+            [
+                "    def deferred():\n",
+                "        import side_effect_mod\n",
+                "        return side_effect_mod\n",
+                "    v = G + 1\n",
+            ],
+            True,
+            False,
+            True,
+            id="control_deferred_import_in_nested_def_strict_safe",
+        ),
+        pytest.param(
+            ["    v = G + 1\n"],
+            True,
+            False,
+            True,
+            id="control_plain_arithmetic_global_read_strict_safe",
+        ),
+        pytest.param(
+            ["    import side_effect_mod\n", "    v = 1\n"],
+            False,
+            False,
+            False,
+            id="control_import_without_global_read_no_global_escape",
+        ),
+    ],
+)
+def test_global_escape_rejects_immediate_import_statements_in_strict_and_pedantic_modes(
+    unit_lines: list[str],
+    reads_global: bool,
+    expect_strict_hazard: bool,
+    expect_pedantic_hazard: bool,
+) -> None:
+    """Verifies immediate import/from-import statements trigger global_escape in both strict and pedantic modes."""
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _unit_has_global_mutating_call,
+    )
+
+    body_str = "".join(unit_lines)
+    direct_stmts = ast.parse("".join(ln[4:] for ln in unit_lines)).body
+    if reads_global:
+        assert (
+            _unit_has_global_mutating_call(
+                direct_stmts, frozenset(), allow_heuristic_builtins=True
+            )
+            is expect_strict_hazard
+        )
+        assert (
+            _unit_has_global_mutating_call(
+                direct_stmts, frozenset(), allow_heuristic_builtins=False
+            )
+            is expect_pedantic_hazard
+        )
+
+    global_decl = "    global G\n" if reads_global else ""
+    start_ln = 3 if reads_global else 2
+    end_ln = start_ln + len(unit_lines) - 1
+    src = f"def run():\n{global_decl}{body_str}    return v\n"
+    tree = ast.parse(src)
+    for mode, expected in (
+        ("strict", expect_strict_hazard),
+        ("pedantic", expect_pedantic_hazard),
+    ):
+        clear_dataflow_cache()
+        sc = inspect_single_unit_scope(
+            {
+                "start": start_ln,
+                "end": end_ln,
+                "kind": "compound_block",
+                "source_text": src,
+                "source_code": body_str,
+                "closure_strictness": mode,
+            },
+            tree=tree,
+        )
+        assert ("global_escape" in sc["closure_hazard_reasons"]) is expected, (mode, sc)
+        assert ("severed_closure_cell" in sc["control_flow_hazards"]) is expected, (
+            mode,
+            sc,
+        )
+        assert bool(sc["is_control_flow_safe"]) is (not expected), (mode, sc)
+
+
+@pytest.mark.parametrize(
+    ("setup_line", "except_clause", "expect_strict_hazard", "expect_pedantic_hazard"),
+    [
+        pytest.param(
+            "",
+            "except CustomExc:",
+            False,
+            True,
+            id="custom_exception_class_rejected_in_pedantic",
+        ),
+        pytest.param(
+            "",
+            "except (ValueError, CustomExc):",
+            False,
+            True,
+            id="tuple_with_custom_exception_rejected_in_pedantic",
+        ),
+        pytest.param(
+            "",
+            "except mod.MyError:",
+            False,
+            True,
+            id="attribute_exception_type_rejected_in_pedantic",
+        ),
+        pytest.param(
+            "    ValueError = CustomExc\n",
+            "except ValueError:",
+            False,
+            True,
+            id="shadowed_builtin_exception_rejected_in_pedantic",
+        ),
+        pytest.param(
+            "",
+            "except ValueError:",
+            False,
+            False,
+            id="control_unshadowed_builtin_exception_allowed_in_pedantic",
+        ),
+        pytest.param(
+            "",
+            "except (ValueError, TypeError):",
+            False,
+            False,
+            id="control_tuple_of_unshadowed_builtins_allowed_in_pedantic",
+        ),
+        pytest.param(
+            "",
+            "except:",
+            False,
+            False,
+            id="control_bare_except_allowed_in_pedantic",
+        ),
+    ],
+)
+def test_pedantic_global_escape_rejects_non_builtin_except_handler_types(
+    setup_line: str,
+    except_clause: str,
+    expect_strict_hazard: bool,
+    expect_pedantic_hazard: bool,
+) -> None:
+    """Verifies pedantic global-escape rejects non-builtin/shadowed ExceptHandler.type (__subclasscheck__)."""
+    src = (
+        "STATE = 10\n"
+        "def run_op(CustomExc, mod):\n"
+        "    global STATE\n"
+        f"{setup_line}"
+        "    first = STATE\n"
+        "    try:\n"
+        "        x = 1\n"
+        f"    {except_clause}\n"
+        "        x = 2\n"
+        "    second = STATE\n"
+        "    return first, second, x\n"
+    )
+    lines = src.splitlines()
+    start_ln = next(i for i, ln in enumerate(lines, start=1) if "first = STATE" in ln)
+    end_ln = next(i for i, ln in enumerate(lines, start=1) if "second = STATE" in ln)
+    body_code = "\n".join(lines[start_ln - 1 : end_ln]) + "\n"
+    tree = ast.parse(src)
+    for mode, expected in (
+        ("strict", expect_strict_hazard),
+        ("pedantic", expect_pedantic_hazard),
+    ):
+        clear_dataflow_cache()
+        sc = inspect_single_unit_scope(
+            {
+                "start": start_ln,
+                "end": end_ln,
+                "kind": "compound_block",
+                "source_text": src,
+                "source_code": body_code,
+                "closure_strictness": mode,
+            },
+            tree=tree,
+        )
+        assert ("global_escape" in sc["closure_hazard_reasons"]) is expected, (mode, sc)
+        assert bool(sc["is_control_flow_safe"]) is (not expected), (mode, sc)
+

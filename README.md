@@ -124,7 +124,8 @@ min_lines = 8
 min_tokens = 15
 cross_file_strategy = "auto"
 shared_module_name = "_common.py"
-# closure_strictness = "strict"  # "strict" (default), "pedantic", or "lenient"
+# closure_strictness = "strict"  # "strict" (reporting default), "pedantic" (--patch default), or "lenient"
+# Prefer explicit dotted/bare names; use wildcards ("<module>.*.attr" or "*.attr") only as a last resort:
 non_suppressing_ctx_managers = []
 exclude = [
     "tests",
@@ -136,7 +137,7 @@ exemptions = [
 ]
 ```
 
-Leaving `closure_strictness` unset (commented out) allows `--replace-clones` (`replace_clones=True`) to default automatically to `"pedantic"` for automated call-site rewrites while keeping reporting (`--suggest`, `--html`) and preview patches (`replace_clones=False`) on `"strict"`. Setting a recognized `closure_strictness` (or enabling `strict_with_suppression = true` / `skip_pre_unit_closures = true`) opts `--replace-clones` out of that automatic `"pedantic"` upgrade; passing `skip_pre_unit_closures = false` or an unrecognized `closure_strictness` does not suppress `"pedantic"`.
+Leaving `closure_strictness` unset (commented out) allows `--patch` (`generate_refactoring_patch`, for both `--replace-clones` / `replace_clones=True` and preview patches with `replace_clones=False`) to default automatically to `"pedantic"` while keeping reporting (`--suggest`, `--html`) on `"strict"`. Setting a canonical `closure_strictness`, setting `strict_with_suppression = true|false`, or enabling `skip_pre_unit_closures = true` opts `--patch` / `generate_refactoring_patch` out of that automatic `"pedantic"` default; passing `skip_pre_unit_closures = false` does not suppress `"pedantic"`, and unrecognized `closure_strictness` values in `pyproject.toml` raise `ValueError` (exiting with CLI status `2`).
 
 ### Cross-Module Deduplication Strategies
 
@@ -189,8 +190,8 @@ from pydoppelgangerhunt import (
 - **`count_physical_newlines(text)`**: Accurately counts physical line endings (`\r\n`, `\r`, `\n`) across mixed and legacy lone-CR formats.
 - **`detect_line_ending(*sources)`**: Detects predominant line ending format across source strings or iterables via majority vote (`\n`, `\r\n`, or `\r`), breaking ties in priority order (`\n` → `\r\n` → `\r`).
 - **`intervals_overlap(s1, e1, s2, e2)`**: Fast primitive returning `True` if two half-open intervals `[s1, e1)` and `[s2, e2)` intersect; `False` otherwise.
-- **`validate_unit_schema(unit, strict=False)`**: Validates a unit dictionary against `UnitSchema`, returning unrecognized keys (or raising `ValueError` under `strict=True`). Positionally consumed fields (`source_lines`, `inputs`, `outputs`, `precomputed_outputs`, `norm_tokens`, `calls`, list-valued `tokens`) must be ordered sequences—sets are rejected because they make helper parameter order and output pairing nondeterministic—while `non_suppressing_ctx_managers` and `shingles` also accept sets. `docstring_end` and `enclosing_class_start` are 1-based and reject `0`, and aliased coordinates (`start`/`lineno`, `end`/`end_lineno`, `start_col`/`col_offset`/`start_col_offset`, `end_col`/`end_col_offset`) must agree.
-- **Notebook cell sources**: Code-cell `source` fragments are concatenated per nbformat before physical line splitting (line endings normalized to `\n`); cells whose `source` is missing or contains non-string fragments, and non-code cells, are skipped during harvesting and resolve to a `SourceLinesOrigin.PLACEHOLDER` (failing closed) in `extract_unit_source_lines_with_state`.
+- **`validate_unit_schema(unit, strict=False)`**: Validates a unit dictionary against `UnitSchema`, returning unrecognized keys (or raising `ValueError` under `strict=True`). Positionally consumed fields (`source_lines`, `inputs`, `outputs`, `precomputed_outputs`, `norm_tokens`, `calls`, list-valued `tokens`) must be ordered sequences—sets are rejected because they make helper parameter order and output pairing nondeterministic—while `non_suppressing_ctx_managers` and `shingles` also accept sets. `docstring_end` and `enclosing_class_start` are 1-based and reject `0`, aliased coordinates (`start`/`lineno`, `end`/`end_lineno`, `start_col`/`col_offset`/`start_col_offset`, `end_col`/`end_col_offset`) must agree, `"file"` accepts `str` or `os.PathLike` backed by `str`, `closure_strictness` must be `"strict"`, `"pedantic"`, or `"lenient"`, and `non_suppressing_ctx_managers` rejects degenerate wildcards (`*`, `*.*`, or malformed `*` segments). **Schema validation is explicit**: only the high-level refactoring entrypoints (`generate_refactoring_patch` and `synthesize_shared_helper_code`) call `validate_unit_schema` automatically at entry; lower-level helpers (`inspect_single_unit_scope`, `extract_unit_source_lines_with_state`, `analyze_unit_variable_scope`, etc.) do not auto-validate external unit payloads unless callers invoke `validate_unit_schema` first.
+- **Notebook cell sources & in-memory anchors**: Code-cell `source` fragments are concatenated per nbformat before physical line splitting (line endings normalized to `\n`); cells whose `source` is missing or contains non-string fragments, and non-code cells, are skipped during harvesting and resolve to a `SourceLinesOrigin.PLACEHOLDER` (failing closed) in `extract_unit_source_lines_with_state`. Malformed `.ipynb#<fragment>` anchors (such as `#cell_0` or `#bad`) always fail closed to `PLACEHOLDER`, and in-memory nbformat JSON buffers (`file_source`/`source_text`/`source_lines`) validate `#cell_N` against the JSON cells (failing closed on out-of-range, non-code, or corrupt JSON); plain-Python in-memory buffers (`source_lines`, or non-JSON `source_text`/`file_source`) alongside a syntactically valid `#cell_N` anchor are treated as authoritative unsaved cell buffers and override disk `.ipynb` anchor lookup.
 - **`is_subroutine_unit(unit, source_text=None, tree=None)`**: Inspects unit metadata to
   determine if a clone unit represents an inner compound block, sliding window, or clause branch
   rather than an entire callable. Explicit `is_subroutine` boolean takes precedence; returns `True`
@@ -292,13 +293,13 @@ escaping callbacks across lexical scopes.
   across CLI and programmatic APIs: explicit valid `closure_strictness` takes precedence over
   `strict_with_suppression` and `skip_pre_unit_closures` (logging a once-per-run conflict warning when
   both are supplied and disagree), while `strict_with_suppression = true` selects `pedantic` when
-  `closure_strictness` is unset. Legacy `closure_strictness` values in configuration files or unit
-  dictionaries log a deprecation warning and map directly (`"fail_closed"` → `pedantic`, `"fast"`
-  and `"skip"` → `lenient`), while unrecognized `closure_strictness` strings log a warning and fall
-  back to the boolean flags (`lenient` when `skip_pre_unit_closures = true`, `pedantic` when
-  `strict_with_suppression = true`, and `strict` otherwise):
-  - `strict` (default for reporting, `--suggest`, `--html`, and preview patch generation with
-    `replace_clones=False`): **Heuristic context-manager safety mode** with conservative closure-cell
+  `closure_strictness` is unset. Unrecognized `closure_strictness` values in `pyproject.toml`
+  or `validate_unit_schema` (including `generate_refactoring_patch` and
+  `synthesize_shared_helper_code`) raise `ValueError`, while low-level
+  `resolve_closure_strictness_mode()` logs a deduplicated warning on unrecognized strings and
+  falls back to the active boolean flags (`lenient` when `skip_pre_unit_closures = true`,
+  `pedantic` when `strict_with_suppression = true`, and `strict` otherwise):
+  - `strict` (default for reporting, `--suggest`, and `--html`): **Heuristic context-manager safety mode** with conservative closure-cell
     analysis. Treats pre-unit closures capturing candidate outputs as live escaping callbacks and
     enforces all closure-cell hazard checks. For `with` / `async with` blocks, calls to standard
     library non-suppressing context-manager factories (`open(...)`, `builtins.open(...)`,
@@ -334,28 +335,34 @@ escaping callbacks across lexical scopes.
     named custom exception-suppressing context managers** (such as `Transaction()`, `Guard()`,
     `SpanContext()`, `SessionScope()`, or `BatchContext()`). In units that read an enclosing
     `global` variable, `strict` mode rejects arbitrary calls, `with`/`async with` blocks,
-    suspension points (`await`, `yield`, `yield from`, `async for`, and async comprehensions),
+    `import` statements, suspension points (`await`, `yield`, `yield from`, `async for`, and async comprehensions),
     attribute/subscript/descriptor mutations, deletions, and external or `@=` augmented assignments,
     while permitting C-level built-ins (`callable`, `id`, `ord`), dunder-invoking inspection/conversion
     built-ins (`bin`, `bool`, `chr`, `hex`, `int`, `isinstance`, `issubclass`, `len`, `oct`, `range`),
     implicit boolean truthiness, synchronous read-only AST expressions, and local primitive-initialized
     accumulator augmented assignments (`total = 0; total += x`) under the heuristic that user dunders
     (`__len__`, `__index__`, `__bool__`, `__radd__`, etc.) do not mutate module-level globals.
-    Whenever an unproven context manager is accepted via the name heuristic, `pyDoppelgangerHunt`
-    logs a deduplicated `INFO` diagnostic and a session-scoped `WARNING` summary (or `INFO`
-    when `warn=False` is passed explicitly) to `stderr`/logging (never polluting `stdout` or
-    `--output` report files, while recording an advisory `# Note:` comment in `--suggest` /
-    `--html` helper blocks and `--patch` unified diffs); automated call-site delegation (`--replace-clones` /
-    `replace_clones=True`) defaults to `pedantic` unless `closure_strictness` is explicitly set.
+    Whenever an unproven context manager is accepted via the name heuristic or a wildcard
+    allowlist pattern, `pyDoppelgangerHunt` logs a deduplicated `INFO` diagnostic and a
+    session-scoped `WARNING` summary (or `INFO` when `warn=False` is passed explicitly) to
+    `stderr`/logging (never polluting `stdout` or `--output` report files, while recording an
+    advisory `# Note:` comment in `--suggest` / `--html` helper blocks and `--patch` unified
+    diffs); `--patch` / `generate_refactoring_patch` (both `replace_clones=False` and `True`)
+    defaults to `pedantic` unless `closure_strictness`, `strict_with_suppression`, or
+    `skip_pre_unit_closures=True` is explicitly set.
     In every mode, positive non-suppression proofs (local class bodies and pure-Python stdlib
     managers such as `contextlib.nullcontext`) are withdrawn for the whole module when it patches
     the exit protocol at runtime anywhere (`Cls.__exit__ = ...`, `del Cls.__aexit__`,
-    `obj.__class__ = ...`, `setattr`/`delattr`/`type.__setattr__` targeting `__exit__`/`__aexit__`
+    `obj.__class__ = ...`, `Cls.__bases__ = ...`, `setattr`/`delattr`/`type.__setattr__`
+    targeting `__exit__`/`__aexit__`/`__class__`/`__bases__`
     or a non-literal attribute name) or calls `exec`/`eval`; directly patched names are treated as
-    suspicious (potentially suppressing), and only builtin `open(...)` and explicit
-    `non_suppressing_ctx_managers` entries remain trusted.
-  - `pedantic` (default when `--replace-clones` / `replace_clones=True` is enabled without an
-    explicit `closure_strictness`, or when `strict_with_suppression = true` is set while
+    suspicious (potentially suppressing) and override `non_suppressing_ctx_managers` for those
+    names (as do targeted imported-factory rebinds), while unshadowed, non-explicitly-rebound
+    builtin `open(...)` and unpatched explicit `non_suppressing_ctx_managers` entries remain
+    trusted.
+  - `pedantic` (default for `--patch` / `generate_refactoring_patch` when no explicit
+    `closure_strictness`, `strict_with_suppression`, or `skip_pre_unit_closures=True` is set,
+    or when `strict_with_suppression = true` is set while
     `closure_strictness` is unset in `pyproject.toml` or `UnitSchema` dicts): **Stricter static conservative mode**
     that treats all unproven unknown `with` / `async with` context managers as potentially
     exception-suppressing unless explicitly allowlisted via `--non-suppressing-ctx-managers` or
@@ -365,14 +372,18 @@ escaping callbacks across lexical scopes.
     and unproven implicit-dunder AST operations (binary/unary operators, non-identity comparisons and
     `in`/`not in` membership checks, attribute/`@property` and subscript reads, `for`/comprehension
     iteration, sequence/mapping unpacking, f-string formatting, `set`/`dict` key hashing, `match`
-    class/value/mapping/sequence patterns on unproven subjects, `import`, non-builtin `raise`, and
-    boolean truth-value evaluations) unless operands are statically proven built-in primitives or
+    class/value/mapping/sequence patterns on unproven subjects, non-builtin `raise`/`except`
+    handlers, and boolean truth-value evaluations) unless operands are statically proven built-in primitives or
     immutable literals. Static analysis remains bounded by Python's dynamic runtime (e.g., runtime
     frame introspection via `sys._getframe()`, metaclasses, or out-of-module monkeypatching of a
-    module's context-manager classes are not modeled). Allowlist entries support bare names (including locally defined classes), relative
-    imports (`.Name` matching `from . import Name`), dotted paths (e.g., `pkg.tx.atomic` or
-    `unittest.mock.patch.object`), and wildcard attribute suffixes (`*.atomic` or `*.lock` matching
-    `<any_receiver>.atomic` / `<any_receiver>.lock(...)`).
+    module's context-manager classes are not modeled). Prefer explicit dotted paths (e.g.,
+    `pkg.tx.atomic` or `unittest.mock.patch.object`), relative imports (`.Name` matching
+    `from . import Name`), and bare names (including locally defined classes); use wildcards
+    (`<module>.*.attr` for resolvable receivers or, as a last resort, `*.atomic` matching
+    `<any_receiver>.atomic(...)`) sparingly, because wildcard matches rely on attribute names
+    alone without proving the receiver cannot suppress exceptions (accepted wildcard matches record
+    an advisory `# Note:` comment and session summary warning). Bare `*`, `*.*`, and malformed
+    wildcard patterns raise `ValueError`.
   - `lenient`: Precision-oriented mode that skips pre-unit
     closure liveness scanning for generator subroutines and relaxes speculative unreferenced-sibling
     closure checks, while still enforcing checks for unbound captured cells at the extraction point,
@@ -414,7 +425,8 @@ strict fail-closed safety invariants:
   module-level units, variables defined within the unit are module-level globals; ensure
   module-level refactorings do not alter globals exported as public module API. When a subroutine
   inside an enclosing function reads a variable declared `global` in that enclosing scope, calls to
-  arbitrary functions, context-manager blocks (`with` / `async with`), coroutine/generator
+  arbitrary functions, context-manager blocks (`with` / `async with`), import statements
+  (`import` / `from ... import`), coroutine/generator
   suspension points (`await`, `yield`, `yield from`, `async for`), attribute/subscript
   assignments (`obj.attr = ...`, `obj[k] = ...`), non-static class-body attributes (`class C: attr = descriptor`,
   which can invoke `__set_name__` during class creation), external or non-primitive/`@=` augmented assignments
@@ -498,15 +510,15 @@ pydoppelgangerhunt --init
 | `--format` | `text\|json\|sarif` | Output report format (default: `text`) |
 | `--output`, `-o` | `PATH` | Output file path to save report |
 | `--html` | `PATH` | Write standalone interactive HTML dashboard report |
-| `--patch` | `PATH` | Write git-apply compatible unified patch file |
-| `--replace-clones` | Flag | Replace duplicate clone bodies with calls delegating to extracted helpers (defaults `--closure-strictness` to `pedantic` when unset) |
+| `--patch` | `PATH` | Write git-apply compatible unified patch file (defaults `--closure-strictness` to `pedantic` when unset) |
+| `--replace-clones` | Flag | Replace duplicate clone bodies with calls delegating to extracted helpers |
 | `--type-merge-strategy` | `fallback_any\|union` | Parameter typing strategy for helper synthesis (`fallback_any` or `union`) |
 | `--method-binding` | `auto\|method\|module` | Target helper binding strategy (`auto`, `method`, or `module`) |
 | `--cross-file-strategy` | `auto\|shared_module\|host_module\|skip` | Cross-module deduplication strategy (`auto`, `shared_module`, `host_module`, or `skip`; default: `auto`) |
 | `--shared-module-name` | `FILENAME` | Target filename for shared utility extractions (default: `_common.py`) |
 | `--skip-pre-unit-closures` | Flag | Relax speculative unreferenced pre-unit closure checks (`lenient` mode) |
-| `--closure-strictness` | `strict\|pedantic\|lenient` | Closure strictness mode (`strict` [heuristic `with`-suppression, default for reports/`--suggest`/preview patches], `pedantic` [all unproven `with`-managers treated as potentially suppressing, default for `--replace-clones`], or `lenient` [relaxes speculative unreferenced-sibling closure checks while keeping unbound/mutated captured-cell, intra-unit `nonlocal`/walrus mutator, and referenced-sibling closure checks]) |
-| `--non-suppressing-ctx-managers` | `NAMES` | Context manager names, `.Name` relative imports, dotted paths, or `*.attr` wildcard suffixes proven not to suppress exceptions (comma-separated or repeatable) |
+| `--closure-strictness` | `strict\|pedantic\|lenient` | Closure strictness mode (`strict` [heuristic `with`-suppression, default for reports/`--suggest`/`--html`], `pedantic` [all unproven `with`-managers treated as potentially suppressing, default for `--patch`], or `lenient` [relaxes speculative unreferenced-sibling closure checks while keeping unbound/mutated captured-cell, intra-unit `nonlocal`/walrus mutator, and referenced-sibling closure checks]) |
+| `--non-suppressing-ctx-managers` | `NAMES` | Context manager dotted paths, `.Name` relative imports, bare names, or (as a last resort) `<module>.*.attr` / `*.attr` wildcards proven not to suppress exceptions (comma-separated or repeatable) |
 | `--sort-by` | `similarity\|priority\|sloc` | Sort clone hits (default: `similarity`) |
 | `--priority` | Flag | Sort clones by Priority score: $\text{Sim} \times \text{SLOC} \times \text{Complexity}$ |
 | `--top` | `INT` | Truncate report to top $N$ clone pairs |
@@ -536,7 +548,9 @@ pydoppelgangerhunt --init
 | `--max-index-frequency` | `FLOAT` | Inverted index frequency threshold to prune ubiquitous shingles (default: `0.25`) |
 | `--workers` | `INT` | Number of worker processes for parallel AST harvesting |
 
-CLI exit codes: `0` when no clones (or only baselined clones) are found cleanly, `1` when clones are reported cleanly, and `2` when internal diagnostic errors or invalid CLI/configuration arguments occur.
+CLI exit codes: `0` when no clones (or only baselined clones) are found cleanly, `1` when clones are reported cleanly, `2` for invalid CLI or configuration usage (`argparse`), `3` when internal diagnostic errors occur without clones, and `4` when both clones and internal diagnostic errors occur.
+
+During CLI execution (`pydoppelgangerhunt`), Python compiler `SyntaxWarning` and invalid-escape `DeprecationWarning` messages emitted while parsing user repositories are suppressed inside `cli.main()`. Direct library callers retain standard Python warning behavior unless wrapped explicitly by the caller.
 
 ### Baseline Calibration & Massive Monorepo Deployments
 

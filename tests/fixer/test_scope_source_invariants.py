@@ -240,6 +240,7 @@ def test_slice_unit_token_lines_multiline_and_utf8_boundaries() -> None:
         {"kind": "complex_expr", "start_col": 8, "end_col": last_bytes_len},
         ml_lines,
     )
+    assert sliced_inside is not None
     assert sliced_inside[0] == "(\n"
     assert sliced_inside[-1] == "    )"
     sliced_exact_first = _slice_unit_token_lines(
@@ -250,7 +251,7 @@ def test_slice_unit_token_lines_multiline_and_utf8_boundaries() -> None:
         },
         ml_lines,
     )
-    assert sliced_exact_first == []
+    assert sliced_exact_first is None
     sliced_beyond_first = _slice_unit_token_lines(
         {
             "kind": "complex_expr",
@@ -259,14 +260,14 @@ def test_slice_unit_token_lines_multiline_and_utf8_boundaries() -> None:
         },
         ml_lines,
     )
-    assert sliced_beyond_first == []
+    assert sliced_beyond_first is None
     utf8_ml = ['    "\u00e9\u754c" + (\n', "        1 + 2\n", "    )\n"]
     after_mb_col = len('    "\u00e9\u754c" + '.encode("utf-8"))
     sliced_mb = _slice_unit_token_lines(
         {"kind": "complex_expr", "start_col": after_mb_col, "end_col": 5},
         utf8_ml,
     )
-    assert sliced_mb[0] == "(\n"
+    assert sliced_mb is not None and sliced_mb[0] == "(\n"
     presliced_ml = ["(\n", "        1 + 2\n", "    )\n"]
     assert (
         _slice_unit_token_lines(
@@ -276,9 +277,20 @@ def test_slice_unit_token_lines_multiline_and_utf8_boundaries() -> None:
                 "end_col": last_bytes_len,
             },
             presliced_ml,
-            is_pre_sliced=True,
         )
-        == []
+        is None
+    )
+    assert (
+        _slice_unit_token_lines(
+            {
+                "kind": "complex_expr",
+                "start_col": 8,
+                "end_col": last_bytes_len,
+            },
+            presliced_ml,
+            explicit_col_sliced=False,
+        )
+        is None
     )
     assert (
         _slice_unit_token_lines(
@@ -683,16 +695,16 @@ def test_slice_unit_token_lines_and_compile_warning_suppression() -> None:
     )
     from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
 
-    # 1. Explicit is_pre_sliced=False on a 2-line file where unit is lines 1..2
+    # 1. Column clipping when explicit_col_sliced=False on a 2-line file where unit is lines 1..2
     full_two_lines = ["a = 1\n", "b = 2\n"]
     sliced_full = _slice_unit_token_lines(
         {"start": 1, "end": 2},
         full_two_lines,
-        is_pre_sliced=False,
+        explicit_col_sliced=False,
     )
     assert sliced_full == ["a = 1\n", "b = 2\n"]
 
-    # 2. Line-sliced source_lines (without source_lines_is_sliced) still undergoes column slicing
+    # 2. Line-sliced source_lines (without source_lines_is_col_sliced) still undergoes column slicing
     sc_col = inspect_single_unit_scope(
         {
             "start": 5,
@@ -708,17 +720,16 @@ def test_slice_unit_token_lines_and_compile_warning_suppression() -> None:
         "b",
     }
 
-    # 3. Pre-sliced multi-line snippet with start_col/end_col is not double-sliced
+    # 3. Pre-sliced multi-line snippet with start_col/end_col is not double-sliced under explicit_col_sliced=True
     pre_sliced_multi = ["x = (\n", "    a + 1\n", ")"]
     res_multi = _slice_unit_token_lines(
         {"start": 10, "end": 12, "start_col": 4, "end_col": 5},
         pre_sliced_multi,
-        is_pre_sliced=True,
         explicit_col_sliced=True,
     )
     assert res_multi == pre_sliced_multi
 
-    # 4. _has_invalid_lexical_scope_declarations suppresses SyntaxWarning/DeprecationWarning from invalid escape sequences
+    # 4. _has_invalid_lexical_scope_declarations lets SyntaxWarning/DeprecationWarning propagate in library mode
     warn_src = 'def f():\n    s = "\\d+"\n    return 1 is 1\n'
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", SyntaxWarning)
@@ -732,11 +743,10 @@ def test_slice_unit_token_lines_and_compile_warning_suppression() -> None:
             source_lines=warn_src.splitlines(),
         )
     assert is_invalid is False
-    assert not [
-        w
+    assert any(
+        issubclass(w.category, (SyntaxWarning, DeprecationWarning))
         for w in caught
-        if issubclass(w.category, (SyntaxWarning, DeprecationWarning))
-    ]
+    )
 
 
 def test_conditional_store_promoted_to_input_only_when_read_downstream() -> None:
@@ -1192,10 +1202,9 @@ def test_source_lines_origin_enum_properties_and_hash_contract() -> None:
     from pydoppelgangerhunt.source_lines import SourceLinesOrigin
 
     assert issubclass(SourceLinesOrigin, enum.Enum)
-    assert "__bool__" in SourceLinesOrigin.__dict__
+    assert "__bool__" not in SourceLinesOrigin.__dict__
     for member in SourceLinesOrigin:
-        with pytest.raises(TypeError, match="no implicit truth value"):
-            bool(member)
+        assert bool(member) is True
     assert SourceLinesOrigin.PRE_SLICED.is_pre_sliced is True
     assert SourceLinesOrigin.PRE_SLICED.is_placeholder is False
     assert SourceLinesOrigin.PRE_SLICED.has_real_source is True
@@ -1388,7 +1397,6 @@ def test_slice_unit_token_lines_clips_multiline_presliced_line_excerpt_without_d
     clipped = _slice_unit_token_lines(
         unit,
         [ln.rstrip("\r\n") for ln in excerpt],
-        is_pre_sliced=SourceLinesOrigin.PRE_SLICED,
     )
     assert clipped == ["[", "        x * 2", "        for x in items", "    ]"]
 
@@ -1454,14 +1462,14 @@ def test_out_of_range_unit_columns_fail_closed_in_scope_and_slicing() -> None:
             {"kind": "comprehension", "start_col": 999, "end_col": 1010},
             [line],
         )
-        == []
+        is None
     )
     assert (
         _slice_unit_token_lines(
             {"kind": "comprehension", "start_col": 10, "end_col": 999},
             [line],
         )
-        == []
+        is None
     )
     sc_oob = inspect_single_unit_scope(
         {
@@ -1522,25 +1530,21 @@ def test_col_sliced_flag_separation_and_unrecognized_strictness_rejection(
     sc_col_sliced = inspect_single_unit_scope(unit_col_sliced)
     assert set(sc_col_sliced["inputs"]) == {"items", "offset"}
 
-    for deprecated_mode, expected_resolved in (
-        ("fail_closed", ("pedantic", False)),
-        ("fast", ("lenient", True)),
-        ("skip", ("lenient", True)),
-    ):
+    for removed_alias in ("fail_closed", "fast", "skip"):
         clear_closure_warning_cache()
         caplog.clear()
         with caplog.at_level(logging.WARNING):
             res_mode, res_skip = resolve_closure_strictness_mode(
-                closure_strictness=deprecated_mode
+                closure_strictness=removed_alias
             )
-        assert (res_mode, res_skip) == expected_resolved
+        assert (res_mode, res_skip) == ("strict", False)
         assert any(
-            "Deprecated closure_strictness" in rec.message
+            f"Unrecognized closure_strictness '{removed_alias}'" in rec.message
             for rec in caplog.records
         )
         with pytest.raises(ValueError, match="closure_strictness"):
             validate_unit_schema(
-                {"start": 1, "end": 2, "closure_strictness": deprecated_mode},
+                {"start": 1, "end": 2, "closure_strictness": removed_alias},
                 strict=True,
             )
 
@@ -1993,8 +1997,7 @@ def test_source_lines_origin_enum_properties_and_truthiness_guard() -> None:
         assert member.is_pre_sliced is exp_sliced
         assert member.is_placeholder is exp_placeholder
         assert member.has_real_source is exp_real
-        with pytest.raises(TypeError, match="no implicit truth value"):
-            bool(member)
+        assert bool(member) is True
 
 
 @pytest.mark.parametrize(
@@ -2190,8 +2193,8 @@ def test_source_lines_origin_disk_notebooks_col_sliced_and_comment_impostor(
         {"file": "corrupt.ipynb", "name": "bad_nb", "start": 1, "end": 2},
         repo_root=str(tmp_path),
     )
-    assert bad_raw_lines == ["# Source for bad_nb lines 1-2\n"]
-    assert bad_raw_origin is SourceLinesOrigin.PLACEHOLDER
+    assert bad_raw_lines == ["{not: valid json\n"]
+    assert bad_raw_origin is SourceLinesOrigin.DISK
 
     # 2. Disk files with CRLF and lone-CR line endings, plus end > available lines
     crlf_py = tmp_path / "crlf_mod.py"
@@ -2343,7 +2346,7 @@ def test_notebook_cell_lines_reject_malformed_source_and_split_physical_lines(
     cell: Any, expected_lines: Any
 ) -> None:
     """Verifies notebook cell extraction never coerces malformed source and splits joined fragments on physical newlines."""
-    from pydoppelgangerhunt.reporters import _extract_notebook_cell_lines
+    from pydoppelgangerhunt.source_lines import _extract_notebook_cell_lines
 
     assert _extract_notebook_cell_lines({"cells": [cell]}, 0) == expected_lines
 
@@ -2536,7 +2539,6 @@ def test_multiline_end_col_zero_allowed_while_single_line_rejected() -> None:
         _has_out_of_bounds_unit_cols(
             multi_unit,
             multi_unit["source_lines"],
-            is_pre_sliced=False,
             is_placeholder_origin=False,
             explicit_col_sliced=False,
         )
@@ -2557,7 +2559,6 @@ def test_multiline_end_col_zero_allowed_while_single_line_rejected() -> None:
         _has_out_of_bounds_unit_cols(
             single_unit,
             single_unit["source_lines"],
-            is_pre_sliced=False,
             is_placeholder_origin=False,
             explicit_col_sliced=False,
         )
@@ -2684,9 +2685,8 @@ def test_local_class_body_lambda_attr_closure_captured_in_method_unit(
     )
     assert sc["is_control_flow_safe"] is expect_safe
     if not expect_safe:
-        assert "nonlocal_closure_hazard" in sc["control_flow_hazards"] or bool(
-            sc["closure_hazard_reasons"]
-        )
+        assert "severed_closure_cell" in sc["control_flow_hazards"]
+        assert sc["closure_hazard_reasons"]
 
 
 def test_tree_only_except_handler_unit_does_not_trigger_stale_source_code() -> None:
@@ -2859,7 +2859,6 @@ def test_validate_unit_schema_and_oob_column_edge_cases() -> None:
         _has_out_of_bounds_unit_cols(
             {"file": "a.py", "start": 1, "end": 2, "start_col": 0},
             ["\n", "x = 1\n"],
-            is_pre_sliced=False,
             is_placeholder_origin=False,
             explicit_col_sliced=False,
         )
@@ -2869,7 +2868,6 @@ def test_validate_unit_schema_and_oob_column_edge_cases() -> None:
         _has_out_of_bounds_unit_cols(
             {"file": "a.py", "start": 1, "end": 2, "start_col": 1},
             ["\n", "x = 1\n"],
-            is_pre_sliced=False,
             is_placeholder_origin=False,
             explicit_col_sliced=False,
         )
@@ -2880,7 +2878,6 @@ def test_validate_unit_schema_and_oob_column_edge_cases() -> None:
         _has_out_of_bounds_unit_cols(
             {"file": "a.py", "start": 1, "end": 1, "end_col": 0},
             ["x = 1\n"],
-            is_pre_sliced=False,
             is_placeholder_origin=False,
             explicit_col_sliced=False,
         )
@@ -2891,7 +2888,6 @@ def test_validate_unit_schema_and_oob_column_edge_cases() -> None:
         _has_out_of_bounds_unit_cols(
             {"file": "a.py", "start": 1, "end": 1, "start_col": 5, "end_col": 2},
             ["abc\n"],
-            is_pre_sliced=True,
             is_placeholder_origin=False,
             explicit_col_sliced=True,
         )
@@ -3029,10 +3025,52 @@ def test_resolve_cached_unit_source_and_tree_populates_cache_for_presliced_unit(
             id="augassign_in_sibling_links_unit_load",
         ),
         pytest.param(
+            "cbs = self.callbacks\ncbs.append(lambda: total)",
+            "out.append(self.callbacks[0]())",
+            False,
+            id="local_alias_append_links_sibling_closure",
+        ),
+        pytest.param(
+            "cbs = self.callbacks\ncbs2 = cbs\ncbs2[0] = lambda: total",
+            "out.append(self.callbacks[0]())",
+            False,
+            id="transitive_local_alias_subscript_store_links_sibling_closure",
+        ),
+        pytest.param(
+            "cbs = self.callbacks\ncbs += [lambda: total]",
+            "out.append(self.callbacks[0]())",
+            False,
+            id="local_alias_augassign_links_sibling_closure",
+        ),
+        pytest.param(
+            "st = self.state\nst.cb = lambda: total",
+            "out.append(self.state.cb())",
+            False,
+            id="local_alias_attr_store_links_sibling_closure",
+        ),
+        pytest.param(
+            "cbs = self.callbacks\nregister_hook(cbs, lambda: total)",
+            "out.append(self.callbacks[0]())",
+            False,
+            id="local_alias_passed_to_helper_links_sibling_closure",
+        ),
+        pytest.param(
             "return self.callbacks.copy(), total",
             "out.append(self.callbacks[0]())",
             True,
             id="negative_readonly_method_does_not_link_sibling_closure",
+        ),
+        pytest.param(
+            "cbs = self.callbacks\nreturn cbs.copy(), total",
+            "out.append(self.callbacks[0]())",
+            True,
+            id="negative_local_alias_readonly_method_does_not_link",
+        ),
+        pytest.param(
+            "cbs = self.callbacks\nreturn len(cbs), total",
+            "out.append(self.callbacks[0]())",
+            True,
+            id="negative_local_alias_readonly_builtin_does_not_link",
         ),
         pytest.param(
             "self.other.append(lambda: total)",
@@ -3084,9 +3122,8 @@ def test_local_class_receiver_in_place_container_and_subattr_mutations(
     )
     assert sc["is_control_flow_safe"] is expect_safe
     if not expect_safe:
-        assert "nonlocal_closure_hazard" in sc["control_flow_hazards"] or bool(
-            sc["closure_hazard_reasons"]
-        )
+        assert "severed_closure_cell" in sc["control_flow_hazards"]
+        assert sc["closure_hazard_reasons"]
 
 
 @pytest.mark.parametrize(
@@ -3161,7 +3198,6 @@ def test_has_out_of_bounds_unit_cols_checks_placeholder_single_line_order(
         _has_out_of_bounds_unit_cols(
             unit_dict,
             [],
-            is_pre_sliced=True,
             is_placeholder_origin=is_placeholder,
             explicit_col_sliced=explicit_sliced,
         )
@@ -3200,3 +3236,2123 @@ def test_validate_unit_schema_single_line_zero_width_and_inverted_cols(
             validate_unit_schema(unit)
     else:
         validate_unit_schema(unit)
+
+
+def test_notebook_in_memory_validation_across_load_text_and_reporter_cache() -> None:
+    """Verifies _load_unit_file_text and resolve_cached_unit_source_and_tree match notebook anchor validation."""
+    import json
+    from pydoppelgangerhunt.fixer.source import _load_unit_file_text
+    from pydoppelgangerhunt.reporters import resolve_cached_unit_source_and_tree
+
+    nb_json = json.dumps(
+        {
+            "nbformat": 4,
+            "cells": [
+                {"cell_type": "code", "source": ["def ok():\n", "    return 1\n"]},
+                {"cell_type": "markdown", "source": ["# md\n"]},
+            ],
+        }
+    )
+
+    for bad_unit in (
+        {"file": "a.ipynb#cell_0", "start": 1, "end": 1, "source_text": "x = 1\n"},
+        {"file": "a.ipynb#bad", "start": 1, "end": 1, "file_source": "x = 1\n"},
+        {"file": "a.ipynb#cell_99", "start": 1, "end": 1, "file_source": nb_json},
+        {"file": "a.ipynb#cell_2", "start": 1, "end": 1, "source_text": nb_json},
+        {"file": "a.ipynb#cell_1", "start": 1, "end": 1, "file_source": "{broken"},
+    ):
+        assert _load_unit_file_text(bad_unit) is None, bad_unit["file"]
+        assert resolve_cached_unit_source_and_tree(bad_unit) == (None, None), bad_unit["file"]
+
+    good_unit = {"file": "a.ipynb#cell_1", "start": 1, "end": 2, "file_source": nb_json}
+    loaded_src = _load_unit_file_text(good_unit)
+    assert loaded_src == "def ok():\n    return 1\n"
+    cached_src, cached_tree = resolve_cached_unit_source_and_tree(good_unit)
+    assert cached_src == "def ok():\n    return 1\n"
+    assert isinstance(cached_tree, ast.Module)
+
+
+def test_validate_unit_schema_boundary_explicit_vs_high_level_entrypoints(
+    tmp_path: Path,
+) -> None:
+    """Verifies validate_unit_schema runs automatically at high-level entrypoints and must be called explicitly for low-level helpers."""
+    from pydoppelgangerhunt.fixer.source import validate_unit_schema
+    from pydoppelgangerhunt.source_lines import (
+        SourceLinesOrigin,
+        extract_unit_source_lines_with_state,
+    )
+
+    src = "def f(x):\n    y = x + 1\n    return y\n"
+    mod = tmp_path / "mod.py"
+    mod.write_text(src, encoding="utf-8")
+
+    bad_unit = {
+        "file": str(mod),
+        "start": 1,
+        "end": 3,
+        "kind": "function",
+        "inputs": {"x"},
+    }
+    # Lower-level helpers do not enforce validate_unit_schema automatically
+    lines, origin = extract_unit_source_lines_with_state(bad_unit, repo_root=str(tmp_path))
+    assert origin is SourceLinesOrigin.DISK
+    assert len(lines) == 3
+    low_scope = inspect_single_unit_scope(bad_unit, repo_root=str(tmp_path))
+    assert isinstance(low_scope, dict)
+
+    # Explicit validation rejects unordered set in positionally consumed 'inputs'
+    with pytest.raises(ValueError, match="ordered sequence"):
+        validate_unit_schema(bad_unit)
+
+    # High-level refactoring entrypoints enforce validate_unit_schema automatically
+    peer_unit = {"file": str(mod), "start": 1, "end": 3, "kind": "function"}
+    with pytest.raises(ValueError, match="ordered sequence"):
+        synthesize_shared_helper_code(bad_unit, peer_unit, repo_root=str(tmp_path))
+    with pytest.raises(ValueError, match="ordered sequence"):
+        generate_refactoring_patch([(1.0, bad_unit, peer_unit)], repo_root=str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "terminal_hazard",
+    ["stale_source_code", "pathological_ast", "invalid_unit_columns"],
+)
+def test_ensure_unit_scope_closure_mode_rejects_contradictory_terminal_hazard(
+    terminal_hazard: str,
+) -> None:
+    """Verifies terminal hazard scopes only short-circuit when is_control_flow_safe is False."""
+    from pydoppelgangerhunt.fixer.scope import ensure_unit_scope_closure_mode
+
+    src = "def f(x):\n    y = x + 1\n    return y\n"
+    unit = {"start": 2, "end": 3, "kind": "compound_block", "source_text": src}
+
+    # Forged or inconsistent dict claiming safe=True despite terminal hazard must NOT short-circuit
+    contradictory: dict[str, Any] = {
+        "inputs": ["x"],
+        "outputs": ["y"],
+        "control_flow_hazards": [terminal_hazard],
+        "is_control_flow_safe": True,
+    }
+    recomputed = ensure_unit_scope_closure_mode(
+        unit,
+        contradictory,
+        False,
+        strict_with_suppression=True,
+        source_text=src,
+    )
+    assert recomputed is not contradictory
+    assert recomputed["inputs"] == ["x"]
+
+    # Without backing source, recomputation still fails closed with is_control_flow_safe=False
+    failed_closed = ensure_unit_scope_closure_mode(
+        {"start": 2, "end": 3, "kind": "compound_block"},
+        contradictory,
+        False,
+        strict_with_suppression=True,
+    )
+    assert failed_closed["is_control_flow_safe"] is False
+
+    # Omitting is_control_flow_safe altogether also avoids unsafe short-circuit
+    missing_flag: dict[str, Any] = {
+        "inputs": ["x"],
+        "outputs": ["y"],
+        "control_flow_hazards": [terminal_hazard],
+    }
+    combined = analyze_unit_variable_scope(
+        {"start": 2, "end": 3, "kind": "compound_block"},
+        {"start": 2, "end": 3, "kind": "compound_block"},
+        scope1=missing_flag,
+        scope2=contradictory,
+    )
+    assert combined["is_control_flow_safe"] is False
+
+    # Positive control: genuine terminal hazard scope (is_control_flow_safe=False) is preserved
+    genuine = {**contradictory, "is_control_flow_safe": False}
+    preserved = ensure_unit_scope_closure_mode(
+        unit,
+        genuine,
+        False,
+        strict_with_suppression=True,
+        source_text=src,
+    )
+    assert preserved is genuine
+    assert preserved["is_control_flow_safe"] is False
+
+
+@pytest.mark.parametrize(
+    ("unit", "err_pattern", "expected_oob"),
+    [
+        pytest.param(
+            {"start": 1, "end": 1, "end_col": 0},
+            "Zero-width column coordinates",
+            True,
+            id="explicit_1_1_omitted_start_col_zero_end_col",
+        ),
+        pytest.param(
+            {"end_col": 0},
+            "Zero-width column coordinates",
+            True,
+            id="omitted_lines_omitted_start_col_zero_end_col",
+        ),
+        pytest.param(
+            {"start_col": 10, "end_col": 5},
+            "Inverted column coordinates",
+            True,
+            id="omitted_lines_inverted_cols",
+        ),
+        pytest.param(
+            {"end": 1, "start_col": 10, "end_col": 5},
+            "Inverted column coordinates",
+            True,
+            id="omitted_start_end_1_inverted_cols",
+        ),
+        pytest.param(
+            {"start": 5, "end_col": 0},
+            "Zero-width column coordinates",
+            True,
+            id="omitted_end_omitted_start_col_zero_end_col",
+        ),
+        pytest.param(
+            {"end": 2, "start_col": 10, "end_col": 5},
+            None,
+            False,
+            id="control_omitted_start_end_2_multiline_cross_col_ok",
+        ),
+        pytest.param(
+            {"start": 1, "end": 1, "end_col": 5},
+            None,
+            False,
+            id="control_omitted_start_col_positive_end_col_ok",
+        ),
+        pytest.param(
+            {"end_col": 5},
+            None,
+            False,
+            id="control_omitted_lines_and_start_col_positive_end_col_ok",
+        ),
+    ],
+)
+def test_validate_unit_schema_omitted_lines_and_default_start_col_bounds(
+    unit: dict[str, Any],
+    err_pattern: str | None,
+    expected_oob: bool,
+) -> None:
+    """Verifies validate_unit_schema aligns single-line column checks when start/end or start_col default."""
+    from pydoppelgangerhunt.fixer.scope import _has_out_of_bounds_unit_cols
+    from pydoppelgangerhunt.fixer.source import validate_unit_schema
+
+    sample_lines = ["abcdefghijklmno\n", "abcdefghijklmno\n"]
+    is_oob = _has_out_of_bounds_unit_cols(
+        unit,
+        sample_lines[: (unit.get("end") or 1)],
+        is_placeholder_origin=False,
+        explicit_col_sliced=False,
+    )
+    assert is_oob is expected_oob
+    if err_pattern is not None:
+        with pytest.raises(ValueError, match=err_pattern):
+            validate_unit_schema(unit)
+    else:
+        validate_unit_schema(unit)
+
+
+@pytest.mark.parametrize(
+    ("unit", "is_placeholder_origin", "explicit_col_sliced", "expected_oob"),
+    [
+        pytest.param(
+            {"start": 1, "end": 1, "start_col": -5, "end_col": 5},
+            False,
+            False,
+            True,
+            id="negative_start_col_minus_5",
+        ),
+        pytest.param(
+            {"start": 1, "end": 1, "start_col": 0, "end_col": -2},
+            False,
+            False,
+            True,
+            id="negative_end_col_minus_2",
+        ),
+        pytest.param(
+            {"start": 1, "end": 1, "start_col": -5, "end_col": 5},
+            True,
+            True,
+            True,
+            id="negative_start_col_even_on_placeholder_col_sliced",
+        ),
+        pytest.param(
+            {"start": 1, "end": 1, "start_col": 0, "end_col": -2},
+            False,
+            True,
+            True,
+            id="negative_end_col_even_on_explicit_col_sliced",
+        ),
+        pytest.param(
+            {"start": 1, "end": 1, "start_col": 0, "end_col": 5},
+            False,
+            False,
+            False,
+            id="control_valid_non_negative_cols",
+        ),
+    ],
+)
+def test_has_out_of_bounds_unit_cols_rejects_all_negative_columns(
+    unit: dict[str, Any],
+    is_placeholder_origin: bool,
+    explicit_col_sliced: bool,
+    expected_oob: bool,
+) -> None:
+    """Verifies _has_out_of_bounds_unit_cols rejects any negative start_col or end_col (< 0)."""
+    from pydoppelgangerhunt.fixer.scope import _has_out_of_bounds_unit_cols
+
+    sample_lines = ["abcdefghijklmno\n"]
+    assert (
+        _has_out_of_bounds_unit_cols(
+            unit,
+            sample_lines,
+            is_placeholder_origin=is_placeholder_origin,
+            explicit_col_sliced=explicit_col_sliced,
+        )
+        is expected_oob
+    )
+
+
+def test_patch_and_synthesis_preserve_hazard_skip_reasons_before_expr_pruning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies blocking unit hazards run before comprehension/complex_expr pruning in patch and synthesis."""
+    import logging
+    from pydoppelgangerhunt.fixer import synthesis as synth_mod
+
+    src = (
+        "def fn1(items):\n"
+        "    vals = [x + 1 for x in items]\n"
+        "    return vals\n\n"
+        "def fn2(items):\n"
+        "    out = [y + 1 for y in items]\n"
+        "    return out\n"
+    )
+    target_file = tmp_path / "expr_hazards.py"
+    target_file.write_text(src, encoding="utf-8")
+
+    # 1. Invalid columns on comprehension units report 'invalid unit columns'
+    bad_col_u1 = {
+        "name": "fn1:comp",
+        "file": str(target_file),
+        "start": 2,
+        "end": 2,
+        "start_col": 500,
+        "end_col": 600,
+        "kind": "comprehension",
+    }
+    bad_col_u2 = {
+        "name": "fn2:comp",
+        "file": str(target_file),
+        "start": 6,
+        "end": 6,
+        "start_col": 500,
+        "end_col": 600,
+        "kind": "comprehension",
+    }
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="pydoppelgangerhunt.fixer.patch"):
+        patch_oob = generate_refactoring_patch(
+            [(1.0, bad_col_u1, bad_col_u2)],
+            repo_root=str(tmp_path),
+        )
+    assert patch_oob == ""
+    assert "1 invalid unit columns" in caplog.text
+
+    # 2. Stale source_code on complex_expr units reports 'stale source code' instead of expr-pruning fallback
+    expr_line = src.splitlines()[1]
+    expr_start = expr_line.index("[x + 1")
+    expr_end = expr_start + len("[x + 1 for x in items]")
+    expr_line2 = src.splitlines()[5]
+    expr_start2 = expr_line2.index("[y + 1")
+    expr_end2 = expr_start2 + len("[y + 1 for y in items]")
+    stale_u1 = {
+        "name": "fn1:comp",
+        "file": str(target_file),
+        "start": 2,
+        "end": 2,
+        "start_col": expr_start,
+        "end_col": expr_end,
+        "kind": "complex_expr",
+        "source_code": "[x + 999 for x in items]\n",
+    }
+    stale_u2 = {
+        "name": "fn2:comp",
+        "file": str(target_file),
+        "start": 6,
+        "end": 6,
+        "start_col": expr_start2,
+        "end_col": expr_end2,
+        "kind": "complex_expr",
+        "source_code": "[y + 1 for y in items]\n",
+    }
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="pydoppelgangerhunt.fixer.patch"):
+        patch_stale = generate_refactoring_patch(
+            [(1.0, stale_u1, stale_u2)],
+            repo_root=str(tmp_path),
+        )
+    assert patch_stale == ""
+    assert "1 stale source code" in caplog.text
+
+    # 3. synthesize_shared_helper_code short-circuits on blocking unit hazards before _prune_pair_lhs_and_augassign_scopes
+    prune_called = 0
+    orig_prune = synth_mod._prune_pair_lhs_and_augassign_scopes
+
+    def _spy_prune(*args: Any, **kwargs: Any) -> bool:
+        nonlocal prune_called
+        prune_called += 1
+        return orig_prune(*args, **kwargs)
+
+    monkeypatch.setattr(synth_mod, "_prune_pair_lhs_and_augassign_scopes", _spy_prune)
+    u1_pre_lines = {
+        **stale_u1,
+        "source_lines": [expr_line + "\n"],
+    }
+    u2_pre_lines = {
+        **stale_u2,
+        "source_lines": [expr_line2 + "\n"],
+    }
+    assert (
+        synthesize_shared_helper_code(u1_pre_lines, u2_pre_lines, repo_root=str(tmp_path))
+        == ""
+    )
+    assert prune_called == 0
+
+
+@pytest.mark.parametrize(
+    ("unit_overrides", "expected_hazard"),
+    [
+        pytest.param(
+            {
+                "start": 2,
+                "end": 2,
+                "start_col": 500,
+                "end_col": 600,
+                "kind": "basic_block",
+                "source_code": "    x = (a + 1)\n",
+            },
+            "invalid_unit_columns",
+            id="tree_only_out_of_range_cols_with_source_code",
+        ),
+        pytest.param(
+            {
+                "start": 2,
+                "end": 2,
+                "start_col": 4,
+                "end_col": 600,
+                "kind": "comprehension",
+                "source_code": "[i for i in items]",
+            },
+            "invalid_unit_columns",
+            id="tree_only_end_col_past_matched_expr",
+        ),
+        pytest.param(
+            {
+                "start": 3,
+                "end": 3,
+                "start_col": 12,
+                "end_col": 17,
+                "kind": "basic_block",
+                "source_code": "a = 1",
+            },
+            "invalid_unit_columns",
+            id="tree_only_cols_pointing_to_second_stmt_on_semicolon_line",
+        ),
+        pytest.param(
+            {
+                "start": 2,
+                "end": 2,
+                "start_col": 500,
+                "end_col": 600,
+                "kind": "comprehension",
+            },
+            "invalid_unit_columns",
+            id="tree_only_out_of_range_cols_without_source_code",
+        ),
+        pytest.param(
+            {
+                "start": 2,
+                "end": 2,
+                "start_col": 4,
+                "end_col": 15,
+                "kind": "basic_block",
+                "source_code": "    z = 999\n",
+            },
+            "stale_source_code",
+            id="control_mismatched_source_code_reports_stale_source_code",
+        ),
+        pytest.param(
+            {
+                "start": 2,
+                "end": 2,
+                "start_col": 4,
+                "end_col": 15,
+                "kind": "basic_block",
+                "source_code": "    x = (a + 1)\n",
+            },
+            None,
+            id="control_matching_stmt_with_exact_ast_cols_ok",
+        ),
+        pytest.param(
+            {
+                "start": 2,
+                "end": 2,
+                "start_col": 8,
+                "end_col": 15,
+                "kind": "complex_expr",
+                "source_code": "(a + 1)",
+            },
+            None,
+            id="control_parenthesized_expr_cols_including_outer_parens_ok",
+        ),
+    ],
+)
+def test_tree_only_placeholder_unit_validates_columns_against_ast(
+    unit_overrides: dict[str, Any], expected_hazard: Any
+) -> None:
+    """Verifies tree-only placeholder units check start_col/end_col against matched AST bounds."""
+    src = (
+        "def fn(a, items):\n"
+        "    x = (a + 1)\n"
+        "    a = 1; b = 2\n"
+        "    vals = [i for i in items]\n"
+        "    return x, b, vals\n"
+    )
+    mod_tree = ast.parse(src)
+    # Adjust line 4 vs line 2 for the comprehension case cleanly by pointing at line 4
+    unit = dict(unit_overrides)
+    if unit.get("kind") == "comprehension":
+        unit["start"] = 4
+        unit["end"] = 4
+    sc = inspect_single_unit_scope(unit, tree=mod_tree)
+    hazards = sc["control_flow_hazards"]
+    if expected_hazard is None:
+        assert "invalid_unit_columns" not in hazards
+        assert "stale_source_code" not in hazards
+    else:
+        assert expected_hazard in hazards
+
+
+@pytest.mark.parametrize(
+    ("src", "lineno", "start_col", "end_col", "kind", "expect_invalid"),
+    [
+        pytest.param(
+            "def fn(items):\n    [x for x in items]\n",
+            2,
+            0,
+            4,
+            "comprehension",
+            True,
+            id="leading_indentation_whitespace_slice_fails_closed",
+        ),
+        pytest.param(
+            "def fn():\n    x = '€'\n",
+            2,
+            10,
+            11,
+            "complex_expr",
+            True,
+            id="intra_utf8_codepoint_empty_slice_fails_closed",
+        ),
+        pytest.param(
+            "def fn(items):\n    [x for x in items]\n",
+            2,
+            4,
+            22,
+            "comprehension",
+            False,
+            id="control_valid_comprehension_slice_ok",
+        ),
+        pytest.param(
+            "def fn():\n    \n    return 1\n",
+            2,
+            None,
+            None,
+            "basic_block",
+            False,
+            id="control_blank_source_line_without_cols_not_invalid_columns",
+        ),
+    ],
+)
+def test_whitespace_and_empty_utf8_column_slices_fail_closed(
+    src: str,
+    lineno: int,
+    start_col: int | None,
+    end_col: int | None,
+    kind: str,
+    expect_invalid: bool,
+) -> None:
+    """Verifies column slices yielding only whitespace or empty intra-codepoint spans fail closed."""
+    clear_dataflow_cache()
+    unit: dict[str, Any] = {
+        "start": lineno,
+        "end": lineno,
+        "kind": kind,
+        "source_text": src,
+    }
+    if start_col is not None:
+        unit["start_col"] = start_col
+    if end_col is not None:
+        unit["end_col"] = end_col
+    sc = inspect_single_unit_scope(unit)
+    if expect_invalid:
+        assert sc["is_control_flow_safe"] is False
+        assert "invalid_unit_columns" in sc["control_flow_hazards"]
+    else:
+        assert "invalid_unit_columns" not in sc["control_flow_hazards"]
+
+
+def test_kindless_colon_subroutine_placeholder_and_closure_mode_recompute(
+    tmp_path: Path,
+) -> None:
+    """Verifies kindless colon-named units use is_subroutine_unit in placeholder and mode-recompute paths."""
+    from pydoppelgangerhunt.fixer.scope import ensure_unit_scope_closure_mode
+
+    clear_dataflow_cache()
+    kindless_placeholder = {
+        "name": "fn:block",
+        "file": str(tmp_path / "missing_mod.py"),
+        "start": 10,
+        "end": 12,
+    }
+    sc_sub = inspect_single_unit_scope(kindless_placeholder)
+    assert sc_sub["is_control_flow_safe"] is False
+    assert set(sc_sub["control_flow_hazards"]) >= {
+        "severed_closure_cell",
+        "unavailable_source_placeholder",
+    }
+
+    whole_fn_placeholder = {**kindless_placeholder, "kind": "function"}
+    sc_whole = inspect_single_unit_scope(whole_fn_placeholder)
+    assert "unavailable_source_placeholder" in sc_whole["control_flow_hazards"]
+    assert "severed_closure_cell" not in sc_whole["control_flow_hazards"]
+
+    # Mode-recompute path: kindless colon unit with only snippet source_code cannot
+    # recompute closure analysis when closure mode mismatches precomputed scope.
+    pre_lenient_scope = {
+        "scope_schema_version": 2,
+        "inputs": ["x"],
+        "outputs": ["y"],
+        "skip_pre_unit_closures": True,
+        "strict_with_suppression": False,
+        "non_suppressing_ctx_managers": [],
+        "is_control_flow_safe": True,
+        "control_flow_hazards": [],
+    }
+    snippet_sub_unit = {
+        "name": "fn:block",
+        "file": str(tmp_path / "missing_snippet.py"),
+        "start": 4,
+        "end": 5,
+        "source_code": "y = x + 1\n",
+    }
+    recomp_sub = ensure_unit_scope_closure_mode(
+        snippet_sub_unit, pre_lenient_scope, skip_pre_unit_closures=False
+    )
+    assert recomp_sub["is_control_flow_safe"] is False
+    assert "unavailable_source_for_closure_mode" in recomp_sub["control_flow_hazards"]
+
+    snippet_whole_unit = {**snippet_sub_unit, "kind": "function", "source_code": "def fn(x):\n    return x + 1\n"}
+    recomp_whole = ensure_unit_scope_closure_mode(
+        snippet_whole_unit, pre_lenient_scope, skip_pre_unit_closures=False
+    )
+    assert "unavailable_source_for_closure_mode" not in recomp_whole["control_flow_hazards"]
+
+
+def test_custom_sequence_and_abstract_set_declared_outputs() -> None:
+    """Verifies live_write_only_cond and outputs support custom Sequence[str] and AbstractSet types."""
+    from collections import UserList
+    from collections.abc import Iterator
+
+    class _OrderedSetView(AbstractSet[str]):
+        def __init__(self, items: list[str]) -> None:
+            self._items = tuple(items)
+
+        def __contains__(self, item: object) -> bool:
+            return item in self._items
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(self._items)
+
+        def __len__(self) -> int:
+            return len(self._items)
+
+    src = (
+        "def run(flag, x):\n"
+        "    if flag:\n"
+        "        acc = x + 1\n"
+        "    return acc\n"
+    )
+    clear_dataflow_cache()
+    sc_seq = inspect_single_unit_scope(
+        {
+            "name": "run:block",
+            "kind": "compound_block",
+            "start": 2,
+            "end": 3,
+            "source_text": src,
+            "precomputed_outputs": UserList(["acc"]),
+        }
+    )
+    assert sc_seq["outputs"] == ["acc"]
+
+    sc_single_set = inspect_single_unit_scope(
+        {
+            "name": "run:block",
+            "kind": "compound_block",
+            "start": 2,
+            "end": 3,
+            "source_text": src,
+            "precomputed_outputs": _OrderedSetView(["acc"]),
+        }
+    )
+    assert sc_single_set["outputs"] == ["acc"]
+
+    sc_multi_set = inspect_single_unit_scope(
+        {
+            "name": "run:block",
+            "kind": "compound_block",
+            "start": 2,
+            "end": 3,
+            "source_text": src,
+            "precomputed_outputs": _OrderedSetView(["acc", "other"]),
+        }
+    )
+    assert sc_multi_set["outputs"] == []
+
+
+def test_with_unit_source_text_and_suggestion_when_explicit_none_source_text(
+    tmp_path: Path,
+) -> None:
+    """Verifies explicit 'source_text': None or '' still attaches preloaded source_text cleanly."""
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+    from pydoppelgangerhunt.source_lines import with_unit_source_text
+
+    full_src = (
+        "def alpha(x):\n"
+        "    a = x + 1\n"
+        "    b = a * 2\n"
+        "    return b + 3\n\n"
+        "def beta(x):\n"
+        "    a = x + 1\n"
+        "    b = a * 2\n"
+        "    return b + 3\n"
+    )
+    for empty_val in (None, "", "   "):
+        enriched = with_unit_source_text({"start": 2, "end": 4, "source_text": empty_val}, full_src)
+        assert enriched["source_text"] == full_src
+
+    u1 = {
+        "name": "alpha",
+        "kind": "function",
+        "file": str(tmp_path / "missing_disk.py"),
+        "start": 1,
+        "end": 4,
+        "source_text": None,
+        "source_lines": ["def alpha(x):\n", "    a = x + 1\n", "    b = a * 2\n", "    return b + 3\n"],
+    }
+    u2 = {
+        "name": "beta",
+        "kind": "function",
+        "file": str(tmp_path / "missing_disk.py"),
+        "start": 6,
+        "end": 9,
+        "source_text": "",
+        "source_lines": ["def beta(x):\n", "    a = x + 1\n", "    b = a * 2\n", "    return b + 3\n"],
+    }
+    suggestion = synthesize_refactoring_suggestion(
+        u1, u2, source_text1=full_src, source_text2=full_src
+    )
+    assert "def _shared_" in suggestion
+    assert "Placeholder" not in suggestion
+
+
+@pytest.mark.parametrize(
+    ("mod_src", "marker", "span_lines", "unit_src_code", "expect_stale"),
+    [
+        pytest.param(
+            "def f(x):\n    if x > 10:\n        out = 'high'\n    elif x > 0:\n        out = 'pos'\n    else:\n        out = 'neg'\n    return out\n",
+            "    elif x > 0:",
+            2,
+            "elif x > 0:\n    out = 'pos'\n",
+            False,
+            id="elif_matching_with_else_is_valid",
+        ),
+        pytest.param(
+            "def f(x):\n    if x > 10:\n        out = 'high'\n    elif x > 0:\n        out = 'pos'\n    return out\n",
+            "    elif x > 0:",
+            2,
+            "elif x > 0:\n    out = 'pos'\n",
+            False,
+            id="elif_matching_without_else_is_valid",
+        ),
+        pytest.param(
+            "def f(x):\n    if x > 10:\n        out = 'high'\n    elif x > 0: out = 'pos'\n    return out\n",
+            "    elif x > 0: out = 'pos'",
+            1,
+            "elif x > 0: out = 'pos'\n",
+            False,
+            id="elif_one_line_matching_is_valid",
+        ),
+        pytest.param(
+            "def f(x):\n    if x > 10:\n        out = 'high'\n    elif x > 0:\n        out = 'pos'\n    else:\n        out = 'neg'\n    return out\n",
+            "    elif x > 0:",
+            2,
+            "elif x < 0:\n    out = 'pos'\n",
+            True,
+            id="elif_stale_condition_rejected",
+        ),
+        pytest.param(
+            "def f(x):\n    if x > 0:\n        out = 'pos'\n    else:\n        out = 'neg'\n    return out\n",
+            "    if x > 0:",
+            2,
+            "elif x > 0:\n    out = 'pos'\n",
+            True,
+            id="adversarial_elif_snippet_cannot_match_if_branch",
+        ),
+        pytest.param(
+            "def f(x):\n    if x > 0:\n        out = 'pos'\n    else:\n        out = 'neg'\n    return out\n",
+            "    else:",
+            2,
+            "else:\n    out = 'neg'\n",
+            False,
+            id="else_matching_branch_is_valid",
+        ),
+        pytest.param(
+            "def f(x):\n    if x > 10:\n        out = 'high'\n    elif x > 0:\n        out = 'neg'\n    return out\n",
+            "    elif x > 0:",
+            2,
+            "else:\n    out = 'neg'\n",
+            True,
+            id="adversarial_else_snippet_cannot_match_elif_branch",
+        ),
+        pytest.param(
+            "def f():\n    try:\n        work()\n    except ValueError:\n        out = 1\n    finally:\n        cleanup()\n",
+            "    except ValueError:",
+            2,
+            "except ValueError:\n    out = 1\n",
+            False,
+            id="except_matching_handler_is_valid",
+        ),
+        pytest.param(
+            "def f():\n    try:\n        work()\n    except ValueError:\n        out = 1\n",
+            "    except ValueError:",
+            2,
+            "except KeyError:\n    out = 1\n",
+            True,
+            id="except_stale_type_rejected",
+        ),
+        pytest.param(
+            "def f():\n    try:\n        work()\n    finally:\n        cleanup()\n",
+            "    finally:",
+            2,
+            "finally:\n    cleanup()\n",
+            False,
+            id="finally_matching_block_is_valid",
+        ),
+        pytest.param(
+            "def f(x):\n    if x:\n        work()\n    else:\n        cleanup()\n",
+            "    else:",
+            2,
+            "finally:\n    cleanup()\n",
+            True,
+            id="adversarial_finally_snippet_cannot_match_else_branch",
+        ),
+        pytest.param(
+            "def f(item):\n    match item:\n        case [1, x] if x > 0:\n            out = x\n",
+            "        case [1, x] if x > 0:",
+            2,
+            "case [1, x] if x > 0:\n    out = x\n",
+            False,
+            id="match_case_matching_pattern_and_guard_is_valid",
+        ),
+        pytest.param(
+            "def f(item):\n    match item:\n        case [1, x] if x > 0:\n            out = x\n",
+            "        case [1, x] if x > 0:",
+            2,
+            "case [2, x] if x > 0:\n    out = x\n",
+            True,
+            id="match_case_stale_pattern_rejected",
+        ),
+        pytest.param(
+            "def f(item):\n    match item:\n        case [1, x] if x > 0:\n            out = x\n",
+            "        case [1, x] if x > 0:",
+            2,
+            "case [1, x] if x < 0:\n    out = x\n",
+            True,
+            id="match_case_stale_guard_rejected",
+        ),
+        pytest.param(
+            "def f(item):\n    match item:\n        case [1, x] if x > 0:\n            out = x\n",
+            "        case [1, x] if x > 0:",
+            2,
+            "case [1, x]:\n    out = x\n",
+            True,
+            id="match_case_dropped_guard_rejected",
+        ),
+        pytest.param(
+            "def f(item):\n    match item:\n        case 1: out = 'one'\n",
+            "        case 1: out = 'one'",
+            1,
+            "case 1: out = 'one'\n",
+            False,
+            id="match_case_one_line_matching_is_valid",
+        ),
+        pytest.param(
+            "def f(item):\n    match item:\n        case 1: out = 'one'\n",
+            "        case 1: out = 'one'",
+            1,
+            "case 2: out = 'one'\n",
+            True,
+            id="match_case_one_line_stale_pattern_rejected",
+        ),
+    ],
+)
+def test_clause_header_source_matching_verifies_header_test_pattern_and_guard(
+    mod_src: str,
+    marker: str,
+    span_lines: int,
+    unit_src_code: str,
+    expect_stale: bool,
+) -> None:
+    """Verifies clause-header snippet matching rejects stale elif conditions, except types, else/finally mismatches, and match-case patterns/guards."""
+    lines = mod_src.splitlines()
+    start_line = next(
+        idx for idx, ln in enumerate(lines, start=1) if ln == marker
+    )
+    end_line = start_line + span_lines - 1
+    clear_dataflow_cache()
+    sc = inspect_single_unit_scope(
+        {
+            "start": start_line,
+            "end": end_line,
+            "kind": "clause",
+            "source_text": mod_src,
+            "source_code": unit_src_code,
+        },
+        tree=ast.parse(mod_src),
+    )
+    assert ("stale_source_code" in sc["control_flow_hazards"]) is expect_stale, sc
+
+
+@pytest.mark.parametrize(
+    ("file_target", "expected_present", "expected_snippet"),
+    [
+        pytest.param("analysis.ipynb#cell_1", True, "def outer_one(items, scale):", id="anchored_cell_1_fragments"),
+        pytest.param("analysis.ipynb#cell1", True, "def outer_one(items, scale):", id="anchored_cell1_no_underscore"),
+        pytest.param("analysis.ipynb#cell_2", True, "def outer_two(values, factor):", id="anchored_cell_2_string_source"),
+        pytest.param("analysis.ipynb", False, None, id="neg_unanchored_notebook_fails_closed"),
+        pytest.param("report.ipynb#cellular.ipynb", False, None, id="neg_literal_hash_ipynb_fails_closed"),
+        pytest.param("analysis.ipynb#cell_0", False, None, id="neg_zero_based_anchor_fails_closed"),
+        pytest.param("analysis.ipynb#bad_anchor", False, None, id="neg_malformed_anchor_fails_closed"),
+        pytest.param("analysis.ipynb#cell_3", False, None, id="neg_markdown_cell_fails_closed"),
+        pytest.param("analysis.ipynb#cell_4", False, None, id="neg_empty_code_cell_fails_closed"),
+        pytest.param("analysis.ipynb#cell_99", False, None, id="neg_out_of_range_cell_fails_closed"),
+    ],
+)
+def test_disk_notebook_cell_extraction_and_fail_closed_anchors(
+    tmp_path: Path,
+    file_target: str,
+    expected_present: bool,
+    expected_snippet: str | None,
+) -> None:
+    """Verifies _load_unit_file_text and resolve_cached_unit_source_and_tree extract only code-cell Python source for anchored disk notebooks."""
+    import json
+
+    from pydoppelgangerhunt.fixer.source import _load_unit_file_text
+    from pydoppelgangerhunt.reporters import resolve_cached_unit_source_and_tree
+
+    nb_file = tmp_path / "analysis.ipynb"
+    nb_payload = {
+        "nbformat": 4,
+        "nbformat_minor": 5,
+        "cells": [
+            {
+                "cell_type": "code",
+                "source": [
+                    "def outer_one(items, scale):\n    total = 0\n",
+                    "    for x in items:\n        total += x * scale\n",
+                    "    return total\n",
+                ],
+            },
+            {
+                "cell_type": "code",
+                "source": (
+                    "def outer_two(values, factor):\n"
+                    "    acc = 0\n"
+                    "    for y in values:\n"
+                    "        acc += y * factor\n"
+                    "    return acc\n"
+                ),
+            },
+            {"cell_type": "markdown", "source": ["# Heading\n"]},
+            {"cell_type": "code", "source": ""},
+        ],
+    }
+    nb_file.write_text(json.dumps(nb_payload), encoding="utf-8")
+
+    literal_hash_nb = tmp_path / "report.ipynb#cellular.ipynb"
+    literal_hash_nb.write_text(json.dumps(nb_payload), encoding="utf-8")
+
+    unit: dict[str, Any] = {
+        "file": file_target,
+        "name": "outer:for",
+        "start": 3,
+        "end": 4,
+    }
+    clear_dataflow_cache()
+    loaded = _load_unit_file_text(unit, repo_root=str(tmp_path))
+    cached_src, cached_tree = resolve_cached_unit_source_and_tree(
+        unit, repo_root=str(tmp_path)
+    )
+    if expected_present:
+        assert isinstance(loaded, str)
+        assert expected_snippet is not None and expected_snippet in loaded
+        assert '"nbformat"' not in loaded and '"cells"' not in loaded
+        assert cached_src == loaded
+        assert isinstance(cached_tree, ast.Module)
+    else:
+        assert loaded is None
+        assert cached_src is None
+        assert cached_tree is None
+
+
+def test_disk_notebook_subroutine_scope_stale_check_synthesis_and_patch_safety(
+    tmp_path: Path,
+) -> None:
+    """Verifies disk .ipynb#cell_N units preserve enclosing AST context for scope, stale check, and helper synthesis while blocking raw-text patches."""
+    import json
+
+    from pydoppelgangerhunt.fixer.dataflow import collect_downstream_read_names
+    from pydoppelgangerhunt.fixer.source import _load_unit_file_text
+
+    nb_file = tmp_path / "notebook.ipynb"
+    nb_payload = {
+        "nbformat": 4,
+        "cells": [
+            {
+                "cell_type": "code",
+                "source": [
+                    "def outer_a(items, scale):\n",
+                    "    total = 0\n",
+                    "    for x in items:\n",
+                    "        total += x * scale\n",
+                    "    return total\n",
+                ],
+            },
+            {
+                "cell_type": "code",
+                "source": [
+                    "def outer_b(items, scale):\n",
+                    "    total = 0\n",
+                    "    for x in items:\n",
+                    "        total += x * scale\n",
+                    "    return total\n",
+                ],
+            },
+            {
+                "cell_type": "code",
+                "source": [
+                    "def enclosing_cell():\n",
+                    "    count = 0\n",
+                    "    def bump():\n",
+                    "        nonlocal count\n",
+                    "        count += 1\n",
+                    "    for _ in range(2):\n",
+                    "        count += 1\n",
+                    "        bump()\n",
+                    "    return count\n",
+                ],
+            },
+        ],
+    }
+    nb_file.write_text(json.dumps(nb_payload), encoding="utf-8")
+
+    sub_a = {
+        "file": "notebook.ipynb#cell_1",
+        "name": "outer_a:for",
+        "kind": "compound_block",
+        "start": 3,
+        "end": 4,
+    }
+    sub_b = {
+        "file": "notebook.ipynb#cell_2",
+        "name": "outer_b:for",
+        "kind": "compound_block",
+        "start": 3,
+        "end": 4,
+    }
+    clear_dataflow_cache()
+    loaded_cell1 = _load_unit_file_text(sub_a, repo_root=str(tmp_path))
+    assert loaded_cell1 is not None
+    assert collect_downstream_read_names(loaded_cell1, sub_a) == {"total"}
+
+    sc_a = inspect_single_unit_scope(sub_a, repo_root=str(tmp_path))
+    sc_b = inspect_single_unit_scope(sub_b, repo_root=str(tmp_path))
+    assert sc_a["is_control_flow_safe"] is True
+    assert "severed_closure_cell" not in sc_a["control_flow_hazards"]
+    assert sc_a["outputs"] == ["x", "total"]
+    assert resolve_clone_pair_outputs(
+        sub_a, sub_b, sc_a, sc_b, repo_root=str(tmp_path)
+    ) == (["x", "total"], ["x", "total"])
+
+    # Adversarial controls on anchored disk cells:
+    # 1. Stale inline source_code must still be caught against the disk notebook cell AST
+    sc_stale = inspect_single_unit_scope(
+        {**sub_a, "source_code": "for y in other:\n    acc += y\n"},
+        repo_root=str(tmp_path),
+    )
+    assert sc_stale["is_control_flow_safe"] is False
+    assert "stale_source_code" in sc_stale["control_flow_hazards"]
+
+    # 2. Enclosing closure cell sharing variable with loop in disk cell must flag real closure hazard
+    closure_loop_unit = {
+        "file": "notebook.ipynb#cell_3",
+        "name": "enclosing_cell:for",
+        "kind": "compound_block",
+        "start": 6,
+        "end": 8,
+    }
+    sc_closure = inspect_single_unit_scope(closure_loop_unit, repo_root=str(tmp_path))
+    assert sc_closure["is_control_flow_safe"] is False
+    assert "severed_closure_cell" in sc_closure["control_flow_hazards"]
+    assert sc_closure["closure_hazard_reasons"] == ["cell_severing"]
+
+    # Helper suggestion succeeds from disk cells, while patch generation still refuses .ipynb files
+    helper = synthesize_shared_helper_code(sub_a, sub_b, repo_root=str(tmp_path))
+    assert "for x in items:" in helper
+    ast.parse(helper)
+    assert generate_refactoring_patch([(1.0, sub_a, sub_b)], repo_root=str(tmp_path)) == ""
+
+
+@pytest.mark.parametrize(
+    ("case_id", "fn1_body", "fn2_body", "u_extra1", "u_extra2", "expected_ret", "expected_tail"),
+    [
+        pytest.param(
+            "comprehension_source_code_without_cols",
+            "def f1(items, tail):\n    res = [x * 2 for x in items] + tail\n    return res\n",
+            "def f2(items, tail):\n    out = [x * 2 for x in items] + tail\n    return out\n",
+            {"kind": "comprehension", "source_code": "[x * 2 for x in items]"},
+            {"kind": "comprehension", "source_code": "[x * 2 for x in items]"},
+            "return [x * 2 for x in items]",
+            "+ tail",
+            id="comprehension_source_code_without_cols",
+        ),
+        pytest.param(
+            "complex_expr_attr_call_without_cols",
+            "def f1(obj, bar):\n    res = obj.foo(1) + bar(2)\n    return res\n",
+            "def f2(obj, bar):\n    out = obj.foo(1) + bar(2)\n    return out\n",
+            {"kind": "complex_expr", "source_code": "obj.foo(1)"},
+            {"kind": "complex_expr", "source_code": "obj.foo(1)"},
+            "return obj.foo(1)",
+            "+ bar(2)",
+            id="complex_expr_attr_call_without_cols",
+        ),
+        pytest.param(
+            "partial_start_col_only",
+            "def f1(items, tail):\n    res = [x * 2 for x in items] + tail\n    return res\n",
+            "def f2(items, tail):\n    out = [x * 2 for x in items] + tail\n    return out\n",
+            {"kind": "comprehension", "start_col": 10},
+            {"kind": "comprehension", "start_col": 10},
+            "return [x * 2 for x in items]",
+            "+ tail",
+            id="partial_start_col_only",
+        ),
+        pytest.param(
+            "partial_col_offset_alias_only",
+            "def f1(items, tail):\n    res = [x * 2 for x in items] + tail\n    return res\n",
+            "def f2(items, tail):\n    out = [x * 2 for x in items] + tail\n    return out\n",
+            {"kind": "comprehension", "col_offset": 10},
+            {"kind": "comprehension", "col_offset": 10},
+            "return [x * 2 for x in items]",
+            "+ tail",
+            id="partial_col_offset_alias_only",
+        ),
+        pytest.param(
+            "multiline_comprehension_source_code_without_cols",
+            "def f1(items, tail):\n    res = [\n        x * 2\n        for x in items\n    ] + tail\n    return res\n",
+            "def f2(items, tail):\n    out = [\n        x * 2\n        for x in items\n    ] + tail\n    return out\n",
+            {
+                "kind": "comprehension",
+                "end": 5,
+                "source_code": "[\n    x * 2\n    for x in items\n]",
+            },
+            {
+                "kind": "comprehension",
+                "end": 5,
+                "source_code": "[\n    x * 2\n    for x in items\n]",
+            },
+            "for x in items",
+            "+ tail",
+            id="multiline_comprehension_source_code_without_cols",
+        ),
+    ],
+)
+def test_subline_expression_inferred_columns_propagate_across_scope_synthesis_and_patch(
+    tmp_path: Path,
+    case_id: str,
+    fn1_body: str,
+    fn2_body: str,
+    u_extra1: dict[str, Any],
+    u_extra2: dict[str, Any],
+    expected_ret: str,
+    expected_tail: str,
+) -> None:
+    """Verifies inferred sub-line expression columns match across scope analysis, helper synthesis, suggestion, and call-site patch replacement."""
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    f1 = tmp_path / "expr_a.py"
+    f2 = tmp_path / "expr_b.py"
+    f1.write_text(fn1_body, encoding="utf-8")
+    f2.write_text(fn2_body, encoding="utf-8")
+
+    u1: dict[str, Any] = {"file": str(f1), "name": "f1", "start": 2, "end": 2, **u_extra1}
+    u2: dict[str, Any] = {"file": str(f2), "name": "f2", "start": 2, "end": 2, **u_extra2}
+
+    clear_dataflow_cache()
+    sc1 = inspect_single_unit_scope(u1, repo_root=str(tmp_path))
+    assert sc1["is_control_flow_safe"] is True, case_id
+    assert "tail" not in sc1["inputs"] and "bar" not in sc1["inputs"], case_id
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert expected_ret in helper, case_id
+    assert expected_tail not in helper, case_id
+    ast.parse(helper)
+
+    suggestion = synthesize_refactoring_suggestion(u1, u2, repo_root=str(tmp_path))
+    assert expected_ret in suggestion and expected_tail not in suggestion, case_id
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert "+    res = _shared_f1_f2(" in patch, case_id
+    assert "+    out = _shared_f1_f2(" in patch, case_id
+    for line in patch.splitlines():
+        if line.startswith("+    res = _shared_") or line.startswith("+    out = _shared_"):
+            assert expected_tail in line, line
+
+
+@pytest.mark.parametrize(
+    ("line_src", "snippet", "expect_cols", "expect_stale"),
+    [
+        pytest.param(
+            "def f(obj, bar):\n    res = obj.foo(1) + bar(2)\n    return res\n",
+            "foo(1)",
+            (None, None),
+            True,
+            id="neg_dot_prefix_before_call_masked_without_attr_boundary",
+        ),
+        pytest.param(
+            "def f(obj, bar):\n    res = obj.foo(1) + bar(2)  # keep note\n    return res\n",
+            "foo(1)",
+            (None, None),
+            True,
+            id="neg_dot_prefix_with_inline_comment_still_stale",
+        ),
+        pytest.param(
+            "def f(a, b):\n    res = a + b.attr\n    return res\n",
+            "a + b",
+            (None, None),
+            True,
+            id="neg_dot_suffix_after_ident_rejected",
+        ),
+        pytest.param(
+            "def f(obj, bar):\n    res = obj.foo(1) + bar(2)  # keep note\n    return res\n",
+            "obj.foo(1)",
+            (10, 20),
+            False,
+            id="pos_full_attr_call_inferred_with_note",
+        ),
+    ],
+)
+def test_unit_cols_attr_dot_boundary_rejects_suffix_and_flags_stale_source(
+    tmp_path: Path,
+    line_src: str,
+    snippet: str,
+    expect_cols: tuple[int | None, int | None],
+    expect_stale: bool,
+) -> None:
+    """Verifies _unit_cols and stale_source_code checks enforce attribute dot boundaries across raw and comment-normalized paths."""
+    from pydoppelgangerhunt.fixer.scope import _unit_cols
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    clear_dataflow_cache()
+    unit_line = line_src.splitlines(keepends=True)[1]
+    assert (
+        _unit_cols({"kind": "complex_expr", "source_code": snippet}, [unit_line])
+        == expect_cols
+    )
+    mod_a = tmp_path / "mod_a.py"
+    mod_b = tmp_path / "mod_b.py"
+    mod_a.write_text(line_src, encoding="utf-8")
+    mod_b.write_text(line_src, encoding="utf-8")
+    unit: dict[str, Any] = {
+        "file": str(mod_a),
+        "name": "f:expr",
+        "start": 2,
+        "end": 2,
+        "kind": "complex_expr",
+        "source_code": snippet,
+    }
+    unit_b = {**unit, "file": str(mod_b)}
+    sc = inspect_single_unit_scope(unit, repo_root=str(tmp_path), tree=ast.parse(line_src))
+    assert ("stale_source_code" in sc["control_flow_hazards"]) is expect_stale, sc
+    assert sc["is_control_flow_safe"] is (not expect_stale), sc
+
+    helper = synthesize_shared_helper_code(unit, unit_b, repo_root=str(tmp_path))
+    suggestion = synthesize_refactoring_suggestion(unit, unit_b, repo_root=str(tmp_path))
+    patch = generate_refactoring_patch(
+        [(1.0, unit, unit_b)], repo_root=str(tmp_path), replace_clones=True
+    )
+    if expect_stale:
+        assert helper == ""
+        assert patch == ""
+        assert "stale source code" in suggestion
+    else:
+        assert f"return {snippet}" in helper
+        assert f"return {snippet}" in patch
+        assert "+ bar(2)" in patch
+        assert "stale source code" not in suggestion
+
+
+@pytest.mark.parametrize(
+    ("min_py", "mod_src", "target_fn_name", "expect_safe"),
+    [
+        pytest.param(
+            (3, 9),
+            (
+                "import contextlib\n"
+                "def target(contextlib, step):\n"
+                "    with contextlib.nullcontext():\n"
+                "        v = step()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "target",
+            False,
+            id="param_shadows_contextlib_in_whole_function",
+        ),
+        pytest.param(
+            (3, 9),
+            (
+                "def target(open, step):\n"
+                "    with open('path'):\n"
+                "        v = step()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "target",
+            False,
+            id="param_shadows_builtin_open_in_whole_function",
+        ),
+        pytest.param(
+            (3, 9),
+            (
+                "from contextlib import nullcontext\n"
+                "def target(nullcontext, step):\n"
+                "    with nullcontext():\n"
+                "        v = step()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "target",
+            False,
+            id="param_shadows_imported_nullcontext_in_whole_function",
+        ),
+        pytest.param(
+            (3, 9),
+            (
+                "import contextlib\n"
+                "def outer(step):\n"
+                "    cm = contextlib.nullcontext\n"
+                "    def target(cm):\n"
+                "        with cm():\n"
+                "            v = step()\n"
+                "        cb = lambda: v\n"
+                "        return cb()\n"
+                "    return target(cm)\n"
+            ),
+            "target",
+            False,
+            id="nested_whole_function_param_shadows_enclosing_cm",
+        ),
+        pytest.param(
+            (3, 9),
+            (
+                "import contextlib\n"
+                "def outer(step):\n"
+                "    cm = contextlib.nullcontext\n"
+                "    def target():\n"
+                "        with cm():\n"
+                "            v = step()\n"
+                "        cb = lambda: v\n"
+                "        return cb()\n"
+                "    return target()\n"
+            ),
+            "target",
+            True,
+            id="unshadowed_nested_whole_function_inherits_enclosing_nullcontext",
+        ),
+        pytest.param(
+            (3, 12),
+            (
+                "import contextlib\n"
+                "def target[contextlib](step):\n"
+                "    with contextlib.nullcontext():\n"
+                "        v = step()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "target",
+            False,
+            id="pep695_type_param_shadows_contextlib_in_whole_function",
+        ),
+    ],
+)
+def test_whole_function_unit_resolves_fn_seed_and_clears_params_and_type_params(
+    tmp_path: Path,
+    min_py: tuple[int, int],
+    mod_src: str,
+    target_fn_name: str,
+    expect_safe: bool,
+) -> None:
+    """Verifies whole-function units seed suppress provenance on their own node and clear params/type_params."""
+    import sys
+
+    if sys.version_info < min_py:
+        pytest.skip(f"Requires Python {min_py[0]}.{min_py[1]}+")
+    clear_dataflow_cache()
+    mod_path = tmp_path / "whole_fn_mod.py"
+    mod_path.write_text(mod_src, encoding="utf-8")
+    tree = ast.parse(mod_src)
+    fn_node = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == target_fn_name
+    )
+    fn_lines = mod_src.splitlines(keepends=True)[fn_node.lineno - 1 : fn_node.end_lineno]
+    sc = inspect_single_unit_scope(
+        {
+            "file": str(mod_path),
+            "name": target_fn_name,
+            "kind": "function",
+            "start": fn_node.lineno,
+            "end": fn_node.end_lineno,
+            "source_code": "".join(fn_lines),
+            "closure_strictness": "pedantic",
+        },
+        repo_root=str(tmp_path),
+        tree=tree,
+    )
+    assert ("v" in sc["definite_stores"]) is expect_safe, sc
+
+
+@pytest.mark.parametrize(
+    ("body_src", "expect_violation"),
+    [
+        pytest.param(
+            "    a = [x := 1 for _ in (1,)]\n    global x\n",
+            True,
+            id="listcomp_walrus_before_global",
+        ),
+        pytest.param(
+            "    a = [[x := 1 for _ in (1,)] for _ in (1,)]\n    global x\n",
+            True,
+            id="nested_listcomp_walrus_before_global",
+        ),
+        pytest.param(
+            "    a = (x := 1 for _ in (1,))\n    nonlocal x\n",
+            True,
+            id="genexpr_walrus_before_nonlocal",
+        ),
+        pytest.param(
+            "    a = [(lambda y=(x := 1): y) for _ in (1,)]\n    global x\n",
+            True,
+            id="lambda_default_walrus_inside_comp_before_global",
+        ),
+        pytest.param(
+            "    a = [x for _ in (1,)]\n    global x\n",
+            False,
+            id="control_comp_plain_read_before_global_is_valid",
+        ),
+        pytest.param(
+            "    a = [(lambda: (x := 1)) for _ in (1,)]\n    global x\n",
+            False,
+            id="control_lambda_body_walrus_inside_comp_is_lambda_local",
+        ),
+        pytest.param(
+            "    a = [x for x in (1,)]\n    global x\n",
+            False,
+            id="control_comp_loop_target_does_not_bind_enclosing_scope",
+        ),
+    ],
+)
+def test_scope_has_use_before_lexical_declaration_detects_comp_walrus_bindings(
+    body_src: str,
+    expect_violation: bool,
+) -> None:
+    """Verifies AST-only use-before-declaration check catches PEP 572 walruses inside comprehensions."""
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _scope_has_use_before_lexical_declaration,
+    )
+
+    fn_node = ast.parse(f"def outer():\n{body_src}").body[0]
+    assert isinstance(fn_node, ast.FunctionDef)
+    assert (
+        _scope_has_use_before_lexical_declaration(fn_node, frozenset({"x"}))
+        is expect_violation
+    )
+
+
+@pytest.mark.parametrize(
+    ("src", "expect_invalid"),
+    [
+        pytest.param(
+            "def f():\n    x = 1 + \\\n        2\n    return x\n",
+            False,
+            id="lf_backslash_line_continuation",
+        ),
+        pytest.param(
+            "def f():\r\n    x = 1 + \\\r\n        2\r\n    return x\r\n",
+            False,
+            id="crlf_backslash_line_continuation",
+        ),
+        pytest.param(
+            "def f():\n    s = '''line1\nline2'''\n    return s\n",
+            False,
+            id="multiline_triple_quoted_string_keepends",
+        ),
+        pytest.param(
+            "def f():\n    x = 1 + \\\n        2\n    global x\n",
+            True,
+            id="control_invalid_global_after_backslash_continuation",
+        ),
+    ],
+)
+def test_compute_scope_invalid_lexical_declarations_handles_keepends_lines(
+    src: str,
+    expect_invalid: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies symtable fast-path strips keepends newlines cleanly so valid line continuations do not fall back to AST walking."""
+    from pydoppelgangerhunt.fixer import _df_span_index as span_mod
+
+    tree = ast.parse(src)
+    fallback_calls = 0
+    orig_walk = span_mod._walk_invalid_lexical_scope_declarations
+
+    def _spy_walk(*args: Any, **kwargs: Any) -> bool:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return orig_walk(*args, **kwargs)
+
+    monkeypatch.setattr(span_mod, "_walk_invalid_lexical_scope_declarations", _spy_walk)
+    result = span_mod._compute_scope_invalid_lexical_declarations(
+        tree,
+        is_module_rooted=True,
+        source_lines=src.splitlines(keepends=True),
+    )
+    assert result is expect_invalid
+    if not expect_invalid:
+        assert fallback_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("src", "unit_code", "start_marker", "end_marker", "expect_match"),
+    [
+        pytest.param(
+            (
+                "def f(flag, x):\n"
+                "    if flag:\n"
+                "        y = x + 1\n"
+                "    else:\n"
+                "        # fallback comment\n"
+                "\n"
+                "        y = x + 2\n"
+                "    return y\n"
+            ),
+            "    else:\n        # fallback comment\n\n        y = x + 2\n",
+            "    else:",
+            "        y = x + 2",
+            True,
+            id="if_else_clause_with_comment_and_blank_line",
+        ),
+        pytest.param(
+            (
+                "def f(a, b, x):\n"
+                "    if a:\n"
+                "        y = x + 1\n"
+                "    elif b:\n"
+                "        # elif comment\n"
+                "        y = x + 2\n"
+                "    return y\n"
+            ),
+            "    elif b:\n        # elif comment\n        y = x + 2\n",
+            "    elif b:",
+            "        y = x + 2",
+            True,
+            id="elif_clause_with_comment_before_body",
+        ),
+        pytest.param(
+            (
+                "def f(op, x):\n"
+                "    try:\n"
+                "        y = op(x)\n"
+                "    finally:\n"
+                "        # cleanup comment\n"
+                "\n"
+                "        z = x + 1\n"
+                "    return y, z\n"
+            ),
+            "    finally:\n        # cleanup comment\n\n        z = x + 1\n",
+            "    finally:",
+            "        z = x + 1",
+            True,
+            id="try_finally_clause_with_comment_and_blank_line",
+        ),
+        pytest.param(
+            (
+                "def f(op, x):\n"
+                "    try:\n"
+                "        y = op(x)\n"
+                "    except ValueError:\n"
+                "        y = 0\n"
+                "    else:\n"
+                "        # ok comment\n"
+                "        y = y + 1\n"
+                "    return y\n"
+            ),
+            "    else:\n        # ok comment\n        y = y + 1\n",
+            "    else:",
+            "        y = y + 1",
+            True,
+            id="try_else_clause_with_comment_before_body",
+        ),
+        pytest.param(
+            (
+                "def f(flag, x):\n"
+                "    if flag:\n"
+                "        y = x + 1\n"
+                "    else:\n"
+                "        # fallback comment\n"
+                "        y = x + 2\n"
+                "    return y\n"
+            ),
+            "    else:\n        # fallback comment\n        y = x + 2\n",
+            "        y = x + 1",
+            "        y = x + 2",
+            False,
+            id="control_start_inside_preceding_clause_rejected",
+        ),
+        pytest.param(
+            (
+                "def f(flag, x):\n"
+                "    if flag:\n"
+                "        y = x + 1\n"
+                "    else:\n"
+                "        # fallback comment\n"
+                "        y = x + 2\n"
+                "    return y\n"
+            ),
+            "        y = x + 2\n",
+            "        # fallback comment",
+            "        y = x + 2",
+            False,
+            id="control_non_clause_snippet_shifted_onto_comment_rejected",
+        ),
+    ],
+)
+def test_tree_only_clause_header_with_leading_comment_or_blank_line_matches_tree(
+    src: str,
+    unit_code: str,
+    start_marker: str,
+    end_marker: str,
+    expect_match: bool,
+) -> None:
+    """Verifies tree-only clause verification allows comments/blank lines after clause headers while rejecting misaligned spans."""
+    from pydoppelgangerhunt.fixer.scope import _unit_source_code_matches_tree
+
+    lines = src.splitlines()
+    u_start = next(i + 1 for i, ln in enumerate(lines) if ln == start_marker)
+    u_end = next(i + 1 for i, ln in enumerate(lines) if ln == end_marker)
+    tree = ast.parse(src)
+    unit = {
+        "start": u_start,
+        "end": u_end,
+        "kind": "compound_block",
+        "source_code": unit_code,
+    }
+    assert _unit_source_code_matches_tree(unit, unit_code, tree) is expect_match
+    clear_dataflow_cache()
+    sc = inspect_single_unit_scope(unit, tree=tree)
+    assert ("stale_source_code" not in sc["control_flow_hazards"]) is expect_match
+
+
+def test_tree_only_match_case_clause_header_with_leading_comment_matches_tree() -> None:
+    """Verifies tree-only Python 3.10+ match-case header matching allows comments between case header and body."""
+    import sys
+    from pydoppelgangerhunt.fixer.scope import _unit_source_code_matches_tree
+
+    if sys.version_info < (3, 10):
+        pytest.skip("match/case requires Python 3.10+")
+    src = (
+        "def f(val, x):\n"
+        "    match val:\n"
+        "        case 1:\n"
+        "            # case comment\n"
+        "\n"
+        "            y = x + 1\n"
+        "        case _:\n"
+        "            y = x + 2\n"
+        "    return y\n"
+    )
+    unit_code = "        case 1:\n            # case comment\n\n            y = x + 1\n"
+    lines = src.splitlines()
+    u_start = next(i + 1 for i, ln in enumerate(lines) if ln == "        case 1:")
+    u_end = next(i + 1 for i, ln in enumerate(lines) if ln == "            y = x + 1")
+    tree = ast.parse(src)
+    unit = {
+        "start": u_start,
+        "end": u_end,
+        "kind": "compound_block",
+        "source_code": unit_code,
+    }
+    assert _unit_source_code_matches_tree(unit, unit_code, tree) is True
+    bad_unit = {**unit, "start": u_start - 1}
+    assert _unit_source_code_matches_tree(bad_unit, unit_code, tree) is False
+
+
+@pytest.mark.parametrize(
+    ("has_source", "expected_phrase", "forbidden_phrase"),
+    [
+        pytest.param(
+            False,
+            "failing closed because backing source is unavailable",
+            "recomputing from source",
+            id="missing_source_logs_fail_closed",
+        ),
+        pytest.param(
+            True,
+            "recomputing from source",
+            "failing closed",
+            id="available_source_logs_recompute",
+        ),
+    ],
+)
+def test_ensure_unit_scope_closure_mode_logs_fail_closed_vs_recompute_accurately(
+    has_source: bool,
+    expected_phrase: str,
+    forbidden_phrase: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies discarded precomputed scopes log whether they fail closed or recompute from source."""
+    import logging
+    from pydoppelgangerhunt.config import clear_closure_warning_cache
+    from pydoppelgangerhunt.fixer.scope import ensure_unit_scope_closure_mode
+
+    src = "def f(x):\n    y = x + 1\n    return y\n"
+    unit: dict[str, Any] = {
+        "name": "f:blk",
+        "start": 2,
+        "end": 2,
+        "kind": "basic_block",
+    }
+    if has_source:
+        unit["source_text"] = src
+    legacy_scope = {"inputs": ["stale"], "outputs": [], "is_control_flow_safe": True}
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        resolved = ensure_unit_scope_closure_mode(
+            unit,
+            legacy_scope,
+            skip_pre_unit_closures=False,
+        )
+    warnings = [
+        rec.message
+        for rec in caplog.records
+        if "Discarding caller-supplied precomputed scope" in rec.message
+    ]
+    assert len(warnings) == 1
+    assert expected_phrase in warnings[0]
+    assert forbidden_phrase not in warnings[0]
+    if has_source:
+        assert resolved["is_control_flow_safe"] is True
+        assert resolved["inputs"] == ["x"]
+    else:
+        assert resolved["is_control_flow_safe"] is False
+        assert "unavailable_source_for_closure_mode" in resolved["control_flow_hazards"]
+
+
+@pytest.mark.parametrize(
+    ("missing_u1", "missing_u2", "is_subroutine", "pass_source_text2", "expect_emitted"),
+    [
+        pytest.param(
+            True,
+            False,
+            False,
+            False,
+            False,
+            id="missing_u1_rejected_even_with_stamped_v2_scope1",
+        ),
+        pytest.param(
+            False,
+            True,
+            True,
+            False,
+            False,
+            id="missing_u2_subroutine_rejected_even_with_stamped_v2_scope2",
+        ),
+        pytest.param(
+            False,
+            True,
+            False,
+            True,
+            False,
+            id="missing_u2_with_explicit_source_text2_rejected_even_with_stamped_v2_scope2",
+        ),
+        pytest.param(
+            False,
+            True,
+            False,
+            False,
+            True,
+            id="control_whole_fn_preview_allows_missing_u2_with_valid_u1",
+        ),
+    ],
+)
+def test_synthesize_shared_helper_rejects_placeholder_origin_even_with_stamped_v2_scope(
+    tmp_path: Path,
+    missing_u1: bool,
+    missing_u2: bool,
+    is_subroutine: bool,
+    pass_source_text2: bool,
+    expect_emitted: bool,
+) -> None:
+    """Verifies synthesize_shared_helper_code rejects placeholder origins even when callers pass stamped v2 scopes."""
+    from pydoppelgangerhunt.fixer import synthesize_shared_helper_code
+    from pydoppelgangerhunt.fixer.scope import SCOPE_SCHEMA_VERSION
+
+    fn_src = "def compute(a, b):\n    res = a + b\n    return res\n"
+    real_file = tmp_path / "real_mod.py"
+    real_file.write_text(fn_src, encoding="utf-8")
+    missing_file = tmp_path / "does_not_exist.py"
+
+    kind = "basic_block" if is_subroutine else "function"
+    start_ln, end_ln = (2, 2) if is_subroutine else (1, 3)
+    u1: dict[str, Any] = {
+        "file": str(missing_file if missing_u1 else real_file),
+        "name": "compute",
+        "kind": kind,
+        "start": start_ln,
+        "end": end_ln,
+    }
+    u2: dict[str, Any] = {
+        "file": str(missing_file if missing_u2 else real_file),
+        "name": "compute",
+        "kind": kind,
+        "start": start_ln,
+        "end": end_ln,
+    }
+    real_unit: dict[str, Any] = {
+        "file": str(real_file),
+        "name": "compute",
+        "kind": kind,
+        "start": start_ln,
+        "end": end_ln,
+    }
+    stamped_v2_scope = inspect_single_unit_scope(
+        real_unit,
+        repo_root=str(tmp_path),
+        closure_strictness="strict",
+    )
+    assert stamped_v2_scope["scope_schema_version"] == SCOPE_SCHEMA_VERSION
+    assert stamped_v2_scope["is_control_flow_safe"] is True
+    assert "unavailable_source_placeholder" not in stamped_v2_scope["control_flow_hazards"]
+    res = synthesize_shared_helper_code(
+        u1,
+        u2,
+        repo_root=str(tmp_path),
+        closure_strictness="strict",
+        source_text2="   \n" if pass_source_text2 else None,
+        scope1=dict(stamped_v2_scope),
+        scope2=dict(stamped_v2_scope),
+    )
+    if expect_emitted:
+        assert "def _shared_compute" in res
+        assert "# Source for" not in res
+    else:
+        assert res == ""
+
+
+@pytest.mark.parametrize(
+    ("outer_prefix", "setup_sig", "setup_body", "expect_safe"),
+    [
+        pytest.param(
+            "    def setattr(obj, k, v):\n        obj.callbacks.append(v)\n",
+            "def setup(self):",
+            "            setattr(self, 'other', lambda: total)\n",
+            False,
+            id="enclosing_fn_shadowed_setattr_triggers_bare_escape",
+        ),
+        pytest.param(
+            "",
+            "def setup(self):",
+            "            setattr = custom_fn\n            setattr(self, 'other', lambda: total)\n",
+            False,
+            id="method_local_shadowed_setattr_triggers_bare_escape",
+        ),
+        pytest.param(
+            "",
+            "def setup(self, setattr):",
+            "            setattr(self, 'other', lambda: total)\n",
+            False,
+            id="method_param_shadowed_setattr_triggers_bare_escape",
+        ),
+        pytest.param(
+            "",
+            "def setup(self):",
+            "            setattr(self, 'other', lambda: total)\n",
+            True,
+            id="control_unshadowed_builtin_setattr_on_unrelated_attr_stays_safe",
+        ),
+    ],
+)
+def test_local_class_shadowed_setattr_on_receiver_triggers_bare_escape(
+    outer_prefix: str,
+    setup_sig: str,
+    setup_body: str,
+    expect_safe: bool,
+) -> None:
+    """Verifies shadowed setattr/delattr on self does not suppress bare_escape in receiver closure linking."""
+    src = (
+        "def outer(items, custom_fn):\n"
+        "    total = 0\n"
+        f"{outer_prefix}"
+        "    class Worker:\n"
+        "        def __init__(self):\n"
+        "            self.callbacks = []\n"
+        f"        {setup_sig}\n"
+        f"{setup_body}"
+        "        def run(self):\n"
+        "            nonlocal total\n"
+        "            out = []\n"
+        "            for x in items:\n"
+        "                total += x\n"
+        "                out.append(self.callbacks[0]())\n"
+        "            return out\n"
+        "    return Worker(), total\n"
+    )
+    lines = src.splitlines()
+    start_idx = next(i + 1 for i, ln in enumerate(lines) if "out = []" in ln)
+    end_idx = next(i + 1 for i, ln in enumerate(lines) if "return out" in ln) - 1
+    clear_dataflow_cache()
+    sc = inspect_single_unit_scope(
+        {
+            "start": start_idx,
+            "end": end_idx,
+            "kind": "block",
+            "source_text": src,
+            "source_lines": src.splitlines(keepends=True),
+        },
+        tree=ast.parse(src),
+    )
+    assert sc["is_control_flow_safe"] is expect_safe, sc
+    if not expect_safe:
+        assert "severed_closure_cell" in sc["control_flow_hazards"], sc
+
+
+@pytest.mark.parametrize(
+    ("src", "unit_fields", "expect_stale"),
+    [
+        pytest.param(
+            "def f(alpha_one, beta_two):\n    x = alpha_one + beta_two\n    return x\n",
+            {
+                "start": 2,
+                "end": 2,
+                "start_col": 8,
+                "end_col": 28,
+                "kind": "complex_expr",
+                "source_code": "e + beta_two",
+            },
+            True,
+            id="single_line_complex_expr_mid_identifier_double_slice_rejected",
+        ),
+        pytest.param(
+            "def f(alpha_one, beta_two, gamma_three):\n"
+            "    x = (alpha_one + beta_two\n"
+            "         + gamma_three)\n"
+            "    return x\n",
+            {
+                "start": 2,
+                "end": 3,
+                "start_col": 8,
+                "end_col": 23,
+                "kind": "complex_expr",
+                "source_code": "ne + beta_two\n         + gamma_three)",
+            },
+            True,
+            id="multiline_complex_expr_mid_identifier_double_slice_rejected",
+        ),
+        pytest.param(
+            "def f(alpha_one, beta_two):\n    x = alpha_one + beta_two\n    return x\n",
+            {
+                "start": 2,
+                "end": 2,
+                "start_col": 8,
+                "end_col": 28,
+                "kind": "complex_expr",
+                "source_code": "alpha_one + beta_two",
+            },
+            False,
+            id="control_matching_complex_expr_source_code_accepted",
+        ),
+    ],
+)
+def test_stale_source_check_does_not_double_slice_clipped_expression_units(
+    src: str,
+    unit_fields: dict[str, Any],
+    expect_stale: bool,
+) -> None:
+    """Verifies stale-source validation does not re-slice already column-clipped expression units with file-relative offsets."""
+    clear_dataflow_cache()
+    unit: dict[str, Any] = {
+        **unit_fields,
+        "source_text": src,
+        "source_lines": src.splitlines(keepends=True),
+    }
+    sc = inspect_single_unit_scope(unit, tree=ast.parse(src))
+    assert ("stale_source_code" in sc["control_flow_hazards"]) is expect_stale, sc
+
+
+@pytest.mark.parametrize(
+    ("dec_line", "expected_col"),
+    [
+        pytest.param("\u2003@dec\n", 3, id="three_byte_em_space_before_decorator"),
+        pytest.param("\u00a0@dec\n", 2, id="two_byte_nbsp_before_decorator"),
+        pytest.param("    @dec\n", 4, id="ascii_four_space_indent_before_decorator"),
+    ],
+)
+def test_node_earliest_start_pos_computes_utf8_byte_col_offset(
+    dec_line: str,
+    expected_col: int,
+) -> None:
+    """Verifies _node_earliest_start_pos reports UTF-8 byte offsets for leading whitespace before '@' decorators."""
+    from pydoppelgangerhunt.fixer._df_closures import _node_earliest_start_pos
+
+    tree = ast.parse("@dec\ndef f():\n    pass\n")
+    fn_node = tree.body[0]
+    source_lines = [dec_line, "def f():\n", "    pass\n"]
+    assert _node_earliest_start_pos(fn_node, source_lines=source_lines) == (
+        1,
+        expected_col,
+    )
+
+
+@pytest.mark.parametrize(
+    ("unit_file", "expect_invalid"),
+    [
+        pytest.param("nb.ipynb#bad_anchor", True, id="malformed_plain_anchor"),
+        pytest.param("nb.ipynb#a#b", True, id="malformed_double_hash_anchor"),
+        pytest.param("nb.ipynb#bad/anchor", True, id="malformed_slash_in_anchor"),
+        pytest.param("NB.IPYNB#bad/frag", True, id="malformed_uppercase_ipynb_anchor"),
+        pytest.param("nb.ipynb#cell_1", False, id="control_valid_cell_anchor"),
+        pytest.param("my#notebook.ipynb", False, id="control_hash_in_notebook_stem"),
+        pytest.param("report.ipynb#cellular.ipynb", False, id="control_literal_ipynb_hash_filename"),
+        pytest.param("dir#1/nb.ipynb#cell_1", False, id="control_hash_in_dir_with_valid_anchor"),
+        pytest.param("dir.ipynb#1/mod.py", False, id="control_py_module_under_hash_dir"),
+    ],
+)
+def test_malformed_notebook_anchors_fail_closed_across_slashes_hashes_and_suffixes(
+    unit_file: str,
+    expect_invalid: bool,
+) -> None:
+    """Verifies malformed .ipynb#<fragment> anchors fail closed even with slashes, extra hashes, or .ipynb suffixes."""
+    from pydoppelgangerhunt.source_lines import (
+        SourceLinesOrigin,
+        extract_unit_source_lines_with_state,
+    )
+
+    lines, origin = extract_unit_source_lines_with_state(
+        {
+            "file": unit_file,
+            "start": 1,
+            "end": 1,
+            "source_text": "x = 1\n",
+        }
+    )
+    if expect_invalid:
+        assert lines == []
+        assert origin is SourceLinesOrigin.PLACEHOLDER
+    else:
+        assert lines == ["x = 1\n"]
+        assert origin is SourceLinesOrigin.FULL_BUFFER
+
+
+@pytest.mark.parametrize(
+    ("src", "expect_invalid"),
+    [
+        pytest.param("global x\nx: int = 1\n", False, id="module_global_then_ann_assign"),
+        pytest.param("global x\nx: int\n", False, id="module_global_then_bare_ann"),
+        pytest.param("x: int = 1\nglobal x\n", True, id="module_ann_assign_then_global"),
+        pytest.param("x: int\nglobal x\n", True, id="module_bare_ann_then_global"),
+        pytest.param("global x\nx: int = 1\nglobal x\n", True, id="module_global_ann_then_second_global"),
+        pytest.param("global x\n(x): int = 1\n", False, id="module_global_then_paren_ann"),
+        pytest.param("(x): int = 1\nglobal x\n", True, id="module_paren_ann_val_then_global"),
+        pytest.param("(x): int\nglobal x\n", False, id="module_paren_bare_ann_then_global"),
+        pytest.param("def f():\n    global x\n    x: int = 1\n", True, id="fn_global_then_ann"),
+        pytest.param("def f():\n    x: int = 1\n    global x\n", True, id="fn_ann_then_global"),
+        pytest.param("def f():\n    global x\n    (x): int = 1\n", False, id="fn_global_then_paren_ann"),
+        pytest.param("def f():\n    (x): int = 1\n    global x\n", True, id="fn_paren_ann_val_then_global"),
+        pytest.param("def f():\n    (x): int\n    global x\n", False, id="fn_paren_bare_ann_then_global"),
+        pytest.param(
+            "def outer():\n    x = 0\n    def f():\n        nonlocal x\n        x: int = 1\n",
+            True,
+            id="fn_nonlocal_then_ann",
+        ),
+        pytest.param(
+            "def outer():\n    x = 0\n    def f():\n        nonlocal x\n        (x): int = 1\n",
+            False,
+            id="fn_nonlocal_then_paren_ann",
+        ),
+        pytest.param("class C:\n    global x\n    x: int = 1\n", True, id="class_global_then_ann"),
+        pytest.param("class C:\n    global x\n    (x): int = 1\n", False, id="class_global_then_paren_ann"),
+    ],
+)
+def test_ast_only_invalid_lexical_declarations_match_cpython_symtable_for_annassign(
+    src: str,
+    expect_invalid: bool,
+) -> None:
+    """Verifies AST-only AnnAssign global/nonlocal validation matches CPython symtable across module, function, and class scopes."""
+    import symtable
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _compute_scope_invalid_lexical_declarations,
+    )
+
+    symtable_invalid = False
+    try:
+        symtable.symtable(src, "<annassign_check>", "exec")
+    except SyntaxError:
+        symtable_invalid = True
+    assert symtable_invalid is expect_invalid
+
+    clear_dataflow_cache()
+    tree = ast.parse(src)
+    assert (
+        _compute_scope_invalid_lexical_declarations(
+            tree, is_module_rooted=True, source_lines=None
+        )
+        is expect_invalid
+    )
+
+
+
+
+
+
+

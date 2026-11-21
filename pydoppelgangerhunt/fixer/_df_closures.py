@@ -16,14 +16,17 @@ from typing import (
     Sequence,
     Set,
     Tuple,
+    Type,
     Union,
     cast,
 )
 
 from pydoppelgangerhunt.fixer._ast_compat import (
     is_match_as_node,
+    is_match_mapping_node,
     is_match_node,
     is_match_or_node,
+    is_match_star_node,
     is_try_or_trystar_node,
     is_type_alias_node,
 )
@@ -88,7 +91,8 @@ def _node_earliest_start_pos(
                     stripped = line_txt.lstrip()
                     if stripped.startswith("@"):
                         eff_d_line = scan_ln
-                        at_col = len(line_txt) - len(stripped)
+                        lead_prefix = line_txt[: len(line_txt) - len(stripped)]
+                        at_col = len(lead_prefix.encode("utf-8"))
                         break
                     if (
                         scan_ln < d_line
@@ -420,14 +424,21 @@ def _extract_single_node_local_names(
             else:
                 global_names.update(curr.names)
             continue
+        elif isinstance(curr, ast.ExceptHandler):
+            if isinstance(curr.name, str):
+                names.add(curr.name)
         elif is_type_alias_node(curr):
             alias_name = getattr(curr, "name", None)
             if isinstance(alias_name, ast.Name):
                 names.add(alias_name.id)
             continue
-        else:
-            bound_sym = getattr(curr, "name", None) or getattr(curr, "rest", None)
-            if isinstance(bound_sym, str) and not isinstance(curr, ast.Attribute):
+        elif (
+            is_match_as_node(curr)
+            or is_match_star_node(curr)
+            or is_match_mapping_node(curr)
+        ):
+            bound_sym = _extract_pattern_bound_name(curr)
+            if bound_sym is not None:
                 names.add(bound_sym)
 
         stack.extend(ast.iter_child_nodes(curr))
@@ -642,6 +653,16 @@ def _resolve_enclosing_scopes_by_coords(
     return [module_tree] if isinstance(module_tree, ast.Module) else []
 
 
+_ALL_LEXICAL_SCOPE_TYPES: Tuple[Type[ast.AST], ...] = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.Lambda,
+    *_COMPREHENSION_TYPES,
+    ast.ClassDef,
+    ast.Module,
+)
+
+
 def _extract_scope_local_names(
     scope_node: ast.AST,
     module_tree: Optional[ast.AST] = None,
@@ -661,27 +682,44 @@ def _extract_scope_local_names(
     visible). Pass ``include_classes=True`` to include all ancestor ``ClassDef``
     bindings unconditionally.
     """
-    if include_self_name and cache_scope_node:
+    if not include_classes and _is_function_like_scope_node(scope_node):
+        is_direct_cls_member = bool(
+            enclosing_scopes and isinstance(enclosing_scopes[-1], ast.ClassDef)
+        )
+        if (
+            not is_direct_cls_member
+            and module_tree is not None
+            and module_tree is not scope_node
+        ):
+            anc_map = _get_scope_ancestor_map(module_tree)
+            anc = anc_map.get(scope_node)
+            while anc is not None:
+                if isinstance(anc, _ALL_LEXICAL_SCOPE_TYPES):
+                    is_direct_cls_member = isinstance(anc, ast.ClassDef)
+                    break
+                anc = anc_map.get(anc)
+        eff_include_self = include_self_name and not is_direct_cls_member
+    else:
+        eff_include_self = include_self_name
+    if eff_include_self and cache_scope_node:
         names = set(_get_cached_single_node_local_names(scope_node))
     else:
         names = (
             _extract_single_node_local_names(scope_node)
-            if include_self_name
+            if eff_include_self
             else _extract_single_node_local_names(
                 scope_node, include_self_name=False
             )
         )
-    for enc in enclosing_scopes:
-        names.update(_get_cached_single_node_local_names(enc))
+    if enclosing_scopes:
+        first_enc = not _is_function_like_scope_node(scope_node)
+        for enc in reversed(enclosing_scopes):
+            if include_classes or not isinstance(enc, ast.ClassDef) or first_enc:
+                names.update(_get_cached_single_node_local_names(enc))
+            if isinstance(enc, _ALL_LEXICAL_SCOPE_TYPES):
+                first_enc = False
     allowed_types = (
-        (
-            ast.FunctionDef,
-            ast.AsyncFunctionDef,
-            ast.Lambda,
-            *_COMPREHENSION_TYPES,
-            ast.ClassDef,
-            ast.Module,
-        )
+        _ALL_LEXICAL_SCOPE_TYPES
         if include_classes
         else (
             ast.FunctionDef,
@@ -709,17 +747,7 @@ def _extract_scope_local_names(
                 first_anc and isinstance(curr, ast.ClassDef)
             ):
                 names.update(_get_cached_single_node_local_names(curr))
-            if isinstance(
-                curr,
-                (
-                    ast.FunctionDef,
-                    ast.AsyncFunctionDef,
-                    ast.Lambda,
-                    *_COMPREHENSION_TYPES,
-                    ast.ClassDef,
-                    ast.Module,
-                ),
-            ):
+            if isinstance(curr, _ALL_LEXICAL_SCOPE_TYPES):
                 first_anc = False
             curr = parent_map.get(curr)
         if not visited_module_tree and (
@@ -1698,7 +1726,11 @@ def _has_escaped_intra_unit_global_declarations(
                 and alias_name.id in intra_globals
             ):
                 return True
-        else:
+        elif (
+            is_match_as_node(curr)
+            or is_match_star_node(curr)
+            or is_match_mapping_node(curr)
+        ):
             pat_name = _extract_pattern_bound_name(curr)
             if pat_name is not None and pat_name in intra_globals:
                 return True

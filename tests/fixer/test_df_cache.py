@@ -1225,8 +1225,8 @@ def test_get_scope_parent_map_excludes_expr_context_tokens() -> None:
     assert fn_node in pmap
 
 
-def test_syntax_warning_suppressed_across_parse_and_inference_paths() -> None:
-    """Verifies SyntaxWarning is suppressed in tree parsing, symtable, column inference, and normalized dumps."""
+def test_syntax_warning_propagates_across_library_parse_and_inference_paths() -> None:
+    """Verifies library parse, symtable, column inference, and stmt dump paths do not suppress SyntaxWarning."""
     import warnings
     from pydoppelgangerhunt.fixer.scope import (
         _get_or_parse_tree,
@@ -1238,23 +1238,31 @@ def test_syntax_warning_suppressed_across_parse_and_inference_paths() -> None:
     escape_src = (
         'PAT = "\\d+\\s+"\n'
         "def match_fn(x):\n"
-        '    y = ("\\d+" + str(x))\n'
-        "    return y\n"
+        "    def inner():\n"
+        '        return ("\\d+" + str(x))\n'
+        "    return inner()\n"
     )
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", SyntaxWarning)
-        warnings.simplefilter("error", DeprecationWarning)
+    with warnings.catch_warnings(record=True) as w_parse:
+        warnings.simplefilter("always")
         esc_tree = _get_or_parse_tree(escape_src)
-        assert esc_tree is not None
-        u_esc = {
-            "name": "match_fn",
-            "kind": "function",
-            "start": 2,
-            "end": 4,
-            "source_text": escape_src,
-        }
+        assert isinstance(esc_tree, ast.Module)
+    assert any(issubclass(w.category, (SyntaxWarning, DeprecationWarning)) for w in w_parse)
+
+    u_esc = {
+        "name": "match_fn",
+        "kind": "function",
+        "start": 2,
+        "end": 5,
+        "source_text": escape_src,
+    }
+    with warnings.catch_warnings(record=True) as w_scope:
+        warnings.simplefilter("always")
         sc_esc = _inspect_unit_scope(u_esc, file_tree=esc_tree)
         assert sc_esc["is_control_flow_safe"] is True
+    assert any(issubclass(w.category, (SyntaxWarning, DeprecationWarning)) for w in w_scope)
+
+    with warnings.catch_warnings(record=True) as w_col:
+        warnings.simplefilter("always")
         col, ecol = _infer_missing_col_from_line_ast(
             '    y = ("\\d+" + str(x))',
             None,
@@ -1262,8 +1270,13 @@ def test_syntax_warning_suppressed_across_parse_and_inference_paths() -> None:
             allow_expr_fallback=True,
         )
         assert col == 4 and ecol == 24
+    assert any(issubclass(w.category, (SyntaxWarning, DeprecationWarning)) for w in w_col)
+
+    with warnings.catch_warnings(record=True) as w_dump:
+        warnings.simplefilter("always")
         dumps = _parse_normalized_stmt_dumps('PAT = "\\d+\\s+"\n')
         assert dumps is not None and len(dumps) == 1
+    assert any(issubclass(w.category, (SyntaxWarning, DeprecationWarning)) for w in w_dump)
 
 
 def test_tracked_cached_dict_prunes_reverse_index_and_missing_cached_ast_nodes_raises() -> (
@@ -1380,52 +1393,20 @@ def test_scope_cache_key_frozenset_and_nested_int_float_bool_non_collision() -> 
     assert len({k_int, k_float, k_nested_int, k_nested_bool}) == 4
 
 
-def test_concurrent_suppress_syntax_warnings_and_stmt_deltas_cap(
+def test_stmt_deltas_cap_and_nan_cache_key_equality(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verifies lock-serialized _suppress_syntax_warnings concurrency and _MAX_STMT_DELTAS_PER_FN LRU reuse."""
-    import concurrent.futures
-    import warnings
+    """Verifies _MAX_STMT_DELTAS_PER_FN LRU reuse and _ScopeCacheKey NaN equality/hashing."""
     import pydoppelgangerhunt.fixer._df_cell_traversal as trav_mod
     from pydoppelgangerhunt.fixer._df_cache import (
         _MAX_STMT_DELTAS_PER_FN,
         _ScopeCacheKey,
         _scope_cell_info_cache,
-        _suppress_syntax_warnings,
-        _syntax_warning_lock,
     )
     from pydoppelgangerhunt.fixer._df_cell_carriers import _SpanBounds
     from pydoppelgangerhunt.fixer._df_cell_traversal import (
         _analyze_enclosing_fn_cells_uncached,
     )
-
-    def _suppress_worker() -> tuple[int, int]:
-        suppressed_syntax = 0
-        kept_user = 0
-        for _ in range(10):
-            with _syntax_warning_lock:
-                with warnings.catch_warnings(record=True) as rec:
-                    warnings.simplefilter("always")
-                    with _suppress_syntax_warnings():
-                        ast.parse(r"s = '\d+'")
-                        warnings.warn("user_msg", UserWarning, stacklevel=1)
-            suppressed_syntax += sum(
-                1 for w in rec if issubclass(w.category, SyntaxWarning)
-            )
-            kept_user += sum(1 for w in rec if issubclass(w.category, UserWarning))
-        return suppressed_syntax, kept_user
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-        futs = [pool.submit(_suppress_worker) for _ in range(6)]
-        for f in futs:
-            sup_cnt, usr_cnt = f.result(timeout=10.0)
-            assert sup_cnt == 0
-            assert usr_cnt == 10
-
-    with warnings.catch_warnings(record=True) as post_rec:
-        warnings.simplefilter("always", SyntaxWarning)
-        warnings.warn("post_check", SyntaxWarning, stacklevel=1)
-    assert any(issubclass(w.category, SyntaxWarning) for w in post_rec)
 
     clear_dataflow_cache()
     many_lines = (
@@ -1442,12 +1423,20 @@ def test_concurrent_suppress_syntax_warnings_and_stmt_deltas_cap(
         mod_tree=big_tree,
         use_stmt_deltas=True,
     )
-    assert info is not None
+    assert info.pre_bound == frozenset({"x"})
+    assert info.pre_unbound == frozenset()
     stmt_deltas = _scope_cell_info_cache.get(
         _ScopeCacheKey(big_fn, "stmt_deltas", aux_ast_nodes=(big_tree,))
     )
     assert isinstance(stmt_deltas, dict)
     assert len(stmt_deltas) == _MAX_STMT_DELTAS_PER_FN
+    assert all(
+        isinstance(k, tuple)
+        and len(k) == 2
+        and k[0] in big_fn.body
+        and isinstance(k[1], bool)
+        for k in stmt_deltas
+    )
 
     orig_apply = trav_mod._try_apply_cached_stmt_delta
     pass2_hits = 0
@@ -1466,30 +1455,10 @@ def test_concurrent_suppress_syntax_warnings_and_stmt_deltas_cap(
         mod_tree=big_tree,
         use_stmt_deltas=True,
     )
-    assert info2 is not None
+    assert info2.pre_bound == frozenset({"x"})
+    assert info2.pre_unbound == frozenset()
     assert len(stmt_deltas) == _MAX_STMT_DELTAS_PER_FN
     assert pass2_hits >= _MAX_STMT_DELTAS_PER_FN - 10
-
-
-def test_suppress_syntax_warnings_copy_on_write_and_nan_cache_key_equality() -> None:
-    """Verifies _suppress_syntax_warnings uses catch_warnings copy-on-write and _ScopeCacheKey handles NaN."""
-    import warnings
-    from pydoppelgangerhunt.fixer._df_cache import (
-        _ScopeCacheKey,
-        _suppress_syntax_warnings,
-    )
-
-    outer_filters_ref = warnings.filters
-    outer_snapshot = list(outer_filters_ref)
-    with _suppress_syntax_warnings():
-        inner_filters_ref = warnings.filters
-        assert inner_filters_ref is not outer_filters_ref
-        assert outer_filters_ref == outer_snapshot
-        with _suppress_syntax_warnings():
-            assert warnings.filters is inner_filters_ref
-        assert warnings.filters is inner_filters_ref
-    assert list(warnings.filters) == outer_snapshot
-    assert outer_filters_ref == outer_snapshot
 
     owner = ast.parse("x = 1\n")
     k_nan_1 = _ScopeCacheKey(
@@ -1523,29 +1492,6 @@ def test_public_evict_tree_scopes_invalidates_mutated_ast_caches() -> None:
     evict_tree_scopes(tree)
     intervals_after = _get_tree_scope_intervals(tree)
     assert intervals_after[0][:2] == (10, 20)
-
-
-def test_suppress_syntax_warnings_exception_and_nested_thread_restoration() -> None:
-    """Verifies _suppress_syntax_warnings restores filters and active count across nested calls and exceptions."""
-    import warnings
-    from pydoppelgangerhunt.fixer._df_cache import (
-        _suppress_syntax_warnings,
-        _syntax_warning_active_count,
-    )
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("always", UserWarning)
-        baseline_filters = list(warnings.filters)
-
-        with pytest.raises(RuntimeError, match="simulated parse failure"):
-            with _suppress_syntax_warnings():
-                assert _syntax_warning_active_count[0] == 1
-                with _suppress_syntax_warnings():
-                    assert _syntax_warning_active_count[0] == 2
-                    raise RuntimeError("simulated parse failure")
-
-        assert _syntax_warning_active_count[0] == 0
-        assert list(warnings.filters) == baseline_filters
 
 
 def test_make_scope_ctx_cache_key_rejects_mutable_extra_params() -> None:
@@ -1663,12 +1609,21 @@ def test_ast_immutability_fingerprint_and_unavailable_source_closure_mode(
     assert fn not in _scope_stmts_by_start
     assert fn not in _scope_stmts_by_end
 
+    # Production mode (default): mutation refreshes cached result without raising.
+    prod_mod = ast.parse("x = 1\n")
+    prod_ck = _ScopeCacheKey(prod_mod, "fp_prod_test")
+    assert _get_or_compute_scope_cached(_scope_cell_info_cache, prod_ck, lambda: ("p1",)) == ("p1",)
+    prod_mod.body.append(ast.Pass())
+    assert _get_or_compute_scope_cached(_scope_cell_info_cache, prod_ck, lambda: ("p2",)) == ("p2",)
+    _evict_tree_scopes(prod_mod)
+
+    # Debug mode: enabling before caching causes in-place mutation to raise RuntimeError.
     mut_mod = ast.parse("x = 1\n")
     ck = _ScopeCacheKey(mut_mod, "fp_test")
-    _get_or_compute_scope_cached(_scope_cell_info_cache, ck, lambda: ("v1",))
-    mut_mod.body.append(ast.Pass())
     _debug_ast_immutability[0] = True
     try:
+        _get_or_compute_scope_cached(_scope_cell_info_cache, ck, lambda: ("v1",))
+        mut_mod.body.append(ast.Pass())
         with pytest.raises(
             RuntimeError,
             match="Cached AST node was mutated in-place without calling evict_tree_scopes",
@@ -1676,6 +1631,7 @@ def test_ast_immutability_fingerprint_and_unavailable_source_closure_mode(
             _get_or_compute_scope_cached(_scope_cell_info_cache, ck, lambda: ("v2",))
     finally:
         _debug_ast_immutability[0] = False
+        _evict_tree_scopes(mut_mod)
     assert _get_or_compute_scope_cached(
         _scope_cell_info_cache, ck, lambda: ("v2",)
     ) == ("v2",)
@@ -2083,7 +2039,9 @@ def test_oversized_module_parent_map_built_once_across_repeated_lookups(
     assert df_cache_mod._tree_contains_scope_node(big_tree, detached_stmt) is False
     anc_map = df_cache_mod._get_scope_ancestor_map(big_tree)
     assert anc_map.get(fn0) is big_tree
-    assert df_cache_mod._get_cached_tree_source_lines(inner_stmt) is not None
+    assert df_cache_mod._get_cached_tree_source_lines(inner_stmt) == tuple(
+        src.splitlines()
+    )
 
     assert big_tree not in df_cache_mod._scope_parent_maps
     assert build_calls == 1
@@ -2163,45 +2121,12 @@ def test_ephemeral_unit_ast_unified_tracking_and_non_weakref_fallback(
     assert custom_mod not in df_cache_mod._scope_parent_maps
 
 
-@pytest.mark.parametrize("sim_version", [(3, 11, 18), (3, 12, 0)])
-def test_suppress_syntax_warnings_fast_path_respects_preceding_error_filters(
-    monkeypatch: pytest.MonkeyPatch,
-    sim_version: tuple[int, int, int],
-) -> None:
-    """Verifies _filters_already_ignore_syntax_warnings fast-paths unconditional ignores but not shadowed error rules."""
-    import warnings
-    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
-    from pydoppelgangerhunt.fixer._df_cache import (
-        _filters_already_ignore_syntax_warnings,
-        _suppress_syntax_warnings,
-    )
-
-    monkeypatch.setattr(df_cache_mod.sys, "version_info", sim_version)
-    with warnings.catch_warnings():
-        if sim_version < (3, 12):
-            warnings.simplefilter("default", DeprecationWarning)
-            warnings.simplefilter("ignore", SyntaxWarning)
-            assert _filters_already_ignore_syntax_warnings() is False
-            warnings.simplefilter("ignore", DeprecationWarning)
-        else:
-            warnings.simplefilter("ignore", SyntaxWarning)
-        assert _filters_already_ignore_syntax_warnings() is True
-
-    with warnings.catch_warnings():
-        if sim_version < (3, 12):
-            warnings.simplefilter("ignore", DeprecationWarning)
-        warnings.simplefilter("ignore", SyntaxWarning)
-        warnings.simplefilter("error", SyntaxWarning)
-        warnings.simplefilter("error", DeprecationWarning)
-        assert _filters_already_ignore_syntax_warnings() is False
-        with _suppress_syntax_warnings():
-            parsed = ast.parse(r"s = '\d+'")
-            assert isinstance(parsed, ast.Module)
-
-
 def test_interior_ast_mutation_detected_without_header_change() -> None:
-    """Verifies mutating an interior expression inside a cached AST raises RuntimeError without evict_tree_scopes."""
-    from pydoppelgangerhunt.fixer._df_cache import evict_tree_scopes
+    """Verifies mutating an interior expression inside a cached AST refreshes in prod mode and raises RuntimeError in debug mode."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _debug_ast_immutability,
+        evict_tree_scopes,
+    )
 
     src = (
         "def compute(x):\n"
@@ -2209,7 +2134,6 @@ def test_interior_ast_mutation_detected_without_header_change() -> None:
         "    b = a * 2\n"
         "    return b\n"
     )
-    tree = ast.parse(src)
     unit = {
         "start": 2,
         "end": 3,
@@ -2217,19 +2141,38 @@ def test_interior_ast_mutation_detected_without_header_change() -> None:
         "source_text": src,
         "source_code": "    a = x + 1\n    b = a * 2\n",
     }
-    sc1 = inspect_single_unit_scope(unit, tree=tree)
-    assert sc1["is_control_flow_safe"] is True
 
-    # Mutate deep interior constant in middle statement without altering header or first/last stmt identity
-    fn = tree.body[0]
-    assert isinstance(fn, ast.FunctionDef)
-    mid_assign = fn.body[1]
-    assert isinstance(mid_assign, ast.Assign) and isinstance(mid_assign.value, ast.BinOp)
-    assert isinstance(mid_assign.value.right, ast.Constant)
-    mid_assign.value.right.value = 99
+    prod_tree = ast.parse(src)
+    assert inspect_single_unit_scope(unit, tree=prod_tree)["is_control_flow_safe"] is True
+    prod_fn = prod_tree.body[0]
+    assert isinstance(prod_fn, ast.FunctionDef)
+    prod_assign = prod_fn.body[1]
+    assert isinstance(prod_assign, ast.Assign) and isinstance(prod_assign.value, ast.BinOp)
+    assert isinstance(prod_assign.value.right, ast.Constant)
+    prod_assign.value.right.value = 99
+    assert inspect_single_unit_scope(unit, tree=prod_tree)["is_control_flow_safe"] is True
+    evict_tree_scopes(prod_tree)
 
-    with pytest.raises(RuntimeError, match="Cached AST node was mutated in-place"):
-        inspect_single_unit_scope(unit, tree=tree)
+    tree = ast.parse(src)
+    prev_dbg = _debug_ast_immutability[0]
+    _debug_ast_immutability[0] = True
+    try:
+        sc1 = inspect_single_unit_scope(unit, tree=tree)
+        assert sc1["is_control_flow_safe"] is True
+
+        # Mutate deep interior constant in middle statement without altering header or first/last stmt identity
+        fn = tree.body[0]
+        assert isinstance(fn, ast.FunctionDef)
+        mid_assign = fn.body[1]
+        assert isinstance(mid_assign, ast.Assign) and isinstance(mid_assign.value, ast.BinOp)
+        assert isinstance(mid_assign.value.right, ast.Constant)
+        mid_assign.value.right.value = 99
+
+        with pytest.raises(RuntimeError, match="Cached AST node was mutated in-place"):
+            inspect_single_unit_scope(unit, tree=tree)
+    finally:
+        _debug_ast_immutability[0] = prev_dbg
+        evict_tree_scopes(tree)
 
     evict_tree_scopes(tree)
     unit_updated = {
@@ -2320,28 +2263,18 @@ def test_oversized_scope_context_unpins_parent_map_and_weakref_attachment(
     assert ctx.parent_map.get(fn.body[0]) is fn
 
     entry = df_cache_mod._oversized_scope_parent_maps[mod]
-    assert isinstance(entry.attached_nodes, weakref.WeakSet)
+    assert not hasattr(entry, "attached_nodes")
+    assert isinstance(entry.weak_parent_map, df_cache_mod._WeakParentMap)
+    assert fn.body[0] in entry.weak_parent_map
+    assert df_cache_mod._oversized_entry_contains_node(mod, entry, fn.body[0]) is True
+    assert df_cache_mod._oversized_entry_contains_node(mod, entry, ast.Pass()) is False
     detached_stmt = fn.body.pop(1)
+    assert detached_stmt in entry.weak_parent_map
     stmt_ref = weakref.ref(detached_stmt)
     del detached_stmt
     gc.collect()
     assert stmt_ref() is None
 
-
-def test_syntax_warning_fast_path_requires_deprecation_warning_before_py312(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Verifies Python <3.12 requires both SyntaxWarning and DeprecationWarning ignored for fast path."""
-    import warnings
-    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
-
-    monkeypatch.setattr(df_cache_mod.sys, "version_info", (3, 11, 9))
-    with warnings.catch_warnings():
-        warnings.simplefilter("default", DeprecationWarning)
-        warnings.simplefilter("ignore", SyntaxWarning)
-        assert df_cache_mod._filters_already_ignore_syntax_warnings() is False
-        warnings.simplefilter("ignore", DeprecationWarning)
-        assert df_cache_mod._filters_already_ignore_syntax_warnings() is True
 
 
 def test_ephemeral_unit_ast_context_handles_non_weakrefable_custom_ast(
@@ -2595,16 +2528,26 @@ def test_tree_raw_source_cache_weakref_and_lru_eviction_releases_trees() -> None
     clear_dataflow_cache()
     cap = df_cache_mod._SCOPE_CACHE_KIND_CAPS["tree_source_lines"]
     reg_refs: list[weakref.ReferenceType[ast.Module]] = []
+    seen_populated = False
     for idx in range(cap + 16):
         src = f"def fn_{idx}(x):\n    y = x + {idx}\n    return y\n"
         caller_tree = ast.parse(src)
         reg_refs.append(weakref.ref(caller_tree))
-        df_cache_mod._register_tree_source_lines(caller_tree, src)
+        df_cache_mod._register_tree_source_lines(caller_tree, source_text=src)
+        if len(df_cache_mod._tree_raw_source_cache) > 0:
+            seen_populated = True
         del caller_tree
 
     gc.collect()
+    assert seen_populated
+    assert 0 < len(df_cache_mod._tree_raw_source_cache) <= cap
     assert reg_refs[0]() is None
-    assert len(df_cache_mod._tree_raw_source_cache) <= cap
+
+    # Negative control: bare str/bytes for source_lines must fail loudly
+    bad_tree = ast.parse("def bad_arg():\n    return 1\n")
+    for raw_bad in ("def bad_arg():\n    return 1\n", b"def bad_arg():\n    return 1\n"):
+        with pytest.raises(TypeError, match="source_lines"):
+            df_cache_mod._register_tree_source_lines(bad_tree, raw_bad)  # type: ignore[arg-type]
 
 
 def test_batch_entrypoints_outer_syntax_warning_guard_preserves_warning_registry(
@@ -2680,6 +2623,7 @@ def test_fingerprint_horizon_deep_ast_mutation_in_production_and_debug_modes() -
     assert isinstance(prod_ret.value.func, ast.Attribute)
     assert isinstance(prod_ret.value.args[0], ast.Name)
 
+    prev_debug = df_cache_mod._debug_ast_immutability[0]
     df_cache_mod._debug_ast_immutability[0] = False
     try:
         initial_reads = _extract_cached_scope_free_reads(prod_inner)
@@ -2728,7 +2672,7 @@ def test_fingerprint_horizon_deep_ast_mutation_in_production_and_debug_modes() -
             {"obj", "first_var"}
         )
     finally:
-        df_cache_mod._debug_ast_immutability[0] = False
+        df_cache_mod._debug_ast_immutability[0] = prev_debug
 
 
 def test_evict_tree_scopes_purges_all_eight_cache_categories_selectively() -> None:
@@ -2900,109 +2844,6 @@ def test_evict_tree_scopes_purges_all_eight_cache_categories_selectively() -> No
     assert all(post_b.values()), post_b
 
 
-def test_suppress_syntax_warnings_concurrency_lock_and_already_ignored_fast_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Verifies _suppress_syntax_warnings serializes active mutations and runs concurrently when already ignored."""
-    from concurrent.futures import ThreadPoolExecutor
-    import sys
-    from types import SimpleNamespace
-    import warnings
-
-    from pydoppelgangerhunt.fixer import _df_cache as df_cache_mod
-
-    flags_attrs = {
-        name: getattr(sys.flags, name)
-        for name in dir(sys.flags)
-        if not name.startswith("_") and isinstance(getattr(sys.flags, name), int)
-    }
-    flags_attrs["context_aware_warnings"] = 0
-    monkeypatch.setattr(sys, "flags", SimpleNamespace(**flags_attrs))
-
-    # 1. Slow path (SyntaxWarning not yet ignored): lock prevents overlapping filter mutations
-    with warnings.catch_warnings():
-        warnings.resetwarnings()
-        inside_count = 0
-        max_inside = 0
-        count_lock = threading.Lock()
-        first_entered = threading.Event()
-
-        def _slow_worker(wait_for_first: bool) -> bool:
-            nonlocal inside_count, max_inside
-            if wait_for_first:
-                assert first_entered.wait(timeout=5.0)
-            with df_cache_mod._suppress_syntax_warnings():
-                first_entered.set()
-                with count_lock:
-                    inside_count += 1
-                    max_inside = max(max_inside, inside_count)
-                threading.Event().wait(0.05)
-                with count_lock:
-                    inside_count -= 1
-                return True
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            fut_a = pool.submit(_slow_worker, False)
-            fut_b = pool.submit(_slow_worker, True)
-            assert fut_a.result(timeout=5.0) is True
-            assert fut_b.result(timeout=5.0) is True
-
-        assert max_inside == 1
-        assert not any(
-            action == "ignore" and category is SyntaxWarning
-            for action, _msg, category, _mod, _ln in warnings.filters
-        )
-
-    # 2. Fast path (SyntaxWarning, plus DeprecationWarning on <3.12, already ignored):
-    # concurrent callers do NOT block on lock
-    with warnings.catch_warnings():
-        warnings.resetwarnings()
-        warnings.simplefilter("ignore", SyntaxWarning)
-        if sys.version_info < (3, 12):
-            warnings.simplefilter("ignore", DeprecationWarning)
-        barrier = threading.Barrier(2, timeout=3.0)
-
-        def _fast_worker() -> int:
-            with df_cache_mod._suppress_syntax_warnings():
-                return barrier.wait()
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            fa = pool.submit(_fast_worker)
-            fb = pool.submit(_fast_worker)
-            results = sorted((fa.result(timeout=5.0), fb.result(timeout=5.0)))
-        assert results == [0, 1]
-
-
-@pytest.mark.parametrize(
-    ("version_info", "ignore_deprecation", "expected"),
-    [
-        ((3, 11, 9), False, False),
-        ((3, 11, 9), True, True),
-        ((3, 12, 0), False, True),
-        ((3, 12, 0), True, True),
-    ],
-)
-def test_filters_already_ignore_syntax_warnings_version_requirements(
-    monkeypatch: pytest.MonkeyPatch,
-    version_info: tuple[int, int, int],
-    ignore_deprecation: bool,
-    expected: bool,
-) -> None:
-    """Verifies Python <3.12 requires DeprecationWarning ignored alongside SyntaxWarning."""
-    import sys
-    import warnings
-
-    from pydoppelgangerhunt.fixer import _df_cache as df_cache_mod
-
-    monkeypatch.setattr(sys, "version_info", version_info)
-    with warnings.catch_warnings():
-        warnings.resetwarnings()
-        warnings.simplefilter("ignore", SyntaxWarning)
-        if ignore_deprecation:
-            warnings.simplefilter("ignore", DeprecationWarning)
-        assert df_cache_mod._filters_already_ignore_syntax_warnings() is expected
-
-
 def test_evict_tree_scopes_evicts_oversized_ast_from_interior_stmt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3058,3 +2899,1291 @@ def test_evict_tree_scopes_evicts_oversized_ast_from_interior_stmt(
         df_cache_mod._key_references_scope_nodes(k, {other_tree, other_fn})
         for k in df_cache_mod._scope_closures_cache
     )
+
+
+def test_ast_fingerprint_detects_excephandler_name_and_keyword_arg_mutations() -> None:
+    """Verifies ExceptHandler.name and keyword.arg mutations raise in debug mode, refresh in prod, and survive prod-to-debug switches."""
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _extract_cached_scope_free_reads,
+    )
+
+    clear_dataflow_cache()
+    src = (
+        "def outer(fn, handler_flag):\n"
+        "    alpha = 1\n"
+        "    beta = 2\n"
+        "    def inner():\n"
+        "        try:\n"
+        "            val = fn(alpha=alpha)\n"
+        "        except ValueError as err_a:\n"
+        "            val = handler_flag(err_a)\n"
+        "        return val\n"
+        "    return inner\n"
+    )
+
+    # 1. Debug mode detects keyword.arg and ExceptHandler.name mutations via RuntimeError
+    dbg_tree = ast.parse(src)
+    dbg_outer = dbg_tree.body[0]
+    assert isinstance(dbg_outer, ast.FunctionDef)
+    dbg_inner = dbg_outer.body[2]
+    assert isinstance(dbg_inner, ast.FunctionDef)
+    try_stmt = dbg_inner.body[0]
+    assert isinstance(try_stmt, ast.Try)
+    try_assign = try_stmt.body[0]
+    assert isinstance(try_assign, ast.Assign) and isinstance(try_assign.value, ast.Call)
+    kw_node = try_assign.value.keywords[0]
+    handler_node = try_stmt.handlers[0]
+
+    prev_dbg = df_cache_mod._debug_ast_immutability[0]
+    df_cache_mod._debug_ast_immutability[0] = True
+    try:
+        assert _extract_cached_scope_free_reads(dbg_inner) == frozenset(
+            {"fn", "alpha", "ValueError", "handler_flag"}
+        )
+        kw_node.arg = "beta"
+        with pytest.raises(RuntimeError, match="Cached AST node was mutated in-place"):
+            _extract_cached_scope_free_reads(dbg_inner)
+        df_cache_mod.evict_tree_scopes(dbg_tree)
+        assert _extract_cached_scope_free_reads(dbg_inner) == frozenset(
+            {"fn", "alpha", "ValueError", "handler_flag"}
+        )
+
+        handler_node.name = "err_b"
+        with pytest.raises(RuntimeError, match="Cached AST node was mutated in-place"):
+            _extract_cached_scope_free_reads(dbg_inner)
+    finally:
+        df_cache_mod._debug_ast_immutability[0] = prev_dbg
+        df_cache_mod.evict_tree_scopes(dbg_tree)
+
+    # 2. Production mode refreshes silently on mutation, and switching prod -> debug never spuriously raises
+    prod_tree = ast.parse(src)
+    prod_outer = prod_tree.body[0]
+    assert isinstance(prod_outer, ast.FunctionDef)
+    prod_inner = prod_outer.body[2]
+    assert isinstance(prod_inner, ast.FunctionDef)
+    prod_try = prod_inner.body[0]
+    assert isinstance(prod_try, ast.Try)
+    prod_call = prod_try.body[0]
+    assert isinstance(prod_call, ast.Assign) and isinstance(prod_call.value, ast.Call)
+    prod_kw = prod_call.value.keywords[0]
+    prod_handler = prod_try.handlers[0]
+
+    ck = df_cache_mod._ScopeCacheKey(prod_inner, "excep_kw_fp_test")
+    df_cache_mod._debug_ast_immutability[0] = False
+    try:
+        assert df_cache_mod._get_or_compute_scope_cached(
+            df_cache_mod._scope_cell_info_cache, ck, lambda: ("v1",)
+        ) == ("v1",)
+        prod_kw.arg = "gamma"
+        assert df_cache_mod._get_or_compute_scope_cached(
+            df_cache_mod._scope_cell_info_cache, ck, lambda: ("v2",)
+        ) == ("v2",)
+
+        # Mode transition (False -> True) refreshes rather than raising false RuntimeError
+        prod_handler.name = "err_c"
+        df_cache_mod._debug_ast_immutability[0] = True
+        assert df_cache_mod._get_or_compute_scope_cached(
+            df_cache_mod._scope_cell_info_cache, ck, lambda: ("v3",)
+        ) == ("v3",)
+    finally:
+        df_cache_mod._debug_ast_immutability[0] = prev_dbg
+        df_cache_mod.evict_tree_scopes(prod_tree)
+
+
+def test_df_cache_deep_mutation_interior_swap_and_selective_eviction() -> None:
+    """Verifies deep expr mutation, same-shape interior swap, detachment, and targeted tree eviction."""
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+    from pydoppelgangerhunt.fixer._df_cell_traversal import _extract_cached_scope_free_reads
+
+    clear_dataflow_cache()
+    src_main = (
+        "def outer(items):\n"
+        "    def inner(seq):\n"
+        "        return [seq[alpha:] for x in items if ok_flag]\n"
+        "    x = init1\n"
+        "    return inner\n"
+    )
+    src_other = "def other_fn(items):\n    return [keep_var for _ in items]\n"
+
+    mod_main = ast.parse(src_main)
+    mod_other = ast.parse(src_other)
+    outer_fn = mod_main.body[0]
+    assert isinstance(outer_fn, ast.FunctionDef)
+    inner_fn = outer_fn.body[0]
+    assert isinstance(inner_fn, ast.FunctionDef)
+    other_fn = mod_other.body[0]
+    assert isinstance(other_fn, ast.FunctionDef)
+
+    # Seed both trees cleanly
+    assert _extract_cached_scope_free_reads(other_fn) == frozenset({"keep_var"})
+    assert _extract_cached_scope_free_reads(inner_fn) == frozenset(
+        {"alpha", "items", "ok_flag"}
+    )
+
+    # 1. Deep nested expression mutation (Subscript slice Name inside ListComp)
+    ret = inner_fn.body[0]
+    assert isinstance(ret, ast.Return) and isinstance(ret.value, ast.ListComp)
+    sub = ret.value.elt
+    assert isinstance(sub, ast.Subscript) and isinstance(sub.slice, ast.Slice)
+    assert isinstance(sub.slice.lower, ast.Name)
+
+    prev_dbg = df_cache_mod._debug_ast_immutability[0]
+    df_cache_mod._debug_ast_immutability[0] = True
+    try:
+        # Switching debug immutability mode on after prod seeding re-fingerprints cleanly without false positives.
+        assert _extract_cached_scope_free_reads(inner_fn) == frozenset(
+            {"alpha", "items", "ok_flag"}
+        )
+        sub.slice.lower.id = "omega"
+        with pytest.raises(RuntimeError, match="Cached AST node was mutated in-place"):
+            _extract_cached_scope_free_reads(inner_fn)
+    finally:
+        df_cache_mod._debug_ast_immutability[0] = False
+
+    # Production mode refreshes silently on deep mutation
+    assert _extract_cached_scope_free_reads(inner_fn) == frozenset(
+        {"omega", "items", "ok_flag"}
+    )
+
+    # 2. Interior statement replacement with identical body length and identical coordinates
+    assert _extract_cached_scope_free_reads(outer_fn) == frozenset(
+        {"init1", "ok_flag", "omega"}
+    )
+    orig_assign = outer_fn.body[1]
+    assert isinstance(orig_assign, ast.Assign)
+    new_assign = ast.Assign(
+        targets=[ast.Name(id="x", ctx=ast.Store())],
+        value=ast.Name(id="init2", ctx=ast.Load()),
+    )
+    ast.copy_location(new_assign, orig_assign)
+    ast.copy_location(new_assign.targets[0], orig_assign.targets[0])
+    ast.copy_location(new_assign.value, orig_assign.value)
+    outer_fn.body[1] = new_assign
+    assert _extract_cached_scope_free_reads(outer_fn) == frozenset(
+        {"init2", "ok_flag", "omega"}
+    )
+
+    # 3. Selective eviction removes mod_main scopes (including detached inner_fn) while retaining mod_other scopes
+    df_cache_mod._debug_ast_immutability[0] = prev_dbg
+    detached = outer_fn.body.pop(0)
+    assert isinstance(detached, ast.FunctionDef)
+    df_cache_mod.evict_tree_scopes(mod_main)
+    cached_owners = {
+        k.owner
+        for k in df_cache_mod._scope_cell_info_cache
+        if isinstance(k, df_cache_mod._ScopeCacheKey)
+    }
+    assert other_fn in cached_owners
+    assert outer_fn not in cached_owners
+    assert inner_fn not in cached_owners
+    clear_dataflow_cache()
+
+
+def test_df_cache_concurrent_workers_and_nested_cm_delta_modes() -> None:
+    """Verifies thread-safe concurrent scope inspection under eviction and per-mode nested CM delta isolation."""
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+
+    clear_dataflow_cache()
+    src = (
+        "import contextlib\n"
+        "def run(CustomLock, compute):\n"
+        "    with contextlib.nullcontext():\n"
+        "        with CustomLock():\n"
+        "            val = compute()\n"
+        "    cb = lambda: val\n"
+        "    return cb()\n"
+    )
+    src_sup = (
+        "import contextlib\n"
+        "def run(flag, compute):\n"
+        "    with contextlib.nullcontext():\n"
+        "        with contextlib.suppress(ValueError):\n"
+        "            val = compute()\n"
+        "    cb = lambda: val\n"
+        "    return cb()\n"
+    )
+    shared_tree = ast.parse(src)
+    sup_tree = ast.parse(src_sup)
+    unrelated_tree = ast.parse("def u():\n    return 1\n")
+    unit = {
+        "name": "run:cb",
+        "start": 6,
+        "end": 6,
+        "kind": "basic_block",
+        "source_text": src,
+        "closure_strictness": "pedantic",
+    }
+
+    # Verify nested CM modes remain isolated across repeated cached analyses
+    results_by_mode: dict[str, bool] = {}
+    for mode in ("lenient", "strict", "pedantic"):
+        sc = inspect_single_unit_scope({**unit, "closure_strictness": mode}, tree=shared_tree)
+        results_by_mode[mode] = bool(sc["is_control_flow_safe"])
+    assert results_by_mode == {"lenient": True, "strict": True, "pedantic": False}
+
+    sup_unit = {**unit, "source_text": src_sup}
+    sup_results: dict[str, bool] = {}
+    for mode in ("lenient", "strict", "pedantic"):
+        sc_sup = inspect_single_unit_scope({**sup_unit, "closure_strictness": mode}, tree=sup_tree)
+        sup_results[mode] = bool(sc_sup["is_control_flow_safe"])
+    assert sup_results == {"lenient": False, "strict": False, "pedantic": False}
+
+    # Concurrent threads inspecting shared_tree while evicting/clearing cache
+    num_workers = 6
+    barrier = threading.Barrier(num_workers)
+    worker_errors: list[BaseException] = []
+    worker_outputs: list[tuple[str, bool]] = []
+    out_lock = threading.Lock()
+
+    def _worker(idx: int) -> None:
+        try:
+            barrier.wait(timeout=5)
+            for step in range(8):
+                mode = ("strict", "pedantic", "lenient")[(idx + step) % 3]
+                sc_w = inspect_single_unit_scope(
+                    {**unit, "closure_strictness": mode},
+                    tree=shared_tree,
+                )
+                with out_lock:
+                    worker_outputs.append((mode, bool(sc_w["is_control_flow_safe"])))
+                if step % 3 == 0:
+                    df_cache_mod.evict_tree_scopes(unrelated_tree)
+                elif idx == 0 and step == 4:
+                    clear_dataflow_cache()
+        except BaseException as exc:  # pragma: no cover - captured for re-raise
+            with out_lock:
+                worker_errors.append(exc)
+
+    threads = [threading.Thread(target=_worker, args=(i,)) for i in range(num_workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert all(not t.is_alive() for t in threads)
+    if worker_errors:
+        raise worker_errors[0]
+    assert len(worker_outputs) == num_workers * 8
+    for mode, is_safe in worker_outputs:
+        assert is_safe is (mode != "pedantic"), (mode, is_safe)
+    clear_dataflow_cache()
+
+
+def test_evict_tree_scopes_evicts_detached_with_stmt_on_oversized_ast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies evict_tree_scopes removes detached non-scope ast.With summaries attached to oversized parent maps."""
+    from pydoppelgangerhunt.fixer import _df_cache as df_cache_mod
+
+    clear_dataflow_cache()
+    monkeypatch.setattr(df_cache_mod, "_MAX_PARENT_MAP_TOTAL_NODES", 20)
+
+    filler = "\n".join(f"    v_{i} = {i}" for i in range(15))
+    target_src = (
+        "def run_oversized(ctx, item):\n"
+        f"{filler}\n"
+        "    with ctx() as val:\n"
+        "        res = val + item\n"
+        "    cb = lambda: res\n"
+        "    return cb()\n"
+    )
+    other_src = (
+        "def run_other(ctx, item):\n"
+        "    with ctx() as val:\n"
+        "        res = val + item\n"
+        "    cb = lambda: res\n"
+        "    return cb()\n"
+    )
+    target_tree = df_cache_mod._get_or_parse_tree(target_src)
+    other_tree = df_cache_mod._get_or_parse_tree(other_src)
+    assert isinstance(target_tree, ast.Module)
+    assert isinstance(other_tree, ast.Module)
+    outer_fn = target_tree.body[0]
+    other_fn = other_tree.body[0]
+    assert isinstance(outer_fn, ast.FunctionDef)
+    assert isinstance(other_fn, ast.FunctionDef)
+    with_target = next(s for s in outer_fn.body if isinstance(s, ast.With))
+    with_other = next(s for s in other_fn.body if isinstance(s, ast.With))
+
+    cb_line = next(
+        idx for idx, ln in enumerate(target_src.splitlines(), start=1) if "cb = lambda" in ln
+    )
+    other_cb_line = next(
+        idx for idx, ln in enumerate(other_src.splitlines(), start=1) if "cb = lambda" in ln
+    )
+    inspect_single_unit_scope(
+        {
+            "name": "run_oversized:cb",
+            "start": cb_line,
+            "end": cb_line,
+            "kind": "basic_block",
+            "source_text": target_src,
+            "closure_strictness": "pedantic",
+        },
+        tree=target_tree,
+    )
+    inspect_single_unit_scope(
+        {
+            "name": "run_other:cb",
+            "start": other_cb_line,
+            "end": other_cb_line,
+            "kind": "basic_block",
+            "source_text": other_src,
+            "closure_strictness": "pedantic",
+        },
+        tree=other_tree,
+    )
+    assert target_tree in df_cache_mod._oversized_scope_parent_maps
+    assert with_target in df_cache_mod._stmt_with_summary_cache
+    assert with_other in df_cache_mod._stmt_with_summary_cache
+
+    # Detach with_target from outer_fn before evicting target_tree
+    outer_fn.body = [s for s in outer_fn.body if s is not with_target]
+    df_cache_mod.evict_tree_scopes(target_tree)
+
+    assert target_tree not in df_cache_mod._oversized_scope_parent_maps
+    assert with_target not in df_cache_mod._stmt_with_summary_cache
+    assert with_other in df_cache_mod._stmt_with_summary_cache
+    clear_dataflow_cache()
+
+
+def test_register_tree_source_lines_computes_sha256_outside_downstream_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies _register_tree_source_lines releases _downstream_cache_lock before computing raw digest SHA-256."""
+    from pydoppelgangerhunt.fixer import _df_cache as df_cache_mod
+
+    clear_dataflow_cache()
+    src = "def alpha(x):\n    return x + 1\n"
+    tree = ast.parse(src)
+    orig_resolve = df_cache_mod._resolve_raw_text_digest
+    observed_lock_free: list[bool] = []
+    worker_errors: list[BaseException] = []
+
+    def _spy_resolve(
+        raw_text: str, source_digest: object = None
+    ) -> object:
+        probe_res: list[bool] = []
+
+        def _probe_lock() -> None:
+            try:
+                acquired = df_cache_mod._downstream_cache_lock.acquire(blocking=False)
+                if acquired:
+                    df_cache_mod._downstream_cache_lock.release()
+                probe_res.append(acquired)
+            except BaseException as exc:  # pragma: no cover
+                worker_errors.append(exc)
+
+        probe_thread = threading.Thread(target=_probe_lock)
+        probe_thread.start()
+        probe_thread.join(timeout=5)
+        assert not probe_thread.is_alive()
+        observed_lock_free.extend(probe_res)
+        return orig_resolve(raw_text, source_digest)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(df_cache_mod, "_resolve_raw_text_digest", _spy_resolve)
+
+    # First registration populates _tree_raw_source_cache; second registration hits hash/len check and refreshes digest
+    df_cache_mod._register_tree_source_lines(tree, source_text=src)
+    df_cache_mod._tree_raw_source_cache[tree] = (hash(src), len(src), "stale_digest")
+    df_cache_mod._register_tree_source_lines(tree, source_text=src)
+
+    assert not worker_errors
+    assert len(observed_lock_free) == 2
+    assert all(observed_lock_free)
+
+    # Concurrent registrations remain consistent without deadlocks
+    trees = [ast.parse(f"def fn_{idx}(x):\n    return x + {idx}\n") for idx in range(8)]
+    srcs = [f"def fn_{idx}(x):\n    return x + {idx}\n" for idx in range(8)]
+    concurrent_errors: list[BaseException] = []
+
+    def _register_worker(idx: int) -> None:
+        try:
+            for iter_idx in range(4):
+                pos = (idx + iter_idx) % len(trees)
+                df_cache_mod._register_tree_source_lines(trees[pos], source_text=srcs[pos])
+        except BaseException as exc:  # pragma: no cover
+            concurrent_errors.append(exc)
+
+    threads = [threading.Thread(target=_register_worker, args=(i,)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+        assert not t.is_alive()
+    assert not concurrent_errors
+    for t_node, expected_src in zip(trees, srcs):
+        assert df_cache_mod._tree_raw_source_cache[t_node] == (
+            hash(expected_src),
+            len(expected_src),
+            df_cache_mod._resolve_raw_text_digest(expected_src, None),
+        )
+    clear_dataflow_cache()
+
+
+@pytest.mark.parametrize(
+    ("node_budget", "detach_with"),
+    [
+        pytest.param(100000, False, id="normal_ast_live_siblings"),
+        pytest.param(100000, True, id="normal_ast_detached_with"),
+        pytest.param(20, False, id="oversized_ast_live_siblings"),
+        pytest.param(20, True, id="oversized_ast_detached_with"),
+    ],
+)
+def test_evict_tree_scopes_interior_stmt_evicts_enclosing_sibling_scopes_and_stmts(
+    monkeypatch: pytest.MonkeyPatch,
+    node_budget: int,
+    detach_with: bool,
+) -> None:
+    """Verifies evict_tree_scopes(stmt) evicts enclosing sibling scopes/with-statements without flushing unrelated functions."""
+    from pydoppelgangerhunt.fixer import _df_cache as df_cache_mod
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _extract_cached_scope_free_reads,
+    )
+    from pydoppelgangerhunt.fixer._df_closures import _collect_scope_closures
+
+    clear_dataflow_cache()
+    monkeypatch.setattr(df_cache_mod, "_MAX_PARENT_MAP_TOTAL_NODES", node_budget)
+    filler = "\n".join(f"    pad_{idx} = {idx}" for idx in range(10))
+    mod_src = (
+        "def target_outer(ctx, item):\n"
+        "    mut_stmt = item\n"
+        f"{filler}\n"
+        "    with ctx() as val:\n"
+        "        target_res = val + mut_stmt\n"
+        "    def sibling_inner():\n"
+        "        return target_res\n"
+        "    return sibling_inner()\n"
+        "\n"
+        "def unrelated_outer(ctx, other):\n"
+        "    with ctx() as uval:\n"
+        "        other_res = uval + other\n"
+        "    def unrelated_inner():\n"
+        "        return other_res\n"
+        "    return unrelated_inner()\n"
+    )
+    mod_tree = df_cache_mod._get_or_parse_tree(mod_src)
+    assert isinstance(mod_tree, ast.Module)
+    target_outer, unrelated_outer = mod_tree.body
+    assert isinstance(target_outer, ast.FunctionDef)
+    assert isinstance(unrelated_outer, ast.FunctionDef)
+    mut_stmt = target_outer.body[0]
+    target_with = next(s for s in target_outer.body if isinstance(s, ast.With))
+    sibling_inner = next(s for s in target_outer.body if isinstance(s, ast.FunctionDef))
+    unrelated_with = next(s for s in unrelated_outer.body if isinstance(s, ast.With))
+    unrelated_inner = next(
+        s for s in unrelated_outer.body if isinstance(s, ast.FunctionDef)
+    )
+
+    lines = mod_src.splitlines()
+    target_sib_line = next(
+        idx for idx, ln in enumerate(lines, start=1) if "    return sibling_inner()" in ln
+    )
+    unrelated_sib_line = next(
+        idx for idx, ln in enumerate(lines, start=1) if "    return unrelated_inner()" in ln
+    )
+    inspect_single_unit_scope(
+        {
+            "name": "target_outer",
+            "start": target_sib_line,
+            "end": target_sib_line,
+            "kind": "basic_block",
+            "source_text": mod_src,
+            "closure_strictness": "pedantic",
+        },
+        tree=mod_tree,
+    )
+    inspect_single_unit_scope(
+        {
+            "name": "unrelated_outer",
+            "start": unrelated_sib_line,
+            "end": unrelated_sib_line,
+            "kind": "basic_block",
+            "source_text": mod_src,
+            "closure_strictness": "pedantic",
+        },
+        tree=mod_tree,
+    )
+    _collect_scope_closures(sibling_inner, target_outer)
+    _collect_scope_closures(unrelated_inner, unrelated_outer)
+    _extract_cached_scope_free_reads(sibling_inner)
+    _extract_cached_scope_free_reads(unrelated_inner)
+
+    assert target_with in df_cache_mod._stmt_with_summary_cache
+    assert unrelated_with in df_cache_mod._stmt_with_summary_cache
+    assert any(
+        df_cache_mod._key_references_scope_nodes(k, {sibling_inner})
+        for k in df_cache_mod._scope_closures_cache
+    )
+    assert any(
+        df_cache_mod._key_references_scope_nodes(k, {sibling_inner})
+        for k in df_cache_mod._scope_cell_info_cache
+    )
+
+    if detach_with:
+        target_outer.body = [s for s in target_outer.body if s is not target_with]
+    df_cache_mod.evict_tree_scopes(mut_stmt)
+
+    assert target_with not in df_cache_mod._stmt_with_summary_cache
+    assert not any(
+        df_cache_mod._key_references_scope_nodes(k, {target_outer, sibling_inner, mut_stmt})
+        for k in df_cache_mod._scope_closures_cache
+    )
+    assert not any(
+        df_cache_mod._key_references_scope_nodes(k, {target_outer, sibling_inner, mut_stmt})
+        for k in df_cache_mod._scope_cell_info_cache
+    )
+    assert unrelated_with in df_cache_mod._stmt_with_summary_cache
+    assert any(
+        df_cache_mod._key_references_scope_nodes(k, {unrelated_inner})
+        for k in df_cache_mod._scope_closures_cache
+    )
+    assert any(
+        df_cache_mod._key_references_scope_nodes(k, {unrelated_inner})
+        for k in df_cache_mod._scope_cell_info_cache
+    )
+    clear_dataflow_cache()
+
+
+@pytest.mark.parametrize(
+    ("debug_mode", "mutate_ast"),
+    [
+        pytest.param(False, False, id="establishes_baseline_and_reuses_parent_map"),
+        pytest.param(False, True, id="detects_in_place_mutation_and_rebuilds_in_prod"),
+        pytest.param(True, True, id="detects_in_place_mutation_and_raises_in_debug"),
+    ],
+)
+def test_get_scope_parent_map_records_baseline_fingerprint_for_chosen_root(
+    debug_mode: bool,
+    mutate_ast: bool,
+) -> None:
+    """Verifies _get_scope_parent_map establishes a baseline fingerprint when chosen_root lacks one."""
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+
+    clear_dataflow_cache()
+    mod_tree = ast.parse("def target(x):\n    y = x + 1\n    return y\n")
+    fn_node = mod_tree.body[0]
+    assert isinstance(fn_node, ast.FunctionDef)
+
+    prev_debug = df_cache_mod._debug_ast_immutability[0]
+    df_cache_mod._debug_ast_immutability[0] = debug_mode
+    try:
+        df_cache_mod._ensure_scope_owner_parent_map(mod_tree)
+        assert mod_tree in df_cache_mod._scope_parent_maps
+        assert mod_tree in df_cache_mod._cached_scope_fingerprints
+        # Simulate fingerprint-table LRU eviction while chosen_root remains in _scope_parent_maps
+        df_cache_mod._cached_scope_fingerprints.pop(mod_tree, None)
+        assert mod_tree not in df_cache_mod._cached_scope_fingerprints
+
+        pmap_first = df_cache_mod._get_scope_parent_map(fn_node)
+        assert mod_tree in df_cache_mod._cached_scope_fingerprints
+
+        if not mutate_ast:
+            pmap_second = df_cache_mod._get_scope_parent_map(fn_node)
+            assert pmap_second is pmap_first
+        else:
+            fn_node.body[0] = ast.Assign(
+                targets=[ast.Name(id="y", ctx=ast.Store(), lineno=2, col_offset=4)],
+                value=ast.Constant(value=99, lineno=2, col_offset=8),
+                lineno=2,
+                col_offset=4,
+                end_lineno=2,
+                end_col_offset=10,
+            )
+            if debug_mode:
+                with pytest.raises(RuntimeError, match="mutated in-place"):
+                    df_cache_mod._get_scope_parent_map(fn_node)
+            else:
+                pmap_rebuilt = df_cache_mod._get_scope_parent_map(fn_node)
+                assert pmap_rebuilt is not pmap_first
+    finally:
+        df_cache_mod._debug_ast_immutability[0] = prev_debug
+        clear_dataflow_cache()
+
+
+def test_scope_cache_key_tuple_subclass_and_dict_subclass_preservation() -> None:
+    """Verifies _canonical_param_type_key distinguishes tuple subclasses and set_entry_locked preserves dict subclasses."""
+    from typing import NamedTuple
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+
+    class _Pair(NamedTuple):
+        left: int
+        right: int
+
+    class _TrackedCustomDict(dict):
+        def cached_ast_nodes(self) -> tuple[ast.AST, ...]:
+            return ()
+
+    clear_dataflow_cache()
+    owner = ast.parse("def f():\n    return 1\n").body[0]
+
+    direct_sub_key = df_cache_mod._make_trusted_scope_cache_key(
+        owner, "test_pair", (_Pair(1, 2),)
+    )
+    direct_plain_key = df_cache_mod._make_trusted_scope_cache_key(
+        owner, "test_pair", ((1, 2),)
+    )
+    assert direct_sub_key != direct_plain_key
+    assert len({direct_sub_key, direct_plain_key}) == 2
+    assert df_cache_mod._params_type_hash((_Pair(1, 2),)) != df_cache_mod._params_type_hash(((1, 2),))
+
+    fs_sub_key = df_cache_mod._make_trusted_scope_cache_key(
+        owner, "test_pair_fs", (frozenset({_Pair(1, 2)}),)
+    )
+    fs_plain_key = df_cache_mod._make_trusted_scope_cache_key(
+        owner, "test_pair_fs", (frozenset({(1, 2)}),)
+    )
+    assert fs_sub_key != fs_plain_key
+    assert len({fs_sub_key, fs_plain_key}) == 2
+    assert {fs_sub_key: "sub", fs_plain_key: "plain"}[fs_plain_key] == "plain"
+
+    custom_val = _TrackedCustomDict({"a": 1})
+    plain_val = {"a": 1}
+    with df_cache_mod._downstream_cache_lock:
+        stored_custom, ok_custom = df_cache_mod._scope_cell_info_cache.set_entry_locked(
+            direct_sub_key, custom_val
+        )
+        stored_plain, ok_plain = df_cache_mod._scope_cell_info_cache.set_entry_locked(
+            direct_plain_key, plain_val
+        )
+    assert ok_custom is True and ok_plain is True
+    assert type(stored_custom) is _TrackedCustomDict
+    assert isinstance(stored_plain, df_cache_mod._TrackedCachedDict)
+    clear_dataflow_cache()
+
+
+def test_tracked_cached_dict_or_and_lazy_seed_span_caches_thread_safety() -> None:
+    """Verifies concurrent safety of _TrackedCachedDict.__or__, _SpanLineIndex.get_dump, and _LazyModuleStmtSeedMap."""
+    import concurrent.futures
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+    import pydoppelgangerhunt.fixer._df_span_index as span_idx_mod
+    from pydoppelgangerhunt.fixer._df_with_provenance import _build_module_suppress_seed
+
+    clear_dataflow_cache()
+    tracked = df_cache_mod._TrackedCachedDict({"seed": 0})
+    mod_src = "import contextlib\n" + "\n".join(
+        f"cm_{i} = contextlib.nullcontext" for i in range(64)
+    ) + "\n"
+    mod_tree = ast.parse(mod_src)
+    span_idx = span_idx_mod._SpanLineIndex(mod_tree)
+    stmt_nodes = list(mod_tree.body)
+    seed_map = _build_module_suppress_seed(mod_tree).by_top_stmt_id
+
+    def _mutator_worker(worker_id: int) -> int:
+        nonlocal tracked
+        for step in range(40):
+            key = f"k_{worker_id}_{step % 8}"
+            if step % 2 == 0:
+                tracked |= {key: step}
+            else:
+                tracked.pop(key, None)
+        return worker_id
+
+    def _reader_worker(worker_id: int) -> int:
+        for step in range(40):
+            merged = tracked | {"probe": step}
+            assert "seed" in merged
+            stmt = stmt_nodes[(worker_id + step) % len(stmt_nodes)]
+            assert isinstance(span_idx.get_dump(stmt), str)
+            assert seed_map[id(stmt)] is not None
+        return worker_id
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [
+            pool.submit(_mutator_worker if i < 2 else _reader_worker, i)
+            for i in range(6)
+        ]
+        for fut in futures:
+            fut.result()
+    clear_dataflow_cache()
+
+
+def test_large_module_fingerprint_suite_stride_and_session_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies suite sampling bounds large fingerprints and ContextVar sessions deduplicate checks."""
+    import concurrent.futures
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+
+    clear_dataflow_cache()
+    n_stmts = 2500
+    large_src = "\n".join(f"def f_{i}():\n    return {i}" for i in range(n_stmts)) + "\n"
+    mod_tree = ast.parse(large_src)
+
+    # Stride preserves head/tail/length detection in production mode and inspects bounded items
+    fp_base = df_cache_mod._compute_scope_fingerprint(mod_tree)
+    orig_first = mod_tree.body[0]
+    mod_tree.body[0] = ast.FunctionDef(
+        name="f_0_mutated",
+        args=orig_first.args,  # type: ignore[attr-defined]
+        body=orig_first.body,  # type: ignore[attr-defined]
+        decorator_list=[],
+    )
+    assert df_cache_mod._compute_scope_fingerprint(mod_tree) != fp_base
+    mod_tree.body[0] = orig_first
+    assert df_cache_mod._compute_scope_fingerprint(mod_tree) == fp_base
+
+    orig_fn = df_cache_mod._compute_scope_fingerprint
+    fp_calls = [0]
+
+    def _counting_fp(node: ast.AST) -> tuple[Any, ...]:
+        fp_calls[0] += 1
+        return orig_fn(node)
+
+    monkeypatch.setattr(df_cache_mod, "_compute_scope_fingerprint", _counting_fp)
+    ck = df_cache_mod._make_trusted_scope_cache_key(owner=mod_tree, kind="span_line_index")
+    df_cache_mod._get_or_compute_scope_cached(
+        df_cache_mod._scope_cell_info_cache, ck, lambda: ("seed_val",)
+    )
+    fp_calls[0] = 0
+
+    with df_cache_mod.scope_fingerprint_verification_session():
+        for _ in range(100):
+            res = df_cache_mod._get_or_compute_scope_cached(
+                df_cache_mod._scope_cell_info_cache, ck, lambda: ("unexpected",)
+            )
+            assert res == ("seed_val",)
+    assert fp_calls[0] == 1
+
+    # Epoch bump via evict_tree_scopes invalidates active session verification cleanly
+    with df_cache_mod.scope_fingerprint_verification_session():
+        df_cache_mod._get_or_compute_scope_cached(
+            df_cache_mod._scope_cell_info_cache, ck, lambda: ("reseeded",)
+        )
+        before_evict = fp_calls[0]
+        df_cache_mod.evict_tree_scopes(mod_tree)
+        df_cache_mod._get_or_compute_scope_cached(
+            df_cache_mod._scope_cell_info_cache, ck, lambda: ("rebuilt",)
+        )
+        assert fp_calls[0] > before_evict
+
+    # Debug immutability mode bypasses session deduplication
+    prev_debug = df_cache_mod._debug_ast_immutability[0]
+    try:
+        df_cache_mod._debug_ast_immutability[0] = True
+        fp_calls[0] = 0
+        with df_cache_mod.scope_fingerprint_verification_session():
+            for _ in range(5):
+                df_cache_mod._get_or_compute_scope_cached(
+                    df_cache_mod._scope_cell_info_cache, ck, lambda: ("rebuilt",)
+                )
+        assert fp_calls[0] == 5
+    finally:
+        df_cache_mod._debug_ast_immutability[0] = prev_debug
+
+    # Worker threads have independent ContextVar sessions and raise cleanly via fut.result()
+    def _worker_check(_: int) -> int:
+        with df_cache_mod.scope_fingerprint_verification_session():
+            return len(
+                df_cache_mod._get_or_compute_scope_cached(
+                    df_cache_mod._scope_cell_info_cache, ck, lambda: ("w",)
+                )
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        for fut in [pool.submit(_worker_check, i) for i in range(4)]:
+            assert fut.result() == 1
+    clear_dataflow_cache()
+
+
+@pytest.mark.parametrize(
+    "bad_source_lines",
+    [
+        "x = 1\n",
+        b"x = 1\n",
+        bytearray(b"x = 1\n"),
+        {"x = 1"},
+        123,
+    ],
+)
+def test_register_tree_source_lines_rejects_strings_bytes_and_non_sequences(
+    bad_source_lines: Any,
+) -> None:
+    """Verifies _register_tree_source_lines rejects str, bytes, bytearray, sets, and scalars."""
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+
+    clear_dataflow_cache()
+    tree = ast.parse("x = 1\n")
+    with pytest.raises(TypeError):
+        df_cache_mod._register_tree_source_lines(tree, bad_source_lines)
+    assert df_cache_mod._register_tree_source_lines(tree, ["x = 1"]) == ("x = 1",)
+    clear_dataflow_cache()
+
+
+def test_tracked_cached_dict_atomic_rollback_on_value_error() -> None:
+    """Verifies _TrackedCachedDict leaves existing values and refcounts intact on extraction errors."""
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+
+    clear_dataflow_cache()
+    owner = ast.parse("def f():\n    return x\n")
+    n1 = ast.Name(id="a", ctx=ast.Load())
+    n2 = ast.Name(id="b", ctx=ast.Load())
+    tracked = df_cache_mod._TrackedCachedDict({"k1": n1})
+    ck = df_cache_mod._make_trusted_scope_cache_key(owner=owner, kind="fn_scope_ctx")
+    df_cache_mod._scope_cell_info_cache[ck] = tracked
+
+    class _UnregisteredObj:
+        pass
+
+    bad = _UnregisteredObj()
+    with pytest.raises(df_cache_mod._MissingCachedAstNodesError):
+        tracked["k1"] = bad
+    assert tracked["k1"] is n1
+    assert n1 in df_cache_mod._scope_owner_keys_index
+
+    with pytest.raises(df_cache_mod._MissingCachedAstNodesError):
+        tracked.setdefault("k2", bad)
+    assert "k2" not in tracked
+
+    with pytest.raises(df_cache_mod._MissingCachedAstNodesError):
+        tracked.update({"k2": n2, "k3": bad})
+    assert "k2" not in tracked and "k3" not in tracked
+    assert n2 not in df_cache_mod._scope_owner_keys_index
+    clear_dataflow_cache()
+
+
+def test_tracked_scope_cache_update_setdefault_and_ior_sync_indexes() -> None:
+    """Verifies _TrackedScopeCache update, setdefault, and |= keep kind rings and owner indexes synchronized."""
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+
+    clear_dataflow_cache()
+    cache = df_cache_mod._scope_cell_info_cache
+    owners = [ast.parse(f"def f_{i}():\n    return v_{i}\n") for i in range(4)]
+    names = [ast.Name(id=f"n_{i}", ctx=ast.Load()) for i in range(4)]
+    keys = [
+        df_cache_mod._make_trusted_scope_cache_key(owner=owners[i], kind="stmt_deltas")
+        for i in range(4)
+    ]
+
+    cache.update({keys[0]: (names[0],)})
+    assert cache.setdefault(keys[1], (names[1],)) == (names[1],)
+    assert cache.setdefault(keys[1], (names[2],)) == (names[1],)
+    cache |= {keys[2]: (names[2],), keys[3]: (names[3],)}
+
+    kind_ring = cache.ensure_kind_keys().get("stmt_deltas")
+    assert kind_ring is not None
+    for idx in range(4):
+        assert keys[idx] in kind_ring
+        assert names[idx] in df_cache_mod._scope_owner_keys_index
+
+    df_cache_mod.evict_tree_scopes(owners[2])
+    assert keys[2] not in cache
+    assert keys[2] not in kind_ring
+    assert names[2] not in df_cache_mod._scope_owner_keys_index
+    clear_dataflow_cache()
+
+
+class _TaggedFrozenset(frozenset):  # type: ignore[type-arg]
+    """Frozenset subclass used to verify exact-type cache key discrimination."""
+
+
+class _TaggedFloat(float):
+    """Float subclass used to verify exact-type cache key discrimination."""
+
+
+@pytest.mark.parametrize(
+    ("val_a", "val_b", "expect_equal"),
+    [
+        pytest.param(
+            frozenset({frozenset({"a"})}),
+            frozenset({_TaggedFrozenset({"a"})}),
+            False,
+            id="frozenset_subclass_inside_frozenset_differs_from_base",
+        ),
+        pytest.param(
+            frozenset({1.5}),
+            frozenset({_TaggedFloat(1.5)}),
+            False,
+            id="float_subclass_inside_frozenset_differs_from_base",
+        ),
+        pytest.param(
+            frozenset({0.0}),
+            frozenset({_TaggedFloat(0.0)}),
+            False,
+            id="pos_zero_float_subclass_inside_frozenset_differs_from_base",
+        ),
+        pytest.param(
+            frozenset({-0.0}),
+            frozenset({_TaggedFloat(-0.0)}),
+            False,
+            id="neg_zero_float_subclass_inside_frozenset_differs_from_base",
+        ),
+        pytest.param(
+            frozenset({float("nan")}),
+            frozenset({_TaggedFloat("nan")}),
+            False,
+            id="nan_float_subclass_inside_frozenset_differs_from_base",
+        ),
+        pytest.param(
+            frozenset({_TaggedFrozenset({"a"})}),
+            frozenset({_TaggedFrozenset({"a"})}),
+            True,
+            id="control_same_frozenset_subclass_matches",
+        ),
+        pytest.param(
+            frozenset({_TaggedFloat(1.5)}),
+            frozenset({_TaggedFloat(1.5)}),
+            True,
+            id="control_same_float_subclass_matches",
+        ),
+    ],
+)
+def test_scope_cache_key_preserves_frozenset_and_float_subclass_identity(
+    val_a: object,
+    val_b: object,
+    expect_equal: bool,
+) -> None:
+    """Verifies _canonical_param_type_key and _ScopeCacheKey preserve frozenset and float subclass types."""
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+
+    owner = ast.parse("x = 1\n")
+    key_a = df_cache_mod._ScopeCacheKey(owner, "subclass_type_test", (val_a,))
+    key_b = df_cache_mod._ScopeCacheKey(owner, "subclass_type_test", (val_b,))
+    assert (key_a == key_b) is expect_equal
+    assert (
+        df_cache_mod._canonical_param_type_key(val_a)
+        == df_cache_mod._canonical_param_type_key(val_b)
+    ) is expect_equal
+    assert df_cache_mod._params_exact_types_match(val_a, val_b) is expect_equal
+    if expect_equal:
+        assert hash(key_a) == hash(key_b)
+
+
+def test_weak_parent_map_bool_avoids_len_and_oversized_entry_builds_outside_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies _WeakParentMap.__bool__ avoids O(N) __len__, handles non-weakref roots, and builds oversized entries lock-free."""
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+
+    clear_dataflow_cache()
+    tree = ast.parse("def f(x):\n    return x + 1\n")
+    pmap = df_cache_mod._build_parent_map_unlocked(tree)
+    wmap = df_cache_mod._WeakParentMap(pmap)
+    empty_wmap = df_cache_mod._WeakParentMap({})
+
+    len_calls = 0
+
+    def _fail_len(self: Any) -> int:
+        nonlocal len_calls
+        len_calls += 1
+        raise AssertionError("__bool__ must not delegate to __len__")
+
+    monkeypatch.setattr(df_cache_mod._WeakParentMap, "__len__", _fail_len)
+    assert bool(wmap) is True
+    assert bool(empty_wmap) is False
+    assert len_calls == 0
+
+    # Non-weakrefable custom AST root node marks has_non_weakref and falls back to dict mapping
+    class _NoWeakrefRoot(ast.AST):
+        __slots__ = ()
+
+    custom_root = _NoWeakrefRoot()
+    child_node = ast.Name(id="v", ctx=ast.Load())
+    oversized_custom = df_cache_mod._build_oversized_parent_entry_unlocked(
+        custom_root, {child_node: custom_root}
+    )
+    assert oversized_custom.has_non_weakref is True
+    assert oversized_custom.weak_parent_map.get(child_node) is custom_root
+
+    # Oversized entry construction runs outside _downstream_cache_lock
+    monkeypatch.setattr(df_cache_mod, "_MAX_PARENT_MAP_TOTAL_NODES", 10)
+    orig_builder = df_cache_mod._build_oversized_parent_entry_unlocked
+    lock_free_observations: list[bool] = []
+    worker_errors: list[BaseException] = []
+
+    def _spy_oversized_builder(*args: Any, **kwargs: Any) -> Any:
+        res: list[bool] = []
+
+        def _probe() -> None:
+            try:
+                acquired = df_cache_mod._downstream_cache_lock.acquire(blocking=False)
+                if acquired:
+                    df_cache_mod._downstream_cache_lock.release()
+                res.append(acquired)
+            except BaseException as exc:  # pragma: no cover - captured for re-raise
+                worker_errors.append(exc)
+
+        t = threading.Thread(target=_probe)
+        t.start()
+        t.join(timeout=5.0)
+        assert not t.is_alive()
+        lock_free_observations.extend(res)
+        return orig_builder(*args, **kwargs)
+
+    monkeypatch.setattr(
+        df_cache_mod, "_build_oversized_parent_entry_unlocked", _spy_oversized_builder
+    )
+    big_tree = ast.parse(
+        "def big(x):\n"
+        + "".join(f"    a_{i} = x + {i}\n" for i in range(12))
+        + "    return a_0\n"
+    )
+    anc_map = df_cache_mod._get_scope_ancestor_map(big_tree)
+    assert isinstance(anc_map, dict)
+    if worker_errors:
+        raise worker_errors[0]
+    assert lock_free_observations and all(lock_free_observations)
+    clear_dataflow_cache()
+
+
+def test_tracked_cached_dict_unregister_pops_empty_key_nodes_bucket() -> None:
+    """Verifies deleting the last AST node from a _TrackedCachedDict under a non-AST key removes empty _scope_key_nodes_index buckets."""
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+
+    clear_dataflow_cache()
+    n1 = ast.Name(id="first", ctx=ast.Load())
+    n2 = ast.Name(id="second", ctx=ast.Load())
+    non_ast_key = ("non_ast_tuple_key", 42)
+    tracked = df_cache_mod._TrackedCachedDict({"k1": n1, "k2": n2})
+    df_cache_mod._scope_cell_info_cache[non_ast_key] = tracked
+
+    assert non_ast_key in df_cache_mod._scope_key_nodes_index
+    assert df_cache_mod._scope_key_nodes_index[non_ast_key] == {n1, n2}
+
+    # Control: removing one entry keeps the bucket with the remaining node
+    del tracked["k1"]
+    assert non_ast_key in df_cache_mod._scope_key_nodes_index
+    assert df_cache_mod._scope_key_nodes_index[non_ast_key] == {n2}
+    assert n1 not in df_cache_mod._scope_owner_keys_index
+
+    # Removing the final AST node must pop the now-empty bucket from _scope_key_nodes_index
+    del tracked["k2"]
+    assert non_ast_key not in df_cache_mod._scope_key_nodes_index
+    assert n2 not in df_cache_mod._scope_owner_keys_index
+    clear_dataflow_cache()
+
+
+@pytest.mark.parametrize("debug_mode", [True, False], ids=["debug_raises", "prod_evicts_and_recomputes"])
+def test_get_or_compute_scope_cached_fingerprints_aux_ast_nodes(
+    debug_mode: bool,
+) -> None:
+    """Verifies _get_or_compute_scope_cached checks aux_ast_nodes fingerprints for in-place mutations outside owner."""
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+
+    clear_dataflow_cache()
+    prev_debug = df_cache_mod._debug_ast_immutability[0]
+    df_cache_mod._debug_ast_immutability[0] = debug_mode
+    try:
+        mod_tree = ast.parse("def target(x):\n    return x + 1\n")
+        fn_node = mod_tree.body[0]
+        key = df_cache_mod._make_trusted_scope_cache_key(
+            owner=fn_node,
+            kind="fn_scope_ctx",
+            aux_ast_nodes=(mod_tree,),
+        )
+        compute_calls = 0
+
+        def _compute() -> int:
+            nonlocal compute_calls
+            compute_calls += 1
+            return len(mod_tree.body)
+
+        first = df_cache_mod._get_or_compute_scope_cached(
+            df_cache_mod._scope_cell_info_cache, key, _compute
+        )
+        assert first == 1
+        assert compute_calls == 1
+
+        # Negative control: repeated lookup without mutation hits cache in O(1)
+        with df_cache_mod.scope_fingerprint_verification_session():
+            cached = df_cache_mod._get_or_compute_scope_cached(
+                df_cache_mod._scope_cell_info_cache, key, _compute
+            )
+            cached_again = df_cache_mod._get_or_compute_scope_cached(
+                df_cache_mod._scope_cell_info_cache, key, _compute
+            )
+        assert cached == 1
+        assert cached_again == 1
+        assert compute_calls == 1
+
+        # Mutate aux_ast_nodes (mod_tree) outside fn_node without calling evict_tree_scopes
+        mod_tree.body.append(ast.parse("from evil import *\n").body[0])
+        if debug_mode:
+            with pytest.raises(RuntimeError, match="mutated in-place"):
+                df_cache_mod._get_or_compute_scope_cached(
+                    df_cache_mod._scope_cell_info_cache, key, _compute
+                )
+        else:
+            refreshed = df_cache_mod._get_or_compute_scope_cached(
+                df_cache_mod._scope_cell_info_cache, key, _compute
+            )
+            assert refreshed == 2
+            assert compute_calls == 2
+    finally:
+        df_cache_mod._debug_ast_immutability[0] = prev_debug
+        clear_dataflow_cache()
+
+
+@pytest.mark.parametrize(
+    ("use_weak_map", "expect_stored_parent_map"),
+    [
+        pytest.param(True, False, id="weak_parent_map_skips_len_and_drops_stored_map"),
+        pytest.param(False, True, id="control_plain_small_dict_retains_stored_map"),
+    ],
+)
+def test_make_nested_fn_scope_context_skips_len_on_weak_parent_map(
+    monkeypatch: pytest.MonkeyPatch,
+    use_weak_map: bool,
+    expect_stored_parent_map: bool,
+) -> None:
+    """Verifies _make_nested_fn_scope_context checks _WeakParentMap before calling len() to avoid O(N) scans."""
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+    import pydoppelgangerhunt.fixer._df_cell_carriers as carriers_mod
+
+    class _NoLenWeakParentMap(df_cache_mod._WeakParentMap):
+        def __len__(self) -> int:
+            raise AssertionError("__len__ must not be called on _WeakParentMap")
+
+    mod_tree = ast.parse("def nested(x):\n    return x + 1\n")
+    fn_node = mod_tree.body[0]
+    assert isinstance(fn_node, ast.FunctionDef)
+    raw_dict: dict[ast.AST, ast.AST] = {fn_node.body[0]: fn_node}
+    returned_map: object = (
+        _NoLenWeakParentMap(raw_dict) if use_weak_map else raw_dict
+    )
+    monkeypatch.setattr(
+        carriers_mod,
+        "_get_scope_parent_map",
+        lambda _node, *, use_cache=True: returned_map,
+    )
+    ctx = carriers_mod._make_nested_fn_scope_context(
+        fn_node, frozenset({"x"}), scope_ctx=None, use_cache=True
+    )
+    assert ctx.has_nonempty_parent_map is True
+    assert (ctx._stored_parent_map is not None) is expect_stored_parent_map
+
+
+def test_node_fingerprint_scalar_detects_comp_async_and_match_pattern_mutations() -> None:
+    """Verifies _compute_scope_fingerprint detects in-place mutations to comprehension.is_async and match patterns."""
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+
+    comp_mod = ast.parse("async def f(xs):\n    return [x for x in xs]\n")
+    comp_node = next(n for n in ast.walk(comp_mod) if isinstance(n, ast.comprehension))
+    fp_sync = df_cache_mod._compute_scope_fingerprint(comp_mod)
+    comp_node.is_async = 1
+    fp_async = df_cache_mod._compute_scope_fingerprint(comp_mod)
+    assert fp_async != fp_sync
+
+    match_mod = ast.parse(
+        "def m(v):\n"
+        "    match v:\n"
+        "        case [first, *rest_seq]:\n"
+        "            return first, rest_seq\n"
+        "        case {'k': True, **rest_map}:\n"
+        "            return rest_map\n"
+    )
+    fp_base = df_cache_mod._compute_scope_fingerprint(match_mod)
+
+    match_as = next(n for n in ast.walk(match_mod) if isinstance(n, ast.MatchAs) and n.name == "first")
+    match_as.name = "renamed_first"
+    fp_as = df_cache_mod._compute_scope_fingerprint(match_mod)
+    assert fp_as != fp_base
+
+    match_star = next(n for n in ast.walk(match_mod) if isinstance(n, ast.MatchStar))
+    match_star.name = "renamed_star"
+    fp_star = df_cache_mod._compute_scope_fingerprint(match_mod)
+    assert fp_star != fp_as
+
+    match_map = next(n for n in ast.walk(match_mod) if isinstance(n, ast.MatchMapping))
+    match_map.rest = "renamed_map"
+    fp_map = df_cache_mod._compute_scope_fingerprint(match_mod)
+    assert fp_map != fp_star
+
+    match_sing = next(n for n in ast.walk(match_mod) if isinstance(n, ast.MatchSingleton))
+    match_sing.value = False
+    fp_sing = df_cache_mod._compute_scope_fingerprint(match_mod)
+    assert fp_sing != fp_map
+
+
+@pytest.mark.parametrize(
+    "index_kind",
+    [
+        pytest.param("ensure_owner", id="ensure_scope_owner_parent_map"),
+        pytest.param("tree_contains", id="tree_contains_scope_node"),
+        pytest.param("ancestor_map", id="get_scope_ancestor_map"),
+    ],
+)
+@pytest.mark.parametrize("debug_mode", [True, False], ids=["debug", "prod"])
+def test_parent_map_root_indexing_records_baseline_fingerprint_for_chosen_root_lookup(
+    index_kind: str,
+    debug_mode: bool,
+) -> None:
+    """Verifies trees indexed via parent-map helpers detect in-place AST mutations on _get_scope_parent_map chosen_root hits."""
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+
+    prev_debug = df_cache_mod._debug_ast_immutability[0]
+    df_cache_mod._debug_ast_immutability[0] = debug_mode
+    try:
+        clear_dataflow_cache()
+        mod_tree = ast.parse("def work(x):\n    y = x + 1\n    return y\n")
+        fn_node = mod_tree.body[0]
+        assert isinstance(fn_node, ast.FunctionDef)
+        if index_kind == "ensure_owner":
+            df_cache_mod._ensure_scope_owner_parent_map(mod_tree)
+        elif index_kind == "tree_contains":
+            assert df_cache_mod._tree_contains_scope_node(mod_tree, fn_node) is True
+        else:
+            assert df_cache_mod._get_scope_ancestor_map(mod_tree)[fn_node] is mod_tree
+
+        assert mod_tree in df_cache_mod._cached_scope_fingerprints
+        # Positive control: unmutated chosen_root fast path returns cached parent map
+        pmap_before = df_cache_mod._get_scope_parent_map(fn_node)
+        assert pmap_before[fn_node] is mod_tree
+
+        # Mutate mod_tree in place without calling evict_tree_scopes(mod_tree)
+        injected_stmt = ast.parse("z = 99\n").body[0]
+        fn_node.body.insert(0, injected_stmt)
+        if debug_mode:
+            with pytest.raises(
+                RuntimeError,
+                match="mutated in-place without calling evict_tree_scopes",
+            ):
+                df_cache_mod._get_scope_parent_map(fn_node)
+        else:
+            pmap_after = df_cache_mod._get_scope_parent_map(fn_node)
+            assert pmap_after.get(injected_stmt) is fn_node
+    finally:
+        df_cache_mod._debug_ast_immutability[0] = prev_debug
+        clear_dataflow_cache()
+
+
+def test_evict_tree_scopes_unregisters_cached_keys_once_and_prunes_orphans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies _evict_tree_scopes does not redundantly invoke _unregister_key_if_absent after TrackedScopeCache.pop."""
+    import pydoppelgangerhunt.fixer._df_cache as df_cache_mod
+
+    clear_dataflow_cache()
+    mod_tree = ast.parse("def work(x):\n    return x + 1\n")
+    ck = df_cache_mod._make_trusted_scope_cache_key(owner=mod_tree, kind="span_line_index")
+    df_cache_mod._get_or_compute_scope_cached(
+        df_cache_mod._scope_cell_info_cache, ck, lambda: ("val",)
+    )
+
+    unreg_calls: list[Any] = []
+    orig_unreg = df_cache_mod._unregister_key_if_absent
+
+    def _spy_unreg(key: Any) -> None:
+        unreg_calls.append(key)
+        orig_unreg(key)
+
+    monkeypatch.setattr(df_cache_mod, "_unregister_key_if_absent", _spy_unreg)
+    df_cache_mod.evict_tree_scopes(mod_tree)
+    assert unreg_calls == [ck]
+    assert ck not in df_cache_mod._scope_key_nodes_index
+
+    # Orphan reverse-index key (not in either cache) is still pruned during eviction
+    orphan_tree = ast.parse("def orphan():\n    return 0\n")
+    orphan_key = df_cache_mod._make_trusted_scope_cache_key(
+        owner=orphan_tree, kind="span_line_index"
+    )
+    df_cache_mod._register_key_ast_nodes(orphan_key, (orphan_tree,))
+    unreg_calls.clear()
+    df_cache_mod.evict_tree_scopes(orphan_tree)
+    assert unreg_calls == [orphan_key]
+    assert orphan_key not in df_cache_mod._scope_key_nodes_index
+
+
+
+
+

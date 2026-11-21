@@ -514,7 +514,7 @@ def test_batch_53_cli_method_binding_and_repo_root(tmp_path: Path) -> None:
     from unittest import mock
     import pytest
     from pydoppelgangerhunt.cli import _audit_clone_risk_warnings, build_arg_parser
-    from pydoppelgangerhunt.fixer import _is_same_file_path
+    from pydoppelgangerhunt.fixer.binding import _is_same_file_path
     from pydoppelgangerhunt.metrics import compute_repository_dry_stats
     from pydoppelgangerhunt.reporters import extract_unit_source_code
 
@@ -751,7 +751,7 @@ def test_batch_67_cli_and_fixer_decomposition(tmp_path: Path) -> None:
         _render_pair_diff_and_suggestions,
         _run_type4_semantic_audit,
     )
-    from pydoppelgangerhunt.fixer import _format_helper_parameters
+    from pydoppelgangerhunt.fixer.synthesis import _format_helper_parameters
 
     # 1. Test _format_scan_mode_description
     parser = argparse.ArgumentParser()
@@ -1075,10 +1075,10 @@ def test_batch_69_modular_decomposition(tmp_path: Path) -> None:
         _apply_baseline_and_diff_filters,
         _render_text_violations,
     )
-    from pydoppelgangerhunt.fixer import (
-        _infer_helper_return_type,
+    from pydoppelgangerhunt.fixer.patch import _build_unit_delegation_call
+    from pydoppelgangerhunt.fixer.synthesis import (
         _format_helper_docstring,
-        _build_unit_delegation_call,
+        _infer_helper_return_type,
     )
 
     # 1. Test _apply_baseline_and_diff_filters
@@ -2874,11 +2874,10 @@ def test_cli_closure_strictness_and_skip_closures_precedence_warning(
             assert len(precedence_warnings_fc) == 1
 
 
-def test_cli_unrecognized_config_closure_strictness_falls_back(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+def test_cli_unrecognized_config_closure_strictness_fails_usage(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Verifies unrecognized closure_strictness in pyproject.toml warns and falls back."""
-    import logging  # pylint: disable=import-outside-toplevel
+    """Verifies unrecognized closure_strictness in pyproject.toml exits 2 with a configuration error."""
     from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
 
     repo = tmp_path / "fallback_repo"
@@ -2890,30 +2889,14 @@ def test_cli_unrecognized_config_closure_strictness_falls_back(
         encoding="utf-8",
     )
 
-    dummy_clone = (
-        0.95,
-        {"name": "u1", "file": "f.py", "start": 1, "end": 1},
-        {"name": "u2", "file": "f.py", "start": 1, "end": 1},
-    )
-
-    with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[dummy_clone]):
-        with mock.patch(
-            "pydoppelgangerhunt.cli.generate_refactoring_patch", return_value="# patch\n"
-        ) as mock_patch:
-            with caplog.at_level(logging.WARNING):
-                exit_code = main([
-                    str(repo),
-                    "--patch",
-                    str(patch_out),
-                ])
-            assert exit_code == 1
-            mock_patch.assert_called_once()
-            _, kwargs = mock_patch.call_args
-            assert kwargs.get("closure_strictness") == "strict"
-            assert any(
-                "Unrecognized closure_strictness 'unrecognized_custom_mode'" in r.message
-                for r in caplog.records
-            )
+    with pytest.raises(SystemExit) as exc_info:
+        main([
+            str(repo),
+            "--patch",
+            str(patch_out),
+        ])
+    assert exc_info.value.code == 2
+    assert "Invalid closure_strictness" in capsys.readouterr().err
 
 
 def test_resolve_closure_strictness_mode_thread_safety() -> None:
@@ -2941,7 +2924,7 @@ def test_resolve_closure_strictness_mode_thread_safety() -> None:
 def test_resolve_closure_strictness_rejects_unshipped_and_unknown_modes(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Verifies that non-canonical and unknown strictness strings warn once per distinct value and fall back to strict."""
+    """Verifies that unshipped aliases and unknown strictness strings warn once per distinct value and fall back to strict."""
     import logging  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
         clear_closure_warning_cache,
@@ -2951,28 +2934,26 @@ def test_resolve_closure_strictness_rejects_unshipped_and_unknown_modes(
     clear_closure_warning_cache()
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        assert resolve_closure_strictness_mode("fail_closed") == ("pedantic", False)
-        assert resolve_closure_strictness_mode("fail_closed") == ("pedantic", False)
-        assert resolve_closure_strictness_mode("fast") == ("lenient", True)
-        assert resolve_closure_strictness_mode("skip") == ("lenient", True)
+        assert resolve_closure_strictness_mode("fail_closed") == ("strict", False)
+        assert resolve_closure_strictness_mode("fail_closed") == ("strict", False)
+        assert resolve_closure_strictness_mode("fast") == ("strict", False)
+        assert resolve_closure_strictness_mode("skip") == ("strict", False)
         assert resolve_closure_strictness_mode("strict_with") == ("strict", False)
 
-    dep_msgs = [
+    assert not [
         r.message
         for r in caplog.records
         if "Deprecated closure_strictness" in r.message
     ]
-    assert len(dep_msgs) == 3
-    for dep_val in ("fail_closed", "fast", "skip"):
-        assert any(f"Deprecated closure_strictness '{dep_val}'" in m for m in dep_msgs)
 
     warn_msgs = [
         r.message
         for r in caplog.records
         if "Unrecognized closure_strictness" in r.message
     ]
-    assert len(warn_msgs) == 1
-    assert "Unrecognized closure_strictness 'strict_with'" in warn_msgs[0]
+    assert len(warn_msgs) == 4
+    for bad_val in ("fail_closed", "fast", "skip", "strict_with"):
+        assert any(f"Unrecognized closure_strictness '{bad_val}'" in m for m in warn_msgs)
 
 
 def test_resolve_closure_strictness_mode_config_conflict_warning(
@@ -3246,9 +3227,25 @@ def test_cli_replace_clones_keeps_reports_strict_and_preserves_unit_policy(
         assert mock_patch.call_args.kwargs.get("closure_strictness") is None
         assert mock_patch.call_args.kwargs.get("skip_pre_unit_closures") is None
 
-        # Even with an unrecognized config closure_strictness, --replace-clones --patch keeps None
+        # An unrecognized config closure_strictness in pyproject.toml exits 2 cleanly
         (repo / "pyproject.toml").write_text(
             '[tool.pydoppelgangerhunt]\nclosure_strictness = "bogus_cfg"\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                str(repo),
+                "--html",
+                str(html_out),
+                "--patch",
+                str(patch_out),
+                "--replace-clones",
+            ])
+        assert exc_info.value.code == 2
+
+        # Explicit strict_with_suppression = false opts --patch out to strict while keeping reports explicit
+        (repo / "pyproject.toml").write_text(
+            "[tool.pydoppelgangerhunt]\nstrict_with_suppression = false\n",
             encoding="utf-8",
         )
         code2 = main([
@@ -3261,8 +3258,8 @@ def test_cli_replace_clones_keeps_reports_strict_and_preserves_unit_policy(
         ])
         assert code2 == 1
         assert mock_html.call_args.kwargs.get("closure_strictness") == "strict"
-        assert mock_patch.call_args.kwargs.get("closure_strictness") is None
-        assert mock_patch.call_args.kwargs.get("skip_pre_unit_closures") is None
+        assert mock_patch.call_args.kwargs.get("closure_strictness") == "strict"
+        assert mock_patch.call_args.kwargs.get("skip_pre_unit_closures") is False
 
 
 def test_resolve_unit_closure_flags_unrecognized_mode_and_strict_with_conflict(
@@ -3346,6 +3343,89 @@ def test_nested_heuristic_ctx_manager_session_does_not_escalate_empty_warn(
     assert "InnerSafeMgr" in warn_records[0].message
 
 
+@pytest.mark.parametrize(
+    ("outer_warn", "target_kind", "expected_level_name"),
+    [
+        pytest.param(False, "nested_default_session", "INFO", id="outer_false_nested_default_session"),
+        pytest.param(False, "generate_refactoring_patch", "INFO", id="outer_false_patch_inherits_info"),
+        pytest.param(False, "generate_html_report", "INFO", id="outer_false_html_report_inherits_info"),
+        pytest.param(None, "nested_default_session", "WARNING", id="neg_outer_default_session_warns"),
+        pytest.param(True, "generate_refactoring_patch", "WARNING", id="neg_outer_true_patch_warns"),
+    ],
+)
+def test_outer_heuristic_session_warn_false_preserved_across_wrappers(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    outer_warn: Optional[bool],
+    target_kind: str,
+    expected_level_name: str,
+) -> None:
+    """Verifies nested default heuristic_ctx_manager_session, generate_refactoring_patch, and generate_html_report honor an outer warn=False setting."""
+    import logging  # pylint: disable=import-outside-toplevel
+
+    from pydoppelgangerhunt.config import (
+        clear_closure_warning_cache,
+        heuristic_ctx_manager_session,
+        record_heuristic_non_suppressing_ctx_manager,
+    )
+    from pydoppelgangerhunt.fixer import generate_refactoring_patch
+    from pydoppelgangerhunt.reporters import generate_html_report
+
+    mod_src = (
+        "def proc_a(NeutralSessionGuard, items):\n"
+        "    with NeutralSessionGuard():\n"
+        "        total = sum(items)\n"
+        "    return total\n"
+        "\n"
+        "def proc_b(NeutralSessionGuard, items):\n"
+        "    with NeutralSessionGuard():\n"
+        "        total = sum(items)\n"
+        "    return total\n"
+    )
+    mod_file = tmp_path / "mod.py"
+    mod_file.write_text(mod_src, encoding="utf-8")
+    u1 = {"file": str(mod_file), "name": "proc_a:w", "kind": "compound_block", "start": 2, "end": 3}
+    u2 = {"file": str(mod_file), "name": "proc_b:w", "kind": "compound_block", "start": 7, "end": 8}
+
+    clear_closure_warning_cache()
+    expected_level = getattr(logging, expected_level_name)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="pydoppelgangerhunt.config"):
+        cm = (
+            heuristic_ctx_manager_session()
+            if outer_warn is None
+            else heuristic_ctx_manager_session(warn=outer_warn)
+        )
+        with cm:
+            if target_kind == "nested_default_session":
+                with heuristic_ctx_manager_session():
+                    record_heuristic_non_suppressing_ctx_manager("NeutralSessionGuard")
+            elif target_kind == "generate_refactoring_patch":
+                patch_out = generate_refactoring_patch(
+                    [(1.0, u1, u2)],
+                    repo_root=str(tmp_path),
+                    replace_clones=True,
+                    closure_strictness="strict",
+                )
+                assert "def _shared_" in patch_out
+            else:
+                html_out = generate_html_report(
+                    [(1.0, u1, u2)],
+                    str(mod_file),
+                    0.8,
+                    repo_root=str(tmp_path),
+                    closure_strictness="strict",
+                )
+                assert "def _shared_" in html_out
+
+    summary_records = [
+        r for r in caplog.records if "unproven context manager(s)" in r.message
+    ]
+    assert len(summary_records) == 1
+    assert summary_records[0].levelno == expected_level
+    assert "NeutralSessionGuard" in summary_records[0].message
+
+
 def test_render_pair_diff_and_suggestions_preload_failure_counts_once(
     tmp_path: Any,
 ) -> None:
@@ -3409,3 +3489,86 @@ def test_render_pair_diff_and_suggestions_preload_failure_counts_once(
         assert errors == 1
         assert len(lines_sug) == 1
         assert "[REFACTOR SUGGESTION] Diagnostic: suggestion skipped due to SyntaxError" in lines_sug[0]
+
+
+def test_cli_exit_code_3_for_clean_scan_with_diagnostic_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verifies CLI exits 3 (distinct from usage error 2 and clone+error 4) when 0 clones are found and an internal diagnostic error occurs."""
+    from pydoppelgangerhunt.cli import main
+
+    clean_file = tmp_path / "clean_mod.py"
+    clean_file.write_text("def solo(x):\n    return x + 1\n", encoding="utf-8")
+    html_out = tmp_path / "clean_diag.html"
+
+    def _diag_html(*_args: Any, **kwargs: Any) -> str:
+        cb = kwargs.get("on_diagnostic_error")
+        if callable(cb):
+            cb()
+        return "<html/>"
+
+    with mock.patch("pydoppelgangerhunt.cli.generate_html_report", side_effect=_diag_html):
+        code = main([str(clean_file), "--html", str(html_out)])
+    assert code == 3
+    assert "1 internal diagnostic error(s) occurred" in capsys.readouterr().err
+
+
+def test_cli_exit_code_4_for_clones_with_diagnostic_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verifies CLI exits 4 when clones are found and an internal diagnostic error occurs during rendering."""
+    from pydoppelgangerhunt.cli import main
+
+    dup_file = tmp_path / "dup_mod.py"
+    dup_file.write_text(
+        "def a(x):\n    y = x + 1\n    z = y * 2\n    return z\n\n"
+        "def b(x):\n    y = x + 1\n    z = y * 2\n    return z\n",
+        encoding="utf-8",
+    )
+    html_out = tmp_path / "dup_diag.html"
+
+    def _diag_html(*_args: Any, **kwargs: Any) -> str:
+        cb = kwargs.get("on_diagnostic_error")
+        if callable(cb):
+            cb()
+        return "<html/>"
+
+    with mock.patch("pydoppelgangerhunt.cli.generate_html_report", side_effect=_diag_html):
+        code = main([str(dup_file), "--min-lines", "3", "--html", str(html_out)])
+    assert code == 4
+    assert "1 internal diagnostic error(s) occurred" in capsys.readouterr().err
+
+
+def test_cli_suppresses_syntax_warning_without_leaking_global_filters(
+    tmp_path: Path,
+) -> None:
+    """Verifies cli.main() suppresses invalid-escape SyntaxWarning locally and restores warnings.filters afterward."""
+    import ast
+    import warnings
+    from pydoppelgangerhunt.cli import main
+
+    esc_file = tmp_path / "escape_mod.py"
+    esc_file.write_text(
+        'def parse_a(s):\n    pat = "\\d+\\s+"\n    out = pat + s\n    return out\n\n'
+        'def parse_b(s):\n    pat = "\\d+\\s+"\n    out = pat + s\n    return out\n',
+        encoding="utf-8",
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", SyntaxWarning)
+        before_filters = list(warnings.filters)
+        code = main([str(esc_file), "--min-lines", "3", "--suggest"])
+        after_filters = list(warnings.filters)
+    assert code == 1
+    assert after_filters == before_filters
+    assert not [
+        w for w in caught if issubclass(w.category, SyntaxWarning) and "invalid escape" in str(w.message)
+    ]
+    with warnings.catch_warnings(record=True) as post_caught:
+        warnings.simplefilter("always", SyntaxWarning)
+        ast.parse('pat = "\\d+"\n', filename="<post_cli_syntax_warning_check>")
+    assert any(
+        issubclass(w.category, SyntaxWarning) and "invalid escape" in str(w.message)
+        for w in post_caught
+    )

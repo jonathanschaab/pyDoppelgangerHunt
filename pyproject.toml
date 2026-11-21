@@ -72,7 +72,7 @@ min_tokens = 15
 idioms = true
 # closure_strictness = "strict"
 # strict_with_suppression = false
-non_suppressing_ctx_managers = []
+# non_suppressing_ctx_managers = []
 exclude = [
     "tests",
     ".git",

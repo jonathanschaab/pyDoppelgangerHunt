@@ -26,9 +26,11 @@ from pydoppelgangerhunt import (
     synthesize_shared_helper_code,
 )
 from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
-    _build_whole_method_delegation,
     patch as patch_mod,
     resolve_closure_strictness_mode,
+)
+from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=protected-access
+    _build_whole_method_delegation,
 )
 from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
     _load_unit_file_text,
@@ -805,7 +807,7 @@ def test_refactoring_patch_global_and_nonlocal_not_assigned_at_call_site(tmp_pat
 def test_batch_34_local_node_traversal_and_delegation_hardening(tmp_path: Path) -> None:
     """Tests Batch 34: _iter_local_nodes isolation and delegation tie-breaking."""
     from pydoppelgangerhunt.parser import harvest_file_units
-    from pydoppelgangerhunt.fixer import _build_whole_method_delegation
+    from pydoppelgangerhunt.fixer.patch import _build_whole_method_delegation
 
     code = (
         "class Handler:\n"
@@ -6510,33 +6512,29 @@ def test_compute_replacement_line_deltas_raises_on_overlapping_units() -> None:
         _compute_replacement_line_deltas([(u1, "# rep 1\n"), (u2, "# rep 2\n")], orig_text)
 
 
-def test_generate_refactoring_patch_skips_malformed_clone_pair_without_aborting_batch(
+def test_generate_refactoring_patch_rejects_malformed_unit_schema_at_entry(
     tmp_path: Path,
 ) -> None:
-    """Verifies that a malformed clone pair in a batch does not abort valid clone pair refactoring."""
+    """Verifies generate_refactoring_patch fails fast on invalid unit schemas before processing valid pairs."""
     f1 = tmp_path / "mod1.py"
     f2 = tmp_path / "mod2.py"
     f1.write_text("def run_a(val: int) -> int:\n    return val * 2\n", encoding="utf-8")
     f2.write_text("def run_b(val: int) -> int:\n    return val * 2\n", encoding="utf-8")
 
-    # Pair 1: Malformed coordinates that would fail coordinate parsing
+    # Pair 1: Malformed coordinates rejected by entry-point schema validation
     bad_u1 = {"file": str(f1), "name": "run_a", "start": "not_an_int", "end": 2}
     bad_u2 = {"file": str(f2), "name": "run_b", "start": 1, "end": 2}
 
-    # Pair 2: Fully valid clone pair
+    # Pair 2: Valid clone pair in the same batch
     good_u1 = {"file": str(f1), "name": "run_a", "start": 1, "end": 2, "kind": "function"}
     good_u2 = {"file": str(f2), "name": "run_b", "start": 1, "end": 2, "kind": "function"}
 
-    patch = generate_refactoring_patch(
-        [(0.9, bad_u1, bad_u2), (1.0, good_u1, good_u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-
-    # Valid pair should have successfully generated patch despite bad pair in batch
-    assert "--- a/mod1.py" in patch
-    assert "--- a/mod2.py" in patch
-    assert "_shared_run_a_run_b" in patch
+    with pytest.raises(ValueError, match="start"):
+        generate_refactoring_patch(
+            [(0.9, bad_u1, bad_u2), (1.0, good_u1, good_u2)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+        )
 
 
 def test_generate_refactoring_patch_skips_syntax_error_pair_without_aborting_batch(
@@ -8891,9 +8889,10 @@ def test_generate_refactoring_patch_closure_strictness_knob(tmp_path: Path) -> N
         (None, False, ("strict", False)),
         ("strict", True, ("strict", False)),
         ("lenient", False, ("lenient", True)),
-        ("fast", None, ("lenient", True)),
-        ("skip", None, ("lenient", True)),
-        ("fail_closed", None, ("pedantic", False)),
+        ("fast", None, ("strict", False)),
+        ("skip", None, ("strict", False)),
+        ("fail_closed", None, ("strict", False)),
+        ("fast", True, ("lenient", True)),
         ("unknown_mode", True, ("lenient", True)),
         ("unknown_mode", False, ("strict", False)),
     ],
@@ -11117,4 +11116,274 @@ def test_out_of_bounds_pragma_and_col0_multiline_string_subroutine_synthesis(
     )
     assert "    col0_body_line" not in patch_str
     assert "+        return tag, banner, res\n" in patch_str
+
+
+def test_generate_refactoring_patch_transactional_rollback_multi_file_same_file_and_cycles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies per-pair snapshot rollback leaves zero partial edits on multi-file, same-file, and cycle failures."""
+    # 1. Multi-file pair-2 exception after Pair 1 succeeded and Pair 2 started modifying files:
+    #    Pair 1 edits remain intact; Pair 2 edits and new module entries are completely rolled back.
+    a1 = tmp_path / "a1.py"
+    a2 = tmp_path / "a2.py"
+    b1 = tmp_path / "b1.py"
+    b2 = tmp_path / "b2.py"
+    pair1_fn = (
+        "def calc_one(x):\n"
+        "    t = x + 10\n"
+        "    return t * 2\n"
+    )
+    pair2_fn = (
+        "def calc_two(y):\n"
+        "    t = y + 20\n"
+        "    return t * 3\n"
+    )
+    a1.write_text(pair1_fn, encoding="utf-8")
+    a2.write_text(pair1_fn, encoding="utf-8")
+    b1.write_text(pair2_fn, encoding="utf-8")
+    b2.write_text(pair2_fn, encoding="utf-8")
+
+    p1_u1 = {"file": str(a1), "start": 1, "end": 3, "name": "calc_one", "kind": "function"}
+    p1_u2 = {"file": str(a2), "start": 1, "end": 3, "name": "calc_one", "kind": "function"}
+    p2_u1 = {"file": str(b1), "start": 1, "end": 3, "name": "calc_two", "kind": "function"}
+    p2_u2 = {"file": str(b2), "start": 1, "end": 3, "name": "calc_two", "kind": "function"}
+
+    real_replace = patch_mod.resolve_unit_replacement
+    replace_calls = 0
+
+    def _fail_second_pair_second_edit(*args: Any, **kwargs: Any) -> Any:
+        nonlocal replace_calls
+        replace_calls += 1
+        # Fail after the 3rd replacement (middle of pair 2 after pair 2 touched its first file)
+        if replace_calls == 4:
+            raise RuntimeError("simulated mid-pair failure after first-file modification")
+        return real_replace(*args, **kwargs)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(patch_mod, "resolve_unit_replacement", _fail_second_pair_second_edit)
+        patch_partial = generate_refactoring_patch(
+            [(0.99, p1_u1, p1_u2), (0.99, p2_u1, p2_u2)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+        )
+    assert "calc_one" in patch_partial
+    assert "b1.py" not in patch_partial
+    assert "b2.py" not in patch_partial
+
+    # 2. Same-file clone pair failure after first replacement leaves empty patch
+    same_file = tmp_path / "same.py"
+    same_file.write_text(
+        "def left(x):\n    v = x + 1\n    return v * 2\n\n"
+        "def right(x):\n    v = x + 1\n    return v * 2\n",
+        encoding="utf-8",
+    )
+    sf_u1 = {"file": str(same_file), "start": 1, "end": 3, "name": "left", "kind": "function"}
+    sf_u2 = {"file": str(same_file), "start": 5, "end": 7, "name": "right", "kind": "function"}
+    sf_calls = 0
+
+    def _fail_same_file_midway(*args: Any, **kwargs: Any) -> Any:
+        nonlocal sf_calls
+        sf_calls += 1
+        if sf_calls == 2:
+            raise RuntimeError("simulated same-file failure")
+        return real_replace(*args, **kwargs)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(patch_mod, "resolve_unit_replacement", _fail_same_file_midway)
+        same_patch = generate_refactoring_patch(
+            [(0.99, sf_u1, sf_u2)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+        )
+    assert same_patch == ""
+
+    # 3. Circular import dependency across modules is rejected cleanly without mutating callers
+    cyc_a = tmp_path / "cyc_a.py"
+    cyc_b = tmp_path / "cyc_b.py"
+    cyc_a.write_text(
+        "import cyc_b\n\n"
+        "def f1(x):\n"
+        "    val = x + 1\n"
+        "    return val * 2\n",
+        encoding="utf-8",
+    )
+    cyc_b.write_text(
+        "def f2(x):\n"
+        "    val = x + 1\n"
+        "    return val * 2\n",
+        encoding="utf-8",
+    )
+    ca_u = {"file": str(cyc_a), "start": 3, "end": 5, "name": "f1", "kind": "function"}
+    cb_u = {"file": str(cyc_b), "start": 1, "end": 3, "name": "f2", "kind": "function"}
+    dg = build_module_graph(str(tmp_path))
+    cyc_patch = generate_refactoring_patch(
+        [(0.99, ca_u, cb_u)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="inline_first",
+        depgraph=dg,
+    )
+    assert "cyc_b" in cyc_patch
+    assert "from cyc_a import" not in cyc_patch
+    assert "Circular import" in cyc_patch or "circular" in cyc_patch.lower()
+
+
+def test_generate_refactoring_patch_uses_unit_source_code_when_second_unit_lacks_file_source(
+    tmp_path: Path,
+) -> None:
+    """Verifies preview patches synthesize from u2 source_code without placeholder comments when disk source is absent."""
+    mod_a = tmp_path / "mod_a.py"
+    mod_a.write_text(
+        "def compute_a(x, y):\n    val = (x * 2 + y)\n    return val\n",
+        encoding="utf-8",
+    )
+    line_text = "    val = (x * 2 + y)"
+    expr_start_col = line_text.index("x * 2 + y")
+    expr_end_col = expr_start_col + len("x * 2 + y")
+
+    u1 = {
+        "file": str(mod_a),
+        "name": "compute_a:expr",
+        "start": 2,
+        "end": 2,
+        "start_col": expr_start_col,
+        "end_col": expr_end_col,
+        "kind": "complex_expr",
+    }
+    u2_with_src = {
+        "file": str(tmp_path / "missing_mod_b.py"),
+        "name": "compute_b:expr",
+        "start": 7,
+        "end": 7,
+        "start_col": 14,
+        "end_col": 23,
+        "kind": "complex_expr",
+        "allow_snippet_only": True,
+        "source_code": "x * 2 + y",
+    }
+    patch_out = generate_refactoring_patch(
+        [(0.99, u1, u2_with_src)],
+        repo_root=str(tmp_path),
+        replace_clones=False,
+    )
+    assert "# Source for " not in patch_out
+    assert "x * 2 + y" in patch_out
+    assert "+def " in patch_out
+
+    # Also verify whole-function u2 with source_code in default strict mode
+    u1_fn = {
+        "file": str(mod_a),
+        "name": "compute_a",
+        "start": 1,
+        "end": 3,
+        "kind": "function",
+    }
+    u2_fn_src = {
+        "file": str(tmp_path / "missing_mod_b.py"),
+        "name": "compute_b",
+        "start": 10,
+        "end": 12,
+        "kind": "function",
+        "source_code": "def compute_b(x, y):\n    val = (x * 2 + y)\n    return val\n",
+    }
+    fn_patch = generate_refactoring_patch(
+        [(0.99, u1_fn, u2_fn_src)],
+        repo_root=str(tmp_path),
+        replace_clones=False,
+    )
+    assert "# Source for " not in fn_patch
+    assert "x * 2 + y" in fn_patch
+    assert "+def " in fn_patch
+
+    # Negative control: missing disk file and no source_code never emits placeholder helper lines
+    u1_missing = {
+        "file": str(tmp_path / "missing_mod_a.py"),
+        "name": "compute_a",
+        "start": 1,
+        "end": 2,
+        "kind": "function",
+    }
+    u2_missing = {
+        "file": str(tmp_path / "missing_mod_b.py"),
+        "name": "compute_b",
+        "start": 1,
+        "end": 2,
+        "kind": "function",
+    }
+    empty_patch = generate_refactoring_patch(
+        [(0.99, u1_missing, u2_missing)],
+        repo_root=str(tmp_path),
+        replace_clones=False,
+    )
+    assert empty_patch == ""
+    assert "# Source for " not in empty_patch
+
+
+@pytest.mark.parametrize(
+    ("hazard_case", "expected_reason"),
+    [
+        pytest.param("invalid_cols", "invalid unit columns", id="invalid_unit_columns"),
+        pytest.param("stale_source", "stale source code", id="stale_source_code"),
+        pytest.param("pathological_ast", "pathological ast", id="pathological_ast"),
+    ],
+)
+def test_generate_refactoring_patch_prioritizes_blocking_hazards_on_complex_expr(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    hazard_case: str,
+    expected_reason: str,
+) -> None:
+    """Verifies complex_expr pairs report blocking source/AST skip reasons rather than expression pruning errors."""
+    expr_file = tmp_path / "exprs.py"
+    if hazard_case == "pathological_ast":
+        deep_expr = "+" * 600 + "x"
+        src = (
+            f"def f1(x):\n    val = {deep_expr}\n    return val\n\n"
+            f"def f2(x):\n    val = {deep_expr}\n    return val\n"
+        )
+        line1 = f"    val = {deep_expr}"
+        expr_text = deep_expr
+    else:
+        src = (
+            "def f1(x):\n    val = (x + 1)\n    return val\n\n"
+            "def f2(x):\n    val = (x + 1)\n    return val\n"
+        )
+        line1 = "    val = (x + 1)"
+        expr_text = "x + 1"
+    expr_file.write_text(src, encoding="utf-8")
+    col_start = line1.index(expr_text)
+    col_end = col_start + len(expr_text)
+
+    u1: Dict[str, Any] = {
+        "file": str(expr_file),
+        "name": "f1:expr",
+        "start": 2,
+        "end": 2,
+        "start_col": col_start,
+        "end_col": col_end,
+        "kind": "complex_expr",
+    }
+    u2: Dict[str, Any] = {
+        "file": str(expr_file),
+        "name": "f2:expr",
+        "start": 6,
+        "end": 6,
+        "start_col": col_start,
+        "end_col": col_end,
+        "kind": "complex_expr",
+    }
+    if hazard_case == "invalid_cols":
+        u1["start_col"] = 500
+        u1["end_col"] = 510
+    elif hazard_case == "stale_source":
+        u1["source_code"] = "stale_expr * 999"
+
+    with caplog.at_level(logging.INFO, logger="pydoppelgangerhunt"):
+        patch_out = generate_refactoring_patch(
+            [(0.99, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+        )
+    assert patch_out == ""
+    assert expected_reason in caplog.text
+    assert "incompatible inputs or outputs" not in caplog.text
 

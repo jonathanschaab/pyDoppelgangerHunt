@@ -1132,7 +1132,14 @@ def harvest_notebook_units(
     p = Path(file_path)
     try:
         data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
-    except (json.JSONDecodeError, OSError):
+    except (
+        json.JSONDecodeError,
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+        TypeError,
+        RecursionError,
+    ):
         return units
 
     cells = data.get("cells", []) if isinstance(data, dict) else None

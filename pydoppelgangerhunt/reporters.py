@@ -13,22 +13,21 @@ from pathlib import Path
 import sys
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
-from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
 from pydoppelgangerhunt.config import (
     APP_VERSION,
     collect_heuristic_ctx_managers,
-    format_heuristic_ctx_manager_comment,
+    collect_wildcard_ctx_managers,
+    format_ctx_manager_assumption_comments,
     heuristic_ctx_manager_session,
     normalize_path_string,
     resolve_pair_closure_flags,
 )
-from pydoppelgangerhunt.fixer.scope import BLOCKING_CONTROL_FLOW_HAZARDS
 from pydoppelgangerhunt.source_lines import (
-    _extract_notebook_cell_lines,
     extract_unit_source_code,
     is_non_string_sequence,
     is_sliced_unit_source_lines,
     parse_unit_coord,
+    resolve_in_memory_notebook_unit,
     resolve_safe_unit_file_path,
     resolve_unit_line_bounds,
     with_unit_source_text,
@@ -82,14 +81,15 @@ def _unit_line_bounds(unit: Dict[str, Any]) -> Tuple[int, int]:
     return resolve_unit_line_bounds(unit)
 
 
-def _read_notebook_cell_lines(resolved_file: Path, cell_idx: int) -> Optional[List[str]]:
-    """Reads and extracts newline-terminated source lines for a 0-indexed Jupyter notebook cell on disk."""
-    try:
-        raw_nb_text = resolved_file.read_text(encoding="utf-8", errors="replace")
-        nb_data = json.loads(raw_nb_text)
-    except (OSError, json.JSONDecodeError, ValueError, TypeError):
-        return None
-    return _extract_notebook_cell_lines(nb_data, cell_idx)
+def _safe_unit_line_bounds_fallback(unit: Any) -> Tuple[int, int]:
+    """Extracts sanitized (start, end) line bounds without raising on invalid metadata."""
+    if not isinstance(unit, dict):
+        return 1, 1
+    raw_start = _safe_unit_coord(unit, "start")
+    raw_end = _safe_unit_coord(unit, "end")
+    start_val = max(1, raw_start) if raw_start is not None else 1
+    end_val = max(start_val, raw_end) if raw_end is not None else start_val
+    return start_val, end_val
 
 
 def generate_clone_diff(
@@ -146,11 +146,14 @@ def _collect_suggestion_rejection_reasons(
     *,
     pair_skip_reason: Optional[str],
     has_async_gen_hazard: bool,
-    synthesis_failed_with_error: bool = False,
+    synthesis_failure_reason: Optional[str] = None,
 ) -> _SuggestionRejectionInfo:
     """Classifies per-unit safety hazards and pair-level structural incompatibilities."""
     from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
         SAFETY_PAIR_SKIP_REASONS,
+    )
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        BLOCKING_CONTROL_FLOW_HAZARDS,
     )
 
     safety_reasons: List[str] = []
@@ -168,10 +171,14 @@ def _collect_suggestion_rejection_reasons(
             _add_unique(safety_reasons, str(cr).replace("_", " "))
 
     if pair_skip_reason:
-        if pair_skip_reason in SAFETY_PAIR_SKIP_REASONS:
-            _add_unique(safety_reasons, pair_skip_reason)
-        elif pair_skip_reason not in safety_reasons:
-            _add_unique(structural_reasons, pair_skip_reason)
+        reason_text = str(pair_skip_reason)
+        if reason_text in SAFETY_PAIR_SKIP_REASONS:
+            _add_unique(safety_reasons, reason_text)
+        elif reason_text not in safety_reasons:
+            _add_unique(structural_reasons, reason_text)
+
+    if synthesis_failure_reason and synthesis_failure_reason in SAFETY_PAIR_SKIP_REASONS:
+        _add_unique(safety_reasons, synthesis_failure_reason)
 
     if has_async_gen_hazard:
         _add_unique(safety_reasons, "async generator delegation hazard")
@@ -210,8 +217,8 @@ def _collect_suggestion_rejection_reasons(
             or sc2.get("has_class_scoped_type_params")
         ):
             _add_unique(structural_reasons, "incompatible class binding")
-        elif synthesis_failed_with_error:
-            _add_unique(structural_reasons, "unparseable or invalid syntax")
+        elif synthesis_failure_reason:
+            _add_unique(structural_reasons, synthesis_failure_reason)
 
     combined = tuple(dict.fromkeys([*safety_reasons, *structural_reasons]))
     return _SuggestionRejectionInfo(
@@ -238,16 +245,32 @@ def resolve_cached_unit_source_and_tree(
         _load_unit_file_text,
     )
 
+    nb_state = resolve_in_memory_notebook_unit(unit)
+    if nb_state.is_invalid:
+        return None, None
+
     inline_src = unit.get("source_text")
-    if not isinstance(inline_src, str) or not inline_src:
+    inline_key = "source_text"
+    if not isinstance(inline_src, str) or not inline_src.strip():
         inline_src = unit.get("file_source")
-    if isinstance(inline_src, str) and inline_src:
+        inline_key = "file_source"
+    if isinstance(inline_src, str) and inline_src.strip():
+        if nb_state.cell_lines is not None and nb_state.source_key == inline_key:
+            inline_src = "".join(nb_state.cell_lines)
+            if not inline_src.strip():
+                return None, None
         try:
             return inline_src, _get_or_parse_tree(inline_src)
-        except (SyntaxError, ValueError, RecursionError, MemoryError):
+        except (SyntaxError, ValueError, RecursionError):
             return inline_src, None
 
     raw_src_lines = unit.get("source_lines")
+    if nb_state.source_key == "source_lines" and nb_state.cell_lines:
+        cell_src = "".join(nb_state.cell_lines)
+        try:
+            return cell_src, _get_or_parse_tree(cell_src)
+        except (SyntaxError, ValueError, RecursionError):
+            return cell_src, None
     if (
         raw_src_lines is not None
         and is_non_string_sequence(raw_src_lines)
@@ -269,21 +292,23 @@ def resolve_cached_unit_source_and_tree(
             file_cache.move_to_end(cache_key)
             return file_cache[cache_key]
 
-    src_text: Optional[str]
-    if resolved_p is not None and resolved_p.suffix.lower() == ".ipynb" and "#" in raw_file:
-        parsed_nb = parse_notebook_cell_anchor(raw_file)
-        if parsed_nb is not None:
-            cell_lines = _read_notebook_cell_lines(resolved_p, parsed_nb[1])
-            src_text = "".join(cell_lines) if cell_lines else None
-        else:
-            src_text = None
-    else:
-        src_text = _load_unit_file_text(unit, repo_root=repo_root)
+    disk_unit = {
+        k: v
+        for k, v in unit.items()
+        if k
+        not in (
+            "source_text",
+            "file_source",
+            "source_lines",
+            "source_lines_is_sliced",
+        )
+    }
+    src_text = _load_unit_file_text(disk_unit, repo_root=repo_root)
     parsed_tree: Optional[ast.AST] = None
-    if isinstance(src_text, str) and src_text:
+    if isinstance(src_text, str) and src_text.strip():
         try:
             parsed_tree = _get_or_parse_tree(src_text)
-        except (SyntaxError, ValueError, RecursionError, MemoryError):
+        except (SyntaxError, ValueError, RecursionError):
             parsed_tree = None
     entry = (src_text, parsed_tree)
     if file_cache is not None and cache_key is not None:
@@ -310,24 +335,60 @@ def _prepare_effective_suggestion_unit(
     tree: Optional[ast.AST],
 ) -> _PreparedSuggestionUnit:
     """Copies unit, attaches resolved full-module source_text when not inline, and slices unit lines."""
-    u_eff = dict(unit)
     eff_src, eff_tree = (
         (source_text, tree)
         if source_text is not None or tree is not None
-        else resolve_cached_unit_source_and_tree(u_eff, repo_root=repo_root)
+        else resolve_cached_unit_source_and_tree(unit, repo_root=repo_root)
     )
-    if (
-        eff_src is not None
-        and "source_text" not in u_eff
-        and "source_lines" not in u_eff
-    ):
-        u_eff["source_text"] = eff_src
+    u_eff = with_unit_source_text(unit, eff_src)
+    if u_eff is unit:
+        u_eff = dict(unit)
     return _PreparedSuggestionUnit(
         unit=u_eff,
         source_text=eff_src,
         tree=eff_tree,
         lines=extract_unit_source_code(u_eff, repo_root),
     )
+
+
+class _RejectionScopeContext(NamedTuple):
+    """Adjusted scopes and pair skip reason for computing suggestion rejection causes."""
+
+    scope1: Dict[str, Any]
+    scope2: Dict[str, Any]
+    pair_skip_reason: Optional[str]
+
+
+def _resolve_rejection_scope_context(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    sc1: Dict[str, Any],
+    sc2: Dict[str, Any],
+    lines1: Sequence[str],
+    lines2: Sequence[str],
+    *,
+    is_expr_unit: bool,
+    pair_skip_reason: Optional[str],
+    prune_lhs_fn: Callable[[Dict[str, Any], Dict[str, Any], Sequence[str]], Any],
+    superseded_skip_reasons: Tuple[str, ...],
+) -> _RejectionScopeContext:
+    """Prunes expression LHS-only scope state and clears superseded output-pairing skip reasons."""
+    if not is_expr_unit:
+        return _RejectionScopeContext(sc1, sc2, pair_skip_reason)
+    pruned1 = dict(sc1)
+    pruned2 = dict(sc2)
+    prune_lhs_fn(dict(u1), pruned1, lines1)
+    prune_lhs_fn(dict(u2), pruned2, lines2)
+    effective_reason = (
+        None
+        if (
+            pair_skip_reason in superseded_skip_reasons
+            and not pruned1.get("outputs")
+            and not pruned2.get("outputs")
+        )
+        else pair_skip_reason
+    )
+    return _RejectionScopeContext(pruned1, pruned2, effective_reason)
 
 
 def synthesize_refactoring_suggestion(
@@ -384,140 +445,198 @@ def synthesize_refactoring_suggestion(
     diff_summary = f"{len(diff_lines)} varying line(s) detected between clone blocks."
 
     from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        SAFETY_PAIR_SKIP_REASONS,
         CloneOutputResolution,
+        PairSkipReason,
         has_async_generator_delegation_hazard,
         resolve_clone_pair_outputs,
     )
     from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
         ensure_unit_scope_closure_mode,
+        resolve_unit_inferred_col_bounds,
+    )
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
+        lines_end_with_unconditional_return,
     )
     from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
         _align_pair_expr_kinds,
+        _prune_unreferenced_lhs_scope,
         synthesize_shared_helper_code,
     )
 
-    _align_pair_expr_kinds(p1.unit, p2.unit)
-    is_expr_unit = p1.unit.get("kind") in ("comprehension", "complex_expr")
+    kinds_aligned = _align_pair_expr_kinds(p1.unit, p2.unit)
+    p1 = p1._replace(
+        unit=resolve_unit_inferred_col_bounds(p1.unit, repo_root=repo_root).unit
+    )
+    p2 = p2._replace(
+        unit=resolve_unit_inferred_col_bounds(p2.unit, repo_root=repo_root).unit
+    )
+    is_expr_unit = kinds_aligned and p1.unit.get("kind") in (
+        "comprehension",
+        "complex_expr",
+    )
 
     with collect_heuristic_ctx_managers() as pair_heuristics:
-        pair_flags = resolve_pair_closure_flags(
-            p1.unit,
-            p2.unit,
-            closure_strictness=closure_strictness,
-            skip_pre_unit_closures=skip_pre_unit_closures,
-            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
-        )
-        pre_sc1 = (
-            p1.unit.get("scope") if isinstance(p1.unit.get("scope"), dict) else None
-        )
-        pre_sc2 = (
-            p2.unit.get("scope") if isinstance(p2.unit.get("scope"), dict) else None
-        )
-        sc1 = ensure_unit_scope_closure_mode(
-            p1.unit,
-            pre_sc1,
-            pair_flags.effective_skip_pre_unit_closures,
-            strict_with_suppression=pair_flags.effective_strict_with_suppression,
-            non_suppressing_ctx_managers=pair_flags.unit1.non_suppressing_ctx_managers,
-            source_text=p1.source_text,
-            tree=p1.tree,
-            repo_root=repo_root,
-        )
-        sc2 = ensure_unit_scope_closure_mode(
-            p2.unit,
-            pre_sc2,
-            pair_flags.effective_skip_pre_unit_closures,
-            strict_with_suppression=pair_flags.effective_strict_with_suppression,
-            non_suppressing_ctx_managers=pair_flags.unit2.non_suppressing_ctx_managers,
-            source_text=p2.source_text,
-            tree=p2.tree,
-            repo_root=repo_root,
-        )
-        has_naked_loop_jump = any(
-            h in ("naked_break", "naked_continue")
-            for h in (
+        with collect_wildcard_ctx_managers() as pair_wildcards:
+            pair_flags = resolve_pair_closure_flags(
+                p1.unit,
+                p2.unit,
+                closure_strictness=closure_strictness,
+                skip_pre_unit_closures=skip_pre_unit_closures,
+                non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+            )
+            pre_sc1 = (
+                p1.unit.get("scope") if isinstance(p1.unit.get("scope"), dict) else None
+            )
+            pre_sc2 = (
+                p2.unit.get("scope") if isinstance(p2.unit.get("scope"), dict) else None
+            )
+            sc1 = ensure_unit_scope_closure_mode(
+                p1.unit,
+                pre_sc1,
+                pair_flags.effective_skip_pre_unit_closures,
+                strict_with_suppression=pair_flags.effective_strict_with_suppression,
+                non_suppressing_ctx_managers=pair_flags.unit1.non_suppressing_ctx_managers,
+                source_text=p1.source_text,
+                tree=p1.tree,
+                repo_root=repo_root,
+            )
+            sc2 = ensure_unit_scope_closure_mode(
+                p2.unit,
+                pre_sc2,
+                pair_flags.effective_skip_pre_unit_closures,
+                strict_with_suppression=pair_flags.effective_strict_with_suppression,
+                non_suppressing_ctx_managers=pair_flags.unit2.non_suppressing_ctx_managers,
+                source_text=p2.source_text,
+                tree=p2.tree,
+                repo_root=repo_root,
+            )
+            combined_hazards = (
                 *sc1.get("control_flow_hazards", ()),
                 *sc2.get("control_flow_hazards", ()),
             )
-        )
-        effective_pair_strictness = (
-            "lenient"
-            if pair_flags.effective_skip_pre_unit_closures
-            else (
-                "pedantic" if pair_flags.effective_strict_with_suppression else "strict"
+            has_naked_loop_jump = any(
+                h in ("naked_break", "naked_continue") for h in combined_hazards
             )
-        )
-        pair_out_raw = resolve_clone_pair_outputs(
-            u1=p1.unit,
-            u2=p2.unit,
-            scope1=sc1,
-            scope2=sc2,
-            source_text1=p1.source_text,
-            source_text2=p2.source_text,
-            tree1=p1.tree,
-            tree2=p2.tree,
-            repo_root=repo_root,
-            skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
-            closure_strictness=effective_pair_strictness,
-            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
-            return_details=True,
-        )
-        pair_outputs: Optional[Tuple[List[str], List[str]]] = (
-            pair_out_raw.outputs
-            if isinstance(pair_out_raw, CloneOutputResolution)
-            else pair_out_raw
-        )
-        pair_skip_reason: Optional[str] = (
-            pair_out_raw.skip_reason
-            if isinstance(pair_out_raw, CloneOutputResolution)
-            else None
-        )
-
-        helper_code = ""
-        synthesis_failed_with_error = False
-        if not has_naked_loop_jump and (pair_outputs is not None or is_expr_unit):
-            try:
-                helper_code = synthesize_shared_helper_code(
-                    p1.unit,
-                    p2.unit,
-                    helper_name=helper_name,
-                    repo_root=repo_root,
+            has_nonterminal_embedded_return = (
+                "embedded_return" in combined_hazards
+                and not (
+                    lines_end_with_unconditional_return(p1.lines)
+                    and lines_end_with_unconditional_return(p2.lines)
+                )
+            )
+            effective_pair_strictness = (
+                "lenient"
+                if pair_flags.effective_skip_pre_unit_closures
+                else (
+                    "pedantic" if pair_flags.effective_strict_with_suppression else "strict"
+                )
+            )
+            pair_outputs: Optional[Tuple[List[str], List[str]]] = None
+            pair_skip_reason: Optional[str] = None
+            if kinds_aligned:
+                pair_out_raw = resolve_clone_pair_outputs(
+                    u1=p1.unit,
+                    u2=p2.unit,
+                    scope1=sc1,
+                    scope2=sc2,
                     source_text1=p1.source_text,
                     source_text2=p2.source_text,
                     tree1=p1.tree,
                     tree2=p2.tree,
-                    closure_strictness=effective_pair_strictness,
+                    repo_root=repo_root,
                     skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
+                    closure_strictness=effective_pair_strictness,
                     non_suppressing_ctx_managers=non_suppressing_ctx_managers,
-                    outputs=None if is_expr_unit or pair_outputs is None else pair_outputs[0],
-                    outputs2=None if is_expr_unit or pair_outputs is None else pair_outputs[1],
-                    scope1=sc1,
-                    scope2=sc2,
+                    return_details=True,
                 )
-            except (
-                SyntaxError,
-                OSError,
-                UnicodeDecodeError,
-                RecursionError,
-                MemoryError,
-            ) as exc:
-                logger.debug(
-                    "Failed to synthesize refactoring suggestion for (%s, %s): %s",
-                    n1,
-                    n2,
-                    exc,
-                    exc_info=True,
+                pair_outputs = (
+                    pair_out_raw.outputs
+                    if isinstance(pair_out_raw, CloneOutputResolution)
+                    else pair_out_raw
                 )
-                helper_code = ""
-                synthesis_failed_with_error = True
+                pair_skip_reason = (
+                    pair_out_raw.skip_reason
+                    if isinstance(pair_out_raw, CloneOutputResolution)
+                    else None
+                )
+
+            helper_code = ""
+            synthesis_failure_reason: Optional[str] = None
+            if (
+                kinds_aligned
+                and not has_naked_loop_jump
+                and not has_nonterminal_embedded_return
+                and pair_skip_reason not in SAFETY_PAIR_SKIP_REASONS
+                and (pair_outputs is not None or is_expr_unit)
+            ):
+                try:
+                    helper_code = synthesize_shared_helper_code(
+                        p1.unit,
+                        p2.unit,
+                        helper_name=helper_name,
+                        repo_root=repo_root,
+                        source_text1=p1.source_text,
+                        source_text2=p2.source_text,
+                        tree1=p1.tree,
+                        tree2=p2.tree,
+                        closure_strictness=effective_pair_strictness,
+                        skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
+                        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+                        outputs=None if is_expr_unit or pair_outputs is None else pair_outputs[0],
+                        outputs2=None if is_expr_unit or pair_outputs is None else pair_outputs[1],
+                        scope1=sc1,
+                        scope2=sc2,
+                    )
+                except SyntaxError as exc:
+                    logger.debug(
+                        "Failed to synthesize refactoring suggestion for (%s, %s): %s",
+                        n1,
+                        n2,
+                        exc,
+                        exc_info=True,
+                    )
+                    helper_code = ""
+                    synthesis_failure_reason = "unparseable or invalid syntax"
+                except (OSError, UnicodeDecodeError) as exc:
+                    logger.debug(
+                        "Failed to synthesize refactoring suggestion for (%s, %s): %s",
+                        n1,
+                        n2,
+                        exc,
+                        exc_info=True,
+                    )
+                    helper_code = ""
+                    synthesis_failure_reason = "source file read or decode failure"
+                except RecursionError as exc:
+                    logger.debug(
+                        "Failed to synthesize refactoring suggestion for (%s, %s): %s",
+                        n1,
+                        n2,
+                        exc,
+                        exc_info=True,
+                    )
+                    helper_code = ""
+                    synthesis_failure_reason = PairSkipReason.PATHOLOGICAL_AST.value
     if helper_code:
         effective_heuristics = sorted(
             set(pair_heuristics)
             | set(sc1.get("heuristic_ctx_managers", ()))
             | set(sc2.get("heuristic_ctx_managers", ()))
         )
-        note_comment = format_heuristic_ctx_manager_comment(effective_heuristics)
-        note_line = f"    {note_comment}\n" if note_comment else ""
+        effective_wildcards = sorted(
+            set(pair_wildcards)
+            | set(sc1.get("wildcard_ctx_managers", ()))
+            | set(sc2.get("wildcard_ctx_managers", ()))
+        )
+        note_comment = format_ctx_manager_assumption_comments(
+            effective_heuristics, effective_wildcards
+        )
+        note_line = (
+            "".join(f"    {ln}\n" for ln in note_comment.splitlines())
+            if note_comment
+            else ""
+        )
         indented_helper = "\n".join(
             f"    {ln}" if ln.strip() else ""
             for ln in helper_code.rstrip("\n").splitlines()
@@ -534,14 +653,30 @@ def synthesize_refactoring_suggestion(
         sc2,
         has_outputs=bool(pair_outputs and (pair_outputs[0] or pair_outputs[1])),
     )
-    rejection = _collect_suggestion_rejection_reasons(
+    rej_ctx = _resolve_rejection_scope_context(
         p1.unit,
         p2.unit,
         sc1,
         sc2,
+        p1.lines,
+        p2.lines,
+        is_expr_unit=is_expr_unit,
         pair_skip_reason=pair_skip_reason,
+        prune_lhs_fn=_prune_unreferenced_lhs_scope,
+        superseded_skip_reasons=(
+            PairSkipReason.OUTPUT_ARITY_MISMATCH.value,
+            PairSkipReason.PERMUTED_OUTPUTS.value,
+            PairSkipReason.UNPAIRED_OUTPUTS.value,
+        ),
+    )
+    rejection = _collect_suggestion_rejection_reasons(
+        p1.unit,
+        p2.unit,
+        rej_ctx.scope1,
+        rej_ctx.scope2,
+        pair_skip_reason=rej_ctx.pair_skip_reason,
         has_async_gen_hazard=has_async_gen_hazard,
-        synthesis_failed_with_error=synthesis_failed_with_error,
+        synthesis_failure_reason=synthesis_failure_reason,
     )
     reason_suffix = (
         f" [{', '.join(rejection.reasons)}]" if rejection.reasons else ""
@@ -906,6 +1041,8 @@ def generate_html_report(
                 s2, e2 = _unit_line_bounds(u2)
                 n1 = str(u1.get("name") or "unit1")
                 n2 = str(u2.get("name") or "unit2")
+            except MemoryError:
+                raise
             except Exception as exc:  # pylint: disable=broad-exception-caught
                 if on_diagnostic_error is not None:
                     on_diagnostic_error()
@@ -938,7 +1075,8 @@ def generate_html_report(
                     if isinstance(u2, dict)
                     else ""
                 )
-                s1, e1, s2, e2 = 1, 1, 1, 1
+                s1, e1 = _safe_unit_line_bounds_fallback(u1)
+                s2, e2 = _safe_unit_line_bounds_fallback(u2)
                 diag = f"Diagnostic: pair rendering failed ({type(exc).__name__}: {exc})"
                 diff_txt = f"# {diag}"
                 sug_txt = f"[REFACTOR SUGGESTION] {diag}"

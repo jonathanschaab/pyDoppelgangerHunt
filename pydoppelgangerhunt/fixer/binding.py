@@ -448,7 +448,7 @@ def _populate_unit_receiver_metadata(
                     u_start = parse_unit_coord(unit, "start", default=1)
                     u_end = parse_unit_coord(unit, "end", default=u_start)
                     u_start_col = _extract_first_unit_coord(
-                        unit, ("start_col", "start_col_offset")
+                        unit, ("start_col", "start_col_offset", "col_offset")
                     )
                     u_end_col = _extract_unit_end_col(unit)
                     has_yield, has_await = _unit_ast_has_async_or_yield(

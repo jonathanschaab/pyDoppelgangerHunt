@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import io
 import logging
+import os
 import textwrap
 import tokenize
 import warnings
@@ -24,26 +25,29 @@ from typing import (
     Union,
 )
 
+from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
+from pydoppelgangerhunt.config import normalize_non_suppressing_ctx_managers
 from pydoppelgangerhunt.fixer._ast_compat import is_trystar_node
 from pydoppelgangerhunt.fixer._df_cache import (
     _get_cached_tree_source_lines,
     _get_or_parse_tree,
     _get_valid_unit_bounds,
     _register_tree_source_lines,
-    _suppress_syntax_warnings,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
     _get_tree_scope_intervals,
     _node_scope_bounds,
 )
 from pydoppelgangerhunt.source_lines import (
-    SourceLinesOrigin,
     count_physical_newlines,
     detect_line_ending,
+    extract_unit_source_lines_with_state,
     is_non_string_sequence,
     is_sliced_unit_source_lines,
     normalize_unit_coordinates,
     parse_unit_coord,
+    read_notebook_cell_lines_cached,
+    resolve_in_memory_notebook_unit,
     resolve_safe_unit_file_path,
     resolve_unit_line_bounds,
     split_source_lines,
@@ -70,6 +74,7 @@ __all__ = [
     "is_sliced_unit_source_lines",
     "is_subroutine_unit",
     "is_valid_unit_coordinates",
+    "lines_end_with_unconditional_return",
     "parse_unit_coord",
     "replace_unit_in_source",
     "resolve_safe_unit_file_path",
@@ -95,6 +100,23 @@ class UnitSchema(TypedDict, total=False):
         5. ``source_code`` (used by ``inspect_single_unit_scope`` when no full-module
            source is available, or validated against the backing module/tree for
            staleness when both are present).
+
+    Notebook Anchors & Authoritative Unsaved Cell Buffers:
+        Malformed ``.ipynb#<fragment>`` anchors fail closed even when in-memory source
+        fields are populated. Valid ``#cell_N`` anchors validate against any in-memory
+        nbformat JSON in ``file_source``/``source_text``/``source_lines`` (extracting the
+        target code cell's Python lines when no plain-Python cell buffer overrides them).
+        Plain-Python in-memory buffers (``source_lines``, or non-JSON ``source_text`` /
+        ``file_source``) alongside a valid ``#cell_N`` anchor act as authoritative unsaved
+        cell buffers overriding disk ``.ipynb`` anchor lookup.
+
+    Schema Validation:
+        ``validate_unit_schema()`` is invoked automatically only at the high-level
+        refactoring entrypoints (``generate_refactoring_patch`` and
+        ``synthesize_shared_helper_code``); lower-level helpers such as
+        ``inspect_single_unit_scope``, ``extract_unit_source_lines_with_state``, and
+        ``analyze_unit_variable_scope`` accept lightweight unit dicts directly without
+        running ``validate_unit_schema()`` unless the caller invokes it explicitly.
 
     Attributes:
         file: Relative or absolute source file path (may include ``#cell_N`` for notebooks).
@@ -132,9 +154,17 @@ class UnitSchema(TypedDict, total=False):
         scope: Precomputed scope analysis dictionary from ``inspect_single_unit_scope``.
         receiver_param: Receiver parameter name (e.g., ``"self"`` or ``"cls"``).
         receiver_kind: Receiver binding kind (``"instance"``, ``"class"``, or ``"module"``).
+        self_param: Instance receiver parameter name (legacy alias for ``receiver_param``
+            on instance methods).
+        cls_param: Class receiver parameter name (legacy alias for ``receiver_param``
+            on classmethods).
         enclosing_class: Name of the enclosing class when the unit is a method or nested block.
         enclosing_class_start: 1-based start line of the enclosing class definition.
         enclosing_is_async: Whether the immediately enclosing function is ``async def``.
+        enclosing_is_classmethod: Whether the immediately enclosing method is decorated
+            with ``@classmethod``.
+        enclosing_is_staticmethod: Whether the immediately enclosing method is decorated
+            with ``@staticmethod``.
         enclosing_function: Name of the immediately enclosing function.
         is_static: Whether the unit is decorated with ``@staticmethod``.
         is_class_method: Whether the unit is decorated with ``@classmethod``.
@@ -155,6 +185,7 @@ class UnitSchema(TypedDict, total=False):
             module ``tree``, ``source_text``, or ``file``. Defaults to ``False`` (fail-closed).
         token_count: Number of normalized AST tokens in the unit.
         tokens: Legacy alias for ``token_count``.
+        norm_tokens: Normalized AST token sequence emitted by the parser.
         lines: Total line span count emitted by the parser.
         sloc: Source lines of code count.
         complexity: McCabe cyclomatic complexity of the unit.
@@ -299,12 +330,14 @@ _UNIT_ORDERED_STR_SEQ_KEYS: frozenset[str] = frozenset(
 )
 # Membership-only fields accept either ordered sequences or unordered sets.
 _UNIT_STR_COLLECTION_KEYS: frozenset[str] = frozenset({"non_suppressing_ctx_managers"})
+_START_COL_KEYS: Tuple[str, ...] = ("start_col", "start_col_offset", "col_offset")
+_END_COL_KEYS: Tuple[str, ...] = ("end_col", "end_col_offset")
 # Mutually aliased coordinate keys that must agree when more than one is supplied.
 _UNIT_COORD_ALIAS_GROUPS: Tuple[Tuple[str, ...], ...] = (
     ("start", "lineno"),
     ("end", "end_lineno"),
-    ("start_col", "col_offset", "start_col_offset"),
-    ("end_col", "end_col_offset"),
+    _START_COL_KEYS,
+    _END_COL_KEYS,
 )
 _VALID_CLOSURE_STRICTNESS_VALUES: frozenset[str] = frozenset(
     {"strict", "pedantic", "lenient"}
@@ -352,6 +385,13 @@ def _validate_known_unit_field_value(key: str, val: Any) -> None:
             raise ValueError(f"Expected bool for unit field {key!r}, got {val!r}")
         return
     if key in _UNIT_STR_KEYS:
+        if key == "file" and isinstance(val, os.PathLike):
+            fspath = os.fspath(val)
+            if not isinstance(fspath, str):
+                raise ValueError(
+                    f"Expected str or str PathLike for unit field {key!r}, got {val!r}"
+                )
+            return
         if not isinstance(val, str):
             raise ValueError(f"Expected str for unit field {key!r}, got {val!r}")
         if (
@@ -392,6 +432,8 @@ def _validate_known_unit_field_value(key: str, val: Any) -> None:
                 raise ValueError(
                     f"Expected {description} of str for unit field {key!r}, got {val!r}"
                 )
+            if key == "non_suppressing_ctx_managers":
+                normalize_non_suppressing_ctx_managers(val)
             return
     if key == "tokens":
         is_nonneg_int = not isinstance(val, bool) and isinstance(val, int) and val >= 0
@@ -445,6 +487,15 @@ def validate_unit_schema(
     unrecognized keys are present). Returns the set of unrecognized keys not
     declared on ``UnitSchema``.
 
+    Important:
+        ``validate_unit_schema()`` is called automatically ONLY at the high-level
+        refactoring entrypoints (``generate_refactoring_patch`` and
+        ``synthesize_shared_helper_code``). Lower-level inspection and extraction
+        helpers (``inspect_single_unit_scope``, ``extract_unit_source_lines_with_state``,
+        ``analyze_unit_variable_scope``, etc.) do NOT invoke ``validate_unit_schema()``
+        automatically; call it explicitly before passing untrusted or external unit
+        payloads into those lower-level helpers.
+
     Note:
         Positionally consumed fields (``source_lines``, ``inputs``, ``outputs``,
         ``precomputed_outputs``, ``norm_tokens``, ``calls``, and list-valued
@@ -468,33 +519,35 @@ def validate_unit_schema(
     _validate_coordinate_alias_agreement(unit)
     start_raw = unit.get("start") if unit.get("start") is not None else unit.get("lineno")
     end_raw = unit.get("end") if unit.get("end") is not None else unit.get("end_lineno")
-    if start_raw is not None:
-        s_val = parse_unit_coord({"start": start_raw}, "start", default=None, strict=True)
-        e_val = (
-            parse_unit_coord({"end": end_raw}, "end", default=None, strict=True)
-            if end_raw is not None
-            else s_val
-        )
-        if s_val is not None and e_val is not None:
-            if e_val < s_val:
-                raise ValueError(
-                    f"Inverted line coordinates in unit dictionary: start={s_val} > end={e_val}"
-                )
-            if s_val == e_val:
-                s_col = _parse_first_unit_coord(
-                    unit, ("start_col", "col_offset", "start_col_offset")
-                )
-                e_col = _parse_first_unit_coord(unit, ("end_col", "end_col_offset"))
-                if s_col is not None and e_col is not None and e_col <= s_col:
-                    if e_col < s_col:
-                        raise ValueError(
-                            f"Inverted column coordinates on line {s_val}: "
-                            f"start_col={s_col} > end_col={e_col}"
-                        )
+    s_val = (
+        parse_unit_coord({"start": start_raw}, "start", default=None, strict=True)
+        if start_raw is not None
+        else 1
+    )
+    e_val = (
+        parse_unit_coord({"end": end_raw}, "end", default=None, strict=True)
+        if end_raw is not None
+        else s_val
+    )
+    if s_val is not None and e_val is not None:
+        if e_val < s_val:
+            raise ValueError(
+                f"Inverted line coordinates in unit dictionary: start={s_val} > end={e_val}"
+            )
+        if s_val == e_val:
+            raw_s_col = _parse_first_unit_coord(unit, _START_COL_KEYS)
+            e_col = _parse_first_unit_coord(unit, _END_COL_KEYS)
+            s_col = 0 if raw_s_col is None else raw_s_col
+            if e_col is not None and e_col <= s_col:
+                if e_col < s_col:
                     raise ValueError(
-                        f"Zero-width column coordinates on line {s_val}: "
-                        f"start_col={s_col} == end_col={e_col}"
+                        f"Inverted column coordinates on line {s_val}: "
+                        f"start_col={s_col} > end_col={e_col}"
                     )
+                raise ValueError(
+                    f"Zero-width column coordinates on line {s_val}: "
+                    f"start_col={s_col} == end_col={e_col}"
+                )
     return unknown
 
 _parse_unit_coord = parse_unit_coord
@@ -542,8 +595,8 @@ def is_valid_unit_coordinates(u: Any, strict: bool = False) -> bool:
                         first_val = c_val
             return first_val
 
-        start_col = _parse_and_validate_cols(("start_col", "start_col_offset"))
-        end_col = _parse_and_validate_cols(("end_col", "end_col_offset"))
+        start_col = _parse_and_validate_cols(_START_COL_KEYS)
+        end_col = _parse_and_validate_cols(_END_COL_KEYS)
 
         effective_end = end_val if end_val is not None else start_val
         if (
@@ -694,27 +747,46 @@ def _load_unit_file_text(
        to prevent length ambiguity heuristics from bypassing the buffer.
     3. Disk-based file resolution within repo_root.
     """
+    nb_state = resolve_in_memory_notebook_unit(unit)
+    if nb_state.is_invalid:
+        return None
+
     source_text = unit.get("source_text")
-    if source_text is None:
-        source_text = unit.get("file_source")
     if source_text is not None:
+        if nb_state.cell_lines is not None and nb_state.source_key == "source_text":
+            return "".join(nb_state.cell_lines)
         return str(source_text)
+
+    file_source = unit.get("file_source")
+    if file_source is not None:
+        if nb_state.cell_lines is not None and nb_state.source_key == "file_source":
+            return "".join(nb_state.cell_lines)
+        return str(file_source)
 
     # In-memory full lines take precedence over disk (vital for IDE/LSP unsaved buffers)
     unit_lines = unit.get("source_lines")
     if unit_lines is not None and is_non_string_sequence(unit_lines):
+        if nb_state.cell_lines is not None and nb_state.source_key == "source_lines":
+            return "".join(nb_state.cell_lines)
         if not _is_sliced_excerpt_for_file(unit, unit_lines):
             return "".join(
                 ln if ln.endswith(("\n", "\r")) else ln + "\n"
                 for ln in unit_lines
             )
 
-    # Disk resolution: strictly only .py files within repo_root or CWD are accepted.
-    # Notebooks (.ipynb) and out-of-root files fail closed and return None.
+    # Disk resolution: accept .py files and anchored .ipynb#cell_N code cells within
+    # repo_root or CWD; unanchored/malformed/out-of-range/non-code notebook targets fail
+    # closed to None instead of exposing raw nbformat JSON.
     resolved_file = resolve_safe_unit_file_path(
-        unit, repo_root=repo_root, allowed_suffixes=(".py",)
+        unit, repo_root=repo_root, allowed_suffixes=(".py", ".ipynb")
     )
     if resolved_file is not None:
+        if resolved_file.suffix.lower() == ".ipynb":
+            parsed_nb = parse_notebook_cell_anchor(str(unit.get("file") or ""))
+            if parsed_nb is None:
+                return None
+            cell_lines = read_notebook_cell_lines_cached(resolved_file, parsed_nb[1])
+            return "".join(cell_lines) if cell_lines else None
         try:
             with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
                 return fh.read()
@@ -1014,8 +1086,7 @@ def _is_valid_eval_expr(text: str) -> bool:
     if not stripped:
         return False
     try:
-        with _suppress_syntax_warnings():
-            ast.parse(stripped, mode="eval")
+        ast.parse(stripped, mode="eval")
         return True
     except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
         return False
@@ -1025,19 +1096,22 @@ def _slice_unit_token_lines(
     unit: Dict[str, Any],
     lines: List[str],
     *,
-    is_pre_sliced: Optional[Union[bool, SourceLinesOrigin]] = None,
     explicit_col_sliced: Optional[bool] = None,
-) -> List[str]:
+) -> Optional[List[str]]:
     """Slices source lines to the exact start_col and end_col offsets of the unit.
 
     Line-sliced excerpts still undergo first/last-line column clipping unless
     ``source_lines_is_col_sliced=True`` (or ``explicit_col_sliced=True``) explicitly
-    declares that column offsets were already stripped. Out-of-bounds column
-    coordinates fail closed by returning ``[]``.
+    declares that column offsets were already stripped. Out-of-bounds or invalid
+    ``start_col`` / ``end_col`` coordinates fail closed by returning ``None`` so
+    callers can distinguish column-slicing failures from legitimately empty inputs.
     """
-    del is_pre_sliced
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
         return lines
+    s_col_opt = _extract_slice_col_offset(unit, _START_COL_KEYS, default=0)
+    e_col = _extract_slice_col_offset(unit, _END_COL_KEYS, default=None)
+    if s_col_opt is None or s_col_opt < 0 or (e_col is not None and e_col < 0):
+        return None
     raw_col_flag = unit.get("source_lines_is_col_sliced")
     eff_col_sliced = (
         explicit_col_sliced
@@ -1046,16 +1120,6 @@ def _slice_unit_token_lines(
     )
     if eff_col_sliced is True:
         return list(lines)
-    s_col_opt = _extract_slice_col_offset(
-        unit, ("start_col", "start_col_offset"), default=0
-    )
-    e_col = _extract_slice_col_offset(
-        unit, ("end_col", "end_col_offset"), default=None
-    )
-    if s_col_opt is None or s_col_opt < 0:
-        return lines
-    if e_col is not None and e_col < 0:
-        return []
     s_col = s_col_opt
     res = list(lines)
     first_byte_len = len(res[0].rstrip("\r\n").encode("utf-8"))
@@ -1065,7 +1129,7 @@ def _slice_unit_token_lines(
             or (s_col == first_byte_len and e_col != first_byte_len)
             or (e_col is not None and (e_col > first_byte_len or e_col < s_col))
         ):
-            return []
+            return None
         res[0] = _slice_utf8_line(res[0], s_col, e_col)
         return res
     last_byte_len = len(res[-1].rstrip("\r\n").encode("utf-8"))
@@ -1074,13 +1138,55 @@ def _slice_unit_token_lines(
         or 0 < first_byte_len == s_col
         or (e_col is not None and e_col > last_byte_len)
     ):
-        return []
+        return None
     clipped = list(res)
     if 0 < s_col < first_byte_len:
         clipped[0] = _slice_utf8_line(clipped[0], s_col, None)
-    if e_col is not None and 0 <= e_col <= last_byte_len:
-        clipped[-1] = _slice_utf8_line(clipped[-1].rstrip("\r\n"), 0, e_col)
+    if e_col is not None:
+        clipped[-1] = _slice_utf8_line(clipped[-1], 0, e_col)
     return clipped
+
+
+class _UnitTokenLinesResult(NamedTuple):
+    """Column-sliced unit body lines paired with placeholder-origin status."""
+
+    lines: Optional[List[str]]
+    is_placeholder: bool
+
+
+def _extract_unit_token_lines_with_state(
+    unit: Dict[str, Any], *, repo_root: Optional[str] = None
+) -> _UnitTokenLinesResult:
+    """Extracts body and column-sliced lines with placeholder status, falling back to ``source_code``."""
+    raw_lines, origin = extract_unit_source_lines_with_state(
+        unit, repo_root=repo_root
+    )
+    if origin.is_placeholder and not raw_lines:
+        return _UnitTokenLinesResult(None, True)
+    used_source_code_fallback = False
+    if origin.is_placeholder:
+        src_code = unit.get("source_code")
+        if isinstance(src_code, str) and src_code.strip():
+            raw_lines = split_source_lines(src_code)
+            used_source_code_fallback = True
+    sliced = _slice_unit_token_lines(
+        unit,
+        _extract_unit_body_lines(
+            unit, [ln.rstrip("\r\n") for ln in raw_lines]
+        ),
+        explicit_col_sliced=True if used_source_code_fallback else None,
+    )
+    return _UnitTokenLinesResult(
+        sliced,
+        origin.is_placeholder and not used_source_code_fallback,
+    )
+
+
+def _extract_unit_token_lines(
+    unit: Dict[str, Any], *, repo_root: Optional[str] = None
+) -> Optional[List[str]]:
+    """Extracts body and column-sliced lines for a unit, falling back to ``source_code`` on non-empty placeholder origins."""
+    return _extract_unit_token_lines_with_state(unit, repo_root=repo_root).lines
 
 
 def _get_module_imported_names(
@@ -1530,16 +1636,8 @@ def compute_unit_spans(
 
     first_line = lines[start - 1]
     last_line = lines[end - 1]
-    raw_sc = (
-        unit.get("start_col")
-        if unit.get("start_col") is not None
-        else unit.get("start_col_offset")
-    )
-    raw_ec = (
-        unit.get("end_col")
-        if unit.get("end_col") is not None
-        else unit.get("end_col_offset")
-    )
+    raw_sc = next((unit.get(k) for k in _START_COL_KEYS if unit.get(k) is not None), None)
+    raw_ec = next((unit.get(k) for k in _END_COL_KEYS if unit.get(k) is not None), None)
 
     try:
         start_col = _parse_unit_coord(unit, "start_col", default=None)
@@ -2004,9 +2102,7 @@ def _find_innermost_enclosing_node(
         "data_table",
     )
     if is_sub_kind and candidates:
-        u_start_col = _extract_slice_col_offset(
-            unit, ("start_col", "start_col_offset"), default=None
-        )
+        u_start_col = _extract_slice_col_offset(unit, _START_COL_KEYS, default=None)
         has_outer_fn = any(
             isinstance(c_node, (ast.FunctionDef, ast.AsyncFunctionDef))
             and not (
@@ -2056,3 +2152,40 @@ def find_enclosing_function_is_async(
     if res is None:
         return False
     return isinstance(res[0], ast.AsyncFunctionDef)
+
+
+def lines_end_with_unconditional_return(cand_lines: Sequence[str]) -> bool:
+    """Returns True when dedented candidate lines end with an unconditional top-level return statement."""
+    if not cand_lines:
+        return False
+    joined = "".join(
+        ln if ln.endswith(("\n", "\r")) else f"{ln}\n" for ln in cand_lines
+    )
+    dedented = dedent_source_text(joined)
+    if not dedented.strip():
+        return False
+    for wrapper in (None, "async def _w():\n"):
+        src = (
+            dedented
+            if wrapper is None
+            else wrapper + textwrap.indent(dedented, "    ")
+        )
+        try:
+            mod = ast.parse(src)
+        except (
+            SyntaxError,
+            ValueError,
+            UnicodeDecodeError,
+            RecursionError,
+            MemoryError,
+        ):
+            continue
+        body = (
+            mod.body[0].body
+            if wrapper is not None
+            and len(mod.body) == 1
+            and isinstance(mod.body[0], ast.AsyncFunctionDef)
+            else mod.body
+        )
+        return bool(body) and isinstance(body[-1], ast.Return)
+    return False

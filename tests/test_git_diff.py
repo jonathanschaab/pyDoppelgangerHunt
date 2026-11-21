@@ -27,7 +27,7 @@ from pydoppelgangerhunt import (
     parse_git_diff_hunks,
     scan_target,
 )
-from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
+from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=protected-access
     _build_whole_method_delegation,
 )
 
@@ -267,7 +267,8 @@ def test_defensive_unit_file_handling_in_diff_and_reporters(tmp_path: Path) -> N
 
 def test_single_line_delegation_with_type_annotations_and_none_bounds() -> None:
     """Verifies that single-line functions with type annotations preserve their signatures during delegation."""
-    from pydoppelgangerhunt.fixer import _build_whole_method_delegation, _find_sig_colon  # pylint: disable=protected-access
+    from pydoppelgangerhunt.fixer.patch import _build_whole_method_delegation  # pylint: disable=protected-access
+    from pydoppelgangerhunt.fixer.source import _find_sig_colon  # pylint: disable=protected-access
     from pydoppelgangerhunt.git_diff import check_temporal_divergence
     from pydoppelgangerhunt.reporters import format_github_annotations
 

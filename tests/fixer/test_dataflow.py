@@ -2487,8 +2487,9 @@ def test_set_valued_outputs_inverting_semantic_order_rejected() -> None:
     res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
     assert res is None
 
-    # 3. Helper synthesis fails closed on multi-item set outputs
-    assert synthesize_shared_helper_code(u1, u2) == ""
+    # 3. Helper synthesis rejects unordered set-valued outputs at entry-point schema validation
+    with pytest.raises(ValueError, match="outputs"):
+        synthesize_shared_helper_code(u1, u2)
 
 
 def test_resolve_clone_generator_subroutine_outputs_side2_zero_coords_rejected() -> None:
@@ -2967,8 +2968,8 @@ def test_scope_parent_map_excludes_scope_node_and_stays_bounded() -> None:
 
 
 def test_load_unit_file_text_fails_closed_on_notebook(tmp_path: Path) -> None:
-    """Verifies that _load_unit_file_text restricts disk fallback to .py files and fails closed
-    (returns None) for Jupyter notebooks (.ipynb) to prevent unsafe patch synthesis."""
+    """Verifies that _load_unit_file_text fails closed (returns None) for unanchored
+    or invalid Jupyter notebook (.ipynb) paths rather than returning raw nbformat JSON."""
     nb_file = tmp_path / "notebook.ipynb"
     nb_file.write_text('{"cells": []}', encoding="utf-8")
 

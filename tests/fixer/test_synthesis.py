@@ -19,15 +19,14 @@ from pydoppelgangerhunt import (
     synthesize_refactoring_suggestion,
     synthesize_shared_helper_code,
 )
-from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
-    _base_unit_name,
-    _extract_required_typing_imports,
-    _format_call_arguments,
-    _infer_helper_return_type,
-    _is_same_file_path,
-    _normalize_file_path,
+from pydoppelgangerhunt.fixer import (
     analyze_unit_variable_scope,
     is_subroutine_unit,
+)
+from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=protected-access
+    _base_unit_name,
+    _is_same_file_path,
+    _normalize_file_path,
 )
 from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
     _extract_nested_scope_free_reads,
@@ -40,7 +39,10 @@ from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=protected-access
 )
 from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access
     _extract_augassign_unreferenced_target,
+    _extract_required_typing_imports,
+    _format_call_arguments,
     _format_union_or_optional,
+    _infer_helper_return_type,
     _infer_outputs_return_type,
     _normalize_pipe_unions,
     _split_type_args,
@@ -3676,12 +3678,14 @@ def test_same_class_whole_line_expr_explicit_method_binding(
     assert call_str == "        self.cache[k] = self._shared_store(items)\n"
 
 
-def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
+def test_lhs_rhs_shared_variable_operand_order_and_return_swap(
     tmp_path: Path,
 ) -> None:
-    """Verifies that whole-line expressions referencing an LHS variable on the RHS
-    preserve RHS free-load operand order, and _infer_helper_return_type strips
-    module prefixes before early-exit generator return type checks."""
+    """Verifies RHS free-load operand order is preserved when LHS and RHS share variables."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _build_unit_delegation_call,
+    )
+
     f1 = tmp_path / "ord1.py"
     f2 = tmp_path / "ord2.py"
     f1.write_text(
@@ -3722,114 +3726,11 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     assert "+    res = _shared_sub_plain_sub_aug(x, y)" in patch_aug
     assert "+    i += _shared_sub_plain_sub_aug(a, i)" in patch_aug
 
-    assert (
-        _infer_helper_return_type(
-            "collections.abc.Iterable[int]",
-            [],
-            set(),
-            {"has_yield": True, "has_return_value": False, "has_yield_assignment": False},
-            {},
-            {},
-        )
-        == "collections.abc.Iterable[int]"
-    )
-    assert (
-        _infer_helper_return_type(
-            "typing.Generator[int, str, None]",
-            [],
-            set(),
-            {"has_yield": True, "has_return_value": False, "has_yield_assignment": False},
-            {},
-            {},
-        )
-        == "typing.Generator[int, str, None]"
-    )
-    assert (
-        _infer_helper_return_type(
-            "collections.abc.AsyncIterable[str]",
-            [],
-            set(),
-            {"has_yield": True, "has_return_value": False, "has_yield_assignment": False},
-            {},
-            {},
-            is_async=True,
-        )
-        == "collections.abc.AsyncIterable[str]"
-    )
-    assert (
-        _infer_helper_return_type(
-            "typing.Generator[int, None, str]",
-            [],
-            set(),
-            {"has_yield": True, "has_return_value": True, "has_yield_assignment": False},
-            {},
-            {},
-        )
-        == "typing.Generator[int, None, str]"
-    )
-
-    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
-        _build_unit_delegation_call,
-        _unit_has_no_refactor_pragma,
-    )
-
-    me_src = (
-        "class CustomRec:\n"
-        "    def calc(me, k: str, val: int) -> None:\n"
-        "        me.cache[k] = val + me.offset\n"
-    )
-    me_lines = me_src.splitlines(keepends=True)
-    me_call = _build_unit_delegation_call(
-        {"start": 3, "end": 3, "kind": "complex_expr", "receiver_param": "me"},
-        me_src,
-        me_lines,
-        effective_binding="module",
-        helper_name="_shared_calc",
-        inputs=["self", "x"],
-        outputs=[],
-        scope={"param_details": []},
-        target_inputs=["me", "k", "val"],
-    )
-    assert me_call == "        me.cache[k] = _shared_calc(me, val)\n"
-
-    me_method_src = (
-        "class CustomRec:\n"
-        "    def store(me, k: str, val: int) -> None:\n"
-        "        me.cache[k] = val * 2\n"
-    )
-    me_method_lines = me_method_src.splitlines(keepends=True)
-    me_method_call = _build_unit_delegation_call(
-        {"start": 3, "end": 3, "kind": "complex_expr", "receiver_param": "me"},
-        me_method_src,
-        me_method_lines,
-        effective_binding="method",
-        helper_name="_shared_store",
-        inputs=["self", "x"],
-        outputs=[],
-        scope={"param_details": []},
-        target_inputs=["me", "k", "val"],
-    )
-    assert me_method_call == "        me.cache[k] = me._shared_store(val)\n"
-
-    pragma_src = "# pragma: no-refactor\n@dec\ndef f():\n    return 1\n"
-    pragma_tree = ast.parse(pragma_src)
-    pragma_tree.body[0].decorator_list[0].lineno = None  # type: ignore[attr-defined]
-    assert _unit_has_no_refactor_pragma(
-        {"start": 3, "end": 4},
-        pragma_src.splitlines(keepends=True),
-        tree=pragma_tree,
-        orig_text=pragma_src,
-    ) is True
-
-    ret_src = (
-        "def compute(x: int, y: int) -> int:\n"
-        "    return y - x\n"
-    )
-    ret_lines = ret_src.splitlines(keepends=True)
+    ret_src = "def compute(x: int, y: int) -> int:\n    return y - x\n"
     ret_call = _build_unit_delegation_call(
         {"start": 2, "end": 2, "kind": "complex_expr", "inputs": ["x", "y"]},
         ret_src,
-        ret_lines,
+        ret_src.splitlines(keepends=True),
         effective_binding="module",
         helper_name="_shared_diff",
         inputs=["b", "a"],
@@ -3863,6 +3764,105 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     assert "res = _shared_sub_plain_sub_slot(x, y)" in swap_patch
     assert "arr[x] = _shared_sub_plain_sub_slot(y, x)" in swap_patch
 
+
+@pytest.mark.parametrize(
+    ("declared_ret", "has_return_value", "is_async"),
+    [
+        pytest.param("collections.abc.Iterable[int]", False, False, id="collections_iterable"),
+        pytest.param("typing.Generator[int, str, None]", False, False, id="typing_generator_none_ret"),
+        pytest.param("collections.abc.AsyncIterable[str]", False, True, id="collections_async_iterable"),
+        pytest.param("typing.Generator[int, None, str]", True, False, id="typing_generator_with_return"),
+    ],
+)
+def test_infer_helper_return_type_preserves_qualified_generator_prefixes(
+    declared_ret: str,
+    has_return_value: bool,
+    is_async: bool,
+) -> None:
+    """Verifies _infer_helper_return_type preserves qualified generator and iterable annotations."""
+    assert (
+        _infer_helper_return_type(
+            declared_ret,
+            [],
+            set(),
+            {"has_yield": True, "has_return_value": has_return_value, "has_yield_assignment": False},
+            {},
+            {},
+            is_async=is_async,
+        )
+        == declared_ret
+    )
+
+
+def test_delegation_call_preserves_custom_receiver_param() -> None:
+    """Verifies custom receiver names such as 'me' bind properly under module and method modes."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _build_unit_delegation_call,
+    )
+
+    me_src = (
+        "class CustomRec:\n"
+        "    def calc(me, k: str, val: int) -> None:\n"
+        "        me.cache[k] = val + me.offset\n"
+    )
+    me_call = _build_unit_delegation_call(
+        {"start": 3, "end": 3, "kind": "complex_expr", "receiver_param": "me"},
+        me_src,
+        me_src.splitlines(keepends=True),
+        effective_binding="module",
+        helper_name="_shared_calc",
+        inputs=["self", "x"],
+        outputs=[],
+        scope={"param_details": []},
+        target_inputs=["me", "k", "val"],
+    )
+    assert me_call == "        me.cache[k] = _shared_calc(me, val)\n"
+
+    me_method_src = (
+        "class CustomRec:\n"
+        "    def store(me, k: str, val: int) -> None:\n"
+        "        me.cache[k] = val * 2\n"
+    )
+    me_method_call = _build_unit_delegation_call(
+        {"start": 3, "end": 3, "kind": "complex_expr", "receiver_param": "me"},
+        me_method_src,
+        me_method_src.splitlines(keepends=True),
+        effective_binding="method",
+        helper_name="_shared_store",
+        inputs=["self", "x"],
+        outputs=[],
+        scope={"param_details": []},
+        target_inputs=["me", "k", "val"],
+    )
+    assert me_method_call == "        me.cache[k] = me._shared_store(val)\n"
+
+
+def test_no_refactor_pragma_handles_missing_decorator_lineno_and_eof() -> None:
+    """Verifies no-refactor pragma checks tolerate None decorator linenos and trailing EOF pragmas."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _unit_has_no_refactor_pragma,
+    )
+
+    pragma_src = "# pragma: no-refactor\n@dec\ndef f():\n    return 1\n"
+    pragma_tree = ast.parse(pragma_src)
+    pragma_tree.body[0].decorator_list[0].lineno = None  # type: ignore[attr-defined]
+    assert _unit_has_no_refactor_pragma(
+        {"start": 3, "end": 4},
+        pragma_src.splitlines(keepends=True),
+        tree=pragma_tree,
+        orig_text=pragma_src,
+    ) is True
+
+    eof_pragma_src = "def normal_fn(x: int) -> int:\n    return x + 1\n# pragma: no-refactor\n"
+    assert not _unit_has_no_refactor_pragma(
+        {"start": 10, "end": 12},
+        eof_pragma_src.splitlines(keepends=True),
+        orig_text=eof_pragma_src,
+    )
+
+
+def test_async_detection_ignores_nested_sync_headers_and_subline_slices() -> None:
+    """Verifies async/yield classification handles nested sync headers, subline slices, and async annotations."""
     from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
         _populate_unit_receiver_metadata,
         _unit_ast_has_async_or_yield,
@@ -3884,9 +3884,7 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     lambda_stmt_node = nested_hdr_tree.body[0].body[1]  # type: ignore[attr-defined]
     assert _node_is_effectively_async(inner_fn_node, enclosing_is_async=True)
     assert _node_is_effectively_async(lambda_stmt_node, enclosing_is_async=True)
-    assert _unit_ast_has_async_or_yield(
-        nested_hdr_tree, 2, 4, is_subroutine=True
-    ) == (False, True)
+    assert _unit_ast_has_async_or_yield(nested_hdr_tree, 2, 4, is_subroutine=True) == (False, True)
 
     subline_await_src = (
         "async def send_items(client, items):\n"
@@ -3913,18 +3911,33 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     _populate_unit_receiver_metadata(subline_u, source_text=subline_await_src, tree=subline_await_tree)
     assert subline_u["is_async"] is False
 
+    ann_async_tree = ast.parse(
+        "async def outer(get_t):\n"
+        "    def inner(x: await get_t()) -> int:\n"
+        "        return 1\n"
+    )
+    outer_async_fn = ann_async_tree.body[0]
+    assert isinstance(outer_async_fn, ast.AsyncFunctionDef)
+    assert _node_is_effectively_async(outer_async_fn.body, False) is True
+    assert _unit_ast_has_async_or_yield(ann_async_tree, 2, 3, is_subroutine=True) == (False, True)
+
+
+def test_extract_helper_symbols_decorator_default_comprehension_and_except_star() -> None:
+    """Verifies helper symbol extraction for same-name decorators/defaults, comprehensions, and except*."""
     from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
         _extract_helper_symbols,
     )
 
-    same_name_hdr_tree = ast.parse(
-        "@item\n"
-        "def item(x=item):\n"
-        "    return x\n"
-    )
+    same_name_hdr_tree = ast.parse("@item\ndef item(x=item):\n    return x\n")
     free_syms, def_syms, _ = _extract_helper_symbols(same_name_hdr_tree)
     assert "item" in free_syms
     assert "item" in def_syms
+
+    comp_free_syms, _, _ = _extract_helper_symbols(
+        ast.parse("def _shared(rows):\n    return [y for x in rows for y in x]\n")
+    )
+    assert "x" not in comp_free_syms
+    assert "y" not in comp_free_syms
 
     if sys.version_info >= (3, 11):
         trystar_tree = ast.parse(
@@ -3942,430 +3955,310 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
         assert "err_group" not in ts_free
         assert "handled_val" in ts_defs
 
-    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
-        _unit_has_no_refactor_pragma,
-        _validate_helper_compilation,
+
+def test_debug_ast_immutability_checks_and_eviction_refresh() -> None:
+    """Verifies AST immutability debug guards detect in-place edits and eviction refreshes cached intervals."""
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
+        _debug_ast_immutability,
+        _evict_tree_scopes,
+        evict_tree_scopes,
     )
     from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
         _get_tree_scope_intervals,
     )
 
-    eof_pragma_src = "def normal_fn(x: int) -> int:\n    return x + 1\n# pragma: no-refactor\n"
-    eof_lines = eof_pragma_src.splitlines(keepends=True)
-    assert not _unit_has_no_refactor_pragma(
-        {"start": 10, "end": 12}, eof_lines, orig_text=eof_pragma_src
-    )
-
-    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
-        _debug_ast_immutability,
-        _evict_tree_scopes,
-    )
+    prod_tree = ast.parse("def alpha():\n    return 1\n")
+    assert _get_tree_scope_intervals(prod_tree)[0][:2] == (1, 2)
+    prod_tree.body[0].lineno = 5  # type: ignore[attr-defined]
+    prod_tree.body[0].end_lineno = 8  # type: ignore[attr-defined]
+    assert _get_tree_scope_intervals(prod_tree)[0][:2] == (5, 8)
+    evict_tree_scopes(prod_tree)
 
     mut_tree = ast.parse("def alpha():\n    return 1\n")
-    intervals_initial = _get_tree_scope_intervals(mut_tree)
-    assert intervals_initial[0][:2] == (1, 2)
-    mut_tree.body[0].lineno = 5  # type: ignore[attr-defined]
-    mut_tree.body[0].end_lineno = 8  # type: ignore[attr-defined]
-    with pytest.raises(RuntimeError, match="Cached AST node was mutated in-place"):
-        _get_tree_scope_intervals(mut_tree)
     prev_dbg = _debug_ast_immutability[0]
-    _debug_ast_immutability[0] = False
+    _debug_ast_immutability[0] = True
     try:
-        assert _get_tree_scope_intervals(mut_tree)[0][:2] == (5, 8)
+        assert _get_tree_scope_intervals(mut_tree)[0][:2] == (1, 2)
+        mut_tree.body[0].lineno = 5  # type: ignore[attr-defined]
+        mut_tree.body[0].end_lineno = 8  # type: ignore[attr-defined]
+        with pytest.raises(RuntimeError, match="Cached AST node was mutated in-place"):
+            _get_tree_scope_intervals(mut_tree)
     finally:
         _debug_ast_immutability[0] = prev_dbg
+        evict_tree_scopes(mut_tree)
+
+    assert _get_tree_scope_intervals(mut_tree)[0][:2] == (5, 8)
     _evict_tree_scopes(mut_tree)
-    intervals_updated = _get_tree_scope_intervals(mut_tree)
-    assert intervals_updated[0][:2] == (5, 8)
-    extra_fn = ast.parse("def beta():\n    return 2\n").body[0]
-    mut_tree.body.append(extra_fn)
+    assert _get_tree_scope_intervals(mut_tree)[0][:2] == (5, 8)
+    mut_tree.body.append(ast.parse("def beta():\n    return 2\n").body[0])
     _evict_tree_scopes(mut_tree)
     assert len(_get_tree_scope_intervals(mut_tree)) == 2
+
+
+def test_helper_compilation_accepts_crlf_and_mixed_newlines() -> None:
+    """Verifies helper compilation validation succeeds on CRLF and mixed CRLF/LF helpers."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _validate_helper_compilation,
+    )
 
     crlf_helper = (
         "from typing import Any\r\n\r\n\r\n"
         "    def _shared_crlf(self, x: Any) -> Any:\r\n"
         "        return x + 1\r\n"
     )
-    assert _validate_helper_compilation(crlf_helper)
     mixed_cr_helper = (
         "from typing import Any\n\n\n\r\n"
         "    def _shared_cr(self, x: Any) -> Any:\n"
         "        return x + 1\n"
     )
+    assert _validate_helper_compilation(crlf_helper)
     assert _validate_helper_compilation(mixed_cr_helper)
 
-    if sys.version_info >= (3, 12):
-        local_bound_file = tmp_path / "closure_type_param_capture.py"
-        local_bound_file.write_text(
-            "class ModuleBound:\n"
-            "    pass\n\n"
-            "def outer_a(local_bound: type):\n"
-            "    def inner_a[T: local_bound](x: T) -> T:\n"
-            "        step = 1\n"
-            "        return x\n"
-            "    return inner_a\n\n"
-            "def outer_b(local_bound: type):\n"
-            "    def inner_b[T: local_bound](x: T) -> T:\n"
-            "        step = 1\n"
-            "        return x\n"
-            "    return inner_b\n\n"
-            "def mod_outer_a():\n"
-            "    def mod_inner_a[T: ModuleBound](x: T) -> T:\n"
-            "        step = 1\n"
-            "        return x\n"
-            "    return mod_inner_a\n\n"
-            "def mod_outer_b():\n"
-            "    def mod_inner_b[T: ModuleBound](x: T) -> T:\n"
-            "        step = 1\n"
-            "        return x\n"
-            "    return mod_inner_b\n",
-            encoding="utf-8",
-        )
-        u_cap1 = {
-            "file": str(local_bound_file),
-            "start": 5,
-            "end": 7,
-            "name": "outer_a:inner_a",
-            "kind": "closure",
-        }
-        u_cap2 = {
-            "file": str(local_bound_file),
-            "start": 11,
-            "end": 13,
-            "name": "outer_b:inner_b",
-            "kind": "closure",
-        }
-        assert (
-            synthesize_shared_helper_code(u_cap1, u_cap2, repo_root=str(tmp_path))
-            == ""
-        )
-        assert (
-            generate_refactoring_patch(
-                [(0.99, u_cap1, u_cap2)],
-                repo_root=str(tmp_path),
-                replace_clones=True,
-            )
-            == ""
-        )
-        sliced_cap = {
-            "start": 1,
-            "end": 3,
-            "name": "inner_sliced",
-            "kind": "closure",
-            "source_text": (
-                "def inner_sliced[T: local_bound](x: T) -> T:\n"
-                "    step = 1\n"
-                "    return x\n"
-            ),
-        }
-        assert synthesize_shared_helper_code(sliced_cap, sliced_cap) == ""
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="Requires PEP 695 type parameter syntax")
+def test_pep695_local_bound_blocks_closure_refactoring_while_module_bound_allows(
+    tmp_path: Path,
+) -> None:
+    """Verifies local type parameter bounds block closure refactoring while module bounds succeed."""
+    local_bound_file = tmp_path / "closure_type_param_capture.py"
+    local_bound_file.write_text(
+        "class ModuleBound:\n"
+        "    pass\n\n"
+        "def outer_a(local_bound: type):\n"
+        "    def inner_a[T: local_bound](x: T) -> T:\n"
+        "        step = 1\n"
+        "        return x\n"
+        "    return inner_a\n\n"
+        "def outer_b(local_bound: type):\n"
+        "    def inner_b[T: local_bound](x: T) -> T:\n"
+        "        step = 1\n"
+        "        return x\n"
+        "    return inner_b\n\n"
+        "def mod_outer_a():\n"
+        "    def mod_inner_a[T: ModuleBound](x: T) -> T:\n"
+        "        step = 1\n"
+        "        return x\n"
+        "    return mod_inner_a\n\n"
+        "def mod_outer_b():\n"
+        "    def mod_inner_b[T: ModuleBound](x: T) -> T:\n"
+        "        step = 1\n"
+        "        return x\n"
+        "    return mod_inner_b\n",
+        encoding="utf-8",
+    )
+    u_cap1 = {"file": str(local_bound_file), "start": 5, "end": 7, "name": "outer_a:inner_a", "kind": "closure"}
+    u_cap2 = {"file": str(local_bound_file), "start": 11, "end": 13, "name": "outer_b:inner_b", "kind": "closure"}
+    assert synthesize_shared_helper_code(u_cap1, u_cap2, repo_root=str(tmp_path)) == ""
+    assert generate_refactoring_patch([(0.99, u_cap1, u_cap2)], repo_root=str(tmp_path), replace_clones=True) == ""
 
-        u_mod1 = {
-            "file": str(local_bound_file),
-            "start": 17,
-            "end": 19,
-            "name": "mod_outer_a:mod_inner_a",
-            "kind": "closure",
-        }
-        u_mod2 = {
-            "file": str(local_bound_file),
-            "start": 23,
-            "end": 25,
-            "name": "mod_outer_b:mod_inner_b",
-            "kind": "closure",
-        }
-        mod_helper = synthesize_shared_helper_code(
-            u_mod1, u_mod2, repo_root=str(tmp_path)
-        )
-        assert "[T: ModuleBound]" in mod_helper
+    sliced_cap = {
+        "start": 1,
+        "end": 3,
+        "name": "inner_sliced",
+        "kind": "closure",
+        "source_text": "def inner_sliced[T: local_bound](x: T) -> T:\n    step = 1\n    return x\n",
+    }
+    assert synthesize_shared_helper_code(sliced_cap, sliced_cap) == ""
 
-        cls_bound_file = tmp_path / "cls_type_param_capture.py"
-        cls_bound_file.write_text(
-            "class ServiceA:\n"
-            "    Bound = int\n"
-            "    def run_a[T: Bound](self, x: T) -> T:\n"
-            "        self.last = x\n"
-            "        return x\n"
-            "    def run_a2[T: Bound](self, x: T) -> T:\n"
-            "        self.last = x\n"
-            "        return x\n\n"
-            "class ServiceB:\n"
-            "    Bound = int\n"
-            "    def run_b[T: Bound](self, x: T) -> T:\n"
-            "        self.last = x\n"
-            "        return x\n",
-            encoding="utf-8",
-        )
-        u_cls_a1 = {
-            "file": str(cls_bound_file),
-            "start": 3,
-            "end": 5,
-            "name": "run_a",
-            "kind": "function",
-            "enclosing_class": "ServiceA",
-            "enclosing_class_start": 1,
-            "receiver_kind": "instance",
-        }
-        u_cls_a2 = {
-            "file": str(cls_bound_file),
-            "start": 6,
-            "end": 8,
-            "name": "run_a2",
-            "kind": "function",
-            "enclosing_class": "ServiceA",
-            "enclosing_class_start": 1,
-            "receiver_kind": "instance",
-        }
-        u_cls_b = {
-            "file": str(cls_bound_file),
-            "start": 12,
-            "end": 14,
-            "name": "run_b",
-            "kind": "function",
-            "enclosing_class": "ServiceB",
-            "enclosing_class_start": 10,
-            "receiver_kind": "instance",
-        }
-        assert (
-            synthesize_shared_helper_code(
-                u_cls_a1, u_cls_b, repo_root=str(tmp_path)
-            )
-            == ""
-        )
-        assert (
-            synthesize_shared_helper_code(
-                u_cls_a1,
-                u_cls_a2,
-                method_binding="module",
-                repo_root=str(tmp_path),
-            )
-            == ""
-        )
-        assert (
-            generate_refactoring_patch(
-                [(0.99, u_cls_a1, u_cls_b)],
-                repo_root=str(tmp_path),
-                replace_clones=True,
-            )
-            == ""
-        )
-        same_cls_helper = synthesize_shared_helper_code(
-            u_cls_a1, u_cls_a2, repo_root=str(tmp_path)
-        )
-        assert "[T: Bound]" in same_cls_helper
-        same_cls_patch = generate_refactoring_patch(
-            [(0.99, u_cls_a1, u_cls_a2)],
-            repo_root=str(tmp_path),
-            replace_clones=True,
-        )
-        assert "def _shared_run_a_run_a2[T: Bound]" in same_cls_patch
+    u_mod1 = {"file": str(local_bound_file), "start": 17, "end": 19, "name": "mod_outer_a:mod_inner_a", "kind": "closure"}
+    u_mod2 = {"file": str(local_bound_file), "start": 23, "end": 25, "name": "mod_outer_b:mod_inner_b", "kind": "closure"}
+    mod_helper = synthesize_shared_helper_code(u_mod1, u_mod2, repo_root=str(tmp_path))
+    assert "[T: ModuleBound]" in mod_helper
 
-        self_cls_file = tmp_path / "self_cls_type_param.py"
-        self_cls_file.write_text(
-            "class Service:\n"
-            "    def copy_a[T: Service](self, other: T) -> T:\n"
-            "        return other\n"
-            "    def copy_b[T: Service](self, other: T) -> T:\n"
-            "        return other\n",
-            encoding="utf-8",
-        )
-        u_self_a = {
-            "file": str(self_cls_file),
-            "start": 2,
-            "end": 3,
-            "name": "copy_a",
-            "kind": "function",
-            "enclosing_class": "Service",
-            "enclosing_class_start": 1,
-            "receiver_kind": "instance",
-        }
-        u_self_b = {
-            "file": str(self_cls_file),
-            "start": 4,
-            "end": 5,
-            "name": "copy_b",
-            "kind": "function",
-            "enclosing_class": "Service",
-            "enclosing_class_start": 1,
-            "receiver_kind": "instance",
-        }
-        mod_self_helper = synthesize_shared_helper_code(
-            u_self_a,
-            u_self_b,
-            method_binding="module",
-            repo_root=str(tmp_path),
-        )
-        assert "[T: Service]" in mod_self_helper
 
-        outer_shadow_file = tmp_path / "outer_shadow_type_param.py"
-        outer_shadow_file.write_text(
-            "Bound = str\n"
-            "class Outer:\n"
-            "    Bound = int\n"
-            "    class Inner:\n"
-            "        def m1[T: Bound](self, x: T) -> T:\n"
-            "            return x\n"
-            "        def m2[T: Bound](self, x: T) -> T:\n"
-            "            return x\n",
-            encoding="utf-8",
-        )
-        u_inner1 = {
-            "file": str(outer_shadow_file),
-            "start": 5,
-            "end": 6,
-            "name": "m1",
-            "kind": "function",
-            "enclosing_class": "Inner",
-            "enclosing_class_start": 4,
-            "receiver_kind": "instance",
-        }
-        u_inner2 = {
-            "file": str(outer_shadow_file),
-            "start": 7,
-            "end": 8,
-            "name": "m2",
-            "kind": "function",
-            "enclosing_class": "Inner",
-            "enclosing_class_start": 4,
-            "receiver_kind": "instance",
-        }
-        inner_mod_helper = synthesize_shared_helper_code(
-            u_inner1,
-            u_inner2,
-            method_binding="module",
-            repo_root=str(tmp_path),
-        )
-        assert "[T: Bound]" in inner_mod_helper
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="Requires PEP 695 type parameter syntax")
+def test_pep695_class_bound_and_self_type_binding_rules(tmp_path: Path) -> None:
+    """Verifies class-scoped, outer-shadowed, and self-referential PEP 695 method type bounds."""
+    cls_bound_file = tmp_path / "cls_type_param_capture.py"
+    cls_bound_file.write_text(
+        "class ServiceA:\n"
+        "    Bound = int\n"
+        "    def run_a[T: Bound](self, x: T) -> T:\n"
+        "        self.last = x\n"
+        "        return x\n"
+        "    def run_a2[T: Bound](self, x: T) -> T:\n"
+        "        self.last = x\n"
+        "        return x\n\n"
+        "class ServiceB:\n"
+        "    Bound = int\n"
+        "    def run_b[T: Bound](self, x: T) -> T:\n"
+        "        self.last = x\n"
+        "        return x\n",
+        encoding="utf-8",
+    )
+    u_cls_a1 = {
+        "file": str(cls_bound_file), "start": 3, "end": 5, "name": "run_a", "kind": "function",
+        "enclosing_class": "ServiceA", "enclosing_class_start": 1, "receiver_kind": "instance",
+    }
+    u_cls_a2 = {
+        "file": str(cls_bound_file), "start": 6, "end": 8, "name": "run_a2", "kind": "function",
+        "enclosing_class": "ServiceA", "enclosing_class_start": 1, "receiver_kind": "instance",
+    }
+    u_cls_b = {
+        "file": str(cls_bound_file), "start": 12, "end": 14, "name": "run_b", "kind": "function",
+        "enclosing_class": "ServiceB", "enclosing_class_start": 10, "receiver_kind": "instance",
+    }
+    assert synthesize_shared_helper_code(u_cls_a1, u_cls_b, repo_root=str(tmp_path)) == ""
+    assert synthesize_shared_helper_code(u_cls_a1, u_cls_a2, method_binding="module", repo_root=str(tmp_path)) == ""
+    assert generate_refactoring_patch([(0.99, u_cls_a1, u_cls_b)], repo_root=str(tmp_path), replace_clones=True) == ""
+    assert "[T: Bound]" in synthesize_shared_helper_code(u_cls_a1, u_cls_a2, repo_root=str(tmp_path))
+    same_cls_patch = generate_refactoring_patch([(0.99, u_cls_a1, u_cls_a2)], repo_root=str(tmp_path), replace_clones=True)
+    assert "def _shared_run_a_run_a2[T: Bound]" in same_cls_patch
 
-        nested_self_ref_file = tmp_path / "nested_self_ref.py"
-        nested_self_ref_file.write_text(
-            "class Outer:\n"
-            "    class Inner:\n"
-            "        def m1[T: Inner](self, x: T) -> T:\n"
-            "            y = x\n"
-            "            return y\n"
-            "\n"
-            "        def m2[T: Inner](self, x: T) -> T:\n"
-            "            y = x\n"
-            "            return y\n",
-            encoding="utf-8",
-        )
-        u_ns1 = {
-            "file": str(nested_self_ref_file),
-            "start": 3,
-            "end": 5,
-            "name": "m1",
-            "kind": "function",
-            "enclosing_class": "Inner",
-            "receiver_kind": "self",
-        }
-        u_ns2 = {
-            "file": str(nested_self_ref_file),
-            "start": 7,
-            "end": 9,
-            "name": "m2",
-            "kind": "function",
-            "enclosing_class": "Inner",
-            "receiver_kind": "self",
-        }
-        assert not synthesize_shared_helper_code(
-            u_ns1,
-            u_ns2,
-            method_binding="module",
-            repo_root=str(tmp_path),
-        )
-        assert "[T: Inner]" in synthesize_shared_helper_code(
-            u_ns1,
-            u_ns2,
-            method_binding="method",
-            repo_root=str(tmp_path),
-        )
-
-        from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
-            _inspect_unit_scope,
-        )
-
-        same_line_tree = ast.parse(
-            "def outer(b: type):\n"
-            "    def inner[T: b](x: T) -> T:\n"
-            "        return x\n"
-        )
-        outer_fn = same_line_tree.body[0]
-        inner_fn = outer_fn.body[0]  # type: ignore[attr-defined]
-        outer_fn.lineno = 1
-        outer_fn.end_lineno = 1
-        outer_fn.col_offset = 0
-        inner_fn.lineno = 1
-        inner_fn.end_lineno = 1
-        inner_fn.col_offset = 14
-        same_line_scope = _inspect_unit_scope(
-            {
-                "start": 1,
-                "end": 1,
-                "start_col": 14,
-                "kind": "closure",
-                "source_text": "              def inner[T: b](x: T) -> T: return x\n",
-            },
-            file_tree=same_line_tree,
-        )
-        assert "type_param_closure_capture" in same_line_scope["control_flow_hazards"]
-
-        outer_same_line_tree = ast.parse(
-            "def outer_gen[T: Bound](x: T) -> T:\n"
-            "    def inner_child(Bound: int = 1) -> int:\n"
-            "        return Bound\n"
-            "    return x\n"
-        )
-        o_fn = outer_same_line_tree.body[0]
-        i_fn = o_fn.body[0]  # type: ignore[attr-defined]
-        o_fn.lineno = 1
-        o_fn.end_lineno = 1
-        o_fn.col_offset = 0
-        i_fn.lineno = 1
-        i_fn.end_lineno = 1
-        i_fn.col_offset = 20
-        outer_same_line_scope = _inspect_unit_scope(
-            {
-                "start": 1,
-                "end": 1,
-                "kind": "function",
-                "source_text": (
-                    "def outer_gen[T: Bound](x: T) -> T:\n"
-                    "    def inner_child(Bound: int = 1) -> int:\n"
-                    "        return Bound\n"
-                    "    return x\n"
-                ),
-            },
-            file_tree=outer_same_line_tree,
-        )
-        assert "type_param_closure_capture" not in outer_same_line_scope["control_flow_hazards"]
-
-        trunc_tree = ast.parse(
-            "def self_fn[T: LocalAlias](x: T) -> T:\n"
-            "    LocalAlias = int\n"
-            "    return x\n"
-        )
-        trunc_scope = _inspect_unit_scope(
-            {
-                "start": 1,
-                "end": 2,
-                "kind": "function",
-                "source_text": (
-                    "def self_fn[T: LocalAlias](x: T) -> T:\n"
-                    "    LocalAlias = int\n"
-                    "    return x\n"
-                ),
-            },
-            file_tree=trunc_tree,
-        )
-        assert "type_param_closure_capture" not in trunc_scope["control_flow_hazards"]
-
-    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
-        _inspect_unit_scope as _inspect_scope_fn,
+    self_cls_file = tmp_path / "self_cls_type_param.py"
+    self_cls_file.write_text(
+        "class Service:\n"
+        "    def copy_a[T: Service](self, other: T) -> T:\n"
+        "        return other\n"
+        "    def copy_b[T: Service](self, other: T) -> T:\n"
+        "        return other\n",
+        encoding="utf-8",
+    )
+    u_self_a = {
+        "file": str(self_cls_file), "start": 2, "end": 3, "name": "copy_a", "kind": "function",
+        "enclosing_class": "Service", "enclosing_class_start": 1, "receiver_kind": "instance",
+    }
+    u_self_b = {
+        "file": str(self_cls_file), "start": 4, "end": 5, "name": "copy_b", "kind": "function",
+        "enclosing_class": "Service", "enclosing_class_start": 1, "receiver_kind": "instance",
+    }
+    assert "[T: Service]" in synthesize_shared_helper_code(
+        u_self_a, u_self_b, method_binding="module", repo_root=str(tmp_path)
     )
 
-    nested_ann_scope = _inspect_scope_fn(
+    outer_shadow_file = tmp_path / "outer_shadow_type_param.py"
+    outer_shadow_file.write_text(
+        "Bound = str\n"
+        "class Outer:\n"
+        "    Bound = int\n"
+        "    class Inner:\n"
+        "        def m1[T: Bound](self, x: T) -> T:\n"
+        "            return x\n"
+        "        def m2[T: Bound](self, x: T) -> T:\n"
+        "            return x\n",
+        encoding="utf-8",
+    )
+    u_inner1 = {
+        "file": str(outer_shadow_file), "start": 5, "end": 6, "name": "m1", "kind": "function",
+        "enclosing_class": "Inner", "enclosing_class_start": 4, "receiver_kind": "instance",
+    }
+    u_inner2 = {
+        "file": str(outer_shadow_file), "start": 7, "end": 8, "name": "m2", "kind": "function",
+        "enclosing_class": "Inner", "enclosing_class_start": 4, "receiver_kind": "instance",
+    }
+    assert "[T: Bound]" in synthesize_shared_helper_code(
+        u_inner1, u_inner2, method_binding="module", repo_root=str(tmp_path)
+    )
+
+    nested_self_ref_file = tmp_path / "nested_self_ref.py"
+    nested_self_ref_file.write_text(
+        "class Outer:\n"
+        "    class Inner:\n"
+        "        def m1[T: Inner](self, x: T) -> T:\n"
+        "            y = x\n"
+        "            return y\n\n"
+        "        def m2[T: Inner](self, x: T) -> T:\n"
+        "            y = x\n"
+        "            return y\n",
+        encoding="utf-8",
+    )
+    u_ns1 = {
+        "file": str(nested_self_ref_file), "start": 3, "end": 5, "name": "m1",
+        "kind": "function", "enclosing_class": "Inner", "receiver_kind": "self",
+    }
+    u_ns2 = {
+        "file": str(nested_self_ref_file), "start": 7, "end": 9, "name": "m2",
+        "kind": "function", "enclosing_class": "Inner", "receiver_kind": "self",
+    }
+    assert not synthesize_shared_helper_code(u_ns1, u_ns2, method_binding="module", repo_root=str(tmp_path))
+    assert "[T: Inner]" in synthesize_shared_helper_code(u_ns1, u_ns2, method_binding="method", repo_root=str(tmp_path))
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="Requires PEP 695 type parameter syntax")
+def test_pep695_same_line_and_truncated_scope_hazards() -> None:
+    """Verifies same-line nested type parameter closure hazards vs shadowed/truncated false positives."""
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        _inspect_unit_scope,
+    )
+
+    same_line_tree = ast.parse(
+        "def outer(b: type):\n"
+        "    def inner[T: b](x: T) -> T:\n"
+        "        return x\n"
+    )
+    outer_fn = same_line_tree.body[0]
+    inner_fn = outer_fn.body[0]  # type: ignore[attr-defined]
+    outer_fn.lineno = 1
+    outer_fn.end_lineno = 1
+    outer_fn.col_offset = 0
+    inner_fn.lineno = 1
+    inner_fn.end_lineno = 1
+    inner_fn.col_offset = 14
+    same_line_scope = _inspect_unit_scope(
+        {
+            "start": 1,
+            "end": 1,
+            "start_col": 14,
+            "kind": "closure",
+            "source_text": "              def inner[T: b](x: T) -> T: return x\n",
+        },
+        file_tree=same_line_tree,
+    )
+    assert "type_param_closure_capture" in same_line_scope["control_flow_hazards"]
+
+    outer_same_line_src = (
+        "def outer_gen[T: Bound](x: T) -> T:\n"
+        "    def inner_child(Bound: int = 1) -> int:\n"
+        "        return Bound\n"
+        "    return x\n"
+    )
+    outer_same_line_tree = ast.parse(outer_same_line_src)
+    o_fn = outer_same_line_tree.body[0]
+    i_fn = o_fn.body[0]  # type: ignore[attr-defined]
+    o_fn.lineno = 1
+    o_fn.end_lineno = 1
+    o_fn.col_offset = 0
+    i_fn.lineno = 1
+    i_fn.end_lineno = 1
+    i_fn.col_offset = 20
+    outer_same_line_scope = _inspect_unit_scope(
+        {"start": 1, "end": 1, "kind": "function", "source_text": outer_same_line_src},
+        file_tree=outer_same_line_tree,
+    )
+    assert "type_param_closure_capture" not in outer_same_line_scope["control_flow_hazards"]
+
+    trunc_src = "def self_fn[T: LocalAlias](x: T) -> T:\n    LocalAlias = int\n    return x\n"
+    trunc_scope = _inspect_unit_scope(
+        {"start": 1, "end": 2, "kind": "function", "source_text": trunc_src},
+        file_tree=ast.parse(trunc_src),
+    )
+    assert "type_param_closure_capture" not in trunc_scope["control_flow_hazards"]
+
+    same_line_same_name_src = "def f[T: Bound](x: T):\n    def f(Bound=1): return Bound\n"
+    synth_tree = ast.parse(same_line_same_name_src)
+    for node in ast.walk(synth_tree):
+        if hasattr(node, "lineno"):
+            setattr(node, "lineno", 1)
+            setattr(node, "end_lineno", 1)
+    same_line_same_name_scope = _inspect_unit_scope(
+        {"start": 1, "end": 1, "kind": "function", "is_subroutine": False, "source_text": same_line_same_name_src},
+        file_tree=synth_tree,
+    )
+    assert "type_param_closure_capture" not in same_line_same_name_scope["control_flow_hazards"]
+
+
+def test_scope_annotations_live_in_and_comprehension_nonlocal_inputs() -> None:
+    """Verifies scope inspection for annotations, async comprehensions, recursion live-ins, and nonlocals."""
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=import-outside-toplevel
+        _UnitLiveInVisitor,
+    )
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
+        _unit_ast_has_async_or_yield,
+    )
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        _inspect_unit_scope,
+    )
+
+    nested_ann_scope = _inspect_unit_scope(
         {
             "start": 1,
             "end": 3,
@@ -4382,136 +4275,31 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
         assert expected_ann_sym in nested_ann_scope["inputs"]
 
     multiline_acomp_tree = ast.parse(
-        "async def run(aiter):\n"
-        "    res = [\n"
-        "        x\n"
-        "        async for x in aiter\n"
-        "    ]\n"
-        "    return res\n"
+        "async def run(aiter):\n    res = [\n        x\n        async for x in aiter\n    ]\n    return res\n"
     )
-    assert _unit_ast_has_async_or_yield(
-        multiline_acomp_tree, 4, 4, is_subroutine=True
-    ) == (False, True)
+    assert _unit_ast_has_async_or_yield(multiline_acomp_tree, 4, 4, is_subroutine=True) == (False, True)
 
-    multiline_str_helper = (
-        'def _shared_doc() -> str:\n'
-        '    msg = """para1\n\n\npara2"""\n'
-        '    return msg\n'
+    await_comp_src = "async def run(items, fetch):\n    res = [await fetch(x) for x in items]\n    return res\n"
+    await_comp_scope = _inspect_unit_scope(
+        {
+            "start": 2,
+            "end": 2,
+            "kind": "comprehension",
+            "is_subroutine": False,
+            "source_text": await_comp_src,
+            "source_lines": await_comp_src.splitlines(keepends=True),
+        },
+        file_tree=ast.parse(await_comp_src),
     )
-    indented_multiline_str_helper = (
-        '    def _shared_doc(self) -> str:\n'
-        '        msg = """para1\n\n\npara2"""\n'
-        '        return msg\n'
-    )
-    assert _validate_helper_compilation(multiline_str_helper) is True
-    assert _validate_helper_compilation(indented_multiline_str_helper) is True
-    assert_valid_python(multiline_str_helper)
-    assert_valid_python(indented_multiline_str_helper)
+    assert await_comp_scope["is_async"] is True
 
-    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
-        _dedent_preserving_multiline_strings,
-        _extract_unit_body_lines,
-    )
-    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
-        _has_type_param_default,
-    )
-
-    unclosed_fstr = '    x = f"""line1 {a}\nline2\nline3'
-    assert _dedent_preserving_multiline_strings(unclosed_fstr) == (
-        'x = f"""line1 {a}\nline2\nline3'
-    )
-    unclosed_str = '    x = """line1\nline2\nline3'
-    assert _dedent_preserving_multiline_strings(unclosed_str) == (
-        'x = """line1\nline2\nline3'
-    )
-
-    dec_first_lines = [
-        "def outer(x: int) -> int:",
-        '    """Docstring."""',
-        "    @my_dec",
-        "    def inner(y: int) -> int:",
-        "        return y + 1",
-        "    return inner(x)",
-    ]
-    extracted_dec_body = _extract_unit_body_lines(
-        {"kind": "function"}, dec_first_lines
-    )
-    assert extracted_dec_body[0] == "@my_dec"
-    assert _has_type_param_default('T: "MyBound = 1"') is False
-    assert _has_type_param_default('T: "MyBound = 1" = int') is True
-
-    from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=import-outside-toplevel
-        _collect_scope_closures_uncached,
-    )
-    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
-        _resolve_unit_ast_end_col,
-    )
-    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
-        _is_valid_expr_unit_lines,
-        _prune_unreferenced_lhs_scope,
-    )
-
-    eager_fn_tree = ast.parse(
-        "def outer(total, cap_dec, cap_def, body_var):\n"
-        "    def eager_helper(default_val=total):\n"
-        "        return default_val\n"
-        "    @dec(lambda: cap_dec)\n"
-        "    def closure_helper(cb=lambda: cap_def):\n"
-        "        return body_var\n"
-    )
-    outer_fn = eager_fn_tree.body[0]
-    assert isinstance(outer_fn, ast.FunctionDef)
-    fn_closures = _collect_scope_closures_uncached(outer_fn)
-    all_captured = set().union(*(reads for _, reads in fn_closures))
-    assert "total" not in all_captured
-    assert {"cap_dec", "cap_def", "body_var"} <= all_captured
-
-    assert _is_valid_expr_unit_lines({"kind": "complex_expr"}, []) is False
-    assert (
-        _is_valid_expr_unit_lines({"kind": "complex_expr"}, ["   # only comment"])
-        is False
-    )
-
-    comp_attr_unit = {"kind": "comprehension", "start": 1, "end": 1}
-    comp_attr_scope = {
-        "inputs": ["self", "items"],
-        "outputs": [],
-        "attrs_read": ["self.tmp"],
-        "attrs_written": ["self.tmp"],
-        "instance_attrs": ["self.tmp"],
-    }
-    _prune_unreferenced_lhs_scope(
-        comp_attr_unit,
-        comp_attr_scope,
-        ["self.tmp = [self.tmp for self.tmp in items]"],
-    )
-    assert "self.tmp" in comp_attr_scope["attrs_written"]
-
-    multi_trail_tree = ast.parse("x = 1; y = (\n    2\n)\n")
-    assert (
-        _resolve_unit_ast_end_col(
-            multi_trail_tree, {"start": 1, "end": 1, "start_col": 0}
-        )
-        == 5
-    )
-
-    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=import-outside-toplevel
-        _UnitLiveInVisitor,
-    )
-
-    cls_self_header_scope = _inspect_scope_fn(
+    cls_self_header_scope = _inspect_unit_scope(
         {
             "start": 1,
             "end": 5,
             "kind": "function",
             "is_subroutine": False,
-            "source_text": (
-                "def outer(C):\n"
-                "    @C\n"
-                "    class C(C):\n"
-                "        pass\n"
-                "    return C\n"
-            ),
+            "source_text": "def outer(C):\n    @C\n    class C(C):\n        pass\n    return C\n",
         }
     )
     assert "C" in cls_self_header_scope["inputs"]
@@ -4528,51 +4316,13 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     assert "f" in live_in_vis.live_ins
     assert "rec_only" not in live_in_vis.live_ins
 
-    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
-        _extract_unreferenced_lhs_loads,
-    )
-
-    assert _extract_unreferenced_lhs_loads(
-        ["arr[[k for k in keys][0]] = rhs"]
-    ) == {"arr", "keys"}
-
-    if sys.version_info >= (3, 12):
-        same_line_same_name_src = (
-            "def f[T: Bound](x: T):\n    def f(Bound=1): return Bound\n"
-        )
-        synth_tree = ast.parse(same_line_same_name_src)
-        for node in ast.walk(synth_tree):
-            if hasattr(node, "lineno"):
-                setattr(node, "lineno", 1)
-                setattr(node, "end_lineno", 1)
-        same_line_same_name_scope = _inspect_scope_fn(
-            {
-                "start": 1,
-                "end": 1,
-                "kind": "function",
-                "is_subroutine": False,
-                "source_text": same_line_same_name_src,
-            },
-            file_tree=synth_tree,
-        )
-        assert (
-            "type_param_closure_capture"
-            not in same_line_same_name_scope["control_flow_hazards"]
-        )
-
     nested_comp_target_src = (
         "res = [k for arr[[k for k in keys][0]] in items]\n"
         "used = [w + x for x in items]\n"
         "w = 0\n"
     )
-    nested_comp_scope = _inspect_scope_fn(
-        {
-            "start": 1,
-            "end": 3,
-            "kind": "compound_block",
-            "is_subroutine": True,
-            "source_text": nested_comp_target_src,
-        }
+    nested_comp_scope = _inspect_unit_scope(
+        {"start": 1, "end": 3, "kind": "compound_block", "is_subroutine": True, "source_text": nested_comp_target_src}
     )
     assert "k" in nested_comp_scope["inputs"]
     assert "w" in nested_comp_scope["inputs"]
@@ -4581,34 +4331,6 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     assert "k" in nested_comp_vis.live_ins
     assert "w" in nested_comp_vis.live_ins
 
-    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
-        _extract_helper_symbols,
-    )
-
-    await_comp_src = (
-        "async def run(items, fetch):\n"
-        "    res = [await fetch(x) for x in items]\n"
-        "    return res\n"
-    )
-    await_comp_scope = _inspect_scope_fn(
-        {
-            "start": 2,
-            "end": 2,
-            "kind": "comprehension",
-            "is_subroutine": False,
-            "source_text": await_comp_src,
-            "source_lines": await_comp_src.splitlines(keepends=True),
-        },
-        file_tree=ast.parse(await_comp_src),
-    )
-    assert await_comp_scope["is_async"] is True
-
-    free_syms, _, _ = _extract_helper_symbols(
-        ast.parse("def _shared(rows):\n    return [y for x in rows for y in x]\n")
-    )
-    assert "x" not in free_syms
-    assert "y" not in free_syms
-
     comp_nonlocal_src = (
         "nonlocal x, y\n"
         "y = 1\n"
@@ -4616,49 +4338,107 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
         "res = [x + y for x in items for y in items]\n"
         "fn = [(lambda a: (b := a))(z) for z in items]\n"
     )
-    comp_nonlocal_scope = _inspect_scope_fn(
-        {
-            "start": 1,
-            "end": 5,
-            "kind": "compound_block",
-            "is_subroutine": True,
-            "source_text": comp_nonlocal_src,
-        }
+    comp_nonlocal_scope = _inspect_unit_scope(
+        {"start": 1, "end": 5, "kind": "compound_block", "is_subroutine": True, "source_text": comp_nonlocal_src}
     )
     assert "x" not in comp_nonlocal_scope["outputs"]
     assert "y" not in comp_nonlocal_scope["outputs"]
     assert "b" not in comp_nonlocal_scope["outputs"]
 
+
+def test_source_dedent_body_lines_and_closure_capture_helpers() -> None:
+    """Verifies multiline dedent, body extraction, closure capture filtering, and LHS pruning."""
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
+        _resolve_unit_ast_end_col,
+    )
+    from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=import-outside-toplevel
+        _collect_scope_closures_uncached,
+    )
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _validate_helper_compilation,
+    )
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        _has_type_param_default,
+    )
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
+        _dedent_preserving_multiline_strings,
+        _extract_unit_body_lines,
+    )
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _extract_unreferenced_lhs_loads,
+        _is_valid_expr_unit_lines,
+        _prune_unreferenced_lhs_scope,
+    )
+
+    multiline_str_helper = 'def _shared_doc() -> str:\n    msg = """para1\n\n\npara2"""\n    return msg\n'
+    indented_multiline_str_helper = '    def _shared_doc(self) -> str:\n        msg = """para1\n\n\npara2"""\n        return msg\n'
+    assert _validate_helper_compilation(multiline_str_helper) is True
+    assert _validate_helper_compilation(indented_multiline_str_helper) is True
+    assert_valid_python(multiline_str_helper)
+    assert_valid_python(indented_multiline_str_helper)
+
+    unclosed_fstr = '    x = f"""line1 {a}\nline2\nline3'
+    assert _dedent_preserving_multiline_strings(unclosed_fstr) == 'x = f"""line1 {a}\nline2\nline3'
+    unclosed_str = '    x = """line1\nline2\nline3'
+    assert _dedent_preserving_multiline_strings(unclosed_str) == 'x = """line1\nline2\nline3'
+
+    dec_first_lines = [
+        "def outer(x: int) -> int:",
+        '    """Docstring."""',
+        "    @my_dec",
+        "    def inner(y: int) -> int:",
+        "        return y + 1",
+        "    return inner(x)",
+    ]
+    assert _extract_unit_body_lines({"kind": "function"}, dec_first_lines)[0] == "@my_dec"
+    assert _has_type_param_default('T: "MyBound = 1"') is False
+    assert _has_type_param_default('T: "MyBound = 1" = int') is True
+
+    eager_fn_tree = ast.parse(
+        "def outer(total, cap_dec, cap_def, body_var):\n"
+        "    def eager_helper(default_val=total):\n"
+        "        return default_val\n"
+        "    @dec(lambda: cap_dec)\n"
+        "    def closure_helper(cb=lambda: cap_def):\n"
+        "        return body_var\n"
+    )
+    outer_fn = eager_fn_tree.body[0]
+    assert isinstance(outer_fn, ast.FunctionDef)
+    all_captured = set().union(*(reads for _, reads in _collect_scope_closures_uncached(outer_fn)))
+    assert "total" not in all_captured
+    assert {"cap_dec", "cap_def", "body_var"} <= all_captured
+
     lambda_def_closures = _collect_scope_closures_uncached(
-        ast.parse(
-            "def f(total, cap):\n"
-            "    cb = lambda x=total, y=(lambda: cap): x\n"
-            "    return cb\n"
-        ).body[0]
+        ast.parse("def f(total, cap):\n    cb = lambda x=total, y=(lambda: cap): x\n    return cb\n").body[0]
     )
     all_lambda_captured = set().union(*(reads for _, reads in lambda_def_closures))
     assert "total" not in all_lambda_captured
     assert "cap" in all_lambda_captured
 
-    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
-        _unit_ast_has_async_or_yield,
-    )
-    from pydoppelgangerhunt.parser import (  # pylint: disable=import-outside-toplevel
-        _node_is_effectively_async,
-    )
+    assert _is_valid_expr_unit_lines({"kind": "complex_expr"}, []) is False
+    assert _is_valid_expr_unit_lines({"kind": "complex_expr"}, ["   # only comment"]) is False
 
-    ann_async_tree = ast.parse(
-        "async def outer(get_t):\n"
-        "    def inner(x: await get_t()) -> int:\n"
-        "        return 1\n"
+    comp_attr_scope = {
+        "inputs": ["self", "items"],
+        "outputs": [],
+        "attrs_read": ["self.tmp"],
+        "attrs_written": ["self.tmp"],
+        "instance_attrs": ["self.tmp"],
+    }
+    _prune_unreferenced_lhs_scope(
+        {"kind": "comprehension", "start": 1, "end": 1},
+        comp_attr_scope,
+        ["self.tmp = [self.tmp for self.tmp in items]"],
     )
-    outer_async_fn = ann_async_tree.body[0]
-    assert isinstance(outer_async_fn, ast.AsyncFunctionDef)
-    assert _node_is_effectively_async(outer_async_fn.body, False) is True
-    _, has_async_ann = _unit_ast_has_async_or_yield(
-        ann_async_tree, 2, 3, is_subroutine=True
+    assert "self.tmp" in comp_attr_scope["attrs_written"]
+
+    assert (
+        _resolve_unit_ast_end_col(
+            ast.parse("x = 1; y = (\n    2\n)\n"), {"start": 1, "end": 1, "start_col": 0}
+        )
+        == 5
     )
-    assert has_async_ann is True
+    assert _extract_unreferenced_lhs_loads(["arr[[k for k in keys][0]] = rhs"]) == {"arr", "keys"}
 
 
 def test_fail_closed_on_recursion_and_memory_errors(
@@ -4843,5 +4623,153 @@ def test_fail_closed_on_recursion_and_memory_errors(
         encoding="utf-8",
     )
     assert harvest_notebook_units(str(nb_file), str(tmp_path)) == []
+
+
+@pytest.mark.parametrize(
+    ("case_id", "u1", "u2", "expected_snippet"),
+    [
+        pytest.param(
+            "whole_function_source_code_only",
+            {
+                "file": "virtual/mod_a.py",
+                "name": "calc_a",
+                "start": 10,
+                "end": 12,
+                "kind": "function",
+                "source_code": "def calc_a(x):\n    y = x * 3\n    return y + 1\n",
+            },
+            {
+                "file": "virtual/mod_b.py",
+                "name": "calc_b",
+                "start": 20,
+                "end": 22,
+                "kind": "function",
+                "source_code": "def calc_b(x):\n    y = x * 3\n    return y + 1\n",
+            },
+            "y = x * 3",
+            id="whole_function_source_code_only",
+        ),
+        pytest.param(
+            "subroutine_source_code_only",
+            {
+                "file": "virtual/mod_a.py",
+                "name": "calc_a:blk",
+                "start": 5,
+                "end": 6,
+                "kind": "subroutine",
+                "is_subroutine": True,
+                "allow_snippet_only": True,
+                "source_code": "log(x * 2)\naudit(x + 5)\n",
+            },
+            {
+                "file": "virtual/mod_b.py",
+                "name": "calc_b:blk",
+                "start": 8,
+                "end": 9,
+                "kind": "subroutine",
+                "is_subroutine": True,
+                "allow_snippet_only": True,
+                "source_code": "log(x * 2)\naudit(x + 5)\n",
+            },
+            "audit(x + 5)",
+            id="subroutine_source_code_only",
+        ),
+        pytest.param(
+            "complex_expr_source_code_with_original_col_offsets",
+            {
+                "file": "virtual/mod_a.py",
+                "name": "calc_a:expr",
+                "start": 4,
+                "end": 4,
+                "start_col": 12,
+                "end_col": 21,
+                "kind": "complex_expr",
+                "allow_snippet_only": True,
+                "source_code": "x * 2 + y",
+            },
+            {
+                "file": "virtual/mod_b.py",
+                "name": "calc_b:expr",
+                "start": 9,
+                "end": 9,
+                "start_col": 12,
+                "end_col": 21,
+                "kind": "complex_expr",
+                "allow_snippet_only": True,
+                "source_code": "x * 2 + y",
+            },
+            "x * 2 + y",
+            id="complex_expr_source_code_with_original_col_offsets",
+        ),
+        pytest.param(
+            "neg_missing_source_code",
+            {
+                "file": "virtual/missing_a.py",
+                "name": "calc_a",
+                "start": 1,
+                "end": 3,
+                "kind": "function",
+            },
+            {
+                "file": "virtual/missing_b.py",
+                "name": "calc_b",
+                "start": 1,
+                "end": 3,
+                "kind": "function",
+            },
+            None,
+            id="neg_missing_source_code",
+        ),
+        pytest.param(
+            "neg_invalid_notebook_cell_anchor_ignores_source_code",
+            {
+                "file": "__NB_PATH__#cell_999",
+                "name": "calc_a",
+                "start": 1,
+                "end": 3,
+                "kind": "function",
+                "source_code": "def calc_a(x):\n    return x + 1\n",
+            },
+            {
+                "file": "__NB_PATH__#cell_999",
+                "name": "calc_b",
+                "start": 1,
+                "end": 3,
+                "kind": "function",
+                "source_code": "def calc_b(x):\n    return x + 1\n",
+            },
+            None,
+            id="neg_invalid_notebook_cell_anchor_ignores_source_code",
+        ),
+    ],
+)
+def test_synthesize_shared_helper_code_uses_source_code_fallback(
+    tmp_path: Path,
+    case_id: str,
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    expected_snippet: str | None,
+) -> None:
+    """Verifies synthesize_shared_helper_code uses source_code on non-empty placeholder origins and fails closed otherwise."""
+    u1_eff = dict(u1)
+    u2_eff = dict(u2)
+    repo_root: str | None = None
+    if "__NB_PATH__" in str(u1_eff.get("file", "")):
+        nb_file = tmp_path / "sample.ipynb"
+        nb_file.write_text(
+            '{"cells": [{"cell_type": "code", "source": ["def existing():\\n    return 0\\n"]}]}',
+            encoding="utf-8",
+        )
+        u1_eff["file"] = str(u1_eff["file"]).replace("__NB_PATH__", str(nb_file))
+        u2_eff["file"] = str(u2_eff["file"]).replace("__NB_PATH__", str(nb_file))
+        repo_root = str(tmp_path)
+
+    helper = synthesize_shared_helper_code(u1_eff, u2_eff, repo_root=repo_root)
+    assert "# Source for " not in helper, case_id
+    if expected_snippet is None:
+        assert helper == "", case_id
+    else:
+        assert expected_snippet in helper, case_id
+        assert_valid_python(helper)
 
 

@@ -7,6 +7,7 @@ validating against downstream requirements and enforcing definite assignment saf
 from __future__ import annotations
 
 import ast
+import enum
 import logging
 from typing import (
     Any,
@@ -105,11 +106,53 @@ def _has_deleted_output_hazard(
     )
 
 
-ENCLOSING_TRY_OR_WITH_CLEANUP_HAZARD_REASON = "enclosing try or with cleanup hazard"
-DELETED_OUTPUT_HAZARD_REASON = "deleted output hazard"
-INVALID_UNIT_BOUNDS_REASON = "invalid unit bounds"
-GENERATOR_OUTPUT_OR_CLOSURE_CONFLICT_REASON = "generator output or closure conflict"
-ASYNC_GENERATOR_DELEGATION_HAZARD_REASON = "async generator delegation hazard"
+class PairSkipReason(str, enum.Enum):
+    """Canonical machine-readable reasons clone pair output resolution or safety validation fails."""
+
+    UNAVAILABLE_SOURCE_FOR_CLOSURE_MODE = "unavailable source for closure mode"
+    UNAVAILABLE_SOURCE_PLACEHOLDER = "unavailable source placeholder"
+    INVALID_UNIT_COLUMNS = "invalid unit columns"
+    SEVERED_CLOSURE_CELL = "severed closure cell"
+    STALE_SOURCE_CODE = "stale source code"
+    PATHOLOGICAL_AST = "pathological ast"
+    ENCLOSING_TRY_OR_WITH_CLEANUP_HAZARD = "enclosing try or with cleanup hazard"
+    DELETED_OUTPUT_HAZARD = "deleted output hazard"
+    ASYNC_GENERATOR_DELEGATION_HAZARD = "async generator delegation hazard"
+    INVALID_UNIT_BOUNDS = "invalid unit bounds"
+    GENERATOR_OUTPUT_CONFLICT = "generator output conflict"
+    GENERATOR_CLOSURE_CONFLICT = "generator closure conflict"
+    MISMATCHED_SUBROUTINE_KINDS = "mismatched subroutine kinds"
+    UNPAIRED_OUTPUTS = "unpaired outputs"
+    AMBIGUOUS_OUTPUTS = "ambiguous outputs"
+    OUTPUT_ARITY_MISMATCH = "output arity mismatch"
+    PERMUTED_OUTPUTS = "permuted outputs"
+
+    def __str__(self) -> str:
+        """Returns the underlying string value across Python 3.9+ Enum formatting rules."""
+        return self.value
+
+
+ENCLOSING_TRY_OR_WITH_CLEANUP_HAZARD_REASON = PairSkipReason.ENCLOSING_TRY_OR_WITH_CLEANUP_HAZARD
+DELETED_OUTPUT_HAZARD_REASON = PairSkipReason.DELETED_OUTPUT_HAZARD
+INVALID_UNIT_BOUNDS_REASON = PairSkipReason.INVALID_UNIT_BOUNDS
+GENERATOR_OUTPUT_CONFLICT_REASON = PairSkipReason.GENERATOR_OUTPUT_CONFLICT
+GENERATOR_CLOSURE_CONFLICT_REASON = PairSkipReason.GENERATOR_CLOSURE_CONFLICT
+ASYNC_GENERATOR_DELEGATION_HAZARD_REASON = PairSkipReason.ASYNC_GENERATOR_DELEGATION_HAZARD
+
+
+def allows_u2_source_placeholder(
+    *,
+    is_subroutine: bool,
+    requires_u2_edit: bool,
+    source_text2: Optional[str],
+) -> bool:
+    """Returns True when missing u2 caller source placeholder is allowed for u1 host preview generation.
+
+    Preview-only non-subroutine extraction (``not is_subroutine``, ``not requires_u2_edit``,
+    and ``source_text2 is None``) permits building the host helper from ``u1`` while emitting
+    a manual-import note when ``u2``'s file is absent on disk.
+    """
+    return not is_subroutine and not requires_u2_edit and source_text2 is None
 
 
 def _validate_try_cleanup_hazard(
@@ -310,22 +353,23 @@ def _extract_effective_unit_outputs(
     return list(dict.fromkeys(v for v in cands if v not in excluded))
 
 
-_BLOCKING_SCOPE_HAZARDS: Tuple[Tuple[str, str], ...] = (
-    ("unavailable_source_for_closure_mode", "unavailable source for closure mode"),
-    ("unavailable_source_placeholder", "unavailable source placeholder"),
-    ("invalid_unit_columns", "invalid unit columns"),
-    ("severed_closure_cell", "severed closure cell"),
-    ("stale_source_code", "stale source code"),
-    ("pathological_ast", "pathological ast"),
+_BLOCKING_SCOPE_HAZARDS: Tuple[Tuple[str, PairSkipReason], ...] = (
+    ("unavailable_source_for_closure_mode", PairSkipReason.UNAVAILABLE_SOURCE_FOR_CLOSURE_MODE),
+    ("unavailable_source_placeholder", PairSkipReason.UNAVAILABLE_SOURCE_PLACEHOLDER),
+    ("invalid_unit_columns", PairSkipReason.INVALID_UNIT_COLUMNS),
+    ("severed_closure_cell", PairSkipReason.SEVERED_CLOSURE_CELL),
+    ("stale_source_code", PairSkipReason.STALE_SOURCE_CODE),
+    ("pathological_ast", PairSkipReason.PATHOLOGICAL_AST),
 )
 
 SAFETY_PAIR_SKIP_REASONS: frozenset[str] = frozenset(
     {
         *(reason for _, reason in _BLOCKING_SCOPE_HAZARDS),
-        ENCLOSING_TRY_OR_WITH_CLEANUP_HAZARD_REASON,
-        DELETED_OUTPUT_HAZARD_REASON,
-        ASYNC_GENERATOR_DELEGATION_HAZARD_REASON,
-        INVALID_UNIT_BOUNDS_REASON,
+        PairSkipReason.ENCLOSING_TRY_OR_WITH_CLEANUP_HAZARD,
+        PairSkipReason.DELETED_OUTPUT_HAZARD,
+        PairSkipReason.ASYNC_GENERATOR_DELEGATION_HAZARD,
+        PairSkipReason.INVALID_UNIT_BOUNDS,
+        PairSkipReason.GENERATOR_CLOSURE_CONFLICT,
     }
 )
 
@@ -497,12 +541,12 @@ def resolve_clone_generator_subroutine_outputs(
     for u_chk, s_chk, side_lbl in ((u1, scope1, "u1"), (u2, scope2, "u2")):
         if _has_unordered_multiset_outputs(u_chk):
             return _reject_gen_pair(
-                "unpaired outputs",
+                PairSkipReason.UNPAIRED_OUTPUTS,
                 "set-valued outputs lack positional ordering",
             )
         if s_chk.get("outputs_ambiguous"):
             return _reject_gen_pair(
-                "ambiguous outputs",
+                PairSkipReason.AMBIGUOUS_OUTPUTS,
                 "ambiguous scope outputs lack positional ordering",
             )
         for hazard_key, reason_str in _BLOCKING_SCOPE_HAZARDS:
@@ -584,7 +628,7 @@ def resolve_clone_generator_subroutine_outputs(
     )
     if resolved is None:
         return (
-            CloneOutputResolution(None, GENERATOR_OUTPUT_OR_CLOSURE_CONFLICT_REASON)
+            CloneOutputResolution(None, PairSkipReason.GENERATOR_OUTPUT_CONFLICT)
             if return_details
             else None
         )
@@ -607,7 +651,7 @@ def resolve_clone_generator_subroutine_outputs(
                 if scope_node is None or bounds is None:
                     return (
                         CloneOutputResolution(
-                            None, GENERATOR_OUTPUT_OR_CLOSURE_CONFLICT_REASON
+                            None, PairSkipReason.GENERATOR_CLOSURE_CONFLICT
                         )
                         if return_details
                         else None
@@ -634,14 +678,14 @@ def resolve_clone_generator_subroutine_outputs(
                         )
                         return (
                             CloneOutputResolution(
-                                None, GENERATOR_OUTPUT_OR_CLOSURE_CONFLICT_REASON
+                                None, PairSkipReason.GENERATOR_CLOSURE_CONFLICT
                             )
                             if return_details
                             else None
                         )
-    except (RecursionError, MemoryError):
+    except RecursionError:
         return (
-            CloneOutputResolution(None, GENERATOR_OUTPUT_OR_CLOSURE_CONFLICT_REASON)
+            CloneOutputResolution(None, PairSkipReason.PATHOLOGICAL_AST)
             if return_details
             else None
         )
@@ -752,7 +796,7 @@ def resolve_clone_pair_outputs(
             is_sub2,
         )
         return (
-            CloneOutputResolution(None, "mismatched subroutine kinds")
+            CloneOutputResolution(None, PairSkipReason.MISMATCHED_SUBROUTINE_KINDS)
             if return_details
             else None
         )
@@ -772,7 +816,7 @@ def resolve_clone_pair_outputs(
             "lack positional ordering"
         )
         return (
-            CloneOutputResolution(None, "unpaired outputs")
+            CloneOutputResolution(None, PairSkipReason.UNPAIRED_OUTPUTS)
             if return_details
             else None
         )
@@ -798,7 +842,7 @@ def resolve_clone_pair_outputs(
             "lack positional ordering"
         )
         return (
-            CloneOutputResolution(None, "ambiguous outputs")
+            CloneOutputResolution(None, PairSkipReason.AMBIGUOUS_OUTPUTS)
             if return_details
             else None
         )
@@ -828,19 +872,18 @@ def resolve_clone_pair_outputs(
     outs2 = _extract_effective_unit_outputs(u2, scope2)
     hazards1 = scope1.get("control_flow_hazards", ())
     hazards2 = scope2.get("control_flow_hazards", ())
-    # Intentional host-caller asymmetry: u1 supplies the extracted helper AST and
-    # unconditionally rejects unavailable_source_placeholder so placeholder comment
-    # lines can never enter a helper. For u2, non-subroutine preview-only extraction
-    # (not is_sub, require_pairing is False, source_text2 is None) permits generating
-    # the host helper from u1's verified AST and emitting a manual-import note when
-    # u2's caller file is missing on disk.
-    u2_blocks_placeholder = (
-        is_sub or require_pairing is not False or source_text2 is not None
+    u2_allows_placeholder = allows_u2_source_placeholder(
+        is_subroutine=is_sub,
+        requires_u2_edit=require_pairing is not False,
+        source_text2=source_text2,
     )
     for hazard_key, reason_str in _BLOCKING_SCOPE_HAZARDS:
         blocked = hazard_key in hazards1 or (
             hazard_key in hazards2
-            and (hazard_key != "unavailable_source_placeholder" or u2_blocks_placeholder)
+            and (
+                hazard_key != "unavailable_source_placeholder"
+                or not u2_allows_placeholder
+            )
         )
         if blocked:
             logger.debug(
@@ -898,13 +941,13 @@ def resolve_clone_pair_outputs(
         return CloneOutputResolution(unpaired_res, None) if return_details else unpaired_res
 
     if len(outs1) != len(outs2):
-        skip_reason = "output arity mismatch"
+        skip_reason = PairSkipReason.OUTPUT_ARITY_MISMATCH
     elif not allow_permuted_outputs and any(
         outs1.index(n) != outs2.index(n) for n in (set(outs1) & set(outs2))
     ):
-        skip_reason = "permuted outputs"
+        skip_reason = PairSkipReason.PERMUTED_OUTPUTS
     else:
-        skip_reason = "unpaired outputs"
+        skip_reason = PairSkipReason.UNPAIRED_OUTPUTS
 
     logger.debug(
         "Rejecting clone pair output resolution: outputs could not be paired "

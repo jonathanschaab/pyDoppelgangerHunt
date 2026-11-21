@@ -36,6 +36,7 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _scope_cell_info_cache,
     _tree_contains_scope_node,
     _validate_scope_cache_params,
+    scope_fingerprint_verification_session,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
     _BUILTIN_NAMES,
@@ -421,19 +422,20 @@ def _get_fn_scope_context(
         "fn_scope_ctx",
         aux_ast_nodes=aux_nodes,
     )
-    return cast(
-        _FnScopeContext,
-        _get_or_compute_scope_cached(
-            _scope_cell_info_cache,
-            cache_key,
-            lambda: _get_fn_scope_context_uncached(
-                scope_node,
-                mod_tree=mod_tree,
-                enclosing_scopes=norm_enclosing,
-                scope_owner=scope_node,
+    with scope_fingerprint_verification_session():
+        return cast(
+            _FnScopeContext,
+            _get_or_compute_scope_cached(
+                _scope_cell_info_cache,
+                cache_key,
+                lambda: _get_fn_scope_context_uncached(
+                    scope_node,
+                    mod_tree=mod_tree,
+                    enclosing_scopes=norm_enclosing,
+                    scope_owner=scope_node,
+                ),
             ),
-        ),
-    )
+        )
 
 
 def _is_lazy_genexp(
@@ -1027,7 +1029,12 @@ class _EnclosingFnCellInfo(NamedTuple):
     pre_unbound: frozenset[str] = frozenset()
     concurrent_sibling_vars: frozenset[str] = frozenset()
     heuristic_ctx_managers: Tuple[str, ...] = ()
+    wildcard_ctx_managers: Tuple[Tuple[str, str], ...] = ()
     mutation_edges: Tuple[Tuple[str, frozenset[str]], ...] = ()
+    receiver_external_closures: Tuple[frozenset[str], frozenset[str]] = (
+        frozenset(),
+        frozenset(),
+    )
 
     def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
         """Returns an empty tuple because _EnclosingFnCellInfo retains only string sets."""
@@ -1164,6 +1171,21 @@ def _extract_root_target_names(target: ast.AST) -> Set[str]:
 def _extract_receiver_root_names(node: ast.AST) -> Set[str]:
     """Extracts root variable names from an attribute or subscript receiver chain."""
     return _collect_target_names(node, mode="receiver")
+
+
+def _extract_decorator_carrier_targets(node: ast.AST) -> Set[str]:
+    """Extracts receiver root names and call-argument carriers from decorators on node."""
+    targets: Set[str] = set()
+    for dec in getattr(node, "decorator_list", ()):
+        expr: ast.AST = dec
+        while isinstance(expr, ast.Call):
+            for arg in expr.args:
+                targets.update(_extract_receiver_root_names(arg))
+            for kw in expr.keywords:
+                targets.update(_extract_receiver_root_names(kw.value))
+            expr = expr.func
+        targets.update(_extract_receiver_root_names(expr))
+    return targets
 
 
 def _extract_mutated_target_names(target: ast.AST) -> Set[str]:
@@ -1439,10 +1461,27 @@ def _extract_closure_carrier_targets_and_values(
     return _extract_assignment_targets_and_value(node, mode="rebound")
 
 
+def _is_setattr_call(node: ast.Call) -> bool:
+    """Returns True when node is an attribute-mutating setattr(...) or builtins.setattr(...) call."""
+    has_target_and_value = len(node.args) >= 3 or (
+        len(node.args) == 2 and isinstance(node.args[1], ast.Starred)
+    )
+    if not has_target_and_value:
+        return False
+    if isinstance(node.func, ast.Name):
+        return node.func.id == "setattr"
+    return (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "setattr"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id in ("builtins", "__builtins__")
+    )
+
+
 def _extract_closure_carrier_mutation_targets_and_values(
     node: ast.AST,
 ) -> Optional[Tuple[Set[str], Sequence[ast.AST]]]:
-    """Extracts (mutated_object_root_names, value_nodes) from attribute/subscript/method mutations."""
+    """Extracts (mutated_object_root_names, value_nodes) from attribute/subscript/method/setattr mutations."""
     assign_res = _extract_assignment_targets_and_value(node, mode="mutated")
     if assign_res is not None:
         return assign_res
@@ -1452,13 +1491,21 @@ def _extract_closure_carrier_mutation_targets_and_values(
         and node.value is not None
     ):
         return ({node.target.id}, (node.value,))
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+    if isinstance(node, ast.Call):
+        if _is_setattr_call(node):
+            arg_vals = node.args[2:] if len(node.args) >= 3 else node.args[1:]
+            receiver_expr: ast.AST = node.args[0]
+        elif isinstance(node.func, ast.Attribute):
+            arg_vals = node.args
+            receiver_expr = node.func.value
+        else:
+            return None
         val_nodes: Sequence[ast.AST] = [
-            *node.args,
+            *arg_vals,
             *(kw.value for kw in node.keywords if kw.value is not None),
         ]
         if val_nodes:
-            targets = _extract_receiver_root_names(node.func.value)
+            targets = _extract_receiver_root_names(receiver_expr)
             return (targets, val_nodes) if targets else None
     return None
 
@@ -2009,7 +2056,8 @@ def _make_nested_fn_scope_context(
         raw_fn_map = _get_scope_parent_map(fn_node, use_cache=use_cache)
         has_nonempty_pmap = bool(raw_fn_map)
         if use_cache and (
-            len(raw_fn_map) > _MAX_PARENT_MAP_TOTAL_NODES
+            isinstance(raw_fn_map, _WeakParentMap)
+            or len(raw_fn_map) > _MAX_PARENT_MAP_TOTAL_NODES
             or _is_oversized_scope_root(fn_node)
         ):
             parent_map = None
@@ -2280,6 +2328,37 @@ def _extract_fn_returned_closure_refs(
     )
 
 
+def _get_nested_shadowed_scope_context(
+    base_ctx: Optional[_FnScopeContext],
+    extra_shadows: frozenset[str],
+    cache: Dict[frozenset[str], _FnScopeContext],
+) -> Optional[_FnScopeContext]:
+    """Returns a _FnScopeContext incorporating nested local/class-body shadowed names."""
+    if base_ctx is None or not extra_shadows:
+        return base_ctx
+    merged_shadows = base_ctx.shadowed_names | extra_shadows
+    if (
+        merged_shadows == base_ctx.shadowed_names
+        and extra_shadows <= base_ctx.fn_locals
+    ):
+        return base_ctx
+    cached = cache.get(extra_shadows)
+    if cached is not None:
+        return cached
+    derived = _FnScopeContext(
+        fn_locals=base_ctx.fn_locals | extra_shadows,
+        parent_map=base_ctx._stored_parent_map,  # pylint: disable=protected-access
+        shadowed_names=merged_shadows,
+        has_star_import=base_ctx.has_star_import,
+        scope_owner=base_ctx.scope_owner,
+        mod_tree=base_ctx.mod_tree,
+        enclosing_scopes=base_ctx.enclosing_scopes,
+        has_nonempty_parent_map=base_ctx.has_nonempty_parent_map,
+    )
+    cache[extra_shadows] = derived
+    return derived
+
+
 def _extract_fn_outer_carrier_targets_uncached(
     fn_node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef],
     fn_globals: AbstractSet[str] = frozenset(),
@@ -2320,33 +2399,71 @@ def _extract_fn_outer_carrier_targets_uncached(
     )
     direct_nl = _extract_direct_nonlocals(fn_node)
     direct_g = _extract_direct_nonlocals(fn_node, is_global=True)
+    unshadowed_builtins: AbstractSet[str] = (
+        _BUILTIN_NAMES - set(scope_ctx.shadowed_names)
+        if scope_ctx is not None and not scope_ctx.has_star_import
+        else frozenset()
+    )
+    own_locals_f = frozenset(own_locals)
+    derived_ctx_cache: Dict[frozenset[str], _FnScopeContext] = {}
+    empty_shadows: frozenset[str] = frozenset()
+    root_cls_shadows: frozenset[str] = (
+        frozenset(_extract_strict_fn_local_names(fn_node))
+        if is_root_cls
+        else empty_shadows
+    )
     fn_g = set(fn_globals) if is_root_cls else (set(fn_globals) | direct_g)
     cls_g = direct_g if is_root_cls else set()
     targets: Set[str] = set()
     local_closure_syms: Set[str] = set()
     local_edges: List[Tuple[str, Set[str]]] = []
     outer_candidates: List[Tuple[str, Set[str]]] = []
-    stack: List[Tuple[ast.AST, Set[str], Set[str], Set[str], Set[str]]] = [
-        (stmt, own_locals, direct_nl, fn_g, cls_g) for stmt in fn_node.body
+    stack: List[
+        Tuple[ast.AST, Set[str], Set[str], Set[str], Set[str], frozenset[str]]
+    ] = [
+        (stmt, own_locals, direct_nl, fn_g, cls_g, root_cls_shadows)
+        for stmt in fn_node.body
     ]
     while stack:
-        sub, cur_locals, cur_nl, cur_fn_g, cur_cls_g = stack.pop()
+        sub, cur_locals, cur_nl, cur_fn_g, cur_cls_g, cur_cls_shadows = stack.pop()
         if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             local_closure_syms.add(sub.name)
             for hdr in iter_nested_scope_header_nodes(sub):
-                stack.append((hdr, cur_locals, cur_nl, cur_fn_g, cur_cls_g))
+                stack.append(
+                    (hdr, cur_locals, cur_nl, cur_fn_g, cur_cls_g, cur_cls_shadows)
+                )
+            dec_targets = _extract_decorator_carrier_targets(sub)
+            if dec_targets:
+                active_builtins = unshadowed_builtins - cur_locals - cur_cls_shadows
+                sub_reads = (
+                    _extract_cached_scope_free_reads(sub, use_cache=use_cache)
+                    - active_builtins
+                )
+                sub_muts, _ = _extract_closure_nonlocal_mutations_and_deletions(
+                    sub, use_cache=use_cache
+                )
+                if sub_reads or sub_muts:
+                    for d_name in dec_targets:
+                        if d_name in cur_fn_g or d_name in cur_cls_g:
+                            continue
+                        if d_name not in cur_locals or d_name in cur_nl:
+                            targets.add(d_name)
+                        else:
+                            local_edges.append((d_name, {sub.name}))
             sub_direct_nl = _extract_direct_nonlocals(sub)
             sub_direct_g = _extract_direct_nonlocals(sub, is_global=True)
             if isinstance(sub, ast.ClassDef):
                 sub_fn_g = cur_fn_g - sub_direct_nl
                 sub_cls_g = sub_direct_g
                 sub_own: Set[str] = set()
+                next_cls_shadows = frozenset(_extract_strict_fn_local_names(sub))
             else:
                 sub_own = _extract_strict_fn_local_names(sub)
                 sub_fn_g = (
                     (cur_fn_g - sub_own) - sub_direct_nl
                 ) | sub_direct_g
                 sub_cls_g = set()
+                next_cls_shadows = empty_shadows
             sub_nl = (
                 (
                     (sub_direct_nl & cur_nl) | (sub_direct_nl - cur_locals)
@@ -2356,11 +2473,15 @@ def _extract_fn_outer_carrier_targets_uncached(
             )
             next_locals = (cur_locals | sub_own) - sub_fn_g - sub_cls_g
             for ch in sub.body:
-                stack.append((ch, next_locals, sub_nl, sub_fn_g, sub_cls_g))
+                stack.append(
+                    (ch, next_locals, sub_nl, sub_fn_g, sub_cls_g, next_cls_shadows)
+                )
             continue
         if isinstance(sub, ast.Lambda):
             for hdr in iter_nested_scope_header_nodes(sub):
-                stack.append((hdr, cur_locals, cur_nl, cur_fn_g, cur_cls_g))
+                stack.append(
+                    (hdr, cur_locals, cur_nl, cur_fn_g, cur_cls_g, cur_cls_shadows)
+                )
             lam_bound = _extract_strict_fn_local_names(sub)
             lam_locals = cur_locals | lam_bound
             stack.append(
@@ -2370,6 +2491,7 @@ def _extract_fn_outer_carrier_targets_uncached(
                     cur_nl - lam_bound,
                     cur_fn_g - lam_bound,
                     set(),
+                    empty_shadows,
                 )
             )
             continue
@@ -2383,19 +2505,35 @@ def _extract_fn_outer_carrier_targets_uncached(
             stack.extend(
                 [
                     *(
-                        [(sub.generators[0].iter, cur_locals, cur_nl, cur_fn_g, cur_cls_g)]
+                        [
+                            (
+                                sub.generators[0].iter,
+                                cur_locals,
+                                cur_nl,
+                                cur_fn_g,
+                                cur_cls_g,
+                                cur_cls_shadows,
+                            )
+                        ]
                         if sub.generators
                         else []
                     ),
-                    *((expr, comp_locals, comp_nl, comp_fn_g, set()) for expr in comp_exprs),
+                    *(
+                        (expr, comp_locals, comp_nl, comp_fn_g, set(), empty_shadows)
+                        for expr in comp_exprs
+                    ),
                 ]
             )
             continue
+        extra_shadows = (frozenset(cur_locals) - own_locals_f) | cur_cls_shadows
+        active_ctx = _get_nested_shadowed_scope_context(
+            local_ctx, extra_shadows, derived_ctx_cache
+        )
         for is_rebound, c_targets, c_values in _iter_carrier_target_entries(sub):
             c_calls: Set[str] = set()
             c_reads, c_muts, c_loads = (
                 _extract_carrier_value_closure_and_load_info(
-                    c_values, local_ctx, called_names_out=c_calls
+                    c_values, active_ctx, called_names_out=c_calls
                 )
             )
             has_inline = bool(c_reads or c_muts)
@@ -2419,7 +2557,9 @@ def _extract_fn_outer_carrier_targets_uncached(
                     elif val_refs & cur_locals:
                         local_edges.append((t_name, val_refs & cur_locals))
         for child_node in ast.iter_child_nodes(sub):
-            stack.append((child_node, cur_locals, cur_nl, cur_fn_g, cur_cls_g))
+            stack.append(
+                (child_node, cur_locals, cur_nl, cur_fn_g, cur_cls_g, cur_cls_shadows)
+            )
     if outer_candidates:
         _propagate_local_closure_syms(local_closure_syms, local_edges)
         for t_name, val_refs in outer_candidates:

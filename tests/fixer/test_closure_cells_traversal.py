@@ -921,7 +921,7 @@ def test_utf8_semicolon_and_multiline_column_slicing() -> None:
             "source_code": comp_snip,
         },
         [comp_snip],
-    ) == []
+    ) is None
     assert _slice_unit_token_lines(
         {
             "kind": "comprehension",
@@ -970,6 +970,7 @@ def test_utf8_semicolon_and_multiline_column_slicing() -> None:
         {"kind": "comprehension", "start_col": ms_col, "end_col": me_col},
         multi_lines,
     )
+    assert sliced_multi is not None
     assert "".join(sliced_multi) == multi_snip
     multi_scope = inspect_single_unit_scope(
         {
@@ -1727,47 +1728,14 @@ def test_same_stmt_evaluation_order_comp_walrus_and_decorator_alignment() -> Non
     assert _node_earliest_start_pos(inner_ml_dec) == (3, 4)
 
 
-def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
-    """Covers lexical def escape identity, column-aware shortcuts, mod_tree cache isolation, genexp matrix, runtime definite-binding validation, and UTF-8 single-boundary ambiguity."""
-    import sys
-    from pydoppelgangerhunt.fixer._df_cache import (
-        _ScopeCacheKey,
-        _evict_tree_scopes,
-        _key_references_scope_nodes,
-        _scope_cell_info_cache,
-        clear_dataflow_cache,
-    )
-    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+def test_lexical_def_escape_identity_and_same_scope_branch_ambiguity() -> None:
+    """Covers lexical-scope def identity in _collect_escaped_intra_unit_defs and same-scope branch ambiguity."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (  # pylint: disable=import-outside-toplevel
         _collect_escaped_intra_unit_defs,
         _collect_escaped_intra_unit_names,
-        _get_fn_scope_context,
     )
-    from pydoppelgangerhunt.fixer._df_cell_carriers import (
-        _SpanBounds,
-    )
-    from pydoppelgangerhunt.fixer._df_cell_traversal import (
-        _analyze_enclosing_fn_cells,
-        _make_empty_traversal_buffers,
-        _try_apply_cached_stmt_delta,
-    )
-    from pydoppelgangerhunt.fixer._df_span_index import (
-        _find_enclosing_function_chain,
-    )
-    from pydoppelgangerhunt.fixer._df_with_provenance import (
-        _extract_block_definite_bindings_and_term,
-    )
-    from pydoppelgangerhunt.fixer._df_pairing import resolve_clone_pair_outputs
-    from pydoppelgangerhunt.fixer.scope import (
-        _find_enclosing_pre_bound_names,
-        _unit_cols,
-        inspect_single_unit_scope,
-    )
-    from pydoppelgangerhunt.fixer.source import (
-        _slice_unit_token_lines,
-        _slice_utf8_line,
-    )
+    from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope  # pylint: disable=import-outside-toplevel
 
-    # 1. Lexical-scope definition identity in _collect_escaped_intra_unit_defs
     src_item1_safe = (
         "def entry(a):\n"
         "    value = a + 10\n"
@@ -1786,7 +1754,6 @@ def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
         "    escaped_cb = other()\n"
         "    return value, escaped_cb\n"
     )
-    tree_item1_safe = ast.parse(src_item1_safe)
     unit_code_item1 = (
         "value = value * 2\n"
         "def helper():\n"
@@ -1814,17 +1781,13 @@ def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
     assert "callback" not in _collect_escaped_intra_unit_names(cand_item1, {"value", "escaped_cb"})
     sc_item1_safe = inspect_single_unit_scope(
         {
-            "start": 3,
-            "end": 15,
-            "kind": "compound_block",
-            "source_text": src_item1_safe,
-            "source_code": unit_code_item1,
+            "start": 3, "end": 15, "kind": "compound_block",
+            "source_text": src_item1_safe, "source_code": unit_code_item1,
         },
-        tree=tree_item1_safe,
+        tree=ast.parse(src_item1_safe),
     )
     assert "severed_closure_cell" not in sc_item1_safe["control_flow_hazards"]
 
-    # Ambiguous same-scope branch definitions with same name conservatively mark both as escaping
     src_item1_ambig = (
         "def entry(a, flag):\n"
         "    value = a + 10\n"
@@ -1859,9 +1822,26 @@ def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
     )
     assert "severed_closure_cell" in sc_item1_ambig["control_flow_hazards"]
 
-    # 2. Column-aware _try_apply_cached_stmt_delta and same-line scope boundaries
+
+def test_column_aware_stmt_delta_and_header_vs_body_span_index() -> None:
+    """Covers column-aware cached stmt delta boundaries and header vs body enclosing function chains."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (  # pylint: disable=import-outside-toplevel
+        _SpanBounds,
+        _get_fn_scope_context,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (  # pylint: disable=import-outside-toplevel
+        _make_empty_traversal_buffers,
+        _try_apply_cached_stmt_delta,
+    )
+    from pydoppelgangerhunt.fixer._df_span_index import (  # pylint: disable=import-outside-toplevel
+        _find_enclosing_function_chain,
+    )
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        _find_enclosing_pre_bound_names,
+    )
+
     same_line_src = (
-        "def f(items):\n" "    a = 1; b = [lambda: a for _ in items]; a = 2\n" "    return b, a\n"
+        "def f(items):\n    a = 1; b = [lambda: a for _ in items]; a = 2\n    return b, a\n"
     )
     same_line_tree = ast.parse(same_line_src)
     fn_same_line = same_line_tree.body[0]
@@ -1875,7 +1855,6 @@ def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
     assert _try_apply_cached_stmt_delta(fn_same_line.body[2], span_sl, bufs_sl, deltas_sl) is True
     assert "a" in bufs_sl.state.post_mutated
 
-    # _find_enclosing_function_chain and _find_enclosing_pre_bound_names with end_col in header vs body
     hdr_body_src = (
         "def outer(items):\n"
         "    x = 1\n"
@@ -1892,7 +1871,23 @@ def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
     pre_body, _ = _find_enclosing_pre_bound_names(hdr_body_tree, 3, 3, u_start_col=41, u_end_col=49)
     assert "d" in pre_body
 
-    # 3. Closure analysis cache isolation across distinct mod_tree contexts and eviction
+
+def test_closure_cache_isolation_across_mod_tree_and_eviction() -> None:
+    """Covers module-tree context isolation, scope eviction, aux_ast_nodes guards, and cache clearing."""
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
+        _ScopeCacheKey,
+        _evict_tree_scopes,
+        _key_references_scope_nodes,
+        _scope_cell_info_cache,
+        clear_dataflow_cache,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (  # pylint: disable=import-outside-toplevel
+        _get_fn_scope_context,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (  # pylint: disable=import-outside-toplevel
+        _analyze_enclosing_fn_cells,
+    )
+
     shared_fn_src = (
         "def worker(items):\n"
         "    v = 1\n"
@@ -1911,9 +1906,7 @@ def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
     assert "list" not in ctx_clean.shadowed_names
     assert "list" in ctx_shadow.shadowed_names
     info_clean = _analyze_enclosing_fn_cells(shared_fn_node, (5, 6, None, None), mod_tree=mod_clean)
-    info_shadow = _analyze_enclosing_fn_cells(
-        shared_fn_node, (5, 6, None, None), mod_tree=mod_shadow
-    )
+    info_shadow = _analyze_enclosing_fn_cells(shared_fn_node, (5, 6, None, None), mod_tree=mod_shadow)
     assert not any("v" in r for _, r, _ in info_clean.sibling_closures)
     assert any("v" in r for _, r, _ in info_shadow.sibling_closures)
     shadow_nodes = set(ast.walk(mod_shadow))
@@ -1933,180 +1926,91 @@ def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
     clear_dataflow_cache()
     assert len(_scope_cell_info_cache) == 0
 
-    # 4. Generator-expression 6-path interaction matrix
-    # 4.1 Lazy genexp consumed AFTER rebinding vs BEFORE rebinding
-    src_gen_after = (
-        "def outer(items):\n"
-        "    value = 1\n"
-        "    gen = (value + x for x in items)\n"
-        "    value = 10\n"
-        "    return list(gen)\n"
-    )
-    sc_gen_after = inspect_single_unit_scope(
-        {
-            "start": 3,
-            "end": 3,
-            "start_col": 10,
-            "end_col": 36,
-            "kind": "comprehension",
-            "source_text": src_gen_after,
-            "source_code": "(value + x for x in items)",
-        },
-        tree=ast.parse(src_gen_after),
-    )
-    assert "severed_closure_cell" in sc_gen_after["control_flow_hazards"]
 
-    src_gen_before = (
-        "def outer(items):\n"
-        "    value = 1\n"
-        "    gen = (value + x for x in items)\n"
-        "    out = list(gen)\n"
-        "    value = 10\n"
-        "    res = value + 1\n"
-        "    return out, res\n"
-    )
-    sc_gen_before = inspect_single_unit_scope(
-        {
-            "start": 5,
-            "end": 6,
-            "kind": "compound_block",
-            "source_text": src_gen_before,
-            "source_code": "value = 10\nres = value + 1\n",
-        },
-        tree=ast.parse(src_gen_before),
-    )
-    assert "severed_closure_cell" not in sc_gen_before["control_flow_hazards"]
+@pytest.mark.parametrize(
+    ("unit", "source", "expect_hazard", "expect_not_input"),
+    [
+        pytest.param(
+            {"start": 3, "end": 3, "start_col": 10, "end_col": 36, "kind": "comprehension",
+             "source_code": "(value + x for x in items)"},
+            "def outer(items):\n    value = 1\n    gen = (value + x for x in items)\n    value = 10\n    return list(gen)\n",
+            True, None, id="lazy_genexp_consumed_after_rebind",
+        ),
+        pytest.param(
+            {"start": 5, "end": 6, "kind": "compound_block", "source_code": "value = 10\nres = value + 1\n"},
+            "def outer(items):\n    value = 1\n    gen = (value + x for x in items)\n    out = list(gen)\n"
+            "    value = 10\n    res = value + 1\n    return out, res\n",
+            False, None, id="genexp_consumed_before_rebind",
+        ),
+        pytest.param(
+            {"start": 3, "end": 4, "kind": "compound_block",
+             "source_code": "gen = (value + x for x in items)\nres = value + 2\n"},
+            "def outer(items):\n    value = 1\n    gen = (value + x for x in items)\n    res = value + 2\n"
+            "    value = 10\n    return gen, res\n",
+            True, None, id="genexp_returned_before_rebind",
+        ),
+        pytest.param(
+            {"start": 3, "end": 3, "start_col": 15, "end_col": 41, "kind": "comprehension",
+             "source_code": "(value + x for x in items)"},
+            "def outer(items, sum):\n    value = 1\n    total = sum(value + x for x in items)\n"
+            "    value = 10\n    return total\n",
+            True, None, id="shadowed_sum_consumer_lazy",
+        ),
+        pytest.param(
+            {"start": 3, "end": 3, "start_col": 11, "end_col": 55, "kind": "comprehension",
+             "source_code": "[(value + x for x in row) for row in matrix]"},
+            "def outer(matrix):\n    value = 1\n    gens = [(value + x for x in row) for row in matrix]\n"
+            "    value = 10\n    return [list(g) for g in gens]\n",
+            True, None, id="genexp_nested_in_listcomp",
+        ),
+        pytest.param(
+            {"start": 4, "end": 5, "kind": "compound_block", "source_code": "y = w\nz = len(y)\n"},
+            "def outer(items):\n    w = 0\n    _, gen = (w := items), (x + 1 for x in w)\n"
+            "    y = w\n    z = len(y)\n    return list(gen), z\n",
+            False, None, id="walrus_in_first_iterable_eager",
+        ),
+        pytest.param(
+            {"start": 4, "end": 5, "kind": "compound_block", "source_code": "w = 10\nres = list(gen) + [w]\n"},
+            "def outer(items):\n    w = 0\n    gen = ((w := x) for x in items)\n    w = 10\n"
+            "    res = list(gen) + [w]\n    return res\n",
+            True, None, id="walrus_in_genexp_body_lazy",
+        ),
+        pytest.param(
+            {"start": 3, "end": 3, "start_col": 10, "end_col": 61, "kind": "comprehension",
+             "source_code": "(sum(value + 1 for value in row) for row in matrix)"},
+            "def outer(matrix):\n    value = 1\n    gen = (sum(value + 1 for value in row) for row in matrix)\n"
+            "    value = 10\n    return list(gen), value\n",
+            False, "value", id="inner_target_shadows_outer_var",
+        ),
+    ],
+)
+def test_genexp_consumer_laziness_walrus_and_shadowing_matrix(
+    unit: dict[str, Any],
+    source: str,
+    expect_hazard: bool,
+    expect_not_input: str | None,
+) -> None:
+    """Covers generator-expression consumer laziness, nested listcomp, walrus timing, and shadowing."""
+    from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope  # pylint: disable=import-outside-toplevel
 
-    # 4.2 Generator expression returned from unit to caller before outer rebinding
-    src_gen_ret = (
-        "def outer(items):\n"
-        "    value = 1\n"
-        "    gen = (value + x for x in items)\n"
-        "    res = value + 2\n"
-        "    value = 10\n"
-        "    return gen, res\n"
-    )
-    sc_gen_ret = inspect_single_unit_scope(
-        {
-            "start": 3,
-            "end": 4,
-            "kind": "compound_block",
-            "source_text": src_gen_ret,
-            "source_code": "gen = (value + x for x in items)\nres = value + 2\n",
-        },
-        tree=ast.parse(src_gen_ret),
-    )
-    assert "severed_closure_cell" in sc_gen_ret["control_flow_hazards"]
+    sc = inspect_single_unit_scope({**unit, "source_text": source}, tree=ast.parse(source))
+    if expect_hazard:
+        assert "severed_closure_cell" in sc["control_flow_hazards"]
+    else:
+        assert "severed_closure_cell" not in sc["control_flow_hazards"]
+    if expect_not_input is not None:
+        assert expect_not_input not in sc["inputs"]
 
-    # 4.3 Shadowed sum/tuple consumer treated as lazy
-    src_gen_shadow_sum = (
-        "def outer(items, sum):\n"
-        "    value = 1\n"
-        "    total = sum(value + x for x in items)\n"
-        "    value = 10\n"
-        "    return total\n"
-    )
-    sc_gen_shadow_sum = inspect_single_unit_scope(
-        {
-            "start": 3,
-            "end": 3,
-            "start_col": 15,
-            "end_col": 41,
-            "kind": "comprehension",
-            "source_text": src_gen_shadow_sum,
-            "source_code": "(value + x for x in items)",
-        },
-        tree=ast.parse(src_gen_shadow_sum),
-    )
-    assert "severed_closure_cell" in sc_gen_shadow_sum["control_flow_hazards"]
 
-    # 4.4 Generator expression nested in list comprehension
-    src_gen_in_listcomp = (
-        "def outer(matrix):\n"
-        "    value = 1\n"
-        "    gens = [(value + x for x in row) for row in matrix]\n"
-        "    value = 10\n"
-        "    return [list(g) for g in gens]\n"
+def test_definite_binding_try_finally_match_and_unseeded_store() -> None:
+    """Covers runtime definite-binding execution checks and unseeded conditional store pairing rejection."""
+    import sys
+    from pydoppelgangerhunt.fixer._df_pairing import resolve_clone_pair_outputs  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer._df_with_provenance import (  # pylint: disable=import-outside-toplevel
+        _extract_block_definite_bindings_and_term,
     )
-    sc_gen_in_listcomp = inspect_single_unit_scope(
-        {
-            "start": 3,
-            "end": 3,
-            "start_col": 11,
-            "end_col": 55,
-            "kind": "comprehension",
-            "source_text": src_gen_in_listcomp,
-            "source_code": "[(value + x for x in row) for row in matrix]",
-        },
-        tree=ast.parse(src_gen_in_listcomp),
-    )
-    assert "severed_closure_cell" in sc_gen_in_listcomp["control_flow_hazards"]
+    from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope  # pylint: disable=import-outside-toplevel
 
-    # 4.5 Walrus in first iterable (eager) vs in body (lazy)
-    src_walrus_iter = (
-        "def outer(items):\n"
-        "    w = 0\n"
-        "    _, gen = (w := items), (x + 1 for x in w)\n"
-        "    y = w\n"
-        "    z = len(y)\n"
-        "    return list(gen), z\n"
-    )
-    sc_walrus_iter = inspect_single_unit_scope(
-        {
-            "start": 4,
-            "end": 5,
-            "kind": "compound_block",
-            "source_text": src_walrus_iter,
-            "source_code": "y = w\nz = len(y)\n",
-        },
-        tree=ast.parse(src_walrus_iter),
-    )
-    assert "severed_closure_cell" not in sc_walrus_iter["control_flow_hazards"]
-
-    src_walrus_body = (
-        "def outer(items):\n"
-        "    w = 0\n"
-        "    gen = ((w := x) for x in items)\n"
-        "    w = 10\n"
-        "    res = list(gen) + [w]\n"
-        "    return res\n"
-    )
-    sc_walrus_body = inspect_single_unit_scope(
-        {
-            "start": 4,
-            "end": 5,
-            "kind": "compound_block",
-            "source_text": src_walrus_body,
-            "source_code": "w = 10\nres = list(gen) + [w]\n",
-        },
-        tree=ast.parse(src_walrus_body),
-    )
-    assert "severed_closure_cell" in sc_walrus_body["control_flow_hazards"]
-
-    # 4.6 Nested generator expressions where inner target shadows outer variable
-    src_gen_shadow_target = (
-        "def outer(matrix):\n"
-        "    value = 1\n"
-        "    gen = (sum(value + 1 for value in row) for row in matrix)\n"
-        "    value = 10\n"
-        "    return list(gen), value\n"
-    )
-    sc_gen_shadow_target = inspect_single_unit_scope(
-        {
-            "start": 3,
-            "end": 3,
-            "start_col": 10,
-            "end_col": 61,
-            "kind": "comprehension",
-            "source_text": src_gen_shadow_target,
-            "source_code": "(sum(value + 1 for value in row) for row in matrix)",
-        },
-        tree=ast.parse(src_gen_shadow_target),
-    )
-    assert "value" not in sc_gen_shadow_target["inputs"]
-    assert "severed_closure_cell" not in sc_gen_shadow_target["control_flow_hazards"]
-
-    # 5. Definite-binding validation against Python runtime execution & refactoring decision
     prog_try_finally = (
         "def run_case(flag):\n"
         "    try:\n"
@@ -2120,8 +2024,7 @@ def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
         "        b = a + 10\n"
         "    return a, b\n"
     )
-    tree_tf = ast.parse(prog_try_finally)
-    fn_tf = tree_tf.body[0]
+    fn_tf = ast.parse(prog_try_finally).body[0]
     assert isinstance(fn_tf, ast.FunctionDef)
     def_bound_tf, all_term_tf = _extract_block_definite_bindings_and_term(fn_tf.body[:1], None)
     assert def_bound_tf == {"a", "b"}
@@ -2131,7 +2034,6 @@ def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
     assert ns_tf["run_case"](True) == (1, 11)
     assert ns_tf["run_case"](False) == (2, 12)
 
-    # Validate unseeded conditional store with sibling closure: both scope fields & resolve_clone_pair_outputs
     src_unseeded = (
         "def outer(flag):\n"
         "    if flag:\n"
@@ -2143,11 +2045,8 @@ def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
         "    return read()\n"
     )
     u_unseeded = {
-        "start": 2,
-        "end": 3,
-        "kind": "if_block",
-        "source_text": src_unseeded,
-        "source_code": "if flag:\n    value = 10\n",
+        "start": 2, "end": 3, "kind": "if_block",
+        "source_text": src_unseeded, "source_code": "if flag:\n    value = 10\n",
     }
     sc_unseeded = inspect_single_unit_scope(u_unseeded, tree=ast.parse(src_unseeded))
     assert sc_unseeded["definite_stores"] == []
@@ -2156,12 +2055,8 @@ def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
     assert "severed_closure_cell" in sc_unseeded["control_flow_hazards"]
     assert (
         resolve_clone_pair_outputs(
-            u_unseeded,
-            dict(u_unseeded),
-            sc_unseeded,
-            dict(sc_unseeded),
-            source_text1=src_unseeded,
-            source_text2=src_unseeded,
+            u_unseeded, dict(u_unseeded), sc_unseeded, dict(sc_unseeded),
+            source_text1=src_unseeded, source_text2=src_unseeded,
         )
         is None
     )
@@ -2186,30 +2081,31 @@ def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
         assert ns_m["eval_match"](1) == 10
         assert ns_m["eval_match"](2) == 20
 
-    # 6. UTF-8 single-boundary ambiguity preservation and round-trip verification
-    ambig_expr_line = ['    tag = "αβγ_🚀"; res = a + b + c\n']
-    res_s_col = len('    tag = "αβγ_🚀"; res = '.encode("utf-8"))
-    # Starting at `a` in `a + b + c`, both `a + b` and `a + b + c` are compound ast.expr nodes -> ambiguous!
-    assert _unit_cols({"kind": "complex_expr", "start_col": res_s_col}, ambig_expr_line) == (
-        res_s_col,
-        None,
-    )
-    # Ending at `c` in `a + b + c`, only `(a + b) + c` is a non-leaf ast.expr ending there -> unambiguous!
-    res_e_col = len('    tag = "αβγ_🚀"; res = a + b + c'.encode("utf-8"))
-    assert _unit_cols({"kind": "complex_expr", "end_col": res_e_col}, ambig_expr_line) == (
-        res_s_col,
-        res_e_col,
+
+def test_utf8_single_boundary_ambiguity_and_roundtrip_slicing() -> None:
+    """Covers UTF-8 single-boundary column ambiguity and multibyte prefix slicing round-trips."""
+    from pydoppelgangerhunt.fixer.scope import _unit_cols  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
+        _slice_unit_token_lines,
+        _slice_utf8_line,
     )
 
-    # Single-line compound statement `if flag: a = 1; b = 2` with only end_col has both If and Assign ending at end_col -> ambiguous!
+    ambig_expr_line = ['    tag = "αβγ_🚀"; res = a + b + c\n']
+    res_s_col = len('    tag = "αβγ_🚀"; res = '.encode("utf-8"))
+    assert _unit_cols({"kind": "complex_expr", "start_col": res_s_col}, ambig_expr_line) == (
+        res_s_col, None,
+    )
+    res_e_col = len('    tag = "αβγ_🚀"; res = a + b + c'.encode("utf-8"))
+    assert _unit_cols({"kind": "complex_expr", "end_col": res_e_col}, ambig_expr_line) == (
+        res_s_col, res_e_col,
+    )
+
     ambig_stmt_line = ['    if flag: a = "café"; b = "🚀"\n']
     stmt_end_col = len(ambig_stmt_line[0].rstrip("\r\n").encode("utf-8"))
     assert _unit_cols({"kind": "basic_block", "end_col": stmt_end_col}, ambig_stmt_line) == (
-        None,
-        stmt_end_col,
+        None, stmt_end_col,
     )
 
-    # Round-trip check across multibyte prefixes and unique expressions
     for prefix in ('    p = "αβγ"; ', '    p = "日本語_🚀_✨"; ', "    "):
         for expr_str, kind_str in (
             ("[x * 2 for x in items]", "comprehension"),
@@ -2219,16 +2115,12 @@ def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
             full_ln = f"{prefix}target = {expr_str}; tail = 1 # comment 🚀\n"
             exp_s = len(f"{prefix}target = ".encode("utf-8"))
             exp_e = exp_s + len(expr_str.encode("utf-8"))
-            assert _unit_cols({"kind": kind_str, "source_code": expr_str}, [full_ln]) == (
-                exp_s,
-                exp_e,
-            )
+            assert _unit_cols({"kind": kind_str, "source_code": expr_str}, [full_ln]) == (exp_s, exp_e)
             assert _unit_cols({"kind": kind_str, "start_col": exp_s}, [full_ln]) == (exp_s, exp_e)
             assert _unit_cols({"kind": kind_str, "end_col": exp_e}, [full_ln]) == (exp_s, exp_e)
             assert _slice_utf8_line(full_ln, exp_s, exp_e) == expr_str
             assert _slice_unit_token_lines(
-                {"kind": kind_str, "start_col": exp_s, "end_col": exp_e},
-                [full_ln],
+                {"kind": kind_str, "start_col": exp_s, "end_col": exp_e}, [full_ln]
             ) == [expr_str]
 
 
@@ -2471,7 +2363,7 @@ def test_slice_utf8_line_and_augassign_post_read_and_trystar_bindings() -> None:
     import copy
     import pickle
     import sys
-    from pydoppelgangerhunt.fixer import (
+    from pydoppelgangerhunt.fixer._df_closures import (
         _is_irrefutable_case,
         _is_irrefutable_pattern,
     )
@@ -2503,7 +2395,7 @@ def test_slice_utf8_line_and_augassign_post_read_and_trystar_bindings() -> None:
     assert _slice_unit_token_lines(
         {"kind": "comprehension", "start_col": 50, "end_col": 70},
         ["[x for x in y]"],
-    ) == []
+    ) is None
     assert _slice_unit_token_lines(
         {"kind": "comprehension", "start_col": 50, "end_col": 70},
         ["[x for x in y]"],
@@ -2882,6 +2774,7 @@ def test_unknown_and_aliased_and_nested_suppressing_context_managers() -> None:
     assert term_nnt is False
 
     nested_term_src = (
+        "from contextlib import suppress\n"
         "with suppress(ValueError):\n"
         "    with suppress(KeyError):\n"
         "        x = 10\n"
@@ -2889,9 +2782,9 @@ def test_unknown_and_aliased_and_nested_suppressing_context_managers() -> None:
         "after = 2\n"
     )
     nested_term_stmts = ast.parse(nested_term_src).body
-    assert _block_terminates([nested_term_stmts[0]]) is True
+    assert _block_terminates(nested_term_stmts[:2]) is True
     bound_nt, term_nt = _extract_block_definite_bindings_and_term(nested_term_stmts, None)
-    assert bound_nt == {"x"}
+    assert bound_nt == {"suppress", "x"}
     assert term_nt is True
 
 
@@ -3046,3 +2939,767 @@ def test_receiver_setattr_delattr_and_external_sibling_escape(
     if not expect_safe:
         assert "severed_closure_cell" in sc["control_flow_hazards"], case_id
         assert sc["closure_hazard_reasons"], case_id
+
+
+@pytest.mark.parametrize(
+    ("setup_src", "expect_pre_bound", "expect_safe"),
+    [
+        pytest.param(
+            (
+                "    cm = contextlib.nullcontext\n"
+                "    try:\n"
+                "        cm = contextlib.suppress\n"
+                "        step()\n"
+                "    except Exception:\n"
+                "        with cm(ValueError):\n"
+                "            v = step()\n"
+                "        cb = lambda: v\n"
+            ),
+            False,
+            False,
+            id="try_body_rebind_to_suppress_invalidates_except_handler_cm",
+        ),
+        pytest.param(
+            (
+                "    cm = contextlib.nullcontext\n"
+                "    try:\n"
+                "        step()\n"
+                "    except ValueError:\n"
+                "        cm = contextlib.suppress\n"
+                "    else:\n"
+                "        with cm():\n"
+                "            v = step()\n"
+                "        cb = lambda: v\n"
+            ),
+            True,
+            True,
+            id="try_else_isolated_from_mutually_exclusive_handler_rebind",
+        ),
+        pytest.param(
+            (
+                "    cm = contextlib.nullcontext\n"
+                "    try:\n"
+                "        step()\n"
+                "    except TypeError:\n"
+                "        cm = contextlib.suppress\n"
+                "    except ValueError:\n"
+                "        with cm():\n"
+                "            v = step()\n"
+                "        cb = lambda: v\n"
+            ),
+            True,
+            True,
+            id="later_try_handler_isolated_from_prior_handler_rebind",
+        ),
+        pytest.param(
+            (
+                "    cm = contextlib.nullcontext\n"
+                "    if step():\n"
+                "        cm = contextlib.suppress\n"
+                "    else:\n"
+                "        with cm():\n"
+                "            v = step()\n"
+                "        cb = lambda: v\n"
+            ),
+            True,
+            True,
+            id="if_else_isolated_from_mutually_exclusive_then_rebind",
+        ),
+        pytest.param(
+            (
+                "    cm = contextlib.nullcontext\n"
+                "    if step():\n"
+                "        with cm():\n"
+                "            v = step()\n"
+                "        cb = lambda: v\n"
+                "        cm = contextlib.suppress\n"
+            ),
+            True,
+            True,
+            id="post_span_suppress_rebind_in_enclosing_if_does_not_leak_backward",
+        ),
+        pytest.param(
+            (
+                "    cm = contextlib.nullcontext\n"
+                "    for cm in step():\n"
+                "        with cm():\n"
+                "            v = step()\n"
+                "        cb = lambda: v\n"
+            ),
+            False,
+            False,
+            id="enclosing_for_target_shadows_outer_nullcontext",
+        ),
+    ],
+)
+def test_branched_pre_unit_suppress_provenance_and_arm_isolation(
+    setup_src: str,
+    expect_pre_bound: bool,
+    expect_safe: bool,
+) -> None:
+    """Verifies branched pre-unit suppress updates apply conservatively and mutually exclusive arms isolate provenance."""
+    from pydoppelgangerhunt.fixer import clear_dataflow_cache, inspect_single_unit_scope
+    from pydoppelgangerhunt.fixer._df_cell_traversal import _analyze_enclosing_fn_cells
+
+    src = (
+        "import contextlib\n"
+        "def outer(step):\n"
+        + setup_src
+        + "    return cb\n"
+    )
+    clear_dataflow_cache()
+    mod_tree = ast.parse(src)
+    fn_node = next(n for n in mod_tree.body if isinstance(n, ast.FunctionDef))
+    lines = src.splitlines()
+    cb_line = next(i + 1 for i, ln in enumerate(lines) if "cb = lambda: v" in ln)
+    cell_info = _analyze_enclosing_fn_cells(
+        fn_node,
+        (cb_line, cb_line, None, None),
+        mod_tree=mod_tree,
+        strict_with_suppression=True,
+    )
+    assert ("v" in cell_info.pre_bound) is expect_pre_bound
+    sc = inspect_single_unit_scope(
+        {
+            "name": "cb_unit",
+            "kind": "block",
+            "start": cb_line,
+            "end": cb_line,
+            "source_text": src,
+            "source_lines": src.splitlines(keepends=True),
+            "closure_strictness": "pedantic",
+        },
+        tree=mod_tree,
+    )
+    assert sc["is_control_flow_safe"] is expect_safe, sc
+
+
+@pytest.mark.parametrize(
+    ("min_py", "setup_src", "expect_pre_bound", "expect_safe"),
+    [
+        pytest.param(
+            (3, 10),
+            (
+                "    cm = contextlib.nullcontext\n"
+                "    match step():\n"
+                "        case 1:\n"
+                "            cm = contextlib.suppress\n"
+                "        case _:\n"
+                "            with cm():\n"
+                "                v = step()\n"
+                "            cb = lambda: v\n"
+            ),
+            True,
+            True,
+            id="match_later_case_isolated_from_earlier_case_body_rebind",
+        ),
+        pytest.param(
+            (3, 10),
+            (
+                "    cm = contextlib.nullcontext\n"
+                "    match step():\n"
+                "        case cm if cm:\n"
+                "            pass\n"
+                "        case _:\n"
+                "            with cm():\n"
+                "                v = step()\n"
+                "            cb = lambda: v\n"
+            ),
+            False,
+            False,
+            id="match_prior_pattern_binding_conservatively_invalidates_cm",
+        ),
+        pytest.param(
+            (3, 11),
+            (
+                "    cm = contextlib.nullcontext\n"
+                "    try:\n"
+                "        step()\n"
+                "    except* TypeError:\n"
+                "        cm = contextlib.suppress\n"
+                "    except* ValueError:\n"
+                "        with cm():\n"
+                "            v = step()\n"
+                "        cb = lambda: v\n"
+            ),
+            False,
+            False,
+            id="trystar_second_except_star_conservatively_sees_prior_handler_rebind",
+        ),
+    ],
+)
+def test_enclosing_match_and_trystar_suppress_provenance(
+    min_py: tuple[int, int],
+    setup_src: str,
+    expect_pre_bound: bool,
+    expect_safe: bool,
+) -> None:
+    """Verifies match case-body isolation vs prior pattern binding and sequential except* semantics."""
+    import sys
+
+    if sys.version_info < min_py:
+        pytest.skip(f"Requires Python {min_py[0]}.{min_py[1]}+")
+    from pydoppelgangerhunt.fixer import clear_dataflow_cache, inspect_single_unit_scope
+    from pydoppelgangerhunt.fixer._df_cell_traversal import _analyze_enclosing_fn_cells
+
+    src = (
+        "import contextlib\n"
+        "def outer(step):\n"
+        + setup_src
+        + "    return cb\n"
+    )
+    clear_dataflow_cache()
+    mod_tree = ast.parse(src)
+    fn_node = next(n for n in mod_tree.body if isinstance(n, ast.FunctionDef))
+    lines = src.splitlines()
+    cb_line = next(i + 1 for i, ln in enumerate(lines) if "cb = lambda: v" in ln)
+    cell_info = _analyze_enclosing_fn_cells(
+        fn_node,
+        (cb_line, cb_line, None, None),
+        mod_tree=mod_tree,
+        strict_with_suppression=True,
+    )
+    assert ("v" in cell_info.pre_bound) is expect_pre_bound
+    sc = inspect_single_unit_scope(
+        {
+            "name": "cb_unit",
+            "kind": "block",
+            "start": cb_line,
+            "end": cb_line,
+            "source_text": src,
+            "source_lines": src.splitlines(keepends=True),
+            "closure_strictness": "pedantic",
+        },
+        tree=mod_tree,
+    )
+    assert sc["is_control_flow_safe"] is expect_safe, sc
+
+
+@pytest.mark.parametrize(
+    ("cls_setup", "run_action", "expect_safe"),
+    [
+        pytest.param(
+            (
+                "    class Worker:\n"
+                "        @property\n"
+                "        def trigger(self):\n"
+                "            return 0\n"
+                "        @trigger.setter\n"
+                "        def trigger(self, val):\n"
+                "            self._seen = total + val\n"
+            ),
+            "                self.trigger = x\n",
+            False,
+            id="store_only_invokes_property_setter_closure",
+        ),
+        pytest.param(
+            (
+                "    class Worker:\n"
+                "        @property\n"
+                "        def trigger(self):\n"
+                "            return 0\n"
+                "        @trigger.deleter\n"
+                "        def trigger(self):\n"
+                "            self._seen = total\n"
+            ),
+            "                del self.trigger\n",
+            False,
+            id="del_only_invokes_property_deleter_closure",
+        ),
+        pytest.param(
+            (
+                "    class Worker:\n"
+                "        def __setattr__(self, k, v):\n"
+                "            object.__setattr__(self, k, v + total)\n"
+            ),
+            "                self.field = x\n",
+            False,
+            id="store_only_invokes_dunder_setattr_closure",
+        ),
+        pytest.param(
+            (
+                "    class Worker:\n"
+                "        def __delattr__(self, k):\n"
+                "            _snap = total\n"
+                "            return _snap\n"
+            ),
+            "                del self.field\n",
+            False,
+            id="del_only_invokes_dunder_delattr_closure",
+        ),
+        pytest.param(
+            (
+                "    class Worker:\n"
+                "        @property\n"
+                "        def trigger(self):\n"
+                "            return 0\n"
+                "        @trigger.setter\n"
+                "        def trigger(self, val):\n"
+                "            self._seen = total + val\n"
+            ),
+            "                setattr(self, 'trigger', x)\n",
+            False,
+            id="setattr_store_only_invokes_property_setter_closure",
+        ),
+        pytest.param(
+            (
+                "    class Worker:\n"
+                "        trigger = property(None, lambda self, v: (v, total))\n"
+            ),
+            "                self.trigger = x\n",
+            False,
+            id="store_only_invokes_class_attr_property_lambda",
+        ),
+        pytest.param(
+            (
+                "    class Worker:\n"
+                "        def _set_trigger(self, val):\n"
+                "            self._seen = total + val\n"
+                "        trigger = property(None, _set_trigger)\n"
+            ),
+            "                self.trigger = x\n",
+            False,
+            id="store_only_invokes_class_attr_property_method_ref",
+        ),
+        pytest.param(
+            (
+                "    class Worker:\n"
+                "        def step(self):\n"
+                "            self.trigger = 1\n"
+                "        @property\n"
+                "        def trigger(self):\n"
+                "            return 0\n"
+                "        @trigger.setter\n"
+                "        def trigger(self, val):\n"
+                "            self._seen = total + val\n"
+            ),
+            "                self.step()\n",
+            False,
+            id="chained_method_call_then_store_invokes_setter",
+        ),
+        pytest.param(
+            (
+                "    class Base:\n"
+                "        @property\n"
+                "        def trigger(self):\n"
+                "            return 0\n"
+                "        @trigger.setter\n"
+                "        def trigger(self, val):\n"
+                "            self._seen = total + val\n"
+                "    class Worker(Base):\n"
+            ),
+            "                self.trigger = x\n",
+            False,
+            id="store_only_invokes_inherited_base_property_setter",
+        ),
+        pytest.param(
+            (
+                "    class Worker:\n"
+                "        def unrelated(self):\n"
+                "            return total\n"
+            ),
+            "                self.result = x\n",
+            True,
+            id="negative_plain_store_does_not_link_unrelated_sibling_closure",
+        ),
+        pytest.param(
+            (
+                "    class Worker:\n"
+                "        def trigger(self):\n"
+                "            return total\n"
+            ),
+            "                self.trigger = x\n",
+            True,
+            id="negative_plain_store_shadows_undecorated_method_without_invoking",
+        ),
+    ],
+)
+def test_store_only_receiver_method_links_setters_dunders_descriptors_and_bases(
+    cls_setup: str,
+    run_action: str,
+    expect_safe: bool,
+) -> None:
+    """Verifies store/del-only receiver methods link sibling setters, dunders, descriptors, and base classes without false positives."""
+    from pydoppelgangerhunt.fixer import clear_dataflow_cache, inspect_single_unit_scope
+
+    src = (
+        "def outer(items):\n"
+        "    total = 0\n"
+        + cls_setup
+        + "        def run(self):\n"
+        "            nonlocal total\n"
+        "            out = []\n"
+        "            for x in items:\n"
+        "                total += x\n"
+        + run_action
+        + "                out.append(x)\n"
+        "            return out\n"
+        "    return Worker(), total\n"
+    )
+    clear_dataflow_cache()
+    tree = ast.parse(src)
+    lines = src.splitlines()
+    start_line = next(i + 1 for i, ln in enumerate(lines) if "out = []" in ln)
+    end_line = next(i + 1 for i, ln in enumerate(lines) if "return out" in ln) - 1
+    sc = inspect_single_unit_scope(
+        {
+            "start": start_line,
+            "end": end_line,
+            "kind": "block",
+            "source_text": src,
+            "source_lines": src.splitlines(keepends=True),
+        },
+        tree=tree,
+    )
+    assert sc["is_control_flow_safe"] is expect_safe, sc
+    if not expect_safe:
+        assert "severed_closure_cell" in sc["control_flow_hazards"], sc
+        assert sc["closure_hazard_reasons"], sc
+
+
+@pytest.mark.parametrize(
+    ("src", "strict_w", "extra_mgrs", "expect_heuristics", "expect_wildcards"),
+    [
+        pytest.param(
+            (
+                "def outer(lock, compute):\n"
+                "    with lock():\n"
+                "        x = compute()\n"
+                "    return x\n"
+            ),
+            False,
+            frozenset(),
+            ["lock"],
+            [],
+            id="neutral_heuristic_ctx_manager",
+        ),
+        pytest.param(
+            (
+                "def outer(db, compute):\n"
+                "    with db.atomic():\n"
+                "        x = compute()\n"
+                "    return x\n"
+            ),
+            True,
+            frozenset({"*.atomic"}),
+            [],
+            [("*.atomic", "db.atomic")],
+            id="wildcard_allowlist_ctx_manager",
+        ),
+    ],
+)
+def test_analyze_enclosing_fn_cells_records_heuristics_and_wildcards_once_per_call(
+    src: str,
+    strict_w: bool,
+    extra_mgrs: frozenset[str],
+    expect_heuristics: list[str],
+    expect_wildcards: list[tuple[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies cold cache misses skip redundant replay in _analyze_enclosing_fn_cells while warm cache hits replay once."""
+    from pydoppelgangerhunt import config as cfg_mod
+    from pydoppelgangerhunt.fixer import clear_dataflow_cache
+    from pydoppelgangerhunt.fixer import _df_cell_traversal as cell_mod
+
+    replayed_heuristics: list[str] = []
+    replayed_wildcards: list[tuple[str, str]] = []
+    orig_rec_h = cfg_mod.record_heuristic_non_suppressing_ctx_manager
+    orig_rec_w = cfg_mod.record_wildcard_ctx_manager_match
+
+    def _spy_cell_h(name: str) -> None:
+        replayed_heuristics.append(name)
+        orig_rec_h(name)
+
+    def _spy_cell_w(pattern: str, mgr_name: str) -> None:
+        replayed_wildcards.append((pattern, mgr_name))
+        orig_rec_w(pattern, mgr_name)
+
+    monkeypatch.setattr(cell_mod, "record_heuristic_non_suppressing_ctx_manager", _spy_cell_h)
+    monkeypatch.setattr(cell_mod, "record_wildcard_ctx_manager_match", _spy_cell_w)
+
+    clear_dataflow_cache()
+    tree = ast.parse(src)
+    fn_node = tree.body[0]
+    unit_line = next(
+        idx for idx, ln in enumerate(src.splitlines(), start=1) if "return x" in ln
+    )
+    span = (unit_line, unit_line, None, None)
+
+    with (
+        cfg_mod.collect_heuristic_ctx_managers() as cold_h,
+        cfg_mod.collect_wildcard_ctx_managers() as cold_w,
+    ):
+        cell_mod._analyze_enclosing_fn_cells(
+            fn_node,
+            span,
+            mod_tree=tree,
+            strict_with_suppression=strict_w,
+            extra_non_suppressing_ctx_managers=extra_mgrs,
+        )
+    assert replayed_heuristics == []
+    assert replayed_wildcards == []
+    assert sorted(cold_h) == expect_heuristics
+    assert sorted(cold_w) == expect_wildcards
+
+    with (
+        cfg_mod.collect_heuristic_ctx_managers() as warm_h,
+        cfg_mod.collect_wildcard_ctx_managers() as warm_w,
+    ):
+        cell_mod._analyze_enclosing_fn_cells(
+            fn_node,
+            span,
+            mod_tree=tree,
+            strict_with_suppression=strict_w,
+            extra_non_suppressing_ctx_managers=extra_mgrs,
+        )
+    assert replayed_heuristics == expect_heuristics
+    assert replayed_wildcards == expect_wildcards
+    assert sorted(warm_h) == expect_heuristics
+    assert sorted(warm_w) == expect_wildcards
+
+
+@pytest.mark.parametrize(
+    ("setup_body", "run_action", "expect_safe"),
+    [
+        pytest.param(
+            "            self.registry.register(lambda: total)\n",
+            "                out.append(self.registry.invoke())\n",
+            False,
+            id="custom_mutating_method_with_positional_arg_links_sibling",
+        ),
+        pytest.param(
+            "            self.registry.add_hook(cb=lambda: total)\n",
+            "                out.append(self.registry.invoke())\n",
+            False,
+            id="custom_mutating_method_with_keyword_arg_links_sibling",
+        ),
+        pytest.param(
+            "            self.registry.sub.register(lambda: total)\n",
+            "                out.append(self.registry.sub.invoke())\n",
+            False,
+            id="nested_attr_custom_mutating_method_links_sibling",
+        ),
+        pytest.param(
+            "            return total if self.config.is_enabled() else 0\n",
+            "                out.append(x if self.config.is_enabled() else 0)\n",
+            True,
+            id="control_zero_arg_query_method_does_not_link_sibling",
+        ),
+        pytest.param(
+            "            return self.items.count(0) + total\n",
+            "                out.append(self.items.count(x))\n",
+            True,
+            id="control_readonly_count_method_does_not_link_sibling",
+        ),
+        pytest.param(
+            "            return self.mapping.get('k', 0) + total\n",
+            "                out.append(self.mapping.get('k', x))\n",
+            True,
+            id="control_readonly_get_method_does_not_link_sibling",
+        ),
+    ],
+)
+def test_receiver_custom_mutating_method_links_sibling_closure_and_ignores_readonly(
+    setup_body: str,
+    run_action: str,
+    expect_safe: bool,
+) -> None:
+    """Verifies non-readonly receiver attribute method calls with arguments link sibling closures while zero-arg/readonly queries do not."""
+    from pydoppelgangerhunt.fixer import clear_dataflow_cache, inspect_single_unit_scope
+
+    src = (
+        "def outer(items):\n"
+        "    total = 0\n"
+        "    class Worker:\n"
+        "        def setup(self):\n"
+        + setup_body
+        + "        def run(self):\n"
+        "            nonlocal total\n"
+        "            out = []\n"
+        "            for x in items:\n"
+        "                total += x\n"
+        + run_action
+        + "            return out\n"
+        "    return Worker(), total\n"
+    )
+    clear_dataflow_cache()
+    tree = ast.parse(src)
+    lines = src.splitlines()
+    start_line = next(i + 1 for i, ln in enumerate(lines) if "out = []" in ln)
+    end_line = next(i + 1 for i, ln in enumerate(lines) if "return out" in ln) - 1
+    sc = inspect_single_unit_scope(
+        {
+            "start": start_line,
+            "end": end_line,
+            "kind": "block",
+            "source_text": src,
+            "source_lines": src.splitlines(keepends=True),
+        },
+        tree=tree,
+    )
+    assert sc["is_control_flow_safe"] is expect_safe, sc
+    if not expect_safe:
+        assert "severed_closure_cell" in sc["control_flow_hazards"], sc
+
+
+@pytest.mark.parametrize(
+    (
+        "src",
+        "target_marker",
+        "pass_mod_tree",
+        "strict_w",
+        "extra_mgrs",
+        "expect_heuristics",
+        "expect_wildcards",
+    ),
+    [
+        pytest.param(
+            (
+                "def outer(cond, compute):\n"
+                "    if cond:\n"
+                "        with NeutralMgr():\n"
+                "            y = compute()\n"
+                "    else:\n"
+                "        z = 1\n"
+                "    return z\n"
+            ),
+            "z = 1",
+            True,
+            False,
+            frozenset(),
+            [],
+            [],
+            id="sibling_branch_heuristic_not_recorded_under_stmt_deltas",
+        ),
+        pytest.param(
+            (
+                "def outer(cond, db, compute):\n"
+                "    if cond:\n"
+                "        with db.atomic():\n"
+                "            y = compute()\n"
+                "    else:\n"
+                "        z = 1\n"
+                "    return z\n"
+            ),
+            "z = 1",
+            False,
+            True,
+            frozenset({"*.atomic"}),
+            [],
+            [("*.atomic", "db.atomic")],
+            id="sibling_branch_pre_span_wildcard_matches_direct_traversal",
+        ),
+        pytest.param(
+            (
+                "def outer(cond, db, compute):\n"
+                "    if cond:\n"
+                "        z = 1\n"
+                "    else:\n"
+                "        with db.atomic():\n"
+                "            y = compute()\n"
+                "    return z\n"
+            ),
+            "z = 1",
+            False,
+            True,
+            frozenset({"*.atomic"}),
+            [],
+            [],
+            id="sibling_branch_post_span_wildcard_not_recorded_under_stmt_deltas",
+        ),
+        pytest.param(
+            (
+                "def outer(compute):\n"
+                "    with NeutralMgr():\n"
+                "        y = compute()\n"
+                "    z = 1\n"
+                "    return z\n"
+            ),
+            "z = 1",
+            True,
+            False,
+            frozenset(),
+            ["NeutralMgr"],
+            [],
+            id="control_unbranched_pre_span_heuristic_recorded_under_both_modes",
+        ),
+    ],
+)
+def test_stmt_delta_parity_for_sibling_branch_heuristic_and_wildcard_telemetry(
+    src: str,
+    target_marker: str,
+    pass_mod_tree: bool,
+    strict_w: bool,
+    extra_mgrs: frozenset[str],
+    expect_heuristics: list[str],
+    expect_wildcards: list[tuple[str, str]],
+) -> None:
+    """Verifies use_stmt_deltas=True (cold and warm) matches use_stmt_deltas=False for sibling-branch telemetry."""
+    from pydoppelgangerhunt import config as cfg_mod
+    from pydoppelgangerhunt.fixer import clear_dataflow_cache
+    from pydoppelgangerhunt.fixer import _df_cell_traversal as cell_mod
+
+    tree = ast.parse(src)
+    fn_node = tree.body[0]
+    eff_mod_tree = tree if pass_mod_tree else None
+    unit_line = next(
+        idx for idx, ln in enumerate(src.splitlines(), start=1) if target_marker in ln
+    )
+    span = cell_mod._SpanBounds(unit_line, unit_line)
+
+    clear_dataflow_cache()
+    cfg_mod.clear_closure_warning_cache()
+    with (
+        cfg_mod.collect_heuristic_ctx_managers() as direct_h,
+        cfg_mod.collect_wildcard_ctx_managers() as direct_w,
+    ):
+        cell_mod._analyze_enclosing_fn_cells_uncached(
+            fn_node,
+            span,
+            mod_tree=eff_mod_tree,
+            use_stmt_deltas=False,
+            strict_with_suppression=strict_w,
+            extra_non_suppressing_ctx_managers=extra_mgrs,
+        )
+    assert sorted(direct_h) == expect_heuristics
+    assert sorted(direct_w) == expect_wildcards
+
+    clear_dataflow_cache()
+    cfg_mod.clear_closure_warning_cache()
+    with (
+        cfg_mod.collect_heuristic_ctx_managers() as cold_h,
+        cfg_mod.collect_wildcard_ctx_managers() as cold_w,
+    ):
+        cell_mod._analyze_enclosing_fn_cells_uncached(
+            fn_node,
+            span,
+            mod_tree=eff_mod_tree,
+            use_stmt_deltas=True,
+            strict_with_suppression=strict_w,
+            extra_non_suppressing_ctx_managers=extra_mgrs,
+        )
+    assert sorted(cold_h) == expect_heuristics
+    assert sorted(cold_w) == expect_wildcards
+    assert list(cfg_mod.peek_heuristic_non_suppressing_ctx_managers()) == expect_heuristics
+    assert list(cfg_mod.peek_wildcard_ctx_manager_matches()) == expect_wildcards
+
+    cfg_mod.clear_closure_warning_cache()
+    with (
+        cfg_mod.collect_heuristic_ctx_managers() as warm_h,
+        cfg_mod.collect_wildcard_ctx_managers() as warm_w,
+    ):
+        cell_mod._analyze_enclosing_fn_cells_uncached(
+            fn_node,
+            span,
+            mod_tree=eff_mod_tree,
+            use_stmt_deltas=True,
+            strict_with_suppression=strict_w,
+            extra_non_suppressing_ctx_managers=extra_mgrs,
+        )
+    assert sorted(warm_h) == expect_heuristics
+    assert sorted(warm_w) == expect_wildcards
+    assert list(cfg_mod.peek_heuristic_non_suppressing_ctx_managers()) == expect_heuristics
+    assert list(cfg_mod.peek_wildcard_ctx_manager_matches()) == expect_wildcards
+
+
+

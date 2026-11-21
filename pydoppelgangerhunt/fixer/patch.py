@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 import builtins
 from collections import defaultdict
-import copy
 import difflib
 import functools
 import hashlib
@@ -29,7 +28,8 @@ from typing import (
 )
 
 from pydoppelgangerhunt.config import (
-    format_heuristic_ctx_manager_comment,
+    collect_wildcard_ctx_managers,
+    format_ctx_manager_assumption_comments,
     heuristic_ctx_manager_session,
     is_recognized_closure_strictness,
     normalize_non_suppressing_ctx_managers,
@@ -52,7 +52,15 @@ from pydoppelgangerhunt.fixer.binding import (
 )
 from pydoppelgangerhunt.fixer._df_cache import (
     _get_or_parse_tree,
-    _parse_ast_no_syntax_warnings,
+    scope_fingerprint_verification_session,
+)
+from pydoppelgangerhunt.fixer._ast_compat import (
+    is_match_as_node,
+    is_match_mapping_node,
+    is_match_node,
+    is_match_star_node,
+    is_try_or_trystar_node,
+    is_type_alias_node,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
     _extract_comprehension_walrus_names,
@@ -60,6 +68,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
 )
 from pydoppelgangerhunt.fixer._df_visitors import _extract_assigned_names
 from pydoppelgangerhunt.fixer.dataflow import (
+    allows_u2_source_placeholder,
     has_async_generator_delegation_hazard,
     resolve_clone_pair_outputs,
 )
@@ -81,20 +90,20 @@ from pydoppelgangerhunt.fixer.scope import (
     _normalize_receiver_attrs,
     analyze_unit_variable_scope,
     ensure_unit_scope_closure_mode,
+    resolve_unit_inferred_col_bounds,
 )
 
 from pydoppelgangerhunt.fixer.source import (
     ReplacementItem,
     UnitDict,
     _detect_indent_step,
-    _extract_unit_body_lines,
+    _extract_unit_token_lines,
     _find_module_helper_insertion_index,
     _find_sig_colon,
     _get_module_imported_names,
     _insert_imports_into_module,
     _is_docstring_node,
     _scan_sig_line,
-    _slice_unit_token_lines,
     _validate_and_parse_unit_bound,
     compute_line_offsets,
     count_physical_newlines,
@@ -102,12 +111,13 @@ from pydoppelgangerhunt.fixer.source import (
     extract_unit_comments_and_pragmas,
     is_subroutine_unit,
     is_valid_unit_coordinates,
+    lines_end_with_unconditional_return,
     parse_unit_coord,
     resolve_unit_replacement,
     split_source_lines,
+    validate_unit_schema,
 )
 from pydoppelgangerhunt.source_lines import (
-    extract_unit_source_lines_with_state,
     normalize_unit_coordinates,
     resolve_unit_line_bounds,
 )
@@ -241,26 +251,24 @@ def check_units_overlap(
                 f"Malformed unit: invalid column offset '{col_name}'={val!r} in {file_path}"
             ) from err
 
+    def _first_non_none(u: Dict[str, Any], *keys: str) -> Any:
+        for k in keys:
+            if u.get(k) is not None:
+                return u.get(k)
+        return None
+
     sc1 = _parse_col(
-        u1.get("start_col") if u1.get("start_col") is not None else u1.get("start_col_offset"),
+        _first_non_none(u1, "start_col", "start_col_offset", "col_offset"),
         "start_col",
         f1,
     )
-    ec1 = _parse_col(
-        u1.get("end_col") if u1.get("end_col") is not None else u1.get("end_col_offset"),
-        "end_col",
-        f1,
-    )
+    ec1 = _parse_col(_first_non_none(u1, "end_col", "end_col_offset"), "end_col", f1)
     sc2 = _parse_col(
-        u2.get("start_col") if u2.get("start_col") is not None else u2.get("start_col_offset"),
+        _first_non_none(u2, "start_col", "start_col_offset", "col_offset"),
         "start_col",
         f2,
     )
-    ec2 = _parse_col(
-        u2.get("end_col") if u2.get("end_col") is not None else u2.get("end_col_offset"),
-        "end_col",
-        f2,
-    )
+    ec2 = _parse_col(_first_non_none(u2, "end_col", "end_col_offset"), "end_col", f2)
 
     # -------------------------------------------------------------------------
     # Case -> Expected Behaviour Mapping:
@@ -607,7 +615,7 @@ def _build_whole_method_delegation(
     base_u_name = raw_u_name.rsplit(":", maxsplit=1)[-1] if raw_u_name else ""
 
     try:
-        tree = _parse_ast_no_syntax_warnings(source_text)
+        tree = ast.parse(source_text)
         cand_nodes: List[Tuple[int, Union[ast.FunctionDef, ast.AsyncFunctionDef]]] = []
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -714,17 +722,7 @@ def _has_unconditional_terminal_return(
     u_end = min(len(orig_lines), parse_unit_coord(unit, "end", default=u_start))
     if u_start > len(orig_lines) or u_start > u_end:
         return False
-    cand_lines = orig_lines[u_start - 1 : u_end]
-    non_empty = [ln for ln in cand_lines if ln.strip() and not ln.strip().startswith("#")]
-    if not non_empty:
-        return False
-    base_ind = len(non_empty[0]) - len(non_empty[0].lstrip())
-    last_ln = non_empty[-1]
-    last_ind = len(last_ln) - len(last_ln.lstrip())
-    if last_ind != base_ind:
-        return False
-    s = last_ln.strip()
-    return s == "return" or s.startswith("return ") or s.startswith("return(") or s.startswith("return\t")
+    return lines_end_with_unconditional_return(orig_lines[u_start - 1 : u_end])
 
 
 _AUGASSIGN_OPS: Dict[type, str] = {
@@ -1500,7 +1498,7 @@ def _render_file_patch_plan(
         unit: Dict[str, Any],
     ) -> Tuple[str, int, int, Optional[int], Optional[int], str, str]:
         s, e = _unit_span(unit)
-        sc = _parse_col_coord(unit, "start_col", "start_col_offset")
+        sc = _parse_col_coord(unit, "start_col", "start_col_offset", "col_offset")
         ec = _parse_col_coord(unit, "end_col", "end_col_offset")
         return (
             _file_key(unit),
@@ -1636,7 +1634,7 @@ def _has_future_annotations(source_text: str) -> bool:
     if not source_text or "__future__" not in source_text:
         return False
     try:
-        tree = _parse_ast_no_syntax_warnings(source_text)
+        tree = ast.parse(source_text)
     except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         return False
     for node in ast.walk(tree):
@@ -1652,7 +1650,7 @@ def _helper_requires_future_annotations(helper_code: str) -> bool:
     if not helper_code or "|" not in helper_code:
         return False
     try:
-        tree = _parse_ast_no_syntax_warnings(helper_code)
+        tree = ast.parse(helper_code)
     except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         return False
     for node in ast.walk(tree):
@@ -1773,7 +1771,7 @@ def _extract_module_import_statements(
     if not source_text.strip():
         return _ModuleImportsResult(stmts, wildcards)
     try:
-        tree = _parse_ast_no_syntax_warnings(source_text)
+        tree = ast.parse(source_text)
         for stmt in tree.body:
             if isinstance(stmt, (ast.Import, ast.ImportFrom)):
                 name_stmts, wilds = _parse_import_node_statements(
@@ -1831,7 +1829,7 @@ def _canonicalize_helper_relative_imports(
     if not valid_mods:
         return helper_code
     try:
-        tree = _parse_ast_no_syntax_warnings(helper_code)
+        tree = ast.parse(helper_code)
     except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         return helper_code
 
@@ -1926,7 +1924,7 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
     if not source_text.strip():
         return set()
     try:
-        tree = _parse_ast_no_syntax_warnings(source_text)
+        tree = ast.parse(source_text)
     except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         return set()
     names: Set[str] = set()
@@ -1961,27 +1959,27 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
             elif isinstance(node, ast.If):
                 _collect_top_defs(node.body)
                 _collect_top_defs(node.orelse)
-            elif isinstance(node, ast.Try) or type(node).__name__ == "TryStar":
+            elif is_try_or_trystar_node(node):
                 _collect_top_defs(getattr(node, "body", []))
                 for handler in getattr(node, "handlers", []):
                     _collect_top_defs(getattr(handler, "body", []))
                 _collect_top_defs(getattr(node, "orelse", []))
                 _collect_top_defs(getattr(node, "finalbody", []))
-            elif type(node).__name__ == "Match":
+            elif is_match_node(node):
                 for case in getattr(node, "cases", []):
                     for sub in ast.walk(case.pattern):
                         if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
                             names.add(sub.id)
-                        elif type(sub).__name__ in ("MatchAs", "MatchStar"):
+                        elif is_match_as_node(sub) or is_match_star_node(sub):
                             sub_name = getattr(sub, "name", None)
                             if isinstance(sub_name, str):
                                 names.add(sub_name)
-                        elif type(sub).__name__ == "MatchMapping":
+                        elif is_match_mapping_node(sub):
                             sub_rest = getattr(sub, "rest", None)
                             if isinstance(sub_rest, str):
                                 names.add(sub_rest)
                     _collect_top_defs(case.body)
-            elif type(node).__name__ == "TypeAlias":
+            elif is_type_alias_node(node):
                 tgt_name = getattr(node, "name", None)
                 if isinstance(tgt_name, ast.Name):
                     names.add(tgt_name.id)
@@ -1992,7 +1990,7 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
                 continue
-            if type(child).__name__ == "NamedExpr":
+            if isinstance(child, ast.NamedExpr):
                 tgt = getattr(child, "target", None)
                 if isinstance(tgt, ast.Name) and isinstance(tgt.ctx, ast.Store):
                     names.add(tgt.id)
@@ -2048,7 +2046,7 @@ def _extract_helper_symbols(
                 ):
                     bound.update(_extract_comprehension_walrus_names(child))
                     continue
-                if type(child).__name__ == "NamedExpr":
+                if isinstance(child, ast.NamedExpr):
                     target_node = getattr(child, "target", None)
                     if isinstance(target_node, ast.Name):
                         bound.add(target_node.id)
@@ -2081,7 +2079,7 @@ def _extract_helper_symbols(
                     if item.optional_vars:
                         bound.update(_extract_assigned_names(item.optional_vars))
                 bound.update(_collect_direct_bindings(stmt.body))
-            elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
+            elif is_try_or_trystar_node(stmt):
                 bound.update(_collect_direct_bindings(getattr(stmt, "body", [])))
                 for handler in getattr(stmt, "handlers", []):
                     if isinstance(getattr(handler, "name", None), str):
@@ -2089,7 +2087,7 @@ def _extract_helper_symbols(
                     bound.update(_collect_direct_bindings(getattr(handler, "body", [])))
                 bound.update(_collect_direct_bindings(getattr(stmt, "orelse", [])))
                 bound.update(_collect_direct_bindings(getattr(stmt, "finalbody", [])))
-            elif type(stmt).__name__ == "Match":
+            elif is_match_node(stmt):
                 for case in getattr(stmt, "cases", []):
                     pattern = getattr(case, "pattern", None)
                     if pattern is not None:
@@ -2098,7 +2096,7 @@ def _extract_helper_symbols(
                             if isinstance(m_name, str) and m_name != "_":
                                 bound.add(m_name)
                     bound.update(_collect_direct_bindings(case.body))
-            elif type(stmt).__name__ == "TypeAlias":
+            elif is_type_alias_node(stmt):
                 name_node = getattr(stmt, "name", None)
                 if isinstance(name_node, ast.Name):
                     bound.add(name_node.id)
@@ -2434,7 +2432,7 @@ def _parse_local_import_statements(
         if not s_loc:
             continue
         try:
-            loc_tree = _parse_ast_no_syntax_warnings(s_loc)
+            loc_tree = ast.parse(s_loc)
         except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
             continue
 
@@ -2586,7 +2584,7 @@ def _collect_host_missing_imports(
 
     # 3. Source dependencies referenced in helper_code
     try:
-        helper_tree = _parse_ast_no_syntax_warnings(helper_code)
+        helper_tree = ast.parse(helper_code)
     except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         helper_tree = None
 
@@ -3190,16 +3188,34 @@ def _unit_start(u: Dict[str, Any]) -> int:
 
 
 _PatchCallableT = TypeVar("_PatchCallableT", bound=Callable[..., str])
+_ScopeValT = TypeVar("_ScopeValT")
 
 
-def _apply_replace_clones_default_policy(
+def _copy_scope_value(val: _ScopeValT) -> _ScopeValT:
+    """Recursively copies plain container values in a unit scope dictionary."""
+    if isinstance(val, dict):
+        return cast(_ScopeValT, {k: _copy_scope_value(v) for k, v in val.items()})
+    if isinstance(val, list):
+        return cast(_ScopeValT, [_copy_scope_value(item) for item in val])
+    if isinstance(val, tuple):
+        return cast(_ScopeValT, tuple(_copy_scope_value(item) for item in val))
+    if isinstance(val, set):
+        return cast(_ScopeValT, {_copy_scope_value(item) for item in val})
+    return val
+
+
+def _copy_scope_dict(scope: Dict[str, Any]) -> Dict[str, Any]:
+    """Returns a recursive copy of a unit scope dictionary."""
+    return {k: _copy_scope_value(v) for k, v in scope.items()}
+
+
+def _apply_patch_default_policy(
     unit: Dict[str, Any],
     *,
-    replace_clones: bool,
     closure_strictness: Optional[str],
     skip_pre_unit_closures: Optional[bool],
 ) -> Dict[str, Any]:
-    """Defaults unset unit closure policy to 'pedantic' when replace_clones=True."""
+    """Defaults unset patch unit closure policy to 'pedantic'."""
     has_explicit_caller_policy = (
         is_recognized_closure_strictness(closure_strictness)
         or skip_pre_unit_closures is True
@@ -3207,13 +3223,9 @@ def _apply_replace_clones_default_policy(
     has_explicit_unit_policy = (
         is_recognized_closure_strictness(unit.get("closure_strictness"))
         or unit.get("skip_pre_unit_closures") is True
-        or unit.get("strict_with_suppression") is True
+        or unit.get("strict_with_suppression") is not None
     )
-    if (
-        replace_clones
-        and not has_explicit_caller_policy
-        and not has_explicit_unit_policy
-    ):
+    if not has_explicit_caller_policy and not has_explicit_unit_policy:
         return {**unit, "closure_strictness": "pedantic"}
     return unit
 
@@ -3223,7 +3235,7 @@ def _with_patch_session(fn: _PatchCallableT) -> _PatchCallableT:
 
     @functools.wraps(fn)
     def _wrapped(*args: Any, **kwargs: Any) -> str:
-        with heuristic_ctx_manager_session(warn=True):
+        with heuristic_ctx_manager_session(), scope_fingerprint_verification_session():
             return fn(*args, **kwargs)
 
     return cast(_PatchCallableT, _wrapped)
@@ -3246,6 +3258,13 @@ def generate_refactoring_patch(
     """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
     if not clones:
         return ""
+    seen_unit_ids: Set[int] = set()
+    for _, u1_item, u2_item in clones:
+        for unit_item in (u1_item, u2_item):
+            unit_obj_id = id(unit_item)
+            if unit_obj_id not in seen_unit_ids:
+                seen_unit_ids.add(unit_obj_id)
+                validate_unit_schema(unit_item)
     skip_reasons: Dict[str, int] = defaultdict(int)
     fs_root = Path(repo_root or os.getcwd()).resolve()
     if fs_root.is_file():
@@ -3269,14 +3288,28 @@ def generate_refactoring_patch(
     method_binding = (method_binding or "auto").strip().lower()
     if method_binding not in ("auto", "method", "module"):
         method_binding = "auto"
-    _, effective_skip_closures = resolve_closure_strictness_mode(
+    default_pedantic_fallback = (
+        closure_strictness is not None
+        and not is_recognized_closure_strictness(closure_strictness)
+        and replace_clones
+        and not bool(skip_pre_unit_closures)
+    )
+    resolved_caller_strictness, effective_skip_closures = resolve_closure_strictness_mode(
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=bool(skip_pre_unit_closures),
+        strict_with_suppression=True if default_pedantic_fallback else None,
     )
     eff_caller_strictness = (
         closure_strictness
         if is_recognized_closure_strictness(closure_strictness)
         else None
+    )
+    pair_caller_strictness = (
+        eff_caller_strictness
+        if eff_caller_strictness is not None
+        or replace_clones
+        or closure_strictness is None
+        else resolved_caller_strictness
     )
     eff_non_sup = normalize_non_suppressing_ctx_managers(
         non_suppressing_ctx_managers
@@ -3448,20 +3481,30 @@ def generate_refactoring_patch(
                 )
                 continue
 
+            if not _align_pair_expr_kinds(u1_eff, u2_eff):
+                skip_reasons["mismatched subroutine kinds"] += 1
+                continue
+            u1_eff = resolve_unit_inferred_col_bounds(
+                u1_eff, repo_root=str(root)
+            ).unit
+            u2_eff = resolve_unit_inferred_col_bounds(
+                u2_eff, repo_root=str(root)
+            ).unit
+
             if replace_clones:
                 u1_claimed = any(
-                    check_units_overlap(u1, prev_u, repo_root=str(root))
+                    check_units_overlap(u1_eff, prev_u, repo_root=str(root))
                     for prev_u in f1_plan.claimed_units
                 )
                 if is_same_file:
                     u2_claimed = any(
-                        check_units_overlap(u2, prev_u, repo_root=str(root))
+                        check_units_overlap(u2_eff, prev_u, repo_root=str(root))
                         for prev_u in f1_plan.claimed_units
                     )
                 else:
                     u2_claimed = (
                         any(
-                            check_units_overlap(u2, prev_u, repo_root=str(root))
+                            check_units_overlap(u2_eff, prev_u, repo_root=str(root))
                             for prev_u in f2_plan.claimed_units
                         )
                         if f2_plan is not None
@@ -3470,10 +3513,6 @@ def generate_refactoring_patch(
                 if u1_claimed or u2_claimed:
                     skip_reasons["overlapping claimed unit"] += 1
                     continue
-
-            if not _align_pair_expr_kinds(u1_eff, u2_eff):
-                skip_reasons["mismatched subroutine kinds"] += 1
-                continue
 
             digest1 = f1_plan.content_digest
             digest2 = (
@@ -3555,26 +3594,23 @@ def generate_refactoring_patch(
 
             # Apply monotone strict-wins pair resolution (pedantic > strict > lenient)
             # across both units so u1_eff and u2_eff are inspected under a single
-            # consistent closure and context-manager suppression policy. When
-            # replace_clones=True and no explicit policy is set on the call or unit,
-            # default to pedantic so automated call-site rewrites fail closed on
-            # unproven context managers.
-            u1_policy = _apply_replace_clones_default_policy(
+            # consistent closure and context-manager suppression policy. When no
+            # explicit policy is set on the call or unit, default patch generation
+            # to pedantic so emitted diffs fail closed on unproven context managers.
+            u1_policy = _apply_patch_default_policy(
                 u1,
-                replace_clones=replace_clones,
                 closure_strictness=eff_caller_strictness,
                 skip_pre_unit_closures=skip_pre_unit_closures,
             )
-            u2_policy = _apply_replace_clones_default_policy(
+            u2_policy = _apply_patch_default_policy(
                 u2,
-                replace_clones=replace_clones,
                 closure_strictness=eff_caller_strictness,
                 skip_pre_unit_closures=skip_pre_unit_closures,
             )
             pair_flags = resolve_pair_closure_flags(
                 u1_policy,
                 u2_policy,
-                closure_strictness=eff_caller_strictness,
+                closure_strictness=pair_caller_strictness,
                 skip_pre_unit_closures=skip_pre_unit_closures,
             )
             u1_eff["skip_pre_unit_closures"] = (
@@ -3601,7 +3637,7 @@ def generate_refactoring_patch(
             )
             if merged_non_sup2 or "non_suppressing_ctx_managers" in u2_eff:
                 u2_eff["non_suppressing_ctx_managers"] = list(merged_non_sup2)
-            s1 = copy.deepcopy(
+            s1 = _copy_scope_dict(
                 ensure_unit_scope_closure_mode(
                     u1_eff,
                     u1_eff.get("scope") if isinstance(u1_eff.get("scope"), dict) else None,
@@ -3613,7 +3649,7 @@ def generate_refactoring_patch(
                     repo_root=str(root),
                 )
             )
-            s2 = copy.deepcopy(
+            s2 = _copy_scope_dict(
                 ensure_unit_scope_closure_mode(
                     u2_eff,
                     u2_eff.get("scope") if isinstance(u2_eff.get("scope"), dict) else None,
@@ -3625,31 +3661,42 @@ def generate_refactoring_patch(
                     repo_root=str(root),
                 )
             )
+            hazards1 = set(s1.get("control_flow_hazards", []))
+            hazards2 = set(s2.get("control_flow_hazards", []))
+            combined_pair_hazards = hazards1 | hazards2
+            if "unavailable_source_placeholder" in hazards1 or (
+                "unavailable_source_placeholder" in hazards2
+                and not allows_u2_source_placeholder(
+                    is_subroutine=is_sub1,
+                    requires_u2_edit=replace_clones,
+                    source_text2=f2_text,
+                )
+            ):
+                skip_reasons["unavailable source placeholder"] += 1
+                continue
+            if "unavailable_source_for_closure_mode" in combined_pair_hazards:
+                skip_reasons["unavailable source for closure mode"] += 1
+                continue
+            if "invalid_unit_columns" in combined_pair_hazards:
+                skip_reasons["invalid unit columns"] += 1
+                continue
+            if "stale_source_code" in combined_pair_hazards:
+                skip_reasons["stale source code"] += 1
+                continue
+            if "pathological_ast" in combined_pair_hazards:
+                skip_reasons["pathological ast"] += 1
+                continue
             if u1_eff.get("kind") in ("comprehension", "complex_expr") or u2_eff.get(
                 "kind"
             ) in ("comprehension", "complex_expr"):
-                raw_l1, _ = extract_unit_source_lines_with_state(
-                    u1_eff, repo_root=str(root)
-                )
-                raw_l2, _ = extract_unit_source_lines_with_state(
-                    u2_eff, repo_root=str(root)
-                )
-                stmt_lines1 = _slice_unit_token_lines(
-                    u1_eff,
-                    _extract_unit_body_lines(
-                        u1_eff,
-                        [ln.rstrip("\r\n") for ln in raw_l1],
-                    ),
-                )
-                stmt_lines2 = _slice_unit_token_lines(
-                    u2_eff,
-                    _extract_unit_body_lines(
-                        u2_eff,
-                        [ln.rstrip("\r\n") for ln in raw_l2],
-                    ),
-                )
-                if not _prune_pair_lhs_and_augassign_scopes(
-                    u1_eff, u2_eff, s1, s2, stmt_lines1, stmt_lines2
+                stmt_lines1 = _extract_unit_token_lines(u1_eff, repo_root=str(root))
+                stmt_lines2 = _extract_unit_token_lines(u2_eff, repo_root=str(root))
+                if (
+                    stmt_lines1 is None
+                    or stmt_lines2 is None
+                    or not _prune_pair_lhs_and_augassign_scopes(
+                        u1_eff, u2_eff, s1, s2, stmt_lines1, stmt_lines2
+                    )
                 ):
                     skip_reasons["incompatible inputs or outputs"] += 1
                     continue
@@ -3691,31 +3738,6 @@ def generate_refactoring_patch(
                 skip_reasons["incompatible receiver attribute accesses"] += 1
                 continue
 
-            hazards1 = set(s1.get("control_flow_hazards", []))
-            hazards2 = set(s2.get("control_flow_hazards", []))
-            combined_pair_hazards = hazards1 | hazards2
-            # Intentional host-caller asymmetry: u1 supplies the extracted helper AST and
-            # always rejects unavailable_source_placeholder; u2 permits preview-only
-            # (not replace_clones, not is_sub1, f2_text is None) host-module helper emission
-            # with a manual-import note when u2's caller file is missing on disk.
-            if "unavailable_source_placeholder" in hazards1 or (
-                "unavailable_source_placeholder" in hazards2
-                and (is_sub1 or replace_clones or f2_text is not None)
-            ):
-                skip_reasons["unavailable source placeholder"] += 1
-                continue
-            if "unavailable_source_for_closure_mode" in combined_pair_hazards:
-                skip_reasons["unavailable source for closure mode"] += 1
-                continue
-            if "invalid_unit_columns" in combined_pair_hazards:
-                skip_reasons["invalid unit columns"] += 1
-                continue
-            if "stale_source_code" in combined_pair_hazards:
-                skip_reasons["stale source code"] += 1
-                continue
-            if "pathological_ast" in combined_pair_hazards:
-                skip_reasons["pathological ast"] += 1
-                continue
             if "type_param_closure_capture" in combined_pair_hazards:
                 skip_reasons["type_param closure capture"] += 1
                 continue
@@ -3843,24 +3865,25 @@ def generate_refactoring_patch(
                     else "strict"
                 )
             )
-            resolved_outs = resolve_clone_pair_outputs(
-                u1=u1_eff,
-                u2=u2_eff,
-                scope1=s1,
-                scope2=s2,
-                source_text1=f1_plan.orig_text,
-                source_text2=f2_text,
-                tree1=tree1,
-                tree2=tree2,
-                repo_root=str(root),
-                skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
-                source_digest1=digest1,
-                source_digest2=digest2,
-                closure_strictness=effective_pair_strictness,
-                non_suppressing_ctx_managers=eff_non_sup or None,
-                require_pairing=replace_clones,
-                return_details=True,
-            )
+            with collect_wildcard_ctx_managers() as out_wildcards:
+                resolved_outs = resolve_clone_pair_outputs(
+                    u1=u1_eff,
+                    u2=u2_eff,
+                    scope1=s1,
+                    scope2=s2,
+                    source_text1=f1_plan.orig_text,
+                    source_text2=f2_text,
+                    tree1=tree1,
+                    tree2=tree2,
+                    repo_root=str(root),
+                    skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
+                    source_digest1=digest1,
+                    source_digest2=digest2,
+                    closure_strictness=effective_pair_strictness,
+                    non_suppressing_ctx_managers=eff_non_sup or None,
+                    require_pairing=replace_clones,
+                    return_details=True,
+                )
             if resolved_outs.outputs is None:
                 reason = resolved_outs.skip_reason or "unpaired outputs"
                 skip_reasons[reason] += 1
@@ -3999,30 +4022,31 @@ def generate_refactoring_patch(
             ):
                 helper_name = f"{base_helper}_{h_idx}"
                 h_idx += 1
-            helper_code = synthesize_shared_helper_code(
-                u1_eff,
-                u2_eff,
-                type_merge_strategy=type_merge_strategy,
-                method_binding=effective_binding,
-                indent=helper_indent,
-                is_static=is_static,
-                receiver_kind=fn1_kind if effective_binding == "method" else None,
-                step=step,
-                repo_root=str(root),
-                helper_name=helper_name,
-                source_text1=f1_plan.orig_text,
-                source_text2=f2_text,
-                tree1=tree1,
-                tree2=tree2,
-                skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
-                closure_strictness=effective_pair_strictness,
-                non_suppressing_ctx_managers=eff_non_sup or None,
-                outputs=outputs,
-                outputs2=target_outs2,
-                scope1=s1,
-                scope2=s2,
-                scope=scope,
-            )
+            with collect_wildcard_ctx_managers() as synth_wildcards:
+                helper_code = synthesize_shared_helper_code(
+                    u1_eff,
+                    u2_eff,
+                    type_merge_strategy=type_merge_strategy,
+                    method_binding=effective_binding,
+                    indent=helper_indent,
+                    is_static=is_static,
+                    receiver_kind=fn1_kind if effective_binding == "method" else None,
+                    step=step,
+                    repo_root=str(root),
+                    helper_name=helper_name,
+                    source_text1=f1_plan.orig_text,
+                    source_text2=f2_text,
+                    tree1=tree1,
+                    tree2=tree2,
+                    skip_pre_unit_closures=pair_flags.effective_skip_pre_unit_closures,
+                    closure_strictness=effective_pair_strictness,
+                    non_suppressing_ctx_managers=eff_non_sup or None,
+                    outputs=outputs,
+                    outputs2=target_outs2,
+                    scope1=s1,
+                    scope2=s2,
+                    scope=scope,
+                )
             if not helper_code:
                 skip_reasons["shared helper synthesis failed"] += 1
                 continue
@@ -4037,10 +4061,19 @@ def generate_refactoring_patch(
                 | set(s2.get("heuristic_ctx_managers", ()))
                 | set(scope.get("heuristic_ctx_managers", ()))
             )
-            if pair_heuristics:
-                pair_comment += (
-                    format_heuristic_ctx_manager_comment(pair_heuristics) + "\n"
-                )
+            pair_wildcards = sorted(
+                set(out_wildcards)
+                | set(synth_wildcards)
+                | set(s1.get("wildcard_ctx_managers", ()))
+                | set(s2.get("wildcard_ctx_managers", ()))
+                | set(scope.get("wildcard_ctx_managers", ()))
+            )
+            assumption_notes = format_ctx_manager_assumption_comments(
+                pair_heuristics,
+                pair_wildcards,
+            )
+            if assumption_notes:
+                pair_comment += assumption_notes + "\n"
 
             candidate_units = [u1_eff]
             if is_same_file and not check_units_overlap(u1_eff, u2_eff, repo_root=str(root)):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import bisect
 import symtable
+import threading
 from typing import (
     AbstractSet,
     Dict,
@@ -31,7 +32,6 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _make_trusted_scope_cache_key,
     _register_tree_source_lines,
     _scope_cell_info_cache,
-    _suppress_syntax_warnings,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
     _COMPREHENSION_TYPES,
@@ -300,6 +300,7 @@ class _SpanLineIndex:
         "closure_prefix_max_ends",
         "_decorated_starts",
         "_dump_cache",
+        "_dump_lock",
     )
 
     def __init__(
@@ -317,6 +318,7 @@ class _SpanLineIndex:
         closure_nodes: List[ast.AST] = []
         decorated_starts: Dict[int, Tuple[int, Optional[int]]] = {}
         self._dump_cache: Dict[int, str] = {}
+        self._dump_lock: threading.Lock = threading.Lock()
 
         stack: List[ast.AST] = [root_node]
         while stack:
@@ -480,11 +482,13 @@ class _SpanLineIndex:
     def get_dump(self, node: ast.AST) -> str:
         """Returns the cached ast.dump(node) string."""
         nid = id(node)
-        cached = self._dump_cache.get(nid)
-        if cached is None:
-            cached = ast.dump(node)
-            self._dump_cache[nid] = cached
-        return cached
+        with self._dump_lock:
+            cached = self._dump_cache.get(nid)
+        if cached is not None:
+            return cached
+        dumped = ast.dump(node)
+        with self._dump_lock:
+            return self._dump_cache.setdefault(nid, dumped)
 
     def iter_boundary_nodes(
         self, u_start: int, u_end: int
@@ -823,6 +827,31 @@ def _extract_type_alias_or_pattern_name(node: ast.AST) -> Optional[str]:
     return None
 
 
+def _collect_comp_walrus_target_names(comp_node: ast.AST) -> Set[str]:
+    """Collects PEP 572 walrus target names inside a comprehension binding in its enclosing scope."""
+    targets: Set[str] = set()
+    stack: List[ast.AST] = list(ast.iter_child_nodes(comp_node))
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, ast.NamedExpr):
+            targets.add(curr.target.id)
+            stack.append(curr.value)
+            continue
+        if isinstance(curr, _COMPREHENSION_TYPES):
+            stack.extend(ast.iter_child_nodes(curr))
+            continue
+        if isinstance(curr, _INNER_SCOPE_TYPES):
+            has_type_params = bool(getattr(curr, "type_params", ()))
+            stack.extend(
+                iter_nested_scope_header_nodes(
+                    curr, include_annotations=not has_type_params
+                )
+            )
+            continue
+        stack.extend(ast.iter_child_nodes(curr))
+    return targets
+
+
 def _scope_has_use_before_lexical_declaration(
     scope_node: ast.AST,
     target_decls: AbstractSet[str],
@@ -839,12 +868,22 @@ def _scope_has_use_before_lexical_declaration(
             if any(name in seen_in_scope for name in node.names):
                 return True
             continue
-        if (
-            isinstance(node, ast.AnnAssign)
-            and isinstance(node.target, ast.Name)
-            and node.target.id in target_decls
-        ):
-            return True
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            is_simple = bool(getattr(node, "simple", 1))
+            if is_simple and node.target.id in target_decls:
+                if not isinstance(scope_node, ast.Module):
+                    return True
+                seen_in_scope.add(node.target.id)
+            elif (
+                not is_simple
+                and node.value is not None
+                and node.target.id in target_decls
+            ):
+                seen_in_scope.add(node.target.id)
+            if node.value is not None:
+                walk_stack.append(node.value)
+            walk_stack.append(node.annotation)
+            continue
         if isinstance(node, _INNER_SCOPE_TYPES):
             if (
                 isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
@@ -858,8 +897,12 @@ def _scope_has_use_before_lexical_declaration(
                 )
             ):
                 walk_stack.append(hdr)
-            if isinstance(node, _COMPREHENSION_TYPES) and node.generators:
-                walk_stack.append(node.generators[0].iter)
+            if isinstance(node, _COMPREHENSION_TYPES):
+                seen_in_scope.update(
+                    _collect_comp_walrus_target_names(node) & target_decls
+                )
+                if node.generators:
+                    walk_stack.append(node.generators[0].iter)
             continue
         if isinstance(node, ast.Name):
             if node.id in target_decls:
@@ -956,8 +999,11 @@ def _compute_scope_invalid_lexical_declarations(
         and eff_lines
     ):
         try:
-            with _suppress_syntax_warnings():
-                symtable.symtable("\n".join(eff_lines), "<symtable>", "exec")
+            symtable.symtable(
+                "\n".join(ln.rstrip("\r\n") for ln in eff_lines),
+                "<symtable>",
+                "exec",
+            )
             return False
         except (SyntaxError, TypeError, ValueError, RecursionError, MemoryError):
             pass

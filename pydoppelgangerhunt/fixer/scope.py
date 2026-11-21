@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import ast
 import builtins
+from enum import Enum
 import hashlib
 import io
+from keyword import iskeyword
 import logging
 import re
 import textwrap
 import tokenize
 from typing import (
+    AbstractSet,
     Any,
     Dict,
     FrozenSet,
     List,
+    Mapping,
+    NamedTuple,
     Optional,
     Sequence,
     Set,
@@ -25,32 +30,21 @@ from typing import (
 
 from pydoppelgangerhunt.config import (
     collect_heuristic_ctx_managers,
+    collect_wildcard_ctx_managers,
     normalize_non_suppressing_ctx_managers,
+    record_heuristic_non_suppressing_ctx_manager,
+    record_wildcard_ctx_manager_match,
     resolve_pair_closure_flags,
     resolve_unit_closure_flags,
     should_warn_closure_event,
 )
-
-BLOCKING_CONTROL_FLOW_HAZARDS: FrozenSet[str] = frozenset(
-    {
-        "naked_break",
-        "naked_continue",
-        "embedded_return",
-        "type_param_closure_capture",
-        "pathological_ast",
-        "deleted_output",
-        "severed_closure_cell",
-        "stale_source_code",
-        "unavailable_source_for_closure_mode",
-        "unavailable_source_placeholder",
-        "invalid_unit_columns",
-    }
-)
 from pydoppelgangerhunt.fixer._ast_compat import (
     is_match_as_node,
+    is_match_case_node,
     is_match_mapping_node,
     is_match_node,
     is_match_star_node,
+    is_try_or_trystar_node,
     is_trystar_node,
     is_type_alias_node,
 )
@@ -64,7 +58,7 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _register_tree_source_lines,
     _scope_cell_info_cache,
     _split_source_lines_stripped,
-    _suppress_syntax_warnings,
+    scope_fingerprint_verification_session,
 )
 from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context
 from pydoppelgangerhunt.fixer._df_cell_hazards import (
@@ -91,6 +85,7 @@ from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=unused-im
     iter_nested_scope_header_nodes,
 )
 from pydoppelgangerhunt.fixer._df_span_index import (
+    _SpanLineIndex,
     _find_enclosing_function_chain,
     _get_span_line_index,
     _has_invalid_lexical_scope_declarations,
@@ -104,7 +99,6 @@ from pydoppelgangerhunt.fixer._df_with_provenance import (  # pylint: disable=un
     _extract_deleted_names,
     _seed_scope_suppress_aliases,
     _walrus_assignment_in_expr,
-    _walrus_in_sequence,
 )
 from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
 from pydoppelgangerhunt.fixer._df_visitors import (
@@ -117,6 +111,8 @@ from pydoppelgangerhunt.source_lines import (
     is_non_string_sequence,
 )
 from pydoppelgangerhunt.fixer.source import (
+    _END_COL_KEYS,
+    _START_COL_KEYS,
     _SUBROUTINE_KINDS,
     _WHOLE_UNIT_KINDS,
     _extract_slice_col_offset,
@@ -148,6 +144,22 @@ logger = logging.getLogger(__name__)
 BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
 SCOPE_SCHEMA_VERSION: int = 2
+
+BLOCKING_CONTROL_FLOW_HAZARDS: FrozenSet[str] = frozenset(
+    {
+        "naked_break",
+        "naked_continue",
+        "embedded_return",
+        "type_param_closure_capture",
+        "pathological_ast",
+        "deleted_output",
+        "severed_closure_cell",
+        "stale_source_code",
+        "unavailable_source_for_closure_mode",
+        "unavailable_source_placeholder",
+        "invalid_unit_columns",
+    }
+)
 
 _SYNTHETIC_WRAPPER_NAME: str = "__pdh_wrapper__"
 
@@ -255,6 +267,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.deleted_names: Set[str] = set()
         self.type_aliases: Set[str] = set()
         self.type_params: List[str] = []
+        self.type_param_names: Set[str] = set()
         self.type_param_free_vars: List[str] = []
         self._scope_stack: List[Set[str]] = []
         self._type_param_scopes: List[Set[str]] = []
@@ -462,6 +475,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         created_outer = False
         if is_top:
             self._has_processed_top_func = True
+            self.type_param_names.update(tp_names)
             for tp in getattr(node, "type_params", []):
                 try:
                     self.type_params.append(ast.unparse(tp))
@@ -1366,8 +1380,7 @@ def _infer_missing_col_from_line_ast(
         )
         parse_src = dedented
     try:
-        with _suppress_syntax_warnings():
-            mod = ast.parse(parse_src)
+        mod = ast.parse(parse_src)
     except SyntaxError:
         return s_col, e_col
     if unit_kind == "comprehension":
@@ -1413,12 +1426,8 @@ def _unit_cols(
     unit_code_lines: Optional[Sequence[str]] = None,
 ) -> Tuple[Optional[int], Optional[int]]:
     """Extracts (start_col, end_col) coordinates from a unit dictionary."""
-    s_col = parse_unit_coord(unit, "start_col", default=None)
-    if s_col is None:
-        s_col = parse_unit_coord(unit, "col_offset", default=None)
-    e_col = parse_unit_coord(unit, "end_col", default=None)
-    if e_col is None:
-        e_col = parse_unit_coord(unit, "end_col_offset", default=None)
+    s_col = _extract_slice_col_offset(unit, _START_COL_KEYS, default=None)
+    e_col = _extract_slice_col_offset(unit, _END_COL_KEYS, default=None)
     u_kind_str = str(unit.get("kind") or "")
     is_inline_expr_kind = u_kind_str in (
         "comprehension",
@@ -1450,11 +1459,13 @@ def _unit_cols(
                     if pos < 0:
                         break
                     end_pos = pos + len(snippet)
-                    left_ok = not start_id or pos == 0 or not (
-                        line0[pos - 1].isalnum() or line0[pos - 1] == "_"
+                    left_ok = not start_id or pos == 0 or not _is_word_or_attr_char(
+                        line0[pos - 1]
                     )
-                    right_ok = not end_id or end_pos >= len(line0) or not (
-                        line0[end_pos].isalnum() or line0[end_pos] == "_"
+                    right_ok = (
+                        not end_id
+                        or end_pos >= len(line0)
+                        or not _is_word_or_attr_char(line0[end_pos])
                     )
                     if left_ok and right_ok:
                         cand_s = len(line0[:pos].encode("utf-8"))
@@ -1508,9 +1519,10 @@ def _unit_cols(
                             tail = line_first[
                                 pos + len(snip_first) :
                             ].strip()
-                            left_ok = not start_id or pos == 0 or not (
-                                line_first[pos - 1].isalnum()
-                                or line_first[pos - 1] == "_"
+                            left_ok = (
+                                not start_id
+                                or pos == 0
+                                or not _is_word_or_attr_char(line_first[pos - 1])
                             )
                             if left_ok and (not tail or tail.startswith("#")):
                                 s_matches.append(
@@ -1534,10 +1546,7 @@ def _unit_cols(
                             right_ok = (
                                 not end_id
                                 or end_pos >= len(line_last)
-                                or not (
-                                    line_last[end_pos].isalnum()
-                                    or line_last[end_pos] == "_"
-                                )
+                                or not _is_word_or_attr_char(line_last[end_pos])
                             )
                             if right_ok:
                                 ml_cand_e = len(
@@ -1556,6 +1565,66 @@ def _unit_cols(
             allow_expr_fallback=is_inline_expr_kind,
         )
     return s_col, e_col
+
+
+class _ResolvedUnitCols(NamedTuple):
+    """Unit dictionary with inferred sub-line columns attached alongside raw column bounds."""
+
+    unit: Dict[str, Any]
+    start_col: Optional[int]
+    end_col: Optional[int]
+
+
+def resolve_unit_inferred_col_bounds(
+    unit: Dict[str, Any],
+    *,
+    repo_root: Optional[str] = None,
+    unit_code_lines: Optional[Sequence[str]] = None,
+    is_placeholder_origin: Optional[bool] = None,
+    explicit_col_sliced: Optional[bool] = None,
+    expr_only: bool = True,
+) -> _ResolvedUnitCols:
+    """Resolves missing sub-line column offsets onto a shallow copy of expression units."""
+    raw_s = _extract_slice_col_offset(unit, _START_COL_KEYS, default=None)
+    raw_e = _extract_slice_col_offset(unit, _END_COL_KEYS, default=None)
+    if (raw_s is not None and raw_s < 0) or (raw_e is not None and raw_e < 0):
+        return _ResolvedUnitCols(unit, raw_s, raw_e)
+    if expr_only and unit.get("kind") not in ("comprehension", "complex_expr"):
+        return _ResolvedUnitCols(unit, raw_s, raw_e)
+
+    if unit_code_lines is None or is_placeholder_origin is None:
+        extracted_lines, origin = extract_unit_source_lines_with_state(
+            unit, repo_root=repo_root
+        )
+        eff_lines: Sequence[str] = (
+            extracted_lines if unit_code_lines is None else unit_code_lines
+        )
+        eff_placeholder = (
+            origin.is_placeholder
+            if is_placeholder_origin is None
+            else is_placeholder_origin
+        )
+    else:
+        eff_lines = unit_code_lines
+        eff_placeholder = is_placeholder_origin
+
+    exp_col_sliced = (
+        bool(unit.get("source_lines_is_col_sliced"))
+        if explicit_col_sliced is None
+        else explicit_col_sliced
+    )
+    inferred_s, inferred_e = _unit_cols(
+        unit,
+        None if (eff_placeholder or exp_col_sliced) else eff_lines,
+    )
+    if inferred_s is not None or inferred_e is not None:
+        updated = dict(unit)
+        if inferred_s is not None:
+            updated["start_col"] = inferred_s
+        if inferred_e is not None:
+            updated["end_col"] = inferred_e
+        return _ResolvedUnitCols(updated, inferred_s, inferred_e)
+    return _ResolvedUnitCols(unit, inferred_s, inferred_e)
 
 
 def _is_word_or_attr_char(ch: str) -> bool:
@@ -1637,18 +1706,57 @@ def _is_ordered_contiguous_source_match(
     )
 
 
+_CLAUSE_HEADER_PATTERNS: Tuple[Tuple[str, str], ...] = (
+    ("elif", r"^elif(?:\s|\(|\[|:)"),
+    ("else", r"^else\s*:"),
+    ("except", r"^except(?:\*|\s|\(|:)"),
+    ("finally", r"^finally\s*:"),
+    ("case", r"^case(?:\s|\(|\[)"),
+)
+
+
+def _leading_clause_header_kind(text: str) -> Optional[str]:
+    """Returns canonical clause header keyword when *text* starts with elif/else/except/finally/case."""
+    stripped = dedent_source_text(text).lstrip(" \t\r\n")
+    for kind, pattern in _CLAUSE_HEADER_PATTERNS:
+        if re.match(pattern, stripped):
+            return kind
+    return None
+
+
 def _normalize_clause_header_snippet(dedented: str) -> str:
     """Normalizes standalone elif/else/except/finally/case clause headers into parseable statements."""
     stripped = dedented.lstrip(" \t")
-    if re.match(r"^elif(?:\s|\(|\[|:)", stripped):
+    header_kind = _leading_clause_header_kind(stripped)
+    if header_kind == "elif":
         return "if" + stripped[4:]
-    if re.match(r"^else\s*:", stripped):
+    if header_kind == "else":
         return "if 1" + stripped[4:]
-    if re.match(r"^(?:except(?:\*|\s|\(|:)|finally\s*:)", stripped):
+    if header_kind in ("except", "finally"):
         return f"try:\n    pass\n{stripped}"
-    if re.match(r"^case(?:\s|\(|\[)", stripped):
+    if header_kind == "case":
         return f"match 0:\n{textwrap.indent(stripped, '    ')}"
     return dedented
+
+
+def _parse_normalized_mod_stmts(normalized_text: str) -> Optional[List[ast.stmt]]:
+    """Parses normalized source text into top-level or async-wrapped AST statements."""
+    for cand in (
+        normalized_text,
+        f"async def _norm_wrap():\n{textwrap.indent(normalized_text, '    ')}",
+    ):
+        try:
+            parsed = ast.parse(cand)
+            stmts = (
+                parsed.body
+                if cand == normalized_text
+                else getattr(parsed.body[0], "body", [])
+            )
+            if stmts:
+                return list(stmts)
+        except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
+            continue
+    return None
 
 
 def _parse_normalized_stmt_dumps(text: str) -> Optional[List[str]]:
@@ -1657,26 +1765,12 @@ def _parse_normalized_stmt_dumps(text: str) -> Optional[List[str]]:
     if not raw_dedented:
         return None
     dedented = _normalize_clause_header_snippet(raw_dedented)
-    for cand in (
-        dedented,
-        f"async def _norm_wrap():\n{textwrap.indent(dedented, '    ')}",
-    ):
-        try:
-            with _suppress_syntax_warnings():
-                parsed = ast.parse(cand)
-            stmts = (
-                parsed.body
-                if cand == dedented
-                else getattr(parsed.body[0], "body", [])
-            )
-            return (
-                [ast.dump(s, include_attributes=False) for s in stmts]
-                if stmts
-                else None
-            )
-        except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
-            continue
-    return None
+    stmts = _parse_normalized_mod_stmts(dedented)
+    return (
+        [ast.dump(s, include_attributes=False) for s in stmts]
+        if stmts
+        else None
+    )
 
 
 def _scan_line_unquoted_comment(
@@ -1727,9 +1821,32 @@ def _strip_unquoted_comment(line: str) -> str:
     return stripped
 
 
+def _join_normalized_tokens(toks: Sequence[Tuple[int, str]]) -> str:
+    """Joins normalized line tokens while preserving dot-attached attribute access."""
+    if not toks:
+        return ""
+    parts: List[str] = [toks[0][1]]
+    for idx in range(1, len(toks)):
+        prev_type, prev_str = toks[idx - 1]
+        cur_type, cur_str = toks[idx]
+        attach_before_dot = cur_str == "." and (
+            (prev_type == tokenize.NAME and not iskeyword(prev_str))
+            or prev_str in (")", "]", "}")
+        )
+        attach_after_dot = (
+            prev_str == "."
+            and cur_type == tokenize.NAME
+            and not iskeyword(cur_str)
+        )
+        if not (attach_before_dot or attach_after_dot):
+            parts.append(" ")
+        parts.append(cur_str)
+    return "".join(parts)
+
+
 def _strip_inline_comment_line(line: str) -> str:
     """Strips trailing Python comments and normalizes intra-line token spacing."""
-    toks: List[str] = []
+    toks: List[Tuple[int, str]] = []
     try:
         for tok in tokenize.generate_tokens(
             io.StringIO(line.lstrip(" \t")).readline
@@ -1744,11 +1861,11 @@ def _strip_inline_comment_line(line: str) -> str:
                 tokenize.ENDMARKER,
             ):
                 continue
-            toks.append(tok.string)
-        return " ".join(toks)
+            toks.append((tok.type, tok.string))
+        return _join_normalized_tokens(toks)
     except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
         if toks and "multi-line statement" in str(exc).lower():
-            return " ".join(toks)
+            return _join_normalized_tokens(toks)
         return _strip_unquoted_comment(line)
 
 
@@ -1776,22 +1893,28 @@ def _is_normalized_source_equivalent(
     allow_subwindow: bool = False,
 ) -> bool:
     """Checks whether normalized or comment-stripped src_code matches raw_lines."""
+    raw_text = "".join(raw_lines)
     src_dumps = _parse_normalized_stmt_dumps(src_code)
-    raw_dumps = _parse_normalized_stmt_dumps("".join(raw_lines))
+    raw_dumps = _parse_normalized_stmt_dumps(raw_text)
+    src_clause_kind = _leading_clause_header_kind(src_code)
+    same_clause_header = src_clause_kind == _leading_clause_header_kind(raw_text)
     has_boundary_semicolon = bool(
         raw_lines and (";" in raw_lines[0] or ";" in raw_lines[-1])
     )
     if src_dumps and raw_dumps:
+        src_dump_seq = list(src_dumps)
+        raw_dump_seq = list(raw_dumps)
         if not (allow_subwindow and has_boundary_semicolon):
-            if src_dumps == raw_dumps:
+            if same_clause_header and src_dump_seq == raw_dump_seq:
                 return True
-        elif len(src_dumps) <= len(raw_dumps):
-            k = len(src_dumps)
-            if any(
-                raw_dumps[i : i + k] == src_dumps
-                for i in range(len(raw_dumps) - k + 1)
-            ):
-                return True
+        elif (
+            src_clause_kind is None
+            and len(src_dump_seq) <= len(raw_dump_seq)
+        ):
+            k = len(src_dump_seq)
+            for i in range(len(raw_dump_seq) - k + 1):
+                if raw_dump_seq[i : i + k] == src_dump_seq:
+                    return True
     norm_src_lines = _strip_comments_from_lines(split_source_lines(src_code))
     norm_raw_lines = _strip_comments_from_lines(raw_lines)
     if norm_src_lines and norm_raw_lines:
@@ -1827,12 +1950,267 @@ def _get_tree_sha256_digest(mod_tree: ast.AST) -> str:
     )
 
 
-def _unit_source_code_matches_tree(
+class _TreeSourceMatch(Enum):
+    """Outcome of matching placeholder unit source_code and column bounds against an AST."""
+
+    MATCH = "match"
+    STALE = "stale"
+    INVALID_COLS = "invalid_cols"
+
+
+def _extra_outer_paren_slack(dedented_code: str) -> int:
+    """Counts outer enclosing '(' ... ')' pairs stripped by ast.parse(..., mode='eval')."""
+    text = dedented_code.strip()
+    slack = 0
+    while len(text) >= 2 and text.startswith("(") and text.endswith(")"):
+        inner = text[1:-1].strip()
+        if not inner:
+            break
+        try:
+            ast.parse(inner, mode="eval")
+        except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
+            break
+        slack += 1
+        text = inner
+    return slack
+
+
+def _matched_ast_cols_compatible(
+    first_node: ast.AST,
+    last_node: ast.AST,
+    u_start: int,
+    u_end: int,
+    s_col: Optional[int],
+    e_col: Optional[int],
+    span_idx: _SpanLineIndex,
+    *,
+    paren_slack: int = 0,
+) -> bool:
+    """Verifies explicit unit columns fit within the matched backing AST node bounds."""
+    if s_col is not None:
+        first_s, _, first_c, _ = span_idx.node_coords(first_node)
+        if first_s == u_start and first_c is not None and s_col > first_c:
+            return False
+    if e_col is not None:
+        _, last_e, _, last_ec = span_idx.node_coords(last_node)
+        if last_e == u_end and last_ec is not None and e_col > last_ec + paren_slack:
+            return False
+    return True
+
+
+def _placeholder_tree_cols_out_of_bounds(
+    unit: Dict[str, Any], file_tree: ast.AST
+) -> bool:
+    """Checks explicit start_col/end_col against tree AST node bounds on u_start/u_end when source_code is absent."""
+    s_col = parse_unit_coord(
+        unit,
+        "start_col",
+        default=parse_unit_coord(unit, "col_offset", default=None),
+    )
+    e_col = parse_unit_coord(
+        unit,
+        "end_col",
+        default=parse_unit_coord(unit, "end_col_offset", default=None),
+    )
+    if s_col is None and e_col is None:
+        return False
+    u_start = parse_unit_coord(unit, "start", default=1)
+    u_end = parse_unit_coord(unit, "end", default=u_start)
+    span_idx = _get_span_line_index(file_tree)
+    for col_val, line_nodes, is_start_col in (
+        (s_col, span_idx.by_start_line.get(u_start, ()), True),
+        (e_col, span_idx.by_end_line.get(u_end, ()), False),
+    ):
+        if col_val is None or not line_nodes:
+            continue
+        bound_cols = [
+            coord
+            for n in line_nodes
+            for _, _, n_c, n_ec in (span_idx.node_coords(n),)
+            for coord in (n_c if is_start_col else n_ec,)
+            if coord is not None
+        ]
+        if bound_cols and col_val > max(bound_cols):
+            return True
+    return False
+
+
+class _ClauseDumpCandidate(NamedTuple):
+    """Expected AST dump sequence and enclosing clause constraints for source matching."""
+
+    dumps: List[str]
+    header_kind: Optional[str] = None
+    expected_dump: Optional[str] = None
+    expected_guard_dump: Optional[str] = None
+
+
+def _is_elif_ast_node(node: ast.AST, parent_map: Mapping[ast.AST, ast.AST]) -> bool:
+    """Returns True when *node* is an ast.If representing an `elif` branch of an enclosing `if`/`elif`."""
+    if not isinstance(node, ast.If):
+        return False
+    parent = parent_map.get(node)
+    if not isinstance(parent, ast.If):
+        return False
+    return node in parent.orelse and node.col_offset == parent.col_offset
+
+
+def _build_clause_dump_candidates(
+    raw_dedented: str,
+    norm_dedented: str,
+    src_dumps: List[str],
+) -> List[_ClauseDumpCandidate]:
+    """Builds candidate AST dump sequences with clause-header checks for normalized snippets."""
+    stmts = _parse_normalized_mod_stmts(norm_dedented)
+    if not stmts or len(stmts) != 1:
+        return [_ClauseDumpCandidate(dumps=src_dumps)]
+    top_s = stmts[0]
+    header_kind = _leading_clause_header_kind(raw_dedented)
+    candidates: List[_ClauseDumpCandidate] = []
+    if header_kind == "elif" and isinstance(top_s, ast.If):
+        candidates.append(_ClauseDumpCandidate(dumps=src_dumps, header_kind="elif_node"))
+        if top_s.body and not top_s.orelse:
+            candidates.append(
+                _ClauseDumpCandidate(
+                    dumps=[ast.dump(n, include_attributes=False) for n in top_s.body],
+                    header_kind="elif_body",
+                    expected_dump=ast.dump(top_s.test, include_attributes=False),
+                )
+            )
+    elif header_kind == "else" and isinstance(top_s, ast.If):
+        if top_s.body and not top_s.orelse:
+            candidates.append(
+                _ClauseDumpCandidate(
+                    dumps=[ast.dump(n, include_attributes=False) for n in top_s.body],
+                    header_kind="else",
+                )
+            )
+    elif header_kind in ("finally", "except") and is_try_or_trystar_node(top_s):
+        target_attr = "finalbody" if header_kind == "finally" else "handlers"
+        other_attr = "handlers" if header_kind == "finally" else "finalbody"
+        target_seq = getattr(top_s, target_attr, ())
+        if (
+            target_seq
+            and not getattr(top_s, other_attr, ())
+            and not getattr(top_s, "orelse", ())
+        ):
+            candidates.append(
+                _ClauseDumpCandidate(
+                    dumps=[ast.dump(n, include_attributes=False) for n in target_seq],
+                    header_kind=header_kind,
+                )
+            )
+    elif header_kind == "case" and is_match_node(top_s):
+        cases: Sequence[Any] = getattr(top_s, "cases", ())
+        if len(cases) == 1:
+            c_node = cases[0]
+            c_body = getattr(c_node, "body", ())
+            if c_body:
+                c_pat = getattr(c_node, "pattern", None)
+                c_guard = getattr(c_node, "guard", None)
+                candidates.append(
+                    _ClauseDumpCandidate(
+                        dumps=[ast.dump(n, include_attributes=False) for n in c_body],
+                        header_kind="case",
+                        expected_dump=(
+                            ast.dump(c_pat, include_attributes=False)
+                            if c_pat is not None
+                            else None
+                        ),
+                        expected_guard_dump=(
+                            ast.dump(c_guard, include_attributes=False)
+                            if c_guard is not None
+                            else None
+                        ),
+                    )
+                )
+    return candidates or [_ClauseDumpCandidate(dumps=src_dumps)]
+
+
+def _clause_parent_matches_spec(
+    node: ast.AST,
+    attr_name: str,
+    in_span: Sequence[ast.AST],
+    cand: _ClauseDumpCandidate,
+    parent_map: Mapping[ast.AST, ast.AST],
+) -> bool:
+    """Verifies enclosing AST container and clause-header predicates satisfy *cand*."""
+    kind = cand.header_kind
+    if kind is None:
+        return True
+    matched = False
+    if kind == "else":
+        matched = attr_name == "orelse"
+    elif kind == "except":
+        matched = attr_name == "handlers" and is_try_or_trystar_node(node)
+    elif kind == "finally":
+        matched = attr_name == "finalbody" and is_try_or_trystar_node(node)
+    elif kind == "elif_node":
+        matched = (
+            isinstance(node, ast.If)
+            and attr_name == "orelse"
+            and len(in_span) == 1
+            and _is_elif_ast_node(in_span[0], parent_map)
+        )
+    elif kind == "elif_body":
+        matched = (
+            isinstance(node, ast.If)
+            and attr_name == "body"
+            and ast.dump(node.test, include_attributes=False) == cand.expected_dump
+            and _is_elif_ast_node(node, parent_map)
+        )
+    elif kind == "case" and is_match_case_node(node) and attr_name == "body":
+        pat = getattr(node, "pattern", None)
+        guard = getattr(node, "guard", None)
+        pat_dump = (
+            ast.dump(pat, include_attributes=False) if pat is not None else None
+        )
+        guard_dump = (
+            ast.dump(guard, include_attributes=False) if guard is not None else None
+        )
+        matched = (
+            pat_dump == cand.expected_dump
+            and guard_dump == cand.expected_guard_dump
+        )
+    return matched
+
+
+def _clause_header_line_in_bounds(
+    node: ast.AST,
+    attr_name: str,
+    u_start: int,
+    first_lineno: Optional[int],
+) -> bool:
+    """Returns True when u_start falls on a clause header preceding first_lineno (allowing comments/blank lines)."""
+    if first_lineno is None or not u_start < first_lineno:
+        return False
+    if attr_name == "body":
+        node_start = getattr(node, "lineno", None)
+        if not isinstance(node_start, int):
+            pat = getattr(node, "pattern", None)
+            node_start = getattr(pat, "lineno", None)
+        return isinstance(node_start, int) and node_start <= u_start
+    prev_seq: Any = None
+    if attr_name == "orelse":
+        prev_seq = getattr(node, "handlers", None) or getattr(node, "body", None)
+    elif attr_name == "finalbody":
+        prev_seq = (
+            getattr(node, "orelse", None)
+            or getattr(node, "handlers", None)
+            or getattr(node, "body", None)
+        )
+    if not isinstance(prev_seq, list) or not prev_seq:
+        return first_lineno == u_start + 1
+    prev_last = prev_seq[-1]
+    prev_end = getattr(prev_last, "end_lineno", getattr(prev_last, "lineno", None))
+    return isinstance(prev_end, int) and prev_end < u_start
+
+
+def _match_unit_source_code_with_tree(
     unit: Dict[str, Any],
     src_code: str,
     file_tree: ast.AST,
-) -> bool:
-    """Checks whether unit['source_code'] matches the ordered AST nodes in file_tree spanning (start, end)."""
+) -> _TreeSourceMatch:
+    """Checks whether unit['source_code'] matches AST nodes in file_tree and validates explicit columns."""
     u_start = parse_unit_coord(unit, "start", default=1)
     u_end = parse_unit_coord(unit, "end", default=u_start)
     s_col = parse_unit_coord(
@@ -1861,40 +2239,16 @@ def _unit_source_code_matches_tree(
         cand_start, cand_end, _c, _ec = span_idx.node_coords(cand_node)
         if cand_end == u_end:
             end_nodes.append((cand_node, cand_start))
+    matched_structurally_with_bad_cols = False
     src_dumps = _parse_normalized_stmt_dumps(src_code)
     if src_dumps:
-        candidate_dump_seqs: List[List[str]] = [src_dumps]
         raw_dedented = dedent_source_text(src_code).strip()
         norm_dedented = _normalize_clause_header_snippet(raw_dedented)
-        if norm_dedented != raw_dedented:
-            try:
-                with _suppress_syntax_warnings():
-                    norm_mod = ast.parse(norm_dedented)
-                inner_nodes: List[ast.AST] = []
-                for top_s in norm_mod.body:
-                    if isinstance(top_s, ast.If):
-                        inner_nodes.extend(top_s.body)
-                    elif isinstance(top_s, ast.Try):
-                        inner_nodes.extend(top_s.handlers)
-                        inner_nodes.extend(top_s.finalbody)
-                    elif is_match_node(top_s):
-                        for c_node in getattr(top_s, "cases", ()):
-                            inner_nodes.extend(getattr(c_node, "body", ()))
-                if inner_nodes:
-                    candidate_dump_seqs.append(
-                        [
-                            ast.dump(n, include_attributes=False)
-                            for n in inner_nodes
-                        ]
-                    )
-            except (
-                SyntaxError,
-                ValueError,
-                UnicodeDecodeError,
-                RecursionError,
-                MemoryError,
-            ):
-                pass
+        candidate_specs = (
+            _build_clause_dump_candidates(raw_dedented, norm_dedented, src_dumps)
+            if norm_dedented != raw_dedented
+            else [_ClauseDumpCandidate(dumps=src_dumps)]
+        )
         parent_map = _get_scope_parent_map(file_tree)
         candidate_parents: List[ast.AST] = []
         seen_parent_ids: Set[int] = set()
@@ -1903,8 +2257,26 @@ def _unit_source_code_matches_tree(
                 n_s = getattr(node, "lineno", entry_start)
                 if u_start in (n_s, entry_start):
                     single_dump = [span_idx.get_dump(node)]
-                    if single_dump in candidate_dump_seqs:
-                        return True
+                    if any(
+                        single_dump == cand.dumps
+                        and (
+                            cand.header_kind is None
+                            or (
+                                cand.header_kind == "elif_node"
+                                and _is_elif_ast_node(node, parent_map)
+                            )
+                            or (
+                                cand.header_kind == "except"
+                                and isinstance(node, ast.ExceptHandler)
+                            )
+                        )
+                        for cand in candidate_specs
+                    ):
+                        if _matched_ast_cols_compatible(
+                            node, node, u_start, u_end, s_col, e_col, span_idx
+                        ):
+                            return _TreeSourceMatch.MATCH
+                        matched_structurally_with_bad_cols = True
                 parent_node = parent_map.get(node)
                 if parent_node is not None and id(parent_node) not in seen_parent_ids:
                     seen_parent_ids.add(id(parent_node))
@@ -1935,42 +2307,106 @@ def _unit_source_code_matches_tree(
                     "end_lineno",
                     getattr(in_span[-1], "lineno", None),
                 )
-                starts_at_u_start = u_start in (first_lineno, first_estart) or (
-                    attr_name in ("body", "orelse", "finalbody")
-                    and first_lineno == u_start + 1
+                exact_start = u_start in (first_lineno, first_estart)
+                clause_header_start = (
+                    not exact_start
+                    and in_span[0] is seq[0]
+                    and attr_name in ("body", "orelse", "finalbody")
+                    and _clause_header_line_in_bounds(
+                        node, attr_name, u_start, first_lineno
+                    )
                 )
-                if not (starts_at_u_start and last_end == u_end):
+                if not ((exact_start or clause_header_start) and last_end == u_end):
                     continue
                 span_dumps = [span_idx.get_dump(s) for s in in_span]
-                for target_dumps in candidate_dump_seqs:
-                    if span_dumps == target_dumps:
-                        return True
-                    if (
-                        (has_explicit_cols or (u_start == u_end and len(span_dumps) > 1))
+                for cand in candidate_specs:
+                    if clause_header_start and cand.header_kind is None:
+                        continue
+                    target_dumps = cand.dumps
+                    if span_dumps == target_dumps and _clause_parent_matches_spec(
+                        node, attr_name, in_span, cand, parent_map
+                    ):
+                        if _matched_ast_cols_compatible(
+                            in_span[0], in_span[-1], u_start, u_end, s_col, e_col, span_idx
+                        ):
+                            return _TreeSourceMatch.MATCH
+                        matched_structurally_with_bad_cols = True
+                    elif (
+                        (
+                            cand.header_kind is None
+                            or _clause_parent_matches_spec(
+                                node, attr_name, in_span, cand, parent_map
+                            )
+                        )
+                        and (has_explicit_cols or (u_start == u_end and len(span_dumps) > 1))
                         and len(target_dumps) <= len(span_dumps)
                     ):
                         k = len(target_dumps)
-                        if any(
-                            span_dumps[i : i + k] == target_dumps
-                            for i in range(len(span_dumps) - k + 1)
-                        ):
-                            return True
+                        for idx in range(len(span_dumps) - k + 1):
+                            if span_dumps[idx : idx + k] == target_dumps and (
+                                cand.header_kind != "elif_node"
+                                or _clause_parent_matches_spec(
+                                    node,
+                                    attr_name,
+                                    in_span[idx : idx + k],
+                                    cand,
+                                    parent_map,
+                                )
+                            ):
+                                if _matched_ast_cols_compatible(
+                                    in_span[idx],
+                                    in_span[idx + k - 1],
+                                    u_start,
+                                    u_end,
+                                    s_col,
+                                    e_col,
+                                    span_idx,
+                                ):
+                                    return _TreeSourceMatch.MATCH
+                                matched_structurally_with_bad_cols = True
     dedented = dedent_source_text(src_code).strip()
     if dedented and (is_inline_expr_kind or has_explicit_cols or not src_dumps):
         try:
-            with _suppress_syntax_warnings():
-                expr_node = ast.parse(dedented, mode="eval").body
+            expr_node = ast.parse(dedented, mode="eval").body
             expr_dump = ast.dump(expr_node, include_attributes=False)
+            paren_slack = _extra_outer_paren_slack(dedented)
             for node, entry_start in end_nodes:
                 if (
                     isinstance(node, ast.expr)
                     and entry_start == u_start
                     and span_idx.get_dump(node) == expr_dump
                 ):
-                    return True
+                    if _matched_ast_cols_compatible(
+                        node,
+                        node,
+                        u_start,
+                        u_end,
+                        s_col,
+                        e_col,
+                        span_idx,
+                        paren_slack=paren_slack,
+                    ):
+                        return _TreeSourceMatch.MATCH
+                    matched_structurally_with_bad_cols = True
         except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
             pass
-    return False
+    return (
+        _TreeSourceMatch.INVALID_COLS
+        if matched_structurally_with_bad_cols
+        else _TreeSourceMatch.STALE
+    )
+
+
+def _unit_source_code_matches_tree(
+    unit: Dict[str, Any],
+    src_code: str,
+    file_tree: ast.AST,
+) -> bool:
+    """Checks whether unit['source_code'] matches ordered AST nodes and column bounds in file_tree."""
+    return (
+        _match_unit_source_code_with_tree(unit, src_code, file_tree)
+        is _TreeSourceMatch.MATCH
+    )
 
 
 def _is_single_line_col_span(
@@ -2001,11 +2437,36 @@ def _is_single_line_col_span(
     return True
 
 
+_LEGACY_SUBROUTINE_OR_EXPR_KINDS: FrozenSet[str] = frozenset(
+    {
+        "subroutine",
+        "basic_block",
+        "linear_block",
+        "stmt_seq",
+        "statement",
+        "closure",
+        "comprehension",
+        "complex_expr",
+    }
+)
+
+
+def _is_subroutine_or_nested_expr_unit(
+    unit: Dict[str, Any],
+    source_text: Optional[str] = None,
+    tree: Optional[ast.AST] = None,
+) -> bool:
+    """Returns True if unit is a subroutine or nested expression requiring closure context."""
+    return (
+        is_subroutine_unit(unit, source_text=source_text, tree=tree)
+        or str(unit.get("kind") or "") in _LEGACY_SUBROUTINE_OR_EXPR_KINDS
+    )
+
+
 def _has_out_of_bounds_unit_cols(
     unit: Dict[str, Any],
     unit_code_lines: Sequence[str],
     *,
-    is_pre_sliced: bool,
     is_placeholder_origin: bool,
     explicit_col_sliced: bool,
 ) -> bool:
@@ -2016,7 +2477,9 @@ def _has_out_of_bounds_unit_cols(
     raw_e_col = _extract_slice_col_offset(
         unit, ("end_col", "end_col_offset"), default=None
     )
-    if raw_s_col == -1 or raw_e_col == -1:
+    if (raw_s_col is not None and raw_s_col < 0) or (
+        raw_e_col is not None and raw_e_col < 0
+    ):
         return True
     if raw_s_col is None and raw_e_col is None:
         return False
@@ -2037,13 +2500,21 @@ def _has_out_of_bounds_unit_cols(
         else raw_s_col == 0
     )
     e_in_bounds = raw_e_col is None or (0 <= raw_e_col <= last_b)
-    if s_in_bounds and e_in_bounds:
-        return False
-    del is_pre_sliced
-    return True
+    return not (s_in_bounds and e_in_bounds)
 
 
 def _inspect_unit_scope(
+    unit: Dict[str, Any],
+    repo_root: Optional[str] = None,
+    file_tree: Optional[ast.AST] = None,
+) -> Dict[str, Any]:
+    with scope_fingerprint_verification_session():
+        return _inspect_unit_scope_impl(
+            unit, repo_root=repo_root, file_tree=file_tree
+        )
+
+
+def _inspect_unit_scope_impl(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
     file_tree: Optional[ast.AST] = None,
@@ -2060,13 +2531,11 @@ def _inspect_unit_scope(
     unit_code_lines, line_origin = extract_unit_source_lines_with_state(
         unit, repo_root=repo_root
     )
-    is_pre_sliced = line_origin.is_pre_sliced
     is_placeholder_origin = line_origin.is_placeholder
     explicit_col_sliced = bool(unit.get("source_lines_is_col_sliced"))
     col_bounds_invalid = _has_out_of_bounds_unit_cols(
         unit,
         unit_code_lines,
-        is_pre_sliced=is_pre_sliced,
         is_placeholder_origin=is_placeholder_origin,
         explicit_col_sliced=explicit_col_sliced,
     )
@@ -2078,29 +2547,53 @@ def _inspect_unit_scope(
     is_placeholder_source = not src_code_str and (
         is_placeholder_origin or not unit_code_lines
     )
-    inferred_s_col, inferred_e_col = _unit_cols(
-        unit, None if is_placeholder_origin else unit_code_lines
+    resolved_cols = resolve_unit_inferred_col_bounds(
+        unit,
+        repo_root=repo_root,
+        unit_code_lines=unit_code_lines,
+        is_placeholder_origin=is_placeholder_origin,
+        explicit_col_sliced=explicit_col_sliced,
+        expr_only=False,
     )
-    slice_unit = (
-        {**unit, "start_col": inferred_s_col, "end_col": inferred_e_col}
-        if inferred_s_col is not None or inferred_e_col is not None
-        else unit
+    slice_unit = resolved_cols.unit
+    inferred_s_col, inferred_e_col = (
+        resolved_cols.start_col,
+        resolved_cols.end_col,
     )
-    raw_lines = (
-        []
-        if col_bounds_invalid
-        else (
-            split_source_lines(str(unit["source_code"]))
-            if is_placeholder_origin and src_code_str
-            else _slice_unit_token_lines(
-                slice_unit,
-                unit_code_lines,
-                is_pre_sliced=is_pre_sliced,
-                explicit_col_sliced=explicit_col_sliced,
-            )
+    raw_lines_col_sliced = False
+    sliced_raw: Optional[List[str]]
+    if col_bounds_invalid:
+        sliced_raw = []
+    elif is_placeholder_origin and src_code_str:
+        sliced_raw = split_source_lines(str(unit["source_code"]))
+    else:
+        sliced_raw = _slice_unit_token_lines(
+            slice_unit,
+            unit_code_lines,
+            explicit_col_sliced=explicit_col_sliced,
         )
+        if sliced_raw is not None and (
+            explicit_col_sliced
+            or unit.get("kind") in ("comprehension", "complex_expr")
+        ):
+            raw_lines_col_sliced = True
+    if sliced_raw is None:
+        col_bounds_invalid = True
+        raw_lines = []
+    else:
+        raw_lines = sliced_raw
+    has_nonempty_unit_lines = bool(
+        unit_code_lines and any(ln.strip() for ln in unit_code_lines)
     )
-    if not is_placeholder_origin and unit_code_lines and not raw_lines:
+    has_explicit_col_bounds = inferred_s_col is not None or inferred_e_col is not None
+    if not is_placeholder_origin and unit_code_lines and (
+        not raw_lines
+        or (
+            has_explicit_col_bounds
+            and has_nonempty_unit_lines
+            and not "".join(raw_lines).strip()
+        )
+    ):
         col_bounds_invalid = True
     if (
         not is_placeholder_origin
@@ -2124,6 +2617,7 @@ def _inspect_unit_scope(
                 or sliced_stmt.lstrip().startswith(("lambda", "(lambda"))
             ):
                 raw_lines = [sliced_stmt]
+                raw_lines_col_sliced = True
         elif len(raw_lines) > 1 and (
             ";" in raw_lines[0] or ";" in raw_lines[-1]
         ):
@@ -2141,6 +2635,7 @@ def _inspect_unit_scope(
                 raw_lines[0] = lead_ws + _slice_utf8_line(
                     raw_lines[0], inferred_s_col, None
                 ).lstrip(" \t")
+                raw_lines_col_sliced = True
             if (
                 inferred_e_col is not None
                 and 0
@@ -2151,6 +2646,7 @@ def _inspect_unit_scope(
                 raw_lines[-1] = _slice_utf8_line(
                     raw_lines[-1], 0, inferred_e_col
                 )
+                raw_lines_col_sliced = True
     # Stale-source check: when both a backing module (file_tree or _get_full_source())
     # and an embedded unit["source_code"] are present, verify that source_code matches
     # the module lines at (start, end, start_col, end_col). When no backing module is
@@ -2159,11 +2655,17 @@ def _inspect_unit_scope(
     stale_source_code_mismatch = False
     if col_bounds_invalid:
         pass
-    elif is_placeholder_origin and src_code_str:
-        if file_tree is not None and not _unit_source_code_matches_tree(
-            unit, str(unit["source_code"]), file_tree
-        ):
-            stale_source_code_mismatch = True
+    elif is_placeholder_origin and file_tree is not None:
+        if src_code_str:
+            tree_match = _match_unit_source_code_with_tree(
+                unit, str(unit["source_code"]), file_tree
+            )
+            if tree_match is _TreeSourceMatch.INVALID_COLS:
+                col_bounds_invalid = True
+            elif tree_match is _TreeSourceMatch.STALE:
+                stale_source_code_mismatch = True
+        elif _placeholder_tree_cols_out_of_bounds(unit, file_tree):
+            col_bounds_invalid = True
     elif (
         src_code_str
         and dedent_source_text("".join(raw_lines)).strip()
@@ -2186,8 +2688,10 @@ def _inspect_unit_scope(
         )
         candidate_line_windows: List[Sequence[str]] = [raw_lines]
         if (
-            inferred_s_col is not None or inferred_e_col is not None
-        ) and raw_lines:
+            not raw_lines_col_sliced
+            and (inferred_s_col is not None or inferred_e_col is not None)
+            and raw_lines
+        ):
             col_sliced = list(raw_lines)
             first_b_len = len(col_sliced[0].rstrip("\r\n").encode("utf-8"))
             if len(col_sliced) == 1:
@@ -2233,49 +2737,19 @@ def _inspect_unit_scope(
             unit.get("non_suppressing_ctx_managers")
         )
     )
-    empty_res: Dict[str, Any] = {
-        "inputs": [],
-        "outputs": [],
-        "stores": [],
-        "free_vars": [],
-        "nonlocals": [],
-        "globals": [],
-        "attrs_read": [],
-        "attrs_written": [],
-        "param_details": [],
-        "return_type": None,
-        "control_flow_hazards": [],
-        "closure_hazard_reasons": [],
-        "is_control_flow_safe": True,
-        "has_yield": False,
-        "has_yield_assignment": False,
-        "has_try_or_with": False,
-        "has_return": False,
-        "has_return_value": False,
-        "has_super": False,
-        "has_mangled_names": False,
-        "local_imports": [],
-        "yield_expr_names": [],
-        "is_async": False,
-        "conditional_outputs": [],
-        "definite_stores": [],
-        "has_instance_binding": False,
-        "has_class_binding": False,
-        "binding_kind": None,
-        "has_receiver_access": False,
-        "instance_attrs": [],
-        "class_attrs": [],
-        "outputs_ambiguous": False,
-        "type_params": [],
-        "type_param_free_vars": [],
-        "has_class_scoped_type_params": False,
-        "deleted_names": [],
-        "scope_schema_version": SCOPE_SCHEMA_VERSION,
-        "skip_pre_unit_closures": skip_pre_unit_closures_flag,
-        "strict_with_suppression": strict_with_flag,
-        "non_suppressing_ctx_managers": sorted(extra_non_sup),
-        "heuristic_ctx_managers": [],
-    }
+    empty_res: Dict[str, Any] = _make_empty_scope_result(
+        skip_pre_unit_closures_flag,
+        strict_with_flag,
+        sorted(extra_non_sup),
+    )
+    if (
+        not col_bounds_invalid
+        and not is_placeholder_origin
+        and has_explicit_col_bounds
+        and has_nonempty_unit_lines
+        and not dedented.strip()
+    ):
+        col_bounds_invalid = True
     if col_bounds_invalid:
         return {
             **empty_res,
@@ -2289,24 +2763,9 @@ def _inspect_unit_scope(
             "is_control_flow_safe": False,
         }
     if is_placeholder_source:
-        unit_kind_str = str(unit.get("kind") or "")
         placeholder_hazards = (
             ["severed_closure_cell", "unavailable_source_placeholder"]
-            if (
-                bool(unit.get("is_subroutine"))
-                or unit_kind_str in _SUBROUTINE_KINDS
-                or unit_kind_str
-                in (
-                    "subroutine",
-                    "basic_block",
-                    "linear_block",
-                    "stmt_seq",
-                    "statement",
-                    "closure",
-                    "comprehension",
-                    "complex_expr",
-                )
-            )
+            if _is_subroutine_or_nested_expr_unit(unit)
             else ["unavailable_source_placeholder"]
         )
         return {
@@ -2375,8 +2834,7 @@ def _inspect_unit_scope(
     cand_text = dedented
     for cand_text, offset in parse_candidates:
         try:
-            with _suppress_syntax_warnings():
-                tree = ast.parse(cand_text)
+            tree = ast.parse(cand_text)
             loop_offset = offset
             if cand_text in (dedented, clause_dedented):
                 if isinstance(tree, ast.Module):
@@ -2658,12 +3116,41 @@ def _inspect_unit_scope(
             for st in candidate_stmts
             for n in ast.walk(st)
         ):
-            sup_fn = enclosing_chain[-1][2] if enclosing_chain else mod_tree
+            unit_fn_node: Optional[ast.AST] = None
+            if not is_subroutine:
+                enclosing_set = {f for _, _, f in enclosing_chain}
+                best_span: Optional[int] = None
+                for earliest_start, n_end, span_sz, sc_node in _get_tree_scope_intervals(
+                    mod_tree, source_lines=full_mod_lines
+                ):
+                    if not (
+                        sc_node not in enclosing_set
+                        and isinstance(sc_node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and earliest_start <= u_start <= getattr(sc_node, "lineno", u_start)
+                        and n_end == u_end
+                    ):
+                        continue
+                    if (
+                        resolved_s_col is not None
+                        and not getattr(sc_node, "decorator_list", None)
+                        and getattr(sc_node, "lineno", None) == u_start
+                        and getattr(sc_node, "col_offset", resolved_s_col) != resolved_s_col
+                    ):
+                        continue
+                    if best_span is None or span_sz < best_span:
+                        unit_fn_node = sc_node
+                        best_span = span_sz
+            if unit_fn_node is not None:
+                sup_fn = unit_fn_node
+                sup_enclosing_scopes = [f for _, _, f in enclosing_chain]
+            else:
+                sup_fn = enclosing_chain[-1][2] if enclosing_chain else mod_tree
+                sup_enclosing_scopes = [f for _, _, f in enclosing_chain[:-1]]
             sup_scope_ctx = (
                 _get_fn_scope_context(
                     sup_fn,
                     mod_tree=mod_tree,
-                    enclosing_scopes=[f for _, _, f in enclosing_chain[:-1]],
+                    enclosing_scopes=sup_enclosing_scopes,
                 )
                 if isinstance(sup_fn, (ast.FunctionDef, ast.AsyncFunctionDef))
                 else None
@@ -2676,12 +3163,11 @@ def _inspect_unit_scope(
                 extra_non_suppressing_ctx_managers=extra_non_sup,
                 strict_with_suppression=strict_with_flag,
             )
-        if "open" in visitor.params:
-            initial_sup_prov = initial_sup_prov.with_shadowed_builtins(
-                ("open",)
-            )
+        for p_name in set(visitor.params) | visitor.type_param_names:
+            initial_sup_prov = initial_sup_prov.clear_name(p_name)
         unit_heuristic_mgrs: Set[str] = set()
-        with collect_heuristic_ctx_managers() as block_heur_mgrs:
+        unit_wildcard_mgrs: Set[Tuple[str, str]] = set()
+        with collect_heuristic_ctx_managers() as block_heur_mgrs, collect_wildcard_ctx_managers() as block_wc_mgrs:
             def_assigned, cond_assigned = _analyze_block_assignment(
                 candidate_stmts,
                 may_deleted=may_deleted,
@@ -2691,6 +3177,7 @@ def _inspect_unit_scope(
                 strict_with_suppression=strict_with_flag,
             )
         unit_heuristic_mgrs.update(block_heur_mgrs)
+        unit_wildcard_mgrs.update(block_wc_mgrs)
         for del_name in sorted(live_in_deleted):
             if (
                 del_name not in visitor.params
@@ -2760,7 +3247,7 @@ def _inspect_unit_scope(
                             ast.ClassDef,
                         )
                         enc_escaping = enc_nonlocals | enc_outer_globals
-                        with collect_heuristic_ctx_managers() as pre_heur_mgrs:
+                        with collect_heuristic_ctx_managers() as pre_heur_mgrs, collect_wildcard_ctx_managers() as pre_wc_mgrs:
                             def_pre_bound = (
                                 _find_enclosing_chain_definite_pre_bound(
                                     enclosing_chain,
@@ -2774,6 +3261,7 @@ def _inspect_unit_scope(
                                 )
                             )
                         unit_heuristic_mgrs.update(pre_heur_mgrs)
+                        unit_wildcard_mgrs.update(pre_wc_mgrs)
                         write_only_cond_cands = {
                             v
                             for v in cond_escaping_cands
@@ -2786,8 +3274,8 @@ def _inspect_unit_scope(
                         live_write_only_cond: Set[str] = set()
                         if write_only_cond_cands:
                             pre_outs_decl = resolve_unit_declared_outputs(unit)
-                            if isinstance(
-                                pre_outs_decl, (list, tuple, set, frozenset)
+                            if is_non_string_sequence(pre_outs_decl) or isinstance(
+                                pre_outs_decl, AbstractSet
                             ):
                                 live_write_only_cond = (
                                     write_only_cond_cands & set(pre_outs_decl)
@@ -2980,7 +3468,7 @@ def _inspect_unit_scope(
 
         if is_subroutine and is_non_string_sequence(pre_outs):
             outputs = list(dict.fromkeys(pre_outs))
-        elif is_subroutine and isinstance(pre_outs, (set, frozenset)):
+        elif is_subroutine and isinstance(pre_outs, AbstractSet):
             if len(pre_outs) > 1:
                 logger.debug(
                     "Rejecting set-valued outputs (%s): unordered set cannot establish "
@@ -3064,7 +3552,7 @@ def _inspect_unit_scope(
         ):
             if u_start > 0 and mod_tree is not None:
                 if "severed_closure_cell" not in hazards:
-                    with collect_heuristic_ctx_managers() as cell_heur_mgrs:
+                    with collect_heuristic_ctx_managers() as cell_heur_mgrs, collect_wildcard_ctx_managers() as cell_wc_mgrs:
                         hazard_res = _evaluate_severed_closure_cell_hazard(
                             _UnitClosureHazardContext(
                                 candidate_stmts=candidate_stmts,
@@ -3094,6 +3582,7 @@ def _inspect_unit_scope(
                             )
                         )
                     unit_heuristic_mgrs.update(cell_heur_mgrs)
+                    unit_wildcard_mgrs.update(cell_wc_mgrs)
                     if hazard_res.has_hazard:
                         hazards.append("severed_closure_cell")
                         for r in hazard_res.reasons:
@@ -3218,6 +3707,7 @@ def _inspect_unit_scope(
             "strict_with_suppression": strict_with_flag,
             "non_suppressing_ctx_managers": sorted(extra_non_sup),
             "heuristic_ctx_managers": sorted(unit_heuristic_mgrs),
+            "wildcard_ctx_managers": sorted(unit_wildcard_mgrs),
         }
     except (RecursionError, MemoryError):
         return {
@@ -3360,6 +3850,58 @@ def scope_matches_closure_mode(
     return True
 
 
+def _make_empty_scope_result(
+    skip_pre_unit_closures_flag: bool,
+    strict_with_flag: bool,
+    non_suppressing_ctx_managers: Sequence[str],
+) -> Dict[str, Any]:
+    """Returns a complete baseline scope analysis dictionary populated with empty defaults."""
+    return {
+        "inputs": [],
+        "outputs": [],
+        "stores": [],
+        "free_vars": [],
+        "nonlocals": [],
+        "globals": [],
+        "attrs_read": [],
+        "attrs_written": [],
+        "param_details": [],
+        "return_type": None,
+        "control_flow_hazards": [],
+        "closure_hazard_reasons": [],
+        "is_control_flow_safe": True,
+        "has_yield": False,
+        "has_yield_assignment": False,
+        "has_try_or_with": False,
+        "has_return": False,
+        "has_return_value": False,
+        "has_super": False,
+        "has_mangled_names": False,
+        "local_imports": [],
+        "yield_expr_names": [],
+        "is_async": False,
+        "conditional_outputs": [],
+        "definite_stores": [],
+        "has_instance_binding": False,
+        "has_class_binding": False,
+        "binding_kind": None,
+        "has_receiver_access": False,
+        "instance_attrs": [],
+        "class_attrs": [],
+        "outputs_ambiguous": False,
+        "type_params": [],
+        "type_param_free_vars": [],
+        "has_class_scoped_type_params": False,
+        "deleted_names": [],
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
+        "skip_pre_unit_closures": skip_pre_unit_closures_flag,
+        "strict_with_suppression": strict_with_flag,
+        "non_suppressing_ctx_managers": list(non_suppressing_ctx_managers),
+        "heuristic_ctx_managers": [],
+        "wildcard_ctx_managers": [],
+    }
+
+
 def ensure_unit_scope_closure_mode(
     unit: Dict[str, Any],
     scope: Optional[Dict[str, Any]],
@@ -3380,11 +3922,15 @@ def ensure_unit_scope_closure_mode(
     the backing module source/AST, or fail closed when backing source is unavailable.
 
     Note:
-        Scopes that already record terminal ``"pathological_ast"``,
-        ``"stale_source_code"``, or ``"invalid_unit_columns"`` in
-        ``control_flow_hazards`` are returned directly without re-parsing or mutating
-        the terminal hazard dict, as they are unconditionally rejected downstream
-        regardless of closure mode. When a caller-supplied ``scope`` (or
+        Scopes that record terminal ``"pathological_ast"``, ``"stale_source_code"``, or
+        ``"invalid_unit_columns"`` in ``control_flow_hazards`` alongside
+        ``is_control_flow_safe=False`` are returned directly without re-parsing or
+        mutating the terminal hazard dict, as they are unconditionally rejected
+        downstream regardless of closure mode. Caller-supplied scopes stamped with
+        matching ``scope_schema_version`` and closure configuration flags are also
+        returned directly without re-running source validation (such as
+        ``stale_source_code``, ``invalid_unit_columns``, or
+        ``unavailable_source_placeholder`` checks). When a caller-supplied ``scope`` (or
         ``unit["scope"]``) is discarded due to a missing schema stamp or mode mismatch,
         a once-per-run ``WARNING`` is emitted.
     """
@@ -3411,15 +3957,24 @@ def ensure_unit_scope_closure_mode(
             strict_with_suppression=eff_strict_with,
             non_suppressing_ctx_managers=eff_non_sup,
         )
-        or any(
-            h in eff_scope.get("control_flow_hazards", ())
-            for h in (
-                "pathological_ast",
-                "stale_source_code",
-                "invalid_unit_columns",
+        or (
+            eff_scope.get("is_control_flow_safe") is False
+            and any(
+                h in eff_scope.get("control_flow_hazards", ())
+                for h in (
+                    "pathological_ast",
+                    "stale_source_code",
+                    "invalid_unit_columns",
+                )
             )
         )
     ):
+        if not eff_strict_with:
+            for mgr_name in eff_scope.get("heuristic_ctx_managers", ()):
+                record_heuristic_non_suppressing_ctx_manager(str(mgr_name))
+        for wc_item in eff_scope.get("wildcard_ctx_managers", ()):
+            if isinstance(wc_item, (list, tuple)) and len(wc_item) == 2:
+                record_wildcard_ctx_manager_match(str(wc_item[0]), str(wc_item[1]))
         return eff_scope
     u_copy = {
         **unit,
@@ -3433,33 +3988,12 @@ def ensure_unit_scope_closure_mode(
     if source_text is not None and not str(u_copy.get("source_text") or "").strip():
         u_copy["source_text"] = source_text
     if eff_scope is not None:
-        if should_warn_closure_event("precomputed_scope_discarded"):
-            discard_reason = (
-                f"missing scope_schema_version={SCOPE_SCHEMA_VERSION}"
-                if eff_scope.get("scope_schema_version") != SCOPE_SCHEMA_VERSION
-                else "closure mode or allowlist mismatch"
-            )
-            logger.warning(
-                "Discarding caller-supplied precomputed scope (%s) and recomputing "
-                "from source (further occurrences suppressed for this run)",
-                discard_reason,
-            )
         src_text_val = u_copy.get("source_text")
         file_src_val = u_copy.get("file_source")
         src_code_val = u_copy.get("source_code")
         src_lines_val = u_copy.get("source_lines")
-        needs_enclosing_module = bool(u_copy.get("is_subroutine")) or str(
-            u_copy.get("kind") or ""
-        ) in (
-            *_SUBROUTINE_KINDS,
-            "subroutine",
-            "basic_block",
-            "linear_block",
-            "stmt_seq",
-            "statement",
-            "closure",
-            "comprehension",
-            "complex_expr",
+        needs_enclosing_module = _is_subroutine_or_nested_expr_unit(
+            u_copy, source_text=source_text, tree=tree
         )
         has_full_module_source = (
             tree is not None
@@ -3488,6 +4022,23 @@ def ensure_unit_scope_closure_mode(
             has_snippet_source
             and (not needs_enclosing_module or bool(u_copy.get("allow_snippet_only")))
         )
+        if should_warn_closure_event("precomputed_scope_discarded"):
+            discard_reason = (
+                f"missing scope_schema_version={SCOPE_SCHEMA_VERSION}"
+                if eff_scope.get("scope_schema_version") != SCOPE_SCHEMA_VERSION
+                else "closure mode or allowlist mismatch"
+            )
+            action_msg = (
+                "recomputing from source"
+                if has_unit_source
+                else "failing closed because backing source is unavailable"
+            )
+            logger.warning(
+                "Discarding caller-supplied precomputed scope (%s) and %s "
+                "(further occurrences suppressed for this run)",
+                discard_reason,
+                action_msg,
+            )
         if not has_unit_source:
             logger.debug(
                 "Precomputed scope for unit %r does not match active closure mode "
@@ -3503,6 +4054,7 @@ def ensure_unit_scope_closure_mode(
             if "unavailable_source_for_closure_mode" not in reasons:
                 reasons.append("unavailable_source_for_closure_mode")
             return {
+                **_make_empty_scope_result(eff_skip, eff_strict_with, eff_non_sup),
                 **eff_scope,
                 "control_flow_hazards": hazards,
                 "closure_hazard_reasons": reasons,
@@ -3514,6 +4066,11 @@ def ensure_unit_scope_closure_mode(
                 "heuristic_ctx_managers": list(
                     eff_scope.get("heuristic_ctx_managers", ())
                 ),
+                "wildcard_ctx_managers": [
+                    tuple(item)
+                    for item in eff_scope.get("wildcard_ctx_managers", ())
+                    if isinstance(item, (list, tuple)) and len(item) == 2
+                ],
             }
         logger.debug(
             "Recomputing precomputed scope for unit %r to match active closure mode",
@@ -3557,24 +4114,25 @@ def analyze_unit_variable_scope(
         )
         eff_skip = pair_flags.effective_skip_pre_unit_closures
         eff_strict_with = pair_flags.effective_strict_with_suppression
-        info1 = ensure_unit_scope_closure_mode(
-            u1,
-            scope1,
-            eff_skip,
-            strict_with_suppression=eff_strict_with,
-            non_suppressing_ctx_managers=pair_flags.unit1.non_suppressing_ctx_managers,
-            repo_root=repo_root,
-            tree=tree1,
-        )
-        info2 = ensure_unit_scope_closure_mode(
-            u2,
-            scope2,
-            eff_skip,
-            strict_with_suppression=eff_strict_with,
-            non_suppressing_ctx_managers=pair_flags.unit2.non_suppressing_ctx_managers,
-            repo_root=repo_root,
-            tree=tree2,
-        )
+        with scope_fingerprint_verification_session():
+            info1 = ensure_unit_scope_closure_mode(
+                u1,
+                scope1,
+                eff_skip,
+                strict_with_suppression=eff_strict_with,
+                non_suppressing_ctx_managers=pair_flags.unit1.non_suppressing_ctx_managers,
+                repo_root=repo_root,
+                tree=tree1,
+            )
+            info2 = ensure_unit_scope_closure_mode(
+                u2,
+                scope2,
+                eff_skip,
+                strict_with_suppression=eff_strict_with,
+                non_suppressing_ctx_managers=pair_flags.unit2.non_suppressing_ctx_managers,
+                repo_root=repo_root,
+                tree=tree2,
+            )
         inputs = _align_symmetric_var_list(info1["inputs"], info2["inputs"])
         outputs = _align_symmetric_var_list(info1["outputs"], info2["outputs"])
         free_vars = list(dict.fromkeys(info1["free_vars"] + info2["free_vars"]))
@@ -3800,6 +4358,22 @@ def analyze_unit_variable_scope(
             set(info1.get("heuristic_ctx_managers", ()))
             | (
                 set(info2.get("heuristic_ctx_managers", ()))
+                if u2 is not None
+                else set()
+            )
+        ),
+        "wildcard_ctx_managers": sorted(
+            {
+                (str(item[0]), str(item[1]))
+                for item in info1.get("wildcard_ctx_managers", ())
+                if isinstance(item, (list, tuple)) and len(item) == 2
+            }
+            | (
+                {
+                    (str(item[0]), str(item[1]))
+                    for item in info2.get("wildcard_ctx_managers", ())
+                    if isinstance(item, (list, tuple)) and len(item) == 2
+                }
                 if u2 is not None
                 else set()
             )

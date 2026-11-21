@@ -311,12 +311,14 @@ def test_unit_column_bounds_resolution_and_lexical_scope_barriers() -> None:
 
 def test_utf8_byte_offsets_and_closure_strictness_mode_transitions() -> None:
     """Covers UTF-8 byte offsets with CRLF and closure-strictness mode transitions."""
-    from pydoppelgangerhunt.fixer import _slice_unit_token_lines
     from pydoppelgangerhunt.fixer.scope import (
         ensure_unit_scope_closure_mode,
         scope_matches_closure_mode,
     )
-    from pydoppelgangerhunt.fixer.source import _slice_utf8_line
+    from pydoppelgangerhunt.fixer.source import (
+        _slice_unit_token_lines,
+        _slice_utf8_line,
+    )
 
     line_accent = '    result = "é" + value\r\n'
     line_cjk = '    result = "界" + value\r\n'
@@ -927,7 +929,8 @@ def test_unmarked_and_mismatched_scope_recomputation_across_modes(
         closure_strictness="lenient",
         return_details=True,
     )
-    assert res_gen_lenient.outputs is not None
+    assert res_gen_lenient.outputs == ([], [])
+    assert res_gen_lenient.skip_reason is None
     unmarked_comb_strict = analyze_unit_variable_scope(u_g1, u_g2, repo_root=str(tmp_path))
     unmarked_comb_strict.pop("skip_pre_unit_closures", None)
     synth_from_unmarked_strict = synthesize_shared_helper_code(
@@ -989,7 +992,7 @@ def test_slice_unit_token_lines_multiline_end_col_truncation() -> None:
     assert _slice_unit_token_lines(
         {"kind": "comprehension", "start_col": 24, "end_col": 5},
         ["[\n", "        x * 2 for x in items\n", "    ] + [99]\n"],
-    ) == []
+    ) is None
     assert _slice_unit_token_lines(
         {"kind": "comprehension", "start_col": 12, "end_col": 5},
         ["    result = [\n", "        x * 2 for x in items\n", "    ] + [99]\n"],
@@ -1226,7 +1229,7 @@ def test_closure_factory_scope_precision_and_cyclic_alias_propagation() -> None:
 def test_except_handler_deletion_and_concurrent_async_generator_suspension() -> None:
     """Verifies exception-handler implicit deletion and concurrent closure/suspension analysis for coroutines and generators."""
     import sys  # pylint: disable=import-outside-toplevel
-    from pydoppelgangerhunt.fixer import (
+    from pydoppelgangerhunt.fixer._df_closures import (
         _is_irrefutable_case,
         _is_irrefutable_pattern,
     )
@@ -1365,132 +1368,72 @@ def test_except_handler_deletion_and_concurrent_async_generator_suspension() -> 
     assert "severed_closure_cell" in sc_multi_gen["control_flow_hazards"]
 
 
-def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closures() -> None:
-    """Covers intra-unit global escapes, detached unit enclosing local shadowing, and suspended units with local closures."""
-    from pydoppelgangerhunt.fixer._df_cell_carriers import (
-        _collect_unit_nonlocal_mutators,
-    )
-    from pydoppelgangerhunt.fixer._df_closures import (
-        _collect_scope_closures_uncached,
-        _extract_scope_local_names,
+@pytest.mark.parametrize(
+    ("source", "start", "end", "source_code", "expect_hazard", "check_helper_fn"),
+    [
+        pytest.param(
+            "x = 0\ndef process():\n    global x\n    x = 1\n    x = 2\n    return x\n",
+            3, 4, "global x\nx = 1\n", True, True, id="escaped_global_assign",
+        ),
+        pytest.param(
+            "x = 0\ndef process():\n    a = 1\n    global x\n    y = x + a\n    x = 2\n    return x, y\n",
+            4, 5, "global x\ny = x + a\n", True, False, id="pre_local_global_post_rw",
+        ),
+        pytest.param(
+            "x = 100\ndef outer():\n    x = 5\n    def middle():\n        global x\n"
+            "        y = 1\n        return x + y\n    return middle\n",
+            5, 6, "global x\ny = 1\n", True, False, id="enclosing_cell_shadowed_by_global_loss",
+        ),
+        pytest.param(
+            "x = 0\ndef process(a):\n    global x\n    x = a + 1\n    res = a * 2\n    return res\n",
+            3, 4, "global x\nx = a + 1\n", False, False, id="self_contained_global_safe",
+        ),
+        pytest.param(
+            "x = 10\ndef process(a):\n    global x\n    global x\n    y = x + a\n    x = 20\n    return y\n",
+            4, 5, "global x\ny = x + a\n", False, False, id="outer_redundant_global_read_safe",
+        ),
+    ],
+)
+def test_intra_unit_global_escape_classification(
+    source: str,
+    start: int,
+    end: int,
+    source_code: str,
+    expect_hazard: bool,
+    check_helper_fn: bool,
+) -> None:
+    """Covers intra-unit global declarations escaping vs self-contained or outer-shared globals."""
+    from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=import-outside-toplevel
         _has_escaped_intra_unit_global_declarations,
-    )
-    from pydoppelgangerhunt.fixer.scope import (
-        SCOPE_SCHEMA_VERSION,
-        _analyze_block_assignment,
-        ensure_unit_scope_closure_mode,
-    )
-    from pydoppelgangerhunt.fixer.source import (
-        _slice_unit_token_lines,
-        _slice_utf8_line,
     )
 
     clear_dataflow_cache()
+    tree = ast.parse(source)
+    if check_helper_fn:
+        assert _has_escaped_intra_unit_global_declarations(tree.body[1], start, end) is True
+    sc = inspect_single_unit_scope(
+        {"start": start, "end": end, "kind": "basic_block", "source_text": source, "source_code": source_code},
+        tree=tree,
+    )
+    if expect_hazard:
+        assert "severed_closure_cell" in sc["control_flow_hazards"]
+        if check_helper_fn:
+            assert sc["is_control_flow_safe"] is False
+    else:
+        assert "severed_closure_cell" not in sc["control_flow_hazards"]
 
-    # Global declarations inside extracted unit escaping to outer statements
-    global_escape_assign_src = (
-        "x = 0\n" "def process():\n" "    global x\n" "    x = 1\n" "    x = 2\n" "    return x\n"
-    )
-    ge_tree = ast.parse(global_escape_assign_src)
-    assert _has_escaped_intra_unit_global_declarations(ge_tree.body[1], 3, 4) is True
-    sc_global_escape = inspect_single_unit_scope(
-        {
-            "start": 3,
-            "end": 4,
-            "kind": "basic_block",
-            "source_text": global_escape_assign_src,
-            "source_code": "global x\nx = 1\n",
-        },
-        tree=ge_tree,
-    )
-    assert "severed_closure_cell" in sc_global_escape["control_flow_hazards"]
-    assert sc_global_escape["is_control_flow_safe"] is False
 
-    # Pre-unit statement + in-unit global + post-unit write/read -> escaping global hazard
-    global_escape_pre_local_src = (
-        "x = 0\n"
-        "def process():\n"
-        "    a = 1\n"
-        "    global x\n"
-        "    y = x + a\n"
-        "    x = 2\n"
-        "    return x, y\n"
+def test_detached_unit_shadowed_builtins_and_class_scope_isolation() -> None:
+    """Covers detached AST enclosing local shadowing and PEP 227 class-body vs method isolation."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (  # pylint: disable=import-outside-toplevel
+        _collect_unit_nonlocal_mutators,
     )
-    sc_global_pre = inspect_single_unit_scope(
-        {
-            "start": 4,
-            "end": 5,
-            "kind": "basic_block",
-            "source_text": global_escape_pre_local_src,
-            "source_code": "global x\ny = x + a\n",
-        }
+    from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=import-outside-toplevel
+        _collect_scope_closures_uncached,
+        _extract_scope_local_names,
     )
-    assert "severed_closure_cell" in sc_global_pre["control_flow_hazards"]
 
-    # Enclosing local `x = 0` shadowed if `def middle` loses `global x` when `return x` remains outside unit
-    global_escape_enclosing_cell_src = (
-        "x = 100\n"
-        "def outer():\n"
-        "    x = 5\n"
-        "    def middle():\n"
-        "        global x\n"
-        "        y = 1\n"
-        "        return x + y\n"
-        "    return middle\n"
-    )
-    sc_global_enc_cell = inspect_single_unit_scope(
-        {
-            "start": 5,
-            "end": 6,
-            "kind": "basic_block",
-            "source_text": global_escape_enclosing_cell_src,
-            "source_code": "global x\ny = 1\n",
-        }
-    )
-    assert "severed_closure_cell" in sc_global_enc_cell["control_flow_hazards"]
-
-    # Safe case 1: `global x` is ONLY used inside the extracted unit, never touched/read outside
-    global_self_contained_src = (
-        "x = 0\n"
-        "def process(a):\n"
-        "    global x\n"
-        "    x = a + 1\n"
-        "    res = a * 2\n"
-        "    return res\n"
-    )
-    sc_global_self = inspect_single_unit_scope(
-        {
-            "start": 3,
-            "end": 4,
-            "kind": "basic_block",
-            "source_text": global_self_contained_src,
-            "source_code": "global x\nx = a + 1\n",
-        }
-    )
-    assert "severed_closure_cell" not in sc_global_self["control_flow_hazards"]
-
-    # Safe case 2: `global x` is also declared outside the unit (`outer_globals`), and unit only reads `x`
-    global_redundant_read_src = (
-        "x = 10\n"
-        "def process(a):\n"
-        "    global x\n"
-        "    global x\n"
-        "    y = x + a\n"
-        "    x = 20\n"
-        "    return y\n"
-    )
-    sc_global_redundant = inspect_single_unit_scope(
-        {
-            "start": 4,
-            "end": 5,
-            "kind": "basic_block",
-            "source_text": global_redundant_read_src,
-            "source_code": "global x\ny = x + a\n",
-        }
-    )
-    assert "severed_closure_cell" not in sc_global_redundant["control_flow_hazards"]
-
-    # Detached unit modules retain enclosing function locals for shadowed builtins
+    clear_dataflow_cache()
     detached_shadow_src = (
         "def outer(items, custom_list):\n"
         "    list = custom_list\n"
@@ -1505,25 +1448,18 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
     detached_mod = ast.Module(body=[ds_outer.body[2]], type_ignores=[])
     assert "list" in _extract_scope_local_names(detached_mod, module_tree=ds_tree)
     detached_closures = _collect_scope_closures_uncached(
-        detached_mod,
-        module_tree=ds_tree,
-        genexp_include_header=False,
-        cache_parent_map=False,
+        detached_mod, module_tree=ds_tree, genexp_include_header=False, cache_parent_map=False
     )
     assert any("value" in reads for _, reads in detached_closures)
     sc_detached_shadow = inspect_single_unit_scope(
         {
-            "start": 4,
-            "end": 4,
-            "kind": "basic_block",
-            "source_text": detached_shadow_src,
-            "source_code": "seq = list(value + item for item in items)\n",
+            "start": 4, "end": 4, "kind": "basic_block",
+            "source_text": detached_shadow_src, "source_code": "seq = list(value + item for item in items)\n",
         },
         tree=ds_tree,
     )
     assert "severed_closure_cell" in sc_detached_shadow["control_flow_hazards"]
 
-    # Detached unit with walrus inside genexp passed to shadowed `list`
     detached_walrus_shadow_src = (
         "def outer(items, custom_list):\n"
         "    list = custom_list\n"
@@ -1534,22 +1470,16 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
     dw_tree = ast.parse(detached_walrus_shadow_src)
     dw_outer = dw_tree.body[0]
     assert isinstance(dw_outer, ast.FunctionDef)
-    dw_muts = _collect_unit_nonlocal_mutators([dw_outer.body[2]], mod_tree=dw_tree)
-    assert any("w" in m.mutated_vars for m in dw_muts)
+    assert any("w" in m.mutated_vars for m in _collect_unit_nonlocal_mutators([dw_outer.body[2]], mod_tree=dw_tree))
     sc_detached_walrus = inspect_single_unit_scope(
         {
-            "start": 4,
-            "end": 4,
-            "kind": "basic_block",
-            "source_text": detached_walrus_shadow_src,
-            "source_code": "seq = list((w := item) for item in items)\n",
+            "start": 4, "end": 4, "kind": "basic_block",
+            "source_text": detached_walrus_shadow_src, "source_code": "seq = list((w := item) for item in items)\n",
         },
         tree=dw_tree,
     )
     assert "severed_closure_cell" in sc_detached_walrus["control_flow_hazards"]
 
-    # PEP 227 class scope isolation: class-body `list = custom_list` applies directly inside ClassDef body,
-    # NOT inside a method `def m(self, items)`!
     cls_isolation_src = (
         "def outer(custom_list):\n"
         "    class Holder:\n"
@@ -1561,20 +1491,15 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
         "            return seq, value\n"
         "    return Holder\n"
     )
-    ci_tree = ast.parse(cls_isolation_src)
     sc_cls_method_safe = inspect_single_unit_scope(
         {
-            "start": 6,
-            "end": 6,
-            "kind": "basic_block",
-            "source_text": cls_isolation_src,
-            "source_code": "seq = list(value + item for item in items)\n",
+            "start": 6, "end": 6, "kind": "basic_block",
+            "source_text": cls_isolation_src, "source_code": "seq = list(value + item for item in items)\n",
         },
-        tree=ci_tree,
+        tree=ast.parse(cls_isolation_src),
     )
     assert "severed_closure_cell" not in sc_cls_method_safe["control_flow_hazards"]
 
-    # Directly inside ClassDef body (not inside a method), `list = custom_list` DOES shadow `list`
     cls_body_shadow_src = (
         "def outer(items, custom_list):\n"
         "    value = 1\n"
@@ -1584,20 +1509,19 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
         "    value = 2\n"
         "    return Holder\n"
     )
-    cbs_tree = ast.parse(cls_body_shadow_src)
     sc_cls_body_shadow = inspect_single_unit_scope(
         {
-            "start": 5,
-            "end": 5,
-            "kind": "basic_block",
-            "source_text": cls_body_shadow_src,
-            "source_code": "seq = list(value + item for item in items)\n",
+            "start": 5, "end": 5, "kind": "basic_block",
+            "source_text": cls_body_shadow_src, "source_code": "seq = list(value + item for item in items)\n",
         },
-        tree=cbs_tree,
+        tree=ast.parse(cls_body_shadow_src),
     )
     assert "severed_closure_cell" in sc_cls_body_shadow["control_flow_hazards"]
 
-    # Suspended units allow purely unit-local nonlocal mutators while rejecting escaping ones
+
+def test_suspended_unit_local_vs_escaping_nonlocal_mutators() -> None:
+    """Verifies suspended units permit purely unit-local nonlocal mutators while blocking escaping/outer ones."""
+    clear_dataflow_cache()
     suspended_local_closure_src = (
         "def worker_a(items):\n"
         "    for item in items:\n"
@@ -1606,21 +1530,10 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
         "            nonlocal value\n"
         "            value += 1\n"
         "        increment()\n"
-        "        yield value\n\n"
-        "def worker_b(items):\n"
-        "    for item in items:\n"
-        "        value = item\n"
-        "        def increment():\n"
-        "            nonlocal value\n"
-        "            value += 1\n"
-        "        increment()\n"
         "        yield value\n"
     )
-    slc_tree = ast.parse(suspended_local_closure_src)
     u_slc1 = {
-        "start": 2,
-        "end": 8,
-        "kind": "compound_block",
+        "start": 2, "end": 8, "kind": "compound_block",
         "source_text": suspended_local_closure_src,
         "source_code": (
             "for item in items:\n"
@@ -1632,34 +1545,16 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
             "    yield value\n"
         ),
     }
-    sc_slc1 = inspect_single_unit_scope(u_slc1, tree=slc_tree)
+    sc_slc1 = inspect_single_unit_scope(u_slc1, tree=ast.parse(suspended_local_closure_src))
     assert "severed_closure_cell" not in sc_slc1["control_flow_hazards"]
     assert sc_slc1["is_control_flow_safe"] is True
 
-    # Suspended unit where inner closure mutates a variable read after the unit IS rejected
-    suspended_escaping_var_src = (
-        "def worker(items):\n"
-        "    for item in items:\n"
-        "        value = item\n"
-        "        def increment():\n"
-        "            nonlocal value\n"
-        "            value += 1\n"
-        "        increment()\n"
-        "        yield value\n"
-        "    return value\n"
-    )
+    suspended_escaping_var_src = suspended_local_closure_src + "    return value\n"
     sc_susp_escape = inspect_single_unit_scope(
-        {
-            "start": 2,
-            "end": 8,
-            "kind": "compound_block",
-            "source_text": suspended_escaping_var_src,
-            "source_code": u_slc1["source_code"],
-        }
+        {"start": 2, "end": 8, "kind": "compound_block", "source_text": suspended_escaping_var_src, "source_code": u_slc1["source_code"]}
     )
     assert "severed_closure_cell" in sc_susp_escape["control_flow_hazards"]
 
-    # Suspended unit where inner closure mutates an outer-scope variable IS rejected
     suspended_outer_var_src = (
         "def worker(items):\n"
         "    total = 0\n"
@@ -1672,9 +1567,7 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
     )
     sc_susp_outer = inspect_single_unit_scope(
         {
-            "start": 3,
-            "end": 8,
-            "kind": "compound_block",
+            "start": 3, "end": 8, "kind": "compound_block",
             "source_text": suspended_outer_var_src,
             "source_code": (
                 "for item in items:\n"
@@ -1688,7 +1581,15 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
     )
     assert "severed_closure_cell" in sc_susp_outer["control_flow_hazards"]
 
-    # Minimal unmarked precomputed scopes are preserved in strict mode and recomputed when mode mismatches
+
+def test_ensure_unit_scope_closure_mode_schema_and_recompute() -> None:
+    """Verifies minimal unmarked precomputed scopes recompute unless stamped with the current schema version."""
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        SCOPE_SCHEMA_VERSION,
+        ensure_unit_scope_closure_mode,
+    )
+
+    clear_dataflow_cache()
     min_src = (
         "def outer(items):\n"
         "    cb = lambda: y\n"
@@ -1698,11 +1599,8 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
     )
     min_tree = ast.parse(min_src)
     min_unit = {
-        "start": 3,
-        "end": 4,
-        "kind": "compound_block",
-        "source_text": min_src,
-        "source_code": "for x in items:\n    y = x + 1\n",
+        "start": 3, "end": 4, "kind": "compound_block",
+        "source_text": min_src, "source_code": "for x in items:\n    y = x + 1\n",
     }
     minimal_unmarked_scope = {"inputs": ["items"], "outputs": ["y"]}
     marked_v2_min = {
@@ -1710,43 +1608,41 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
         "skip_pre_unit_closures": False,
         "scope_schema_version": SCOPE_SCHEMA_VERSION,
     }
-    assert (
-        ensure_unit_scope_closure_mode(min_unit, marked_v2_min, False, tree=min_tree)
-        is marked_v2_min
-    )
-    recomputed_unmarked_min = ensure_unit_scope_closure_mode(
-        min_unit, minimal_unmarked_scope, False, tree=min_tree
-    )
+    assert ensure_unit_scope_closure_mode(min_unit, marked_v2_min, False, tree=min_tree) is marked_v2_min
+    recomputed_unmarked_min = ensure_unit_scope_closure_mode(min_unit, minimal_unmarked_scope, False, tree=min_tree)
     assert recomputed_unmarked_min["scope_schema_version"] == SCOPE_SCHEMA_VERSION
     assert "severed_closure_cell" in recomputed_unmarked_min["control_flow_hazards"]
     recomputed_min = ensure_unit_scope_closure_mode(
-        min_unit,
-        {**minimal_unmarked_scope, "skip_pre_unit_closures": True},
-        False,
-        tree=min_tree,
+        min_unit, {**minimal_unmarked_scope, "skip_pre_unit_closures": True}, False, tree=min_tree
     )
     assert "skip_pre_unit_closures" in recomputed_min
     assert recomputed_min["skip_pre_unit_closures"] is False
     assert "severed_closure_cell" in recomputed_min["control_flow_hazards"]
 
-    # Exception-handler termination & unexported conditional rebinding
-    term_handler_stmts = ast.parse(
-        "e = 1\n" "try:\n" "    x = 2\n" "except Exception as e:\n" "    return 0\n"
-    ).body
+
+def test_exception_handler_termination_and_prebound_clobber() -> None:
+    """Verifies except-as termination, unexported conditional rebinding, and pre-bound clobber hazard."""
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        _analyze_block_assignment,
+    )
+
     def_th: set[str] = set()
     cond_th: set[str] = set()
-    _analyze_block_assignment(term_handler_stmts, def_th, cond_th)
-    assert "e" in def_th
-    assert "e" not in cond_th
+    _analyze_block_assignment(
+        ast.parse("e = 1\ntry:\n    x = 2\nexcept Exception as e:\n    return 0\n").body,
+        def_th,
+        cond_th,
+    )
+    assert "e" in def_th and "e" not in cond_th
 
-    nonterm_handler_stmts = ast.parse(
-        "e = 1\n" "try:\n" "    x = 2\n" "except Exception as e:\n" "    x = 0\n"
-    ).body
     def_nth: set[str] = set()
     cond_nth: set[str] = set()
-    _analyze_block_assignment(nonterm_handler_stmts, def_nth, cond_nth)
-    assert "e" not in def_nth
-    assert "e" in cond_nth
+    _analyze_block_assignment(
+        ast.parse("e = 1\ntry:\n    x = 2\nexcept Exception as e:\n    x = 0\n").body,
+        def_nth,
+        cond_nth,
+    )
+    assert "e" not in def_nth and "e" in cond_nth
 
     rebind_handler_stmts = ast.parse(
         "v = 1\n"
@@ -1766,11 +1662,9 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
     def_rh: set[str] = set()
     cond_rh: set[str] = set()
     _analyze_block_assignment(rebind_handler_stmts, def_rh, cond_rh)
-    assert "v" in def_rh
-    assert "v" not in cond_rh
+    assert "v" in def_rh and "v" not in cond_rh
     assert "rebound_e" in def_rh
-    assert "e" not in def_rh
-    assert "e" in cond_rh
+    assert "e" not in def_rh and "e" in cond_rh
 
     except_clobber_prebound_src = (
         "def f(a):\n"
@@ -1783,27 +1677,29 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
     )
     sc_except_clobber = inspect_single_unit_scope(
         {
-            "start": 3,
-            "end": 6,
-            "kind": "compound_block",
+            "start": 3, "end": 6, "kind": "compound_block",
             "source_text": except_clobber_prebound_src,
-            "source_code": (
-                "try:\n" "    res = a * 2\n" "except Exception as e:\n" "    res = 0\n"
-            ),
+            "source_code": "try:\n    res = a * 2\nexcept Exception as e:\n    res = 0\n",
         }
     )
     assert "severed_closure_cell" in sc_except_clobber["control_flow_hazards"]
     assert sc_except_clobber["is_control_flow_safe"] is False
 
-    # UTF-8 slicing edge cases (CRLF, astral emoji, CJK, accented)
+
+def test_utf8_slicing_crlf_astral_and_cjk() -> None:
+    """Verifies UTF-8 byte-offset line and token slicing with CRLF, astral emoji, and CJK characters."""
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
+        _slice_unit_token_lines,
+        _slice_utf8_line,
+    )
+
     astral_line = '    msg = "🚀✨café日本語"; val = (a + b) * c\r\n'
     val_expr = "(a + b) * c"
     s_utf8 = len('    msg = "🚀✨café日本語"; val = '.encode("utf-8"))
     e_utf8 = s_utf8 + len(val_expr.encode("utf-8"))
     assert _slice_utf8_line(astral_line, s_utf8, e_utf8) == val_expr
     assert _slice_unit_token_lines(
-        {"kind": "complex_expr", "start_col": s_utf8, "end_col": e_utf8},
-        [astral_line],
+        {"kind": "complex_expr", "start_col": s_utf8, "end_col": e_utf8}, [astral_line]
     ) == [val_expr]
 
 
@@ -2393,7 +2289,8 @@ def test_utf8_source_slicing_multibyte_and_idempotence() -> None:
     unit1 = {"kind": "complex_expr", "start_col": s1, "end_col": e1}
     sliced1 = _slice_unit_token_lines(unit1, [line1])
     assert sliced1 == [expr1]
-    assert _slice_unit_token_lines(unit1, sliced1, is_pre_sliced=True) == []
+    assert _slice_unit_token_lines(unit1, sliced1) is None
+    assert _slice_unit_token_lines(unit1, sliced1, explicit_col_sliced=False) is None
     assert _slice_unit_token_lines(unit1, sliced1, explicit_col_sliced=True) == [expr1]
 
     # 2. result = "é"; another = "世界"; final = 42
@@ -2414,7 +2311,8 @@ def test_utf8_source_slicing_multibyte_and_idempotence() -> None:
     u3 = {"kind": "comprehension", "start_col": 4, "end_col": 4 + len(expr3)}
     sliced3 = _slice_unit_token_lines(u3, [line3])
     assert sliced3 == [expr3]
-    assert _slice_unit_token_lines(u3, sliced3, is_pre_sliced=True) == []
+    assert _slice_unit_token_lines(u3, sliced3) is None
+    assert _slice_unit_token_lines(u3, sliced3, explicit_col_sliced=False) is None
     assert _slice_unit_token_lines(u3, sliced3, explicit_col_sliced=True) == [expr3]
 
     # 4. Multiline UTF-8 expression slicing and explicit_col_sliced idempotence
@@ -2428,7 +2326,8 @@ def test_utf8_source_slicing_multibyte_and_idempotence() -> None:
     u_ml = {"kind": "complex_expr", "start_col": s_ml, "end_col": e_ml}
     sliced_ml = _slice_unit_token_lines(u_ml, ml_utf8)
     assert sliced_ml == ["(\n", '        café + "世界"\n', "    )"]
-    assert _slice_unit_token_lines(u_ml, sliced_ml, is_pre_sliced=True) == []
+    assert _slice_unit_token_lines(u_ml, sliced_ml) is None
+    assert _slice_unit_token_lines(u_ml, sliced_ml, explicit_col_sliced=False) is None
     assert _slice_unit_token_lines(u_ml, sliced_ml, explicit_col_sliced=True) == sliced_ml
 
 
@@ -3192,3 +3091,1166 @@ def test_class_body_unconditional_def_compound_delete_before_use(
     assert isinstance(cls_node, ast.ClassDef)
     uncond = _extract_class_body_unconditional_def_names(cls_node)
     assert ("x" in uncond) is expect_x_uncond_def, case_id
+
+
+@pytest.mark.parametrize(
+    ("case_id", "fn_src", "unit_bounds", "expect_severed", "expect_live_output"),
+    [
+        pytest.param(
+            "container_alias_extend_lambda_read_in_unit",
+            (
+                "def outer(items):\n"
+                "    result = 0\n"
+                "    callbacks = []\n"
+                "    other = callbacks\n"
+                "    other.extend([lambda: result])\n"
+                "    for item in items:\n"
+                "        result = item * 2\n"
+                "        step = callbacks[0]()\n"
+                "    return step\n"
+            ),
+            (6, 8),
+            True,
+            None,
+            id="container_alias_extend_lambda_in_unit",
+        ),
+        pytest.param(
+            "nested_fn_mutating_container_alias_called_in_unit",
+            (
+                "def outer(items):\n"
+                "    result = 0\n"
+                "    callbacks = []\n"
+                "    other = callbacks\n"
+                "    def register():\n"
+                "        def cb():\n"
+                "            return result\n"
+                "        other.append(cb)\n"
+                "    register()\n"
+                "    for item in items:\n"
+                "        result = item * 2\n"
+                "        step = callbacks[0]()\n"
+                "    return step\n"
+            ),
+            (10, 12),
+            True,
+            None,
+            id="nested_fn_mutating_container_alias_in_unit",
+        ),
+        pytest.param(
+            "nested_fn_mutating_container_alias_post_unit_liveness",
+            (
+                "def outer(x, run_all):\n"
+                "    callbacks = []\n"
+                "    other = callbacks\n"
+                "    def register():\n"
+                "        def cb():\n"
+                "            return result\n"
+                "        other.append(cb)\n"
+                "    register()\n"
+                "    result = x + 1\n"
+                "    step = result * 2\n"
+                "    run_all(callbacks)\n"
+                "    return step\n"
+            ),
+            (9, 10),
+            False,
+            "result",
+            id="nested_fn_mutating_container_alias_post_unit_output",
+        ),
+        pytest.param(
+            "nested_class_method_mutating_container_alias_called_in_unit",
+            (
+                "def outer(items):\n"
+                "    result = 0\n"
+                "    callbacks = []\n"
+                "    other = callbacks\n"
+                "    class Registrar:\n"
+                "        def add(self):\n"
+                "            other.append(lambda: result)\n"
+                "    reg = Registrar()\n"
+                "    reg.add()\n"
+                "    for item in items:\n"
+                "        result = item * 2\n"
+                "        step = callbacks[0]()\n"
+                "    return step\n"
+            ),
+            (10, 12),
+            True,
+            None,
+            id="nested_class_method_mutating_container_alias",
+        ),
+        pytest.param(
+            "rebind_original_after_alias_escape_and_append",
+            (
+                "def outer(items):\n"
+                "    result = 0\n"
+                "    callbacks = []\n"
+                "    other = callbacks\n"
+                "    callbacks = []\n"
+                "    other.append(lambda: result)\n"
+                "    for item in items:\n"
+                "        result = item * 2\n"
+                "        step = other[0]()\n"
+                "    return step\n"
+            ),
+            (7, 9),
+            True,
+            None,
+            id="rebind_original_after_alias_escape",
+        ),
+        pytest.param(
+            "local_class_attribute_carrier_called_in_unit",
+            (
+                "def outer(items):\n"
+                "    result = 0\n"
+                "    class Registry:\n"
+                "        callbacks = []\n"
+                "    Registry.callbacks.append(lambda: result)\n"
+                "    for item in items:\n"
+                "        result = item * 2\n"
+                "        step = Registry.callbacks[0]()\n"
+                "    return step\n"
+            ),
+            (6, 8),
+            True,
+            None,
+            id="local_class_attribute_carrier",
+        ),
+        pytest.param(
+            "recursive_closure_factory_capturing_unit_store",
+            (
+                "def outer(items):\n"
+                "    result = 0\n"
+                "    def make_callback(depth):\n"
+                "        if depth <= 0:\n"
+                "            return lambda: result\n"
+                "        return make_callback(depth - 1)\n"
+                "    cb = make_callback(2)\n"
+                "    for item in items:\n"
+                "        result = item * 2\n"
+                "        step = cb()\n"
+                "    return step\n"
+            ),
+            (8, 10),
+            True,
+            None,
+            id="recursive_closure_factory",
+        ),
+        pytest.param(
+            "recursive_factory_with_container_alias_escaping",
+            (
+                "def outer(items):\n"
+                "    result = 0\n"
+                "    callbacks = []\n"
+                "    other = callbacks\n"
+                "    def build(n, target):\n"
+                "        if n <= 0:\n"
+                "            target.append(lambda: result)\n"
+                "            return target\n"
+                "        return build(n - 1, target)\n"
+                "    out = build(1, other)\n"
+                "    for item in items:\n"
+                "        result = item * 2\n"
+                "        step = callbacks[0]() + out[0]()\n"
+                "    return step\n"
+            ),
+            (11, 13),
+            True,
+            None,
+            id="recursive_factory_with_container_alias",
+        ),
+        pytest.param(
+            "closure_carrier_mutation_inside_suppressing_with",
+            (
+                "import contextlib\n"
+                "def outer(items):\n"
+                "    result = 0\n"
+                "    callbacks = []\n"
+                "    other = callbacks\n"
+                "    with contextlib.suppress(RuntimeError):\n"
+                "        other.append(lambda: result)\n"
+                "    for item in items:\n"
+                "        result = item * 2\n"
+                "        step = callbacks[0]()\n"
+                "    return step\n"
+            ),
+            (8, 10),
+            True,
+            None,
+            id="closure_carrier_mutation_inside_suppressing_with",
+        ),
+        pytest.param(
+            "negative_control_unused_container_alias_unrelated_var",
+            (
+                "def outer(items, fn):\n"
+                "    other_var = 0\n"
+                "    callbacks = []\n"
+                "    other = callbacks\n"
+                "    other.append(lambda: other_var)\n"
+                "    for item in items:\n"
+                "        result = item * 2\n"
+                "        step = fn(result)\n"
+                "    return step\n"
+            ),
+            (6, 8),
+            False,
+            None,
+            id="negative_control_unrelated_closure_var",
+        ),
+    ],
+)
+def test_closure_carrier_aliases_recursive_factories_and_with_interactions(
+    case_id: str,
+    fn_src: str,
+    unit_bounds: tuple[int, int],
+    expect_severed: bool,
+    expect_live_output: Optional[str],
+) -> None:
+    """Verifies closure carriers via aliases, nested mutators, class attrs, recursive factories, and suppressing with blocks."""
+    for mode in ("strict", "pedantic"):
+        clear_dataflow_cache()
+        sc = inspect_single_unit_scope(
+            {
+                "name": f"sub_{case_id}",
+                "kind": "compound_block",
+                "start": unit_bounds[0],
+                "end": unit_bounds[1],
+                "source_text": fn_src,
+                "closure_strictness": mode,
+            }
+        )
+        assert ("severed_closure_cell" in sc["control_flow_hazards"]) is expect_severed, (
+            case_id,
+            mode,
+            sc,
+        )
+        if expect_live_output is not None:
+            assert expect_live_output in sc["outputs"], (case_id, mode, sc)
+
+
+@pytest.mark.parametrize(
+    ("case_id", "fn_src", "unit_bounds", "expect_severed"),
+    [
+        pytest.param(
+            "bare_attr_decorator_callbacks_append",
+            (
+                "def outer(items, callbacks):\n"
+                "    total = 0\n"
+                "    @callbacks.append\n"
+                "    def on_event():\n"
+                "        return total\n"
+                "    for item in items:\n"
+                "        total = item + 1\n"
+                "        res = callbacks[0]()\n"
+                "    return res\n"
+            ),
+            (6, 8),
+            True,
+            id="bare_attr_decorator_callbacks_append",
+        ),
+        pytest.param(
+            "subscript_attr_decorator_registry_register",
+            (
+                "def outer(items, registry):\n"
+                "    total = 0\n"
+                "    @registry[0].register\n"
+                "    def on_event():\n"
+                "        return total\n"
+                "    for item in items:\n"
+                "        total = item + 1\n"
+                "        res = registry[0]()\n"
+                "    return res\n"
+            ),
+            (6, 8),
+            True,
+            id="subscript_attr_decorator_registry_register",
+        ),
+        pytest.param(
+            "call_decorator_with_container_positional_arg",
+            (
+                "def outer(items, register, callbacks):\n"
+                "    total = 0\n"
+                "    @register(callbacks)\n"
+                "    def on_event():\n"
+                "        return total\n"
+                "    for item in items:\n"
+                "        total = item + 1\n"
+                "        res = callbacks[0]()\n"
+                "    return res\n"
+            ),
+            (6, 8),
+            True,
+            id="call_decorator_with_container_positional_arg",
+        ),
+        pytest.param(
+            "call_decorator_with_keyword_box_attr",
+            (
+                "def outer(items, register, box):\n"
+                "    total = 0\n"
+                "    @register(sink=box.items)\n"
+                "    def on_event():\n"
+                "        return total\n"
+                "    for item in items:\n"
+                "        total = item + 1\n"
+                "        res = box.items[0]()\n"
+                "    return res\n"
+            ),
+            (6, 8),
+            True,
+            id="call_decorator_with_keyword_box_attr",
+        ),
+        pytest.param(
+            "nested_factory_bare_attr_decorator_carrier",
+            (
+                "def outer(items):\n"
+                "    total = 0\n"
+                "    callbacks = []\n"
+                "    def install():\n"
+                "        @callbacks.append\n"
+                "        def on_event():\n"
+                "            return total\n"
+                "    install()\n"
+                "    for item in items:\n"
+                "        total = item + 1\n"
+                "        res = callbacks[0]()\n"
+                "    return res\n"
+            ),
+            (9, 11),
+            True,
+            id="nested_factory_bare_attr_decorator_carrier",
+        ),
+        pytest.param(
+            "enclosing_local_class_method_bare_attr_decorator",
+            (
+                "def outer(items, callbacks):\n"
+                "    total = 0\n"
+                "    class Worker:\n"
+                "        @callbacks.append\n"
+                "        def on_event(self):\n"
+                "            return total\n"
+                "        def run(self):\n"
+                "            nonlocal total\n"
+                "            for item in items:\n"
+                "                total = item + 1\n"
+                "                res = callbacks[0]()\n"
+                "            return res\n"
+                "    return Worker()\n"
+            ),
+            (9, 11),
+            True,
+            id="enclosing_local_class_method_bare_attr_decorator",
+        ),
+        pytest.param(
+            "negative_control_decorated_pure_fn_with_unrelated_mutation",
+            (
+                "def outer(items, callbacks):\n"
+                "    other_var = 0\n"
+                "    def pure_deco(fn):\n"
+                "        return fn\n"
+                "    def install():\n"
+                "        @callbacks.append\n"
+                "        def pure_fn(x):\n"
+                "            return len(x)\n"
+                "        return pure_deco(lambda: other_var)\n"
+                "    install()\n"
+                "    for item in items:\n"
+                "        total = item + 1\n"
+                "        res = callbacks[0]([total])\n"
+                "    return res\n"
+            ),
+            (11, 13),
+            False,
+            id="negative_control_decorated_pure_fn_with_unrelated_mutation",
+        ),
+    ],
+)
+def test_decorator_carrier_links_and_factory_propagation(
+    case_id: str,
+    fn_src: str,
+    unit_bounds: tuple[int, int],
+    expect_severed: bool,
+) -> None:
+    """Verifies bare/attribute/subscript/call decorators create carrier closure links cleanly."""
+    for mode in ("strict", "pedantic"):
+        clear_dataflow_cache()
+        sc = inspect_single_unit_scope(
+            {
+                "name": f"sub_{case_id}",
+                "kind": "compound_block",
+                "start": unit_bounds[0],
+                "end": unit_bounds[1],
+                "source_text": fn_src,
+                "closure_strictness": mode,
+            }
+        )
+        assert ("severed_closure_cell" in sc["control_flow_hazards"]) is expect_severed, (
+            case_id,
+            mode,
+            sc,
+        )
+
+
+@pytest.mark.parametrize(
+    ("captured_in_cb", "unreturned_muts", "expect_severed"),
+    [
+        pytest.param("x", True, True, id="outer_cb_capturing_x_blocks_when_comp_target_shadows_cb"),
+        pytest.param(
+            "x",
+            False,
+            False,
+            id="negative_control_shadowed_cb_not_falsely_treated_as_referenced_when_returned",
+        ),
+        pytest.param(
+            "y",
+            True,
+            False,
+            id="negative_control_shadowed_cb_capturing_unrelated_y_not_falsely_flagged",
+        ),
+    ],
+)
+def test_shadowed_outer_sibling_closure_preserved_for_unreturned_mutations(
+    captured_in_cb: str,
+    unreturned_muts: bool,
+    expect_severed: bool,
+) -> None:
+    """Verifies inner shadowing of sibling closure name demotes s_name to None without dropping captured vars."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import _EnclosingFnCellInfo
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _check_sibling_closure_sharing,
+        _collect_unshadowed_chain_closure_info,
+    )
+
+    src = (
+        "def outer(items):\n"
+        "    x = 0\n"
+        "    y = 0\n"
+        "    def cb():\n"
+        f"        return {captured_in_cb}\n"
+        "    res = [\n"
+        "        [(x := i + cb) for i in items]\n"
+        "        for cb in (1, 2)\n"
+        "    ]\n"
+        "    return res, cb, y\n"
+    )
+    comp_marker = "[(x := i + cb) for i in items]"
+    comp_lineno, comp_line = next(
+        (idx, ln)
+        for idx, ln in enumerate(src.splitlines(), start=1)
+        if comp_marker in ln
+    )
+    s_col = len(comp_line[: comp_line.index(comp_marker)].encode("utf-8"))
+    e_col = s_col + len(comp_marker.encode("utf-8"))
+
+    clear_dataflow_cache()
+    if unreturned_muts:
+        sc = inspect_single_unit_scope(
+            {
+                "name": "inner_comp",
+                "kind": "comprehension",
+                "start": comp_lineno,
+                "end": comp_lineno,
+                "start_col": s_col,
+                "end_col": e_col,
+                "source_text": src,
+                "closure_strictness": "strict",
+            }
+        )
+        assert ("severed_closure_cell" in sc["control_flow_hazards"]) is expect_severed, sc
+
+    # Direct invariant check on _collect_unshadowed_chain_closure_info & Check 4
+    outer_info = _EnclosingFnCellInfo(
+        fn_locals=frozenset({"x", "y", "cb"}),
+        pre_bound=frozenset(),
+        pre_mutated=frozenset(),
+        post_mutated=frozenset(),
+        post_reads=frozenset(),
+        loop_mutated=frozenset(),
+        sibling_closures=(("cb", frozenset({captured_in_cb}), frozenset()),),
+        all_sibling_nonlocal_mutations=frozenset(),
+    )
+    mid_info = _EnclosingFnCellInfo(
+        fn_locals=frozenset({"cb"}),
+        pre_bound=frozenset(),
+        pre_mutated=frozenset(),
+        post_mutated=frozenset(),
+        post_reads=frozenset(),
+        loop_mutated=frozenset(),
+        sibling_closures=(),
+        all_sibling_nonlocal_mutations=frozenset(),
+    )
+    unshadowed = _collect_unshadowed_chain_closure_info([outer_info, mid_info])
+    assert unshadowed.sib_closures == [(None, {captured_in_cb}, set())]
+    assert (
+        _check_sibling_closure_sharing(
+            eff_input_set={"cb", "items"},
+            sub_mutated={"x"},
+            chain_infos=[outer_info, mid_info],
+            unreturned_mutations=unreturned_muts,
+            skip_pre_unit_closures=False,
+        )
+        is expect_severed
+    )
+
+
+@pytest.mark.parametrize(
+    ("stmt_src", "expected_escape"),
+    [
+        ("return self.__dict__['cb']()", True),
+        ("return self.__class__.cb(self)", True),
+        ("self.__dict__['cb'] = fn", True),
+        ("self.__class__ = Other", True),
+        ("setattr(self, '__class__', Other)", True),
+        ("setattr(self, '__dict__', {})", True),
+        ("return self.safe_val()", False),
+    ],
+)
+def test_extract_receiver_usage_marks_class_and_dict_as_bare_escape(
+    stmt_src: str,
+    expected_escape: bool,
+) -> None:
+    """Verifies receiver __class__ and __dict__ attribute accesses mark bare_escape True."""
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _extract_receiver_usage_in_method,
+    )
+
+    fn_node = ast.parse(f"def run(self, fn):\n    {stmt_src}\n").body[0]
+    _loads, _stores, bare_escape = _extract_receiver_usage_in_method(fn_node, "self")
+    assert bare_escape is expected_escape
+
+
+@pytest.mark.parametrize(
+    ("sibling_body", "helper_body", "run_access", "expect_severed"),
+    [
+        pytest.param(
+            "total",
+            "pass",
+            "self.__dict__['cb'](self)",
+            True,
+            id="self_dict_subscript_call_exposes_sibling_closure",
+        ),
+        pytest.param(
+            "total",
+            "pass",
+            "self.__class__.cb(self)",
+            True,
+            id="self_class_attribute_call_exposes_sibling_closure",
+        ),
+        pytest.param(
+            "total",
+            "pass",
+            "setattr(self, '__dict__', {'cb': self.cb})",
+            True,
+            id="setattr_self_dict_exposes_sibling_closure",
+        ),
+        pytest.param(
+            "total",
+            "return self.__dict__['cb']()",
+            "self.helper()",
+            True,
+            id="adversarial_transitive_helper_self_dict_escape",
+        ),
+        pytest.param(
+            "total",
+            "return 1",
+            "self.helper()",
+            False,
+            id="control_normal_method_call_ignores_uncalled_sibling_closure",
+        ),
+        pytest.param(
+            "1",
+            "pass",
+            "self.__class__.__name__",
+            False,
+            id="control_receiver_escape_with_pure_siblings_is_safe",
+        ),
+    ],
+)
+def test_local_class_receiver_class_and_dict_escape_triggers_closure_hazard(
+    sibling_body: str,
+    helper_body: str,
+    run_access: str,
+    expect_severed: bool,
+) -> None:
+    """Verifies local base-less class methods propagate sibling closure reads through self.__dict__ and self.__class__."""
+    src = (
+        "def outer(items):\n"
+        "    total = 0\n"
+        "    class Worker:\n"
+        "        def cb(self):\n"
+        f"            return {sibling_body}\n"
+        "        def helper(self):\n"
+        f"            {helper_body}\n"
+        "        def run(self):\n"
+        "            nonlocal total\n"
+        "            for item in items:\n"
+        "                total = item + 1\n"
+        f"                res = {run_access}\n"
+        "            return res\n"
+        "    return Worker().run()\n"
+    )
+    lines = src.splitlines()
+    loop_start = next(
+        idx for idx, ln in enumerate(lines, start=1) if "for item in items:" in ln
+    )
+    loop_end = next(
+        idx for idx, ln in enumerate(lines, start=1) if f"res = {run_access}" in ln
+    )
+    clear_dataflow_cache()
+    sc = inspect_single_unit_scope(
+        {
+            "name": "worker_loop",
+            "kind": "compound_block",
+            "start": loop_start,
+            "end": loop_end,
+            "source_text": src,
+            "closure_strictness": "strict",
+        },
+        tree=ast.parse(src),
+    )
+    assert ("severed_closure_cell" in sc["control_flow_hazards"]) is expect_severed, sc
+
+
+@pytest.mark.parametrize(
+    ("helper_def", "run_sig", "run_access", "expect_severed"),
+    [
+        pytest.param(
+            "def helper(*args):\n            return args[0].cb()",
+            "self",
+            "self.helper()",
+            True,
+            id="vararg_sibling_method_receiver_access",
+        ),
+        pytest.param(
+            "cb_attr = lambda *args: args[0].cb()",
+            "self",
+            "self.cb_attr()",
+            True,
+            id="vararg_class_attr_lambda_receiver_access",
+        ),
+        pytest.param(
+            "def helper(self):\n            return 1",
+            "*args",
+            "args[0].cb()",
+            True,
+            id="vararg_enclosing_method_receiver_access",
+        ),
+        pytest.param(
+            "@staticmethod\n        def helper(*args):\n            return args[0].cb()",
+            "self",
+            "self.helper()",
+            False,
+            id="control_staticmethod_vararg_ignored",
+        ),
+        pytest.param(
+            "def helper(*args):\n            return 1",
+            "self",
+            "self.helper()",
+            False,
+            id="control_unused_vararg_does_not_escape",
+        ),
+        pytest.param(
+            "cb_pure = lambda *args: 1",
+            "self",
+            "self.cb_pure()",
+            False,
+            id="control_unused_vararg_lambda_safe",
+        ),
+    ],
+)
+def test_vararg_only_method_and_lambda_receivers_propagate_sibling_closures(
+    helper_def: str,
+    run_sig: str,
+    run_access: str,
+    expect_severed: bool,
+) -> None:
+    """Verifies non-staticmethod *args methods and lambdas propagate sibling closure hazards."""
+    src = (
+        "def outer(items):\n"
+        "    total = 0\n"
+        "    class Worker:\n"
+        "        def cb(self):\n"
+        "            return total\n"
+        f"        {helper_def}\n"
+        f"        def run({run_sig}):\n"
+        "            nonlocal total\n"
+        "            res = None\n"
+        "            for item in items:\n"
+        "                total = item + 1\n"
+        f"                res = {run_access}\n"
+        "            return res\n"
+        "    return Worker().run()\n"
+    )
+    lines = src.splitlines()
+    loop_start = next(
+        idx for idx, ln in enumerate(lines, start=1) if "for item in items:" in ln
+    )
+    loop_end = next(
+        idx for idx, ln in enumerate(lines, start=1) if f"res = {run_access}" in ln
+    )
+    clear_dataflow_cache()
+    sc = inspect_single_unit_scope(
+        {
+            "name": "worker_vararg_loop",
+            "kind": "compound_block",
+            "start": loop_start,
+            "end": loop_end,
+            "source_text": src,
+            "closure_strictness": "strict",
+        },
+        tree=ast.parse(src),
+    )
+    assert ("severed_closure_cell" in sc["control_flow_hazards"]) is expect_severed, sc
+
+
+@pytest.mark.parametrize(
+    ("call_src", "expect_targets", "expected_val_repr"),
+    [
+        pytest.param(
+            "setattr(holder, 'cb', reader)",
+            {"holder"},
+            "reader",
+            id="builtin_setattr_call",
+        ),
+        pytest.param(
+            "builtins.setattr(holder, 'cb', reader)",
+            {"holder"},
+            "reader",
+            id="qualified_builtins_setattr_call",
+        ),
+        pytest.param(
+            "setattr(holder.nested, 'cb', reader)",
+            {"holder"},
+            "reader",
+            id="dotted_receiver_setattr_call",
+        ),
+        pytest.param(
+            "setattr(holder, *attr_val)",
+            {"holder"},
+            "attr_val",
+            id="starred_args_setattr_call",
+        ),
+        pytest.param(
+            "getattr(holder, 'cb', reader)",
+            None,
+            None,
+            id="negative_getattr_default_not_a_mutation",
+        ),
+        pytest.param(
+            "setattr(holder, 'cb')",
+            None,
+            None,
+            id="negative_two_arg_setattr_ignored",
+        ),
+    ],
+)
+def test_setattr_carrier_mutation_extraction_targets_receiver(
+    call_src: str,
+    expect_targets: Any,
+    expected_val_repr: Any,
+) -> None:
+    """Verifies setattr/builtins.setattr extracts receiver roots while getattr and incomplete calls do not."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _extract_closure_carrier_mutation_targets_and_values,
+    )
+
+    call_node = ast.parse(call_src, mode="eval").body
+    res = _extract_closure_carrier_mutation_targets_and_values(call_node)
+    if expect_targets is None:
+        assert res is None
+    else:
+        assert res is not None
+        assert res[0] == expect_targets
+        assert any(ast.unparse(v).lstrip("*") == expected_val_repr for v in res[1])
+
+
+@pytest.mark.parametrize(
+    ("attach_stmt", "expect_severed"),
+    [
+        pytest.param(
+            "setattr(holder, 'cb', reader)",
+            True,
+            id="setattr_attaches_closure_reader_to_carrier",
+        ),
+        pytest.param(
+            "builtins.setattr(holder, 'cb', reader)",
+            True,
+            id="builtins_setattr_attaches_closure_reader_to_carrier",
+        ),
+        pytest.param(
+            "setattr(holder, 'cb', 42)",
+            False,
+            id="control_setattr_scalar_does_not_taint_carrier",
+        ),
+        pytest.param(
+            "getattr(other_holder, 'cb', 42)",
+            False,
+            id="control_getattr_scalar_does_not_taint_carrier",
+        ),
+    ],
+)
+def test_setattr_closure_carrier_propagation_end_to_end(
+    attach_stmt: str,
+    expect_severed: bool,
+) -> None:
+    """Verifies setattr carrier mutations propagate enclosing closure hazards into loop extractions."""
+    src = (
+        "import builtins\n"
+        "def outer(items, other_holder):\n"
+        "    total = 0\n"
+        "    holder = Box()\n"
+        "    reader = lambda: total\n"
+        f"    {attach_stmt}\n"
+        "    for item in items:\n"
+        "        total = item + 1\n"
+        "        res = holder.cb()\n"
+        "    return res\n"
+    )
+    lines = src.splitlines()
+    loop_start = next(
+        idx for idx, ln in enumerate(lines, start=1) if "for item in items:" in ln
+    )
+    loop_end = next(
+        idx for idx, ln in enumerate(lines, start=1) if "res = holder.cb()" in ln
+    )
+    clear_dataflow_cache()
+    sc = inspect_single_unit_scope(
+        {
+            "name": "setattr_carrier_loop",
+            "kind": "compound_block",
+            "start": loop_start,
+            "end": loop_end,
+            "source_text": src,
+            "closure_strictness": "strict",
+        },
+        tree=ast.parse(src),
+    )
+    assert ("severed_closure_cell" in sc["control_flow_hazards"]) is expect_severed, sc
+
+
+@pytest.mark.parametrize(
+    ("src", "expect_severed"),
+    [
+        pytest.param(
+            (
+                "def outer(items):\n"
+                "    total = 0\n"
+                "    class Base:\n"
+                "        def peek(self):\n"
+                "            return total\n"
+                "    class Worker(Base):\n"
+                "        def run(self):\n"
+                "            nonlocal total\n"
+                "            out = []\n"
+                "            for x in items:\n"
+                "                total += x\n"
+                "                out.append(self.peek())\n"
+                "            return out\n"
+                "    return Worker().run(), total\n"
+            ),
+            True,
+            id="same_fn_subclass_inherits_base_closure",
+        ),
+        pytest.param(
+            (
+                "def outer(items):\n"
+                "    total = 0\n"
+                "    class GrandBase:\n"
+                "        def peek(self):\n"
+                "            return total\n"
+                "    class Base(GrandBase):\n"
+                "        pass\n"
+                "    class Worker(Base):\n"
+                "        def run(self):\n"
+                "            nonlocal total\n"
+                "            out = []\n"
+                "            for x in items:\n"
+                "                total += x\n"
+                "                out.append(self.peek())\n"
+                "            return out\n"
+                "    return Worker().run(), total\n"
+            ),
+            True,
+            id="multi_hop_subclass_inherits_grandbase_closure",
+        ),
+        pytest.param(
+            (
+                "def outer(items):\n"
+                "    total = 0\n"
+                "    class Base:\n"
+                "        def peek(self):\n"
+                "            return total\n"
+                "    def make_worker():\n"
+                "        class Worker(Base):\n"
+                "            def run(self):\n"
+                "                nonlocal total\n"
+                "                out = []\n"
+                "                for x in items:\n"
+                "                    total += x\n"
+                "                    out.append(self.peek())\n"
+                "                return out\n"
+                "        return Worker().run()\n"
+                "    return make_worker(), total\n"
+            ),
+            True,
+            id="cross_function_subclass_inherits_outer_base_closure",
+        ),
+        pytest.param(
+            (
+                "def outer(items):\n"
+                "    total = 0\n"
+                "    class Meta(type):\n"
+                "        def __call__(cls, *a, **kw):\n"
+                "            return total\n"
+                "    class Worker(metaclass=Meta):\n"
+                "        def run(self):\n"
+                "            nonlocal total\n"
+                "            out = []\n"
+                "            for x in items:\n"
+                "                total += x\n"
+                "                out.append(self.tag)\n"
+                "            return out\n"
+                "    return Worker().run(), total\n"
+            ),
+            True,
+            id="subclass_metaclass_kwarg_closure_propagates",
+        ),
+        pytest.param(
+            (
+                "def outer(items):\n"
+                "    total = 0\n"
+                "    class Base:\n"
+                "        def peek(self):\n"
+                "            return 1\n"
+                "    class Worker(Base):\n"
+                "        def run(self):\n"
+                "            nonlocal total\n"
+                "            out = []\n"
+                "            for x in items:\n"
+                "                total += x\n"
+                "                out.append(self.peek())\n"
+                "            return out\n"
+                "    return Worker().run(), total\n"
+            ),
+            False,
+            id="control_pure_base_class_safe",
+        ),
+        pytest.param(
+            (
+                "def outer(items):\n"
+                "    total = 0\n"
+                "    class Base:\n"
+                "        def peek(self):\n"
+                "            return total\n"
+                "    class Worker:\n"
+                "        def helper(self):\n"
+                "            return 1\n"
+                "        def run(self):\n"
+                "            nonlocal total\n"
+                "            out = []\n"
+                "            for x in items:\n"
+                "                total += x\n"
+                "                out.append(self.helper())\n"
+                "            return out\n"
+                "    return Worker().run(), total\n"
+            ),
+            False,
+            id="control_uninherited_closure_class_does_not_taint_worker",
+        ),
+        pytest.param(
+            (
+                "def outer(items):\n"
+                "    total = 0\n"
+                "    class Base:\n"
+                "        def peek(self):\n"
+                "            return total\n"
+                "    def make_worker():\n"
+                "        class Base:\n"
+                "            def peek(self):\n"
+                "                return 1\n"
+                "        class Worker(Base):\n"
+                "            def run(self):\n"
+                "                nonlocal total\n"
+                "                out = []\n"
+                "                for x in items:\n"
+                "                    total += x\n"
+                "                    out.append(self.peek())\n"
+                "                return out\n"
+                "        return Worker().run()\n"
+                "    return make_worker(), total\n"
+            ),
+            False,
+            id="control_shadowed_inner_pure_base_blocks_outer_base_closure",
+        ),
+    ],
+)
+def test_local_subclass_inherits_base_class_sibling_closures(
+    src: str,
+    expect_severed: bool,
+) -> None:
+    """Verifies local subclasses inherit enclosing base-class sibling closures across single, multi-hop, and nested chains."""
+    lines = src.splitlines()
+    loop_start = next(
+        idx for idx, ln in enumerate(lines, start=1) if "for x in items:" in ln
+    )
+    loop_end = next(
+        idx for idx, ln in enumerate(lines, start=1) if "out.append(" in ln
+    )
+    clear_dataflow_cache()
+    sc = inspect_single_unit_scope(
+        {
+            "name": "subclass_loop",
+            "kind": "compound_block",
+            "start": loop_start,
+            "end": loop_end,
+            "source_text": src,
+            "closure_strictness": "strict",
+        },
+        tree=ast.parse(src),
+    )
+    assert ("severed_closure_cell" in sc["control_flow_hazards"]) is expect_severed, sc
+
+
+@pytest.mark.parametrize(
+    ("src", "expect_box_carrier", "expect_severed"),
+    [
+        pytest.param(
+            (
+                "def outer(items):\n"
+                "    total = 0\n"
+                "    box = []\n"
+                "    def inner(len):\n"
+                "        box.append(len(lambda: total))\n"
+                "    inner(lambda fn: fn)\n"
+                "    out = []\n"
+                "    for x in items:\n"
+                "        total += x\n"
+                "        out.append(box[0]())\n"
+                "    return total, out\n"
+            ),
+            True,
+            True,
+            id="nested_fn_param_shadows_len_allows_closure_carrier_escape",
+        ),
+        pytest.param(
+            (
+                "def outer(items):\n"
+                "    total = 0\n"
+                "    box = []\n"
+                "    def inner():\n"
+                "        dict = lambda fn: fn\n"
+                "        box.append(dict(lambda: total))\n"
+                "    inner()\n"
+                "    out = []\n"
+                "    for x in items:\n"
+                "        total += x\n"
+                "        out.append(box[0]())\n"
+                "    return total, out\n"
+            ),
+            True,
+            True,
+            id="nested_fn_local_shadows_dict_allows_closure_carrier_escape",
+        ),
+        pytest.param(
+            (
+                "def outer(items):\n"
+                "    total = 0\n"
+                "    box = []\n"
+                "    def inner(len):\n"
+                "        @box.append\n"
+                "        def helper():\n"
+                "            return len\n"
+                "    inner(1)\n"
+                "    out = []\n"
+                "    for x in items:\n"
+                "        total += x\n"
+                "        out.append(len(box))\n"
+                "    return total, out\n"
+            ),
+            True,
+            False,
+            id="nested_fn_decorator_shadowed_len_read_marks_box_carrier",
+        ),
+        pytest.param(
+            (
+                "def outer(items):\n"
+                "    total = 0\n"
+                "    box = []\n"
+                "    class BoxHolder:\n"
+                "        len = staticmethod(lambda fn: fn)\n"
+                "        box.append(len(lambda: total))\n"
+                "    out = []\n"
+                "    for x in items:\n"
+                "        total += x\n"
+                "        out.append(box[0]())\n"
+                "    return total, out, BoxHolder\n"
+            ),
+            True,
+            True,
+            id="class_body_local_shadows_len_for_direct_carrier_escape",
+        ),
+        pytest.param(
+            (
+                "def outer(items):\n"
+                "    total = 0\n"
+                "    box = []\n"
+                "    class BoxHolder:\n"
+                "        len = 42\n"
+                "        def helper(self):\n"
+                "            box.append(len([1, 2]))\n"
+                "    BoxHolder().helper()\n"
+                "    out = []\n"
+                "    for x in items:\n"
+                "        total += x\n"
+                "        out.append(box[0])\n"
+                "    return total, out\n"
+            ),
+            False,
+            False,
+            id="pep227_class_body_len_does_not_shadow_builtin_in_method",
+        ),
+    ],
+)
+def test_nested_local_and_class_shadowing_of_non_closure_builtins(
+    src: str,
+    expect_box_carrier: bool,
+    expect_severed: bool,
+) -> None:
+    """Verifies nested local/class shadowing bypasses non-closure builtin exemption while respecting PEP 227."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _extract_fn_outer_carrier_targets,
+        _get_fn_scope_context,
+    )
+
+    clear_dataflow_cache()
+    mod_tree = ast.parse(src)
+    outer_fn = next(n for n in mod_tree.body if isinstance(n, ast.FunctionDef))
+    scope_ctx = _get_fn_scope_context(outer_fn, mod_tree=mod_tree)
+    inner_scope = next(
+        n
+        for n in outer_fn.body
+        if isinstance(n, (ast.FunctionDef, ast.ClassDef))
+    )
+    carriers = _extract_fn_outer_carrier_targets(
+        inner_scope, scope_ctx=scope_ctx
+    )
+    assert ("box" in carriers) is expect_box_carrier
+
+    lines = src.splitlines()
+    loop_start = next(
+        idx for idx, ln in enumerate(lines, start=1) if "for x in items:" in ln
+    )
+    loop_end = next(
+        idx for idx, ln in enumerate(lines, start=1) if "out.append(" in ln
+    )
+    sc = inspect_single_unit_scope(
+        {
+            "name": "nested_shadow_loop",
+            "kind": "compound_block",
+            "start": loop_start,
+            "end": loop_end,
+            "source_text": src,
+            "closure_strictness": "strict",
+        },
+        tree=mod_tree,
+    )
+    assert ("severed_closure_cell" in sc["control_flow_hazards"]) is expect_severed, sc

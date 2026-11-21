@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import sys
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+import warnings
 
 from pydoppelgangerhunt.baseline import (
     BaselineFingerprints,
@@ -225,8 +226,9 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         action="append",
         default=[],
         help=(
-            "Context manager names, dotted paths, or suffix wildcards ('*.attr' / '.attr') "
-            "proven not to suppress exceptions (comma-separated or repeatable)"
+            "Context manager names, '.Name' relative imports, dotted paths, or "
+            "'<module>.*.attr' / '*.attr' suffix wildcards proven not to suppress "
+            "exceptions (comma-separated or repeatable)"
         ),
     )
 
@@ -401,6 +403,24 @@ def _render_dry_scorecard(stats: Dict[str, Any], use_color: bool) -> None:
     print("=" * 55)
 
 
+def _emit_indented_suggestion(
+    lines: List[str], sug: str, *, indent: str, use_color: bool
+) -> None:
+    """Prints and records an indented suggestion block with optional ANSI styling."""
+    sug_colored = colorize(sug, COLOR_YELLOW, use_color)
+    print(indent + sug_colored.replace("\n", "\n" + indent))
+    lines.append(indent + sug.replace("\n", "\n" + indent))
+
+
+def _emit_indented_diff(lines: List[str], diff_out: str, *, indent: str) -> None:
+    """Prints and records an indented unified diff block."""
+    if not diff_out:
+        return
+    print(f"{indent}--- Diff ---")
+    print(indent + diff_out.replace("\n", "\n" + indent))
+    lines.append(f"{indent}--- Diff ---\n{indent}" + diff_out.replace("\n", "\n" + indent))
+
+
 def _append_preload_failure_lines(
     lines: List[str],
     exc: Exception,
@@ -415,16 +435,10 @@ def _append_preload_failure_lines(
             f"[REFACTOR SUGGESTION] Diagnostic: suggestion skipped due to "
             f"{type(exc).__name__}: {exc}"
         )
-        sug_colored = colorize(sug, COLOR_YELLOW, use_color)
-        print(indent + sug_colored.replace("\n", "\n" + indent))
-        lines.append(indent + sug.replace("\n", "\n" + indent))
+        _emit_indented_suggestion(lines, sug, indent=indent, use_color=use_color)
     if args.diff:
         diff_out = f"# Diagnostic: diff skipped due to {type(exc).__name__}: {exc}"
-        print(f"{indent}--- Diff ---")
-        print(indent + diff_out.replace("\n", "\n" + indent))
-        lines.append(
-            f"{indent}--- Diff ---\n{indent}" + diff_out.replace("\n", "\n" + indent)
-        )
+        _emit_indented_diff(lines, diff_out, indent=indent)
 
 
 def _render_pair_diff_and_suggestions(
@@ -504,9 +518,7 @@ def _render_pair_diff_and_suggestions(
                 f"[REFACTOR SUGGESTION] Diagnostic: suggestion skipped due to "
                 f"{type(exc).__name__}: {exc}"
             )
-        sug_colored = colorize(sug, COLOR_YELLOW, use_color)
-        print(indent + sug_colored.replace("\n", "\n" + indent))
-        lines.append(indent + sug.replace("\n", "\n" + indent))
+        _emit_indented_suggestion(lines, sug, indent=indent, use_color=use_color)
     if args.diff:
         try:
             u1_diff = with_unit_source_text(u1, src1)
@@ -524,10 +536,7 @@ def _render_pair_diff_and_suggestions(
                 exc_info=True,
             )
             diff_out = f"# Diagnostic: diff skipped due to {type(exc).__name__}: {exc}"
-        if diff_out:
-            print(f"{indent}--- Diff ---")
-            print(indent + diff_out.replace("\n", "\n" + indent))
-            lines.append(f"{indent}--- Diff ---\n{indent}" + diff_out.replace("\n", "\n" + indent))
+        _emit_indented_diff(lines, diff_out, indent=indent)
     return lines
 
 
@@ -1197,8 +1206,154 @@ def _resolve_effective_config(
     )
 
 
+def _warn_cli_strictness_overrides(
+    *,
+    cli_strictness_str: str,
+    closure_strictness: str,
+    skip_pre_unit_closures: bool,
+    cli_skip: bool,
+    cfg_skip: bool,
+    cfg_strictness: Any,
+    cfg_resolved_strictness: Optional[str],
+    cfg_strict_with: Any = None,
+) -> None:
+    """Logs precedence and conflict warnings when --closure-strictness overrides other flags."""
+    has_cfg_strictness = is_recognized_closure_strictness(cfg_strictness)
+    overrides_cfg_strictness = (
+        has_cfg_strictness and cfg_resolved_strictness != closure_strictness
+    )
+    conflict_rules: Tuple[Tuple[bool, str, Tuple[Any, ...]], ...] = (
+        (
+            cli_skip and not skip_pre_unit_closures,
+            "Conflicting configuration: closure_strictness '%s' takes precedence over "
+            "skip_pre_unit_closures=True (--skip-pre-unit-closures)",
+            (cli_strictness_str,),
+        ),
+        (
+            overrides_cfg_strictness,
+            "Conflicting configuration: CLI flag --closure-strictness '%s' overrides "
+            "configured closure_strictness='%s'",
+            (cli_strictness_str, cfg_strictness),
+        ),
+        (
+            not overrides_cfg_strictness and cfg_skip and not skip_pre_unit_closures,
+            "Conflicting configuration: CLI flag --closure-strictness '%s' overrides "
+            "configured skip_pre_unit_closures=True",
+            (cli_strictness_str,),
+        ),
+        (
+            not overrides_cfg_strictness
+            and cfg_strict_with is True
+            and closure_strictness != "pedantic",
+            "Conflicting configuration: CLI flag --closure-strictness '%s' overrides "
+            "configured strict_with_suppression=True",
+            (cli_strictness_str,),
+        ),
+    )
+    for should_warn, msg_fmt, msg_args in conflict_rules:
+        if should_warn:
+            logger.warning(msg_fmt, *msg_args)
+
+
+def _resolve_cli_closure_policy(
+    args: argparse.Namespace, tool_cfg: Dict[str, Any]
+) -> Tuple[Optional[str], Optional[bool], bool]:
+    """Resolves closure strictness policy across CLI flags and loaded tool configuration.
+
+    Logs conflict warnings symmetrically whenever an explicit CLI override disagrees
+    with an explicitly configured ``pyproject.toml`` ``closure_strictness``,
+    ``skip_pre_unit_closures=True``, or ``strict_with_suppression=True`` setting.
+    """
+    cfg_strictness = tool_cfg.get("closure_strictness")
+    cfg_skip = _safe_bool(tool_cfg.get("skip_pre_unit_closures", False))
+    cfg_strict_with = (
+        _safe_bool(tool_cfg.get("strict_with_suppression"))
+        if "strict_with_suppression" in tool_cfg
+        and tool_cfg.get("strict_with_suppression") is not None
+        else None
+    )
+    has_cfg_closure = (
+        is_recognized_closure_strictness(cfg_strictness)
+        or cfg_skip
+        or cfg_strict_with is not None
+    )
+    has_cli_closure = args.closure_strictness is not None or bool(
+        args.skip_pre_unit_closures
+    )
+    if not (has_cfg_closure or has_cli_closure):
+        return None, None, False
+
+    cfg_resolved_strictness: Optional[str] = None
+    cfg_resolved_skip: bool = False
+    if cfg_strictness is not None or cfg_skip or cfg_strict_with is not None:
+        cfg_resolved_strictness, cfg_resolved_skip = resolve_closure_strictness_mode(
+            closure_strictness=cfg_strictness,
+            skip_pre_unit_closures=cfg_skip,
+            strict_with_suppression=cfg_strict_with,
+        )
+
+    if args.closure_strictness is not None:
+        cli_strictness_str = str(args.closure_strictness)
+        cli_skip = _safe_bool(args.skip_pre_unit_closures)
+        closure_strictness, skip_pre_unit_closures = resolve_closure_strictness_mode(
+            closure_strictness=cli_strictness_str,
+            skip_pre_unit_closures=False,
+            strict_with_suppression=None,
+        )
+        _warn_cli_strictness_overrides(
+            cfg_strict_with=cfg_strict_with,
+            cli_strictness_str=cli_strictness_str,
+            closure_strictness=closure_strictness,
+            skip_pre_unit_closures=skip_pre_unit_closures,
+            cli_skip=cli_skip,
+            cfg_skip=cfg_skip,
+            cfg_strictness=cfg_strictness,
+            cfg_resolved_strictness=cfg_resolved_strictness,
+        )
+        return closure_strictness, skip_pre_unit_closures, True
+
+    if args.skip_pre_unit_closures:
+        if cfg_resolved_strictness in ("strict", "pedantic"):
+            if is_recognized_closure_strictness(cfg_strictness):
+                logger.warning(
+                    "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
+                    "configured closure_strictness='%s'",
+                    cfg_strictness,
+                )
+            elif cfg_strict_with:
+                logger.warning(
+                    "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
+                    "configured strict_with_suppression=True"
+                )
+        closure_strictness, skip_pre_unit_closures = resolve_closure_strictness_mode(
+            closure_strictness="lenient",
+            skip_pre_unit_closures=True,
+        )
+        return closure_strictness, skip_pre_unit_closures, True
+    return cfg_resolved_strictness, cfg_resolved_skip, True
+
+
+def _determine_cli_exit_code(*, has_clones: bool, diagnostic_errors: int) -> int:
+    """Computes CLI exit code separating usage errors (2) from diagnostic failures (3, 4)."""
+    if diagnostic_errors > 0:
+        return 4 if has_clones else 3
+    return 1 if has_clones else 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Main execution CLI entrypoint."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=SyntaxWarning)
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*invalid escape sequence.*",
+            category=DeprecationWarning,
+        )
+        return _main_impl(argv)
+
+
+def _main_impl(argv: Optional[Sequence[str]] = None) -> int:
+    """Executes CLI argument parsing, scanning, reporting, and patch emission."""
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     if args.top is not None and args.top <= 0:
@@ -1215,19 +1370,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # Load configuration from pyproject.toml / config file
     tool_cfg: Dict[str, Any] = {}
-    if args.config:
-        tool_cfg = load_tool_config(args.config)
-    else:
-        if target_arg:
-            target_dir = (
-                target_arg
-                if os.path.isdir(target_arg)
-                else (os.path.dirname(target_arg) or ".")
-            )
-            if target_dir != ".":
-                tool_cfg = load_tool_config(repo_root=target_dir)
-        if not tool_cfg:
-            tool_cfg = load_tool_config()
+    try:
+        if args.config:
+            tool_cfg = load_tool_config(args.config)
+        else:
+            if target_arg:
+                target_dir = (
+                    target_arg
+                    if os.path.isdir(target_arg)
+                    else (os.path.dirname(target_arg) or ".")
+                )
+                if target_dir != ".":
+                    tool_cfg = load_tool_config(repo_root=target_dir)
+            if not tool_cfg:
+                tool_cfg = load_tool_config()
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.top is None and tool_cfg.get("top") is not None:
         raw_top = tool_cfg["top"]
         if isinstance(raw_top, (bool, float)):
@@ -1272,95 +1430,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     shared_module_name = str(
         args.shared_module_name or tool_cfg.get("shared_module_name", "_common.py")
     )
-    cfg_strictness = tool_cfg.get("closure_strictness")
-    cfg_skip = _safe_bool(tool_cfg.get("skip_pre_unit_closures", False))
-    has_cfg_skip = cfg_skip
-
-    cfg_strict_with = (
-        _safe_bool(tool_cfg.get("strict_with_suppression"))
-        if "strict_with_suppression" in tool_cfg
-        and tool_cfg.get("strict_with_suppression") is not None
-        else None
-    )
-    has_cfg_closure = (
-        is_recognized_closure_strictness(cfg_strictness)
-        or has_cfg_skip
-        or bool(cfg_strict_with)
-    )
-    has_cli_closure = args.closure_strictness is not None or bool(
-        args.skip_pre_unit_closures
-    )
-    has_explicit_closure_cfg = has_cfg_closure or has_cli_closure
-    closure_strictness: Optional[str]
-    skip_pre_unit_closures: Optional[bool]
-    if not has_explicit_closure_cfg:
-        cfg_fallback_mode: Optional[str] = None
-        cfg_fallback_skip: Optional[bool] = None
-        if cfg_strictness is not None:
-            cfg_fallback_mode, cfg_fallback_skip = resolve_closure_strictness_mode(
-                closure_strictness=cfg_strictness,
-                skip_pre_unit_closures=cfg_skip,
-                strict_with_suppression=cfg_strict_with,
-            )
-        closure_strictness = cfg_fallback_mode
-        skip_pre_unit_closures = cfg_fallback_skip
-    else:
-        if args.closure_strictness is not None:
-            cli_strictness_str = str(args.closure_strictness)
-            cli_skip = _safe_bool(args.skip_pre_unit_closures)
-            closure_strictness, skip_pre_unit_closures = (
-                resolve_closure_strictness_mode(
-                    closure_strictness=cli_strictness_str,
-                    skip_pre_unit_closures=False,
-                    strict_with_suppression=True if cfg_strict_with is True else None,
-                )
-            )
-            if cli_skip and not skip_pre_unit_closures:
-                logger.warning(
-                    "Conflicting configuration: closure_strictness '%s' takes precedence over "
-                    "skip_pre_unit_closures=True (--skip-pre-unit-closures)",
-                    cli_strictness_str,
-                )
-        else:
-            cfg_resolved_strictness: Optional[str] = None
-            cfg_resolved_skip: bool = False
-            if cfg_strictness is not None or has_cfg_skip or cfg_strict_with is not None:
-                cfg_resolved_strictness, cfg_resolved_skip = (
-                    resolve_closure_strictness_mode(
-                        closure_strictness=cfg_strictness,
-                        skip_pre_unit_closures=cfg_skip,
-                        strict_with_suppression=cfg_strict_with,
-                    )
-                )
-            if args.skip_pre_unit_closures:
-                if cfg_resolved_strictness in ("strict", "pedantic"):
-                    if cfg_strictness is not None and str(cfg_strictness).strip().lower() in (
-                        "strict",
-                        "pedantic",
-                    ):
-                        logger.warning(
-                            "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
-                            "configured closure_strictness='%s'",
-                            cfg_strictness,
-                        )
-                    elif cfg_strict_with:
-                        logger.warning(
-                            "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
-                            "configured strict_with_suppression=True"
-                        )
-                closure_strictness, skip_pre_unit_closures = (
-                    resolve_closure_strictness_mode(
-                        closure_strictness="lenient",
-                        skip_pre_unit_closures=True,
-                    )
-                )
-            else:
-                closure_strictness = cfg_resolved_strictness
-                skip_pre_unit_closures = cfg_resolved_skip
-    non_suppressing_ctx_managers = normalize_non_suppressing_ctx_managers(
-        tool_cfg.get("non_suppressing_ctx_managers"),
-        getattr(args, "non_suppressing_ctx_managers", ()),
-    )
+    (
+        closure_strictness,
+        skip_pre_unit_closures,
+        has_explicit_closure_cfg,
+    ) = _resolve_cli_closure_policy(args, tool_cfg)
+    try:
+        non_suppressing_ctx_managers = normalize_non_suppressing_ctx_managers(
+            tool_cfg.get("non_suppressing_ctx_managers"),
+            getattr(args, "non_suppressing_ctx_managers", ()),
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     if skip_pre_unit_closures and getattr(args, "patch", False):
         logger.info(
             "Lenient closure mode active; skipping pre-unit closure scan during refactoring"
@@ -1741,14 +1822,10 @@ def _emit_scan_artifacts_and_report(
 
     if args.patch:
         patch_closure_strictness = (
-            None
-            if (replace_clones and not has_explicit_closure_cfg)
-            else closure_strictness
+            None if not has_explicit_closure_cfg else closure_strictness
         )
         patch_skip_pre_unit_closures = (
-            None
-            if (replace_clones and not has_explicit_closure_cfg)
-            else skip_pre_unit_closures
+            None if not has_explicit_closure_cfg else skip_pre_unit_closures
         )
         patch_text = (
             generate_refactoring_patch(
@@ -1799,9 +1876,10 @@ def _emit_scan_artifacts_and_report(
             report_data, "SARIF 2.1.0" if args.format == "sarif" else "JSON", args.output
         )
         _emit_diagnostic_error_summary()
-        if diagnostic_errors > 0:
-            return 2
-        return 0 if not clones else 1
+        return _determine_cli_exit_code(
+            has_clones=bool(clones),
+            diagnostic_errors=diagnostic_errors,
+        )
 
     if stats and args.stats:
         _render_dry_scorecard(stats, use_color)
@@ -1821,7 +1899,10 @@ def _emit_scan_artifacts_and_report(
                     f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!\n"
                 )
         _emit_diagnostic_error_summary()
-        return 2 if diagnostic_errors > 0 else 0
+        return _determine_cli_exit_code(
+            has_clones=False,
+            diagnostic_errors=diagnostic_errors,
+        )
 
     report_lines = _render_text_violations(
         clones,
@@ -1847,7 +1928,10 @@ def _emit_scan_artifacts_and_report(
 
     _emit_diagnostic_error_summary()
 
-    return 2 if diagnostic_errors > 0 else 1
+    return _determine_cli_exit_code(
+        has_clones=True,
+        diagnostic_errors=diagnostic_errors,
+    )
 
 
 if __name__ == "__main__":

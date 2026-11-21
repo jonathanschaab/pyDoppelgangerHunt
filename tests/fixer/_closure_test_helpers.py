@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import symtable
 from typing import Any, Dict, List, Optional, Set, Tuple
+import warnings
 
 import pytest
 
@@ -14,7 +15,6 @@ from pydoppelgangerhunt.fixer import (
     generate_refactoring_patch,
     inspect_single_unit_scope,
 )
-from pydoppelgangerhunt.fixer._df_cache import _suppress_syntax_warnings
 
 __all__ = [
     "_ensure_shared_git_repo",
@@ -42,7 +42,8 @@ def _extract_symtable_scope_info(
 ) -> Dict[Tuple[str, int], Dict[str, frozenset[str]]]:
     """Computes C-level symtable locals, frees, globals, and cells keyed by (scope_name, lineno)."""
     try:
-        with _suppress_syntax_warnings():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
             root_table = symtable.symtable(source_text, "<symtable>", "exec")
     except (SyntaxError, ValueError):
         return {}

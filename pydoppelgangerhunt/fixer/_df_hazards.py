@@ -11,6 +11,7 @@ import builtins
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from pydoppelgangerhunt.fixer._ast_compat import is_try_or_trystar_node
 from pydoppelgangerhunt.fixer._df_cache import (
     _MAX_DOWNSTREAM_CACHE_SIZE,
     _build_downstream_cache_key,
@@ -110,19 +111,12 @@ def _stmt_definitely_terminates(stmt: ast.stmt, *, _depth: int = 0) -> bool:
             and _block_definitely_terminates(stmt.body, _depth=_depth + 1)
             and _block_definitely_terminates(stmt.orelse, _depth=_depth + 1)
         )
-    if isinstance(stmt, ast.Try):
-        if stmt.finalbody and _block_definitely_terminates(stmt.finalbody, _depth=_depth + 1):
-            return True
-        if stmt.handlers and _block_definitely_terminates(stmt.body, _depth=_depth + 1):
-            return all(
-                _block_definitely_terminates(h.body, _depth=_depth + 1) for h in stmt.handlers
-            )
-    if type(stmt).__name__ == "TryStar":
+    if is_try_or_trystar_node(stmt):
         finalbody = getattr(stmt, "finalbody", None)
         if finalbody and _block_definitely_terminates(finalbody, _depth=_depth + 1):
             return True
-        handlers = getattr(stmt, "handlers", [])
-        body = getattr(stmt, "body", [])
+        handlers = getattr(stmt, "handlers", ())
+        body = getattr(stmt, "body", ())
         if handlers and _block_definitely_terminates(body, _depth=_depth + 1):
             return all(
                 _block_definitely_terminates(h.body, _depth=_depth + 1) for h in handlers
@@ -182,10 +176,7 @@ def _get_scope_try_and_with_blocks(
         for node in ast.walk(scope_node):
             if node is scope_node:
                 continue
-            if (
-                isinstance(node, (ast.Try, ast.With, ast.AsyncWith))
-                or type(node).__name__ == "TryStar"
-            ):
+            if isinstance(node, (ast.With, ast.AsyncWith)) or is_try_or_trystar_node(node):
                 blocks.append(node)
         return blocks
 
@@ -360,7 +351,7 @@ def _enclosing_try_reads_outputs(
                         return True
                 continue
 
-            if isinstance(node, ast.Try) or type(node).__name__ == "TryStar":
+            if is_try_or_trystar_node(node):
                 body_nodes = getattr(node, "body", [])
                 orelse_nodes = getattr(node, "orelse", [])
                 handlers = getattr(node, "handlers", [])

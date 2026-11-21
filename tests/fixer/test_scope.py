@@ -16,15 +16,17 @@ from pydoppelgangerhunt import (
     inspect_single_unit_scope,
     synthesize_shared_helper_code,
 )
-from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
+from pydoppelgangerhunt.fixer._df_with_provenance import (  # pylint: disable=protected-access
     _analyze_block_assignment,
     _block_terminates,
     _extract_deleted_names,
+    _walrus_assignment_in_expr,
+)
+from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=protected-access
     _inspect_unit_scope,
     _normalize_receiver_attr_name,
     _normalize_receiver_attrs,
     _unfold_receiver_attribute,
-    _walrus_assignment_in_expr,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
 
@@ -536,7 +538,8 @@ def test_comprehension_token_span_and_bare_call_replacement(tmp_path: Path) -> N
 
 def test_annassign_without_value_not_treated_as_definite_assignment(tmp_path: Path) -> None:
     """Verifies that type annotations without values do not prevent conditional output initialization."""
-    from pydoppelgangerhunt.fixer import _analyze_block_assignment, synthesize_shared_helper_code  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer import synthesize_shared_helper_code  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer._df_with_provenance import _analyze_block_assignment  # pylint: disable=import-outside-toplevel
 
     tree = ast.parse("res: int\nif flag:\n    res = 42\n")
     definite, conditional = _analyze_block_assignment(tree.body)
@@ -1347,7 +1350,7 @@ def test_partially_overlapping_inputs_preserves_full_signature(tmp_path: Path) -
 @pytest.mark.skipif(sys.version_info < (3, 10), reason="Pattern matching requires Python 3.10+")
 def test_is_irrefutable_pattern_and_case() -> None:
     """Verifies that _is_irrefutable_case identifies wildcard, as, and alternative irrefutable patterns."""
-    from pydoppelgangerhunt.fixer import _is_irrefutable_case  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer._df_closures import _is_irrefutable_case  # pylint: disable=import-outside-toplevel
 
     code = (
         "match x:\n"

@@ -6,14 +6,11 @@ import ast
 import difflib
 import re
 import typing
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import AbstractSet, Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.config import (
     normalize_path_string,
     resolve_pair_closure_flags,
-)
-from pydoppelgangerhunt.source_lines import (
-    extract_unit_source_lines_with_state,
 )
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
@@ -24,14 +21,14 @@ from pydoppelgangerhunt.fixer.binding import (
     _prune_unshared_receivers,
     _resolve_effective_binding,
 )
+from pydoppelgangerhunt.fixer._ast_compat import is_type_alias_node
 from pydoppelgangerhunt.fixer._df_cache import (
     _get_or_parse_tree,
-    _parse_ast_no_syntax_warnings,
-    _suppress_syntax_warnings,
 )
 from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor
 from pydoppelgangerhunt.fixer.dataflow import (
     _load_unit_file_text,
+    allows_u2_source_placeholder,
     has_async_generator_delegation_hazard,
     resolve_clone_pair_outputs,
 )
@@ -43,13 +40,14 @@ from pydoppelgangerhunt.fixer.scope import (
     analyze_unit_variable_scope,
     ensure_unit_scope_closure_mode,
     is_subroutine_unit,
+    resolve_unit_inferred_col_bounds,
     scope_matches_closure_mode,
 )
 from pydoppelgangerhunt.fixer.source import (
     _detect_indent_step,
-    _extract_unit_body_lines,
+    _extract_unit_token_lines_with_state,
     _find_multiline_string_continuation_lines,
-    _slice_unit_token_lines,
+    validate_unit_schema,
     dedent_source_text,
     extract_unit_comments_and_pragmas,
     split_source_lines,
@@ -95,12 +93,12 @@ def _parse_dedented_stmts(raw_text: str) -> List[ast.stmt]:
     if not stripped:
         return []
     try:
-        return _parse_ast_no_syntax_warnings(stripped).body
+        return ast.parse(stripped).body
     except (RecursionError, MemoryError):
         return []
     except (SyntaxError, ValueError, UnicodeDecodeError):
         try:
-            wrapped = _parse_ast_no_syntax_warnings(f"if 1:\n{dedented}").body
+            wrapped = ast.parse(f"if 1:\n{dedented}").body
             if len(wrapped) == 1 and isinstance(wrapped[0], ast.If):
                 return wrapped[0].body
         except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
@@ -152,7 +150,13 @@ def _is_subline_unit(unit: Dict[str, Any]) -> bool:
     """Returns True if the unit represents a sub-line token span rather than a whole statement."""
     return any(
         unit.get(k) is not None
-        for k in ("start_col", "end_col", "start_col_offset", "end_col_offset")
+        for k in (
+            "start_col",
+            "end_col",
+            "start_col_offset",
+            "col_offset",
+            "end_col_offset",
+        )
     )
 
 
@@ -793,7 +797,7 @@ def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
     text = signature_or_func_text.strip()
     tree: Optional[ast.AST] = None
     try:
-        tree = _parse_ast_no_syntax_warnings(text)
+        tree = ast.parse(text)
     except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
         pass
 
@@ -804,7 +808,7 @@ def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
             params_part = params_part[1:-1].strip()
         ret_part = parts[1].strip()
         try:
-            tree = _parse_ast_no_syntax_warnings(
+            tree = ast.parse(
                 f"def _sig_wrapper({params_part}) -> {ret_part}: pass"
             )
         except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
@@ -812,7 +816,7 @@ def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
 
     if tree is None:
         try:
-            tree = _parse_ast_no_syntax_warnings(f"def _sig_wrapper({text}): pass")
+            tree = ast.parse(f"def _sig_wrapper({text}): pass")
         except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
             pass
 
@@ -822,7 +826,7 @@ def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
 
     has_defs = any(
         isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.AnnAssign))
-        or type(n).__name__ == "TypeAlias"
+        or is_type_alias_node(n)
         for n in ast.walk(tree)
     )
     needed: Set[str] = set()
@@ -851,7 +855,7 @@ def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
         elif isinstance(node, ast.AnnAssign):
             if node.annotation is not None:
                 annotations.append(node.annotation)
-        elif type(node).__name__ == "TypeAlias":
+        elif is_type_alias_node(node):
             alias_val = getattr(node, "value", None)
             if isinstance(alias_val, ast.AST):
                 annotations.append(alias_val)
@@ -1258,7 +1262,7 @@ def _format_helper_docstring(
 def _extract_probe_active_idents(probe_src: str, return_type: str) -> Set[str]:
     """Extracts referenced AST Name identifiers and annotation string-constant identifiers."""
     try:
-        probe_tree = _parse_ast_no_syntax_warnings(probe_src)
+        probe_tree = ast.parse(probe_src)
     except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
         return set(re.findall(r"\b[A-Za-z_]\w*\b", f"{probe_src}\n{return_type}"))
     all_nodes = list(ast.walk(probe_tree))
@@ -1290,6 +1294,37 @@ def _extract_probe_active_idents(probe_src: str, return_type: str) -> Set[str]:
     return {
         n.id for n in all_nodes if isinstance(n, ast.Name)
     } | set(re.findall(r"\b[A-Za-z_]\w*\b", f"{return_type}\n{str_ann_text}"))
+
+
+_SYNTHESIS_DISALLOWED_HAZARDS: frozenset[str] = frozenset(
+    {
+        "type_param_closure_capture",
+        "pathological_ast",
+        "stale_source_code",
+        "invalid_unit_columns",
+        "deleted_output",
+        "severed_closure_cell",
+        "unavailable_source_for_closure_mode",
+    }
+)
+
+
+def _has_blocking_synthesis_hazards(
+    hazards1: AbstractSet[str],
+    hazards2: AbstractSet[str],
+    *,
+    u2_allows_placeholder: bool,
+    extra_hazards: Iterable[str] = (),
+) -> bool:
+    """Returns True when unit or pair hazards block helper synthesis."""
+    if "unavailable_source_placeholder" in hazards1 or (
+        "unavailable_source_placeholder" in hazards2 and not u2_allows_placeholder
+    ):
+        return True
+    return any(
+        h in _SYNTHESIS_DISALLOWED_HAZARDS
+        for h in (*hazards1, *hazards2, *extra_hazards)
+    )
 
 
 def synthesize_shared_helper_code(
@@ -1344,6 +1379,8 @@ def synthesize_shared_helper_code(
         outputs: Optional pre-resolved output variable names for u1.
         outputs2: Optional pre-resolved output variable names for u2.
     """
+    validate_unit_schema(u1)
+    validate_unit_schema(u2)
     u1 = dict(u1)
     u2 = dict(u2)
     for u_target, src_override in ((u1, source_text1), (u2, source_text2)):
@@ -1354,24 +1391,14 @@ def synthesize_shared_helper_code(
             u_target["source_text"] = src_override
     if not _align_pair_expr_kinds(u1, u2):
         return ""
-    raw_lines1, _ = extract_unit_source_lines_with_state(
-        u1, repo_root=repo_root
-    )
-    raw_lines2, _ = extract_unit_source_lines_with_state(
-        u2, repo_root=repo_root
-    )
-    lines1 = _slice_unit_token_lines(
-        u1,
-        _extract_unit_body_lines(
-            u1, [ln.rstrip("\r\n") for ln in raw_lines1]
-        ),
-    )
-    lines2 = _slice_unit_token_lines(
-        u2,
-        _extract_unit_body_lines(
-            u2, [ln.rstrip("\r\n") for ln in raw_lines2]
-        ),
-    )
+    u1 = resolve_unit_inferred_col_bounds(u1, repo_root=repo_root).unit
+    u2 = resolve_unit_inferred_col_bounds(u2, repo_root=repo_root).unit
+    tok1 = _extract_unit_token_lines_with_state(u1, repo_root=repo_root)
+    tok2 = _extract_unit_token_lines_with_state(u2, repo_root=repo_root)
+    if tok1.lines is None or tok2.lines is None or tok1.is_placeholder:
+        return ""
+    lines1 = tok1.lines
+    lines2 = tok2.lines
 
     base_name1 = _base_unit_name(u1)
     base_name2 = _base_unit_name(u2)
@@ -1500,6 +1527,25 @@ def synthesize_shared_helper_code(
             u_item["is_async"] = True
         scopes.append(s_item)
     scope1, scope2 = scopes[0], scopes[1]
+    is_sub1 = is_subroutine_unit(u1, source_text=source_text1, tree=tree1)
+    is_sub2 = is_subroutine_unit(u2, source_text=source_text2, tree=tree2)
+    if is_sub1 != is_sub2:
+        return ""
+    is_sub = is_sub1
+    hazards1 = set(scope1.get("control_flow_hazards", ()))
+    hazards2 = set(scope2.get("control_flow_hazards", ()))
+    u2_allows_placeholder = allows_u2_source_placeholder(
+        is_subroutine=is_sub,
+        requires_u2_edit=False,
+        source_text2=source_text2,
+    )
+    if (
+        (tok2.is_placeholder and not u2_allows_placeholder)
+        or _has_blocking_synthesis_hazards(
+            hazards1, hazards2, u2_allows_placeholder=u2_allows_placeholder
+        )
+    ):
+        return ""
     if (
         has_precomputed_scopes
         and scope is not None
@@ -1531,6 +1577,13 @@ def synthesize_shared_helper_code(
             closure_strictness=closure_strictness,
             non_suppressing_ctx_managers=non_suppressing_ctx_managers,
         )
+    if _has_blocking_synthesis_hazards(
+        hazards1,
+        hazards2,
+        u2_allows_placeholder=u2_allows_placeholder,
+        extra_hazards=scope.get("control_flow_hazards", ()),
+    ):
+        return ""
 
     if scope1.get("is_async") or scope2.get("is_async"):
         scope["is_async"] = True
@@ -1589,40 +1642,6 @@ def synthesize_shared_helper_code(
     if has_async_generator_delegation_hazard(scope1, scope2, scope):
         return ""
     if scope1.get("nonlocals") or scope2.get("nonlocals") or scope.get("nonlocals"):
-        return ""
-    is_sub1 = is_subroutine_unit(u1, source_text=source_text1, tree=tree1)
-    is_sub2 = is_subroutine_unit(u2, source_text=source_text2, tree=tree2)
-    if is_sub1 != is_sub2:
-        return ""
-    is_sub = is_sub1
-    hazards1 = scope1.get("control_flow_hazards", ())
-    hazards2 = scope2.get("control_flow_hazards", ())
-    # Intentional host-caller asymmetry: synthesize_shared_helper_code always builds
-    # the helper body from u1, so unavailable_source_placeholder on u1 always blocks.
-    # For u2, non-subroutine preview-only extraction (not is_sub and source_text2 is None)
-    # permits emitting the u1-backed host helper when u2's caller file is missing on disk.
-    if "unavailable_source_placeholder" in hazards1 or (
-        "unavailable_source_placeholder" in hazards2
-        and (is_sub or source_text2 is not None)
-    ):
-        return ""
-    combined_hazards = (
-        list(hazards1)
-        + list(hazards2)
-        + list(scope.get("control_flow_hazards", ()))
-    )
-    if any(
-        h in combined_hazards
-        for h in (
-            "type_param_closure_capture",
-            "pathological_ast",
-            "stale_source_code",
-            "invalid_unit_columns",
-            "deleted_output",
-            "severed_closure_cell",
-            "unavailable_source_for_closure_mode",
-        )
-    ):
         return ""
     if not is_same_class and not _is_same_file_path(f1, f2, repo_root=repo_root) and (
         scope1.get("globals") or scope2.get("globals") or scope.get("globals")
@@ -1964,11 +1983,10 @@ def synthesize_shared_helper_code(
     has_naked_ctrl = any(h in ("naked_break", "naked_continue") for h in hazards)
     if not has_naked_ctrl:
         try:
-            with _suppress_syntax_warnings():
-                if indent:
-                    compile("if 1:\n" + helper_def, "<synthesized_helper>", "exec")
-                else:
-                    compile(helper_def, "<synthesized_helper>", "exec")
+            if indent:
+                compile("if 1:\n" + helper_def, "<synthesized_helper>", "exec")
+            else:
+                compile(helper_def, "<synthesized_helper>", "exec")
         except (SyntaxError, ValueError, RecursionError, MemoryError):
             return ""
 
@@ -1983,8 +2001,7 @@ def synthesize_shared_helper_code(
         if import_header_parts:
             combined = "\n".join(import_header_parts) + "\n\n\n" + helper_def
             try:
-                with _suppress_syntax_warnings():
-                    compile("\n".join(import_header_parts), "<synthesized_imports>", "exec")
+                compile("\n".join(import_header_parts), "<synthesized_imports>", "exec")
             except (SyntaxError, ValueError, RecursionError, MemoryError):
                 return ""
             return combined

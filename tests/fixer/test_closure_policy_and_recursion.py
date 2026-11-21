@@ -38,7 +38,8 @@ from pydoppelgangerhunt.fixer._df_pairing import (
     ASYNC_GENERATOR_DELEGATION_HAZARD_REASON,
     DELETED_OUTPUT_HAZARD_REASON,
     ENCLOSING_TRY_OR_WITH_CLEANUP_HAZARD_REASON,
-    GENERATOR_OUTPUT_OR_CLOSURE_CONFLICT_REASON,
+    GENERATOR_CLOSURE_CONFLICT_REASON,
+    GENERATOR_OUTPUT_CONFLICT_REASON,
     INVALID_UNIT_BOUNDS_REASON,
 )
 from pydoppelgangerhunt.fixer._df_with_provenance import (
@@ -126,8 +127,8 @@ def _conditional_tx_pair(
         pytest.param(
             {},
             {"strict_with_suppression": False},
-            True,
-            id="unit_strict_with_suppression_false_preserves_pedantic_default",
+            False,
+            id="unit_strict_with_suppression_false_opts_out_of_pedantic",
         ),
         pytest.param(
             {"closure_strictness": "strict"},
@@ -252,14 +253,14 @@ def test_clear_closure_warning_cache_preserves_other_threads_and_sessions() -> N
         pytest.param("sarif", [], id="sarif_format"),
     ],
 )
-def test_cli_exit_code_2_on_diagnostic_errors_across_formats(
+def test_cli_exit_code_4_on_diagnostic_errors_with_clones_across_formats(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     cli_format: str,
     extra_flags: list[str],
 ) -> None:
-    """Verifies internal synthesis/HTML errors cause CLI exit code 2 and stderr warning across output formats."""
+    """Verifies internal synthesis/HTML errors cause CLI exit code 4 (clones + diagnostic errors) and stderr warning across output formats."""
     target = tmp_path / "dup.py"
     target.write_text(
         "def alpha(x):\n    a = x + 1\n    b = a * 2\n    return b + 3\n\n"
@@ -281,7 +282,7 @@ def test_cli_exit_code_2_on_diagnostic_errors_across_formats(
         [str(target), "--min-lines", "3", "--format", cli_format, "--html", str(html_out), *extra_flags]
     )
     captured = capsys.readouterr()
-    assert err_exit == 2
+    assert err_exit == 4
     assert "internal diagnostic error(s)" in captured.err
     if cli_format in ("json", "sarif"):
         parsed = json.loads(captured.out)
@@ -323,7 +324,7 @@ def test_per_unit_non_suppressing_ctx_managers_honored_end_to_end(tmp_path: Path
         blocked_u1, blocked_u2, repo_root=str(tmp_path), closure_strictness="pedantic"
     )
     assert "def _shared_" not in sug_blocked
-    assert "generator output or closure conflict" in sug_blocked
+    assert "generator output conflict" in sug_blocked
     html_blocked = generate_html_report(
         [(1.0, blocked_u1, blocked_u2)],
         str(tmp_path),
@@ -397,7 +398,8 @@ def test_safety_pair_skip_reasons_and_suggestion_rejection_enclosing_with_cleanu
         ASYNC_GENERATOR_DELEGATION_HAZARD_REASON,
     ):
         assert reason in SAFETY_PAIR_SKIP_REASONS
-    assert GENERATOR_OUTPUT_OR_CLOSURE_CONFLICT_REASON not in SAFETY_PAIR_SKIP_REASONS
+    assert GENERATOR_OUTPUT_CONFLICT_REASON not in SAFETY_PAIR_SKIP_REASONS
+    assert GENERATOR_CLOSURE_CONFLICT_REASON in SAFETY_PAIR_SKIP_REASONS
 
     src = (
         "def run_a(GuardCtx, items):\n"
@@ -436,13 +438,13 @@ def test_safety_pair_skip_reasons_and_suggestion_rejection_enclosing_with_cleanu
 
 
 def test_slice_unit_token_lines_inverted_single_line_columns_fail_closed() -> None:
-    """Verifies single-line inverted column bounds fail closed in _slice_unit_token_lines."""
+    """Verifies single-line inverted column bounds fail closed by returning None in _slice_unit_token_lines."""
     assert (
         _slice_unit_token_lines(
             {"kind": "comprehension", "start_col": 12, "end_col": 4},
             ["    [x for x in y]\n"],
         )
-        == []
+        is None
     )
     assert (
         _slice_unit_token_lines(
@@ -671,4 +673,294 @@ def test_deep_nested_with_block_flow_and_provenance_fail_closed() -> None:
     assert out_prov.imported_symbols == frozenset()
     assert "deep_mgr" in out_prov.suppressors
     assert "deep_mgr" in out_prov.shadowed_names
+
+
+@pytest.mark.parametrize("cli_format", ["text", "json", "sarif"])
+def test_cli_exit_code_matrix_and_inline_fallback_separation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    cli_format: str,
+) -> None:
+    """Verifies CLI exit codes 0, 1, 2, 3, and 4 and ensures inline error fallbacks are distinct from helper code."""
+    clean_file = tmp_path / "clean.py"
+    clean_file.write_text("def only_one():\n    return 1\n", encoding="utf-8")
+
+    # Exit code 0: clean run with 0 clones
+    assert main([str(clean_file), "--min-lines", "3", "--format", cli_format]) == 0
+    capsys.readouterr()
+
+    # Exit code 2: invalid config in pyproject.toml exits via parser.error (SystemExit(2))
+    bad_cfg = tmp_path / "bad_pyproject.toml"
+    bad_cfg.write_text(
+        '[tool.pydoppelgangerhunt]\nclosure_strictness = "invalid_legacy_value"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit) as cfg_exc:
+        main([str(clean_file), "--config", str(bad_cfg), "--format", cli_format])
+    assert cfg_exc.value.code == 2
+    capsys.readouterr()
+
+    # Exit code 3: 0 clones + internal diagnostic error reported via callback
+    def _html_err(*_args: Any, **kwargs: Any) -> str:
+        cb = kwargs.get("on_diagnostic_error")
+        if cb is not None:
+            cb()
+        return "<html>fallback</html>"
+
+    html_clean = tmp_path / f"clean_{cli_format}.html"
+    with monkeypatch.context() as mp:
+        mp.setattr("pydoppelgangerhunt.cli.generate_html_report", _html_err)
+        exit_clean_err = main(
+            [str(clean_file), "--min-lines", "3", "--format", cli_format, "--html", str(html_clean)]
+        )
+    captured_clean = capsys.readouterr()
+    assert exit_clean_err == 3
+    assert "internal diagnostic error(s)" in captured_clean.err
+
+    # Exit code 1 & 4 + inline fallback is never mistaken for a synthesized def _shared_ helper
+    dup_file = tmp_path / "dup.py"
+    dup_file.write_text(
+        "def alpha(x):\n    a = x + 1\n    b = a * 2\n    return b + 3\n\n"
+        "def beta(x):\n    a = x + 1\n    b = a * 2\n    return b + 3\n",
+        encoding="utf-8",
+    )
+    assert main([str(dup_file), "--min-lines", "3", "--format", cli_format]) == 1
+    capsys.readouterr()
+
+    def _boom(*_args: Any, **_kwargs: Any) -> str:
+        raise RuntimeError("synthetic synthesis failure")
+
+    html_dup = tmp_path / f"dup_{cli_format}.html"
+    with monkeypatch.context() as mp:
+        mp.setattr("pydoppelgangerhunt.cli.synthesize_refactoring_suggestion", _boom)
+        mp.setattr("pydoppelgangerhunt.reporters.synthesize_refactoring_suggestion", _boom)
+        exit_dup_err = main(
+            [str(dup_file), "--min-lines", "3", "--format", cli_format, "--html", str(html_dup), "--suggest"]
+        )
+    captured_dup = capsys.readouterr()
+    assert exit_dup_err == 4
+    html_text = html_dup.read_text(encoding="utf-8")
+    assert "Diagnostic: pair rendering failed" in html_text
+    assert "def _shared_" not in html_text
+    if cli_format == "text":
+        assert "Diagnostic: suggestion skipped due to" in captured_dup.out
+        assert "def _shared_" not in captured_dup.out
+
+
+def test_cli_config_closure_strictness_skip_warning_and_ctx_manager_help(
+    tmp_path: Path,
+    caplog: Any,
+    capsys: Any,
+) -> None:
+    """Verifies configured closure_strictness conflicts, legacy rejection, and help distinguishing .Name from *.attr."""
+    import logging
+
+    src_file = tmp_path / "sample.py"
+    src_file.write_text("def clean(x):\n    return x + 1\n", encoding="utf-8")
+
+    cfg_pedantic = tmp_path / "pedantic.toml"
+    cfg_pedantic.write_text(
+        '[tool.pydoppelgangerhunt]\nclosure_strictness = "pedantic"\n',
+        encoding="utf-8",
+    )
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt"):
+        exit_rc = main(
+            [
+                str(src_file),
+                "--config",
+                str(cfg_pedantic),
+                "--skip-pre-unit-closures",
+            ]
+        )
+    assert exit_rc == 0
+    assert any(
+        "overrides configured closure_strictness='pedantic'" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+    # Negative control: lenient config (already lenient) does not warn on --skip-pre-unit-closures
+    cfg_lenient = tmp_path / "lenient.toml"
+    cfg_lenient.write_text(
+        '[tool.pydoppelgangerhunt]\nclosure_strictness = "lenient"\n',
+        encoding="utf-8",
+    )
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt"):
+        exit_lenient = main(
+            [
+                str(src_file),
+                "--config",
+                str(cfg_lenient),
+                "--skip-pre-unit-closures",
+            ]
+        )
+    assert exit_lenient == 0
+    assert not any(
+        "overrides configured closure_strictness=" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+    # Removed legacy aliases in TOML fail strictly at CLI boundary
+    cfg_legacy = tmp_path / "legacy_fail_closed.toml"
+    cfg_legacy.write_text(
+        '[tool.pydoppelgangerhunt]\nclosure_strictness = "fail_closed"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        main([str(src_file), "--config", str(cfg_legacy), "--skip-pre-unit-closures"])
+    assert exc_info.value.code == 2
+    assert "Invalid closure_strictness value 'fail_closed'" in capsys.readouterr().err
+
+    # Help string accurately distinguishes .Name relative imports from *.attr suffix wildcards
+    from pydoppelgangerhunt.cli import build_arg_parser
+
+    help_text = " ".join(build_arg_parser().format_help().split())
+    assert "'.Name' relative imports" in help_text
+    assert "'*.attr' suffix wildcards" in help_text
+    assert "'*.attr' / '.attr'" not in help_text
+
+    # Behavioral check: '.lock' matches `from . import lock`, NOT `obj.lock()` (which requires '*.lock')
+    attr_src = (
+        "def run(obj, step):\n"
+        "    with obj.lock():\n"
+        "        v = step()\n"
+        "    cb = lambda: v\n"
+        "    return cb()\n"
+    )
+    u_attr = {
+        "start": 4,
+        "end": 4,
+        "kind": "statement",
+        "source_text": attr_src,
+        "closure_strictness": "pedantic",
+        "non_suppressing_ctx_managers": [".lock"],
+    }
+    sc_dot_name = inspect_single_unit_scope(u_attr)
+    assert sc_dot_name["is_control_flow_safe"] is False
+
+    sc_star_attr = inspect_single_unit_scope(
+        {**u_attr, "non_suppressing_ctx_managers": ["*.lock"]}
+    )
+    assert sc_star_attr["is_control_flow_safe"] is True
+
+    rel_src = (
+        "from . import lock\n"
+        "def run(step):\n"
+        "    with lock():\n"
+        "        v = step()\n"
+        "    cb = lambda: v\n"
+        "    return cb()\n"
+    )
+    sc_rel = inspect_single_unit_scope(
+        {
+            "start": 5,
+            "end": 5,
+            "kind": "statement",
+            "source_text": rel_src,
+            "closure_strictness": "pedantic",
+            "non_suppressing_ctx_managers": [".lock"],
+        }
+    )
+    assert sc_rel["is_control_flow_safe"] is True
+
+
+def test_unrecognized_caller_strictness_preview_mode_enforces_strict_over_lenient_unit(
+    tmp_path: Path,
+) -> None:
+    """Verifies unrecognized caller closure_strictness in replace_clones=False enforces 'strict' fallback over unit 'lenient'."""
+    src_closure = (
+        "def g1(items: list[int]):\n"
+        "    cb = lambda: extra\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "        extra = x\n"
+        "    return 0\n\n"
+        "def g2(items: list[int]):\n"
+        "    for y in items:\n"
+        "        yield y\n"
+        "        extra = y\n"
+        "    return 0\n"
+    )
+    mod_closure = tmp_path / "closure_pair.py"
+    mod_closure.write_text(src_closure, encoding="utf-8")
+    u1_lenient = {
+        "file": str(mod_closure),
+        "start": 3,
+        "end": 5,
+        "name": "g1:block",
+        "kind": "compound_block",
+        "closure_strictness": "lenient",
+    }
+    u2_lenient = {
+        "file": str(mod_closure),
+        "start": 9,
+        "end": 11,
+        "name": "g2:block",
+        "kind": "compound_block",
+        "closure_strictness": "lenient",
+    }
+
+    clear_dataflow_cache()
+    clear_closure_warning_cache()
+    # Control: explicit lenient works as expected in preview mode
+    preview_lenient = generate_refactoring_patch(
+        [(1.0, u1_lenient, u2_lenient)],
+        repo_root=str(tmp_path),
+        replace_clones=False,
+        closure_strictness="lenient",
+    )
+    assert "yield from" in preview_lenient
+
+    # Unrecognized caller strictness in replace_clones=False must fall back to 'strict'
+    # rather than letting u1['closure_strictness'] = 'lenient' weaken it.
+    clear_dataflow_cache()
+    clear_closure_warning_cache()
+    preview_unrecognized = generate_refactoring_patch(
+        [(1.0, u1_lenient, u2_lenient)],
+        repo_root=str(tmp_path),
+        replace_clones=False,
+        closure_strictness="unrecognized_policy_xyz",
+    )
+    assert preview_unrecognized == ""
+
+    # Confirm the fallback in replace_clones=False is 'strict' (allows heuristic unknown ctx mgr preview),
+    # unlike replace_clones=True on unset units which preserves 'pedantic' default.
+    tx_src = (
+        "def alpha(compute, scale):\n"
+        "    with UnknownTxGuard():\n"
+        "        val = compute(scale)\n"
+        "        yield val\n"
+        "        extra = val + 1\n"
+        "    yield extra * 2\n\n"
+        "def beta(compute, scale):\n"
+        "    with UnknownTxGuard():\n"
+        "        val = compute(scale)\n"
+        "        yield val\n"
+        "        extra = val + 1\n"
+        "    yield extra * 2\n"
+    )
+    mod_tx = tmp_path / "tx_pair.py"
+    mod_tx.write_text(tx_src, encoding="utf-8")
+    u_tx1 = {"file": str(mod_tx), "start": 2, "end": 5, "name": "alpha:block", "kind": "compound_block"}
+    u_tx2 = {"file": str(mod_tx), "start": 9, "end": 12, "name": "beta:block", "kind": "compound_block"}
+    clear_dataflow_cache()
+    clear_closure_warning_cache()
+    tx_preview_fallback = generate_refactoring_patch(
+        [(1.0, u_tx1, u_tx2)],
+        repo_root=str(tmp_path),
+        replace_clones=False,
+        closure_strictness="unrecognized_policy_xyz",
+    )
+    assert "def _shared_" in tx_preview_fallback
+    clear_dataflow_cache()
+    clear_closure_warning_cache()
+    tx_rewrite_fallback = generate_refactoring_patch(
+        [(1.0, u_tx1, u_tx2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        closure_strictness="unrecognized_policy_xyz",
+    )
+    assert tx_rewrite_fallback == ""
 

@@ -16,7 +16,7 @@ from pydoppelgangerhunt import (
     generate_refactoring_patch,
     synthesize_shared_helper_code,
 )
-from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
+from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=protected-access
     _is_method_of_class,
     _populate_unit_receiver_metadata,
     _prune_unshared_receivers,
@@ -806,10 +806,12 @@ def test_batch_54_fixer_path_resolution_and_receiver_metadata(tmp_path: Path) ->
     """Batch 54: Test _normalize_file_path and _populate_unit_receiver_metadata edge cases."""
     # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.fixer import (
-        _normalize_file_path,
-        _populate_unit_receiver_metadata,
         find_enclosing_class,
         find_enclosing_function,
+    )
+    from pydoppelgangerhunt.fixer.binding import (
+        _normalize_file_path,
+        _populate_unit_receiver_metadata,
     )
 
     # 1. Test _normalize_file_path with existing cwd-relative file and repo_root

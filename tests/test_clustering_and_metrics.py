@@ -15,9 +15,11 @@ from pydoppelgangerhunt import (
     compute_repository_dry_stats,
     compute_unit_coverage,
 )
-from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
-    _detect_indent_step,
+from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=protected-access
     _inspect_unit_scope,
+)
+from pydoppelgangerhunt.fixer.source import (  # pylint: disable=protected-access
+    _detect_indent_step,
 )
 
 
@@ -229,7 +231,7 @@ def test_batch_37_directory_boundary_path_matching_and_exclude_filtering(tmp_pat
 def test_batch_39_notebook_cell_clustering_and_metrics_isolation(tmp_path: Any) -> None:
     """Tests Batch 39: notebook cell clustering isolation, notebook SLOC/DLOC metrics, and indent step detection."""
     from pydoppelgangerhunt.clustering import cluster_clone_families
-    from pydoppelgangerhunt.fixer import _detect_indent_step
+    from pydoppelgangerhunt.fixer.source import _detect_indent_step
     from pydoppelgangerhunt.metrics import compute_repository_dry_stats
 
     # 1. Notebook clone pairs across different cells form distinct members and families
@@ -288,7 +290,8 @@ def test_batch_39_notebook_cell_clustering_and_metrics_isolation(tmp_path: Any) 
 def test_batch_57_empty_res_has_receiver_access_and_metrics_package_sloc(tmp_path: Path) -> None:
     """Batch 57: Test empty_res has_receiver_access key parity and cross-platform package SLOC."""
     # pylint: disable=import-outside-toplevel
-    from pydoppelgangerhunt.fixer import _inspect_unit_scope, analyze_unit_variable_scope
+    from pydoppelgangerhunt.fixer import analyze_unit_variable_scope
+    from pydoppelgangerhunt.fixer.scope import _inspect_unit_scope
     from pydoppelgangerhunt.metrics import compute_repository_dry_stats
 
     # 1. Test _inspect_unit_scope on empty / whitespace units
@@ -326,3 +329,42 @@ def test_batch_57_empty_res_has_receiver_access_and_metrics_package_sloc(tmp_pat
     stats = compute_repository_dry_stats(str(tmp_path), [])
     assert "core_pkg" in stats["package_sloc"]
     assert stats["package_sloc"]["core_pkg"] == 2
+
+
+@pytest.mark.parametrize(
+    ("cell_source", "expected_sloc"),
+    [
+        pytest.param("x = 'a\x0cb'\n", 1, id="form_feed_inside_string_not_split"),
+        pytest.param("x = 'a\x0bb'\n", 1, id="vtab_inside_string_not_split"),
+        pytest.param("x = 1\ny = 2\n# comment\n", 2, id="control_physical_newlines_counted"),
+    ],
+)
+def test_compute_repository_dry_stats_notebook_uses_physical_line_splitting(
+    tmp_path: Path,
+    cell_source: str,
+    expected_sloc: int,
+) -> None:
+    """Verifies compute_repository_dry_stats splits notebook cell lines on physical newlines rather than \\x0c/\\x0b."""
+    import json
+
+    nb_file = tmp_path / "metrics_cell.ipynb"
+    nb_payload = {
+        "cells": [
+            {
+                "cell_type": "code",
+                "metadata": {},
+                "source": [cell_source],
+                "outputs": [],
+                "execution_count": None,
+            }
+        ],
+        "metadata": {},
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
+    nb_file.write_text(json.dumps(nb_payload), encoding="utf-8")
+    stats = compute_repository_dry_stats(
+        str(tmp_path), [], include_notebooks=True
+    )
+    assert stats["sloc"] == expected_sloc
+

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from typing import Any
+import warnings
+
 from pydoppelgangerhunt.baseline import (
     BaselineFingerprints,
     ClonePairFingerprint,
@@ -154,7 +157,7 @@ from pydoppelgangerhunt.reporters import (
     supports_color,
     synthesize_refactoring_suggestion,
 )
-from pydoppelgangerhunt.source_lines import SourceLinesOrigin, _PHYSICAL_LINE_RE
+from pydoppelgangerhunt.source_lines import SourceLinesOrigin
 
 __version__ = APP_VERSION
 __all__ = [
@@ -252,7 +255,6 @@ __all__ = [
     "parse_unit_coord",
     "refactor_module_units",
     "split_source_lines",
-    "_PHYSICAL_LINE_RE",
     "validate_module_unit_replacements",
     "validate_unit_schema",
     "generate_refactoring_patch",
@@ -294,3 +296,18 @@ __all__ = [
     "COMPOUND_BLOCK_TYPES",
     "BRANCH_NODE_TYPES",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Provides a deprecated shim for internal attributes removed from the public API."""
+    if name == "_PHYSICAL_LINE_RE":
+        warnings.warn(
+            "pydoppelgangerhunt._PHYSICAL_LINE_RE is internal and deprecated; "
+            "it will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        from pydoppelgangerhunt.source_lines import _PHYSICAL_LINE_RE
+
+        return _PHYSICAL_LINE_RE
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

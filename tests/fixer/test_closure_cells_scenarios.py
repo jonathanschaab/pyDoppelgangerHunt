@@ -2522,16 +2522,13 @@ def test_severed_closure_cell_scenarios(
         assert "severed_closure_cell" in scope["control_flow_hazards"]
 
 
-def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> None:
-    """Verifies end-to-end refactoring, skip reasons, and nonlocal promotion."""
+def test_generator_vs_sync_nonlocal_subroutine_refactoring(tmp_path: Path) -> None:
+    """Verifies generator nonlocal subroutines are blocked while synchronous nonlocal subroutines refactor cleanly."""
     from pydoppelgangerhunt.fixer import (
         generate_refactoring_patch,
         inspect_single_unit_scope,
-        resolve_clone_pair_outputs,
-        synthesize_shared_helper_code,
     )
 
-    # 1. Generator subroutine inside nested closure with outer nonlocal declaration
     gen_nl_src = (
         "def outer_a(items):\n"
         "    total = 0\n"
@@ -2540,8 +2537,7 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
         "        for x in items:\n"
         "            total += x * 2\n"
         "            yield x\n"
-        "    return gen_a, lambda: total\n"
-        "\n"
+        "    return gen_a, lambda: total\n\n"
         "def outer_b(items):\n"
         "    total = 10\n"
         "    def gen_b():\n"
@@ -2553,33 +2549,15 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
     )
     f_gen_nl = tmp_path / "gen_nl.py"
     f_gen_nl.write_text(gen_nl_src, encoding="utf-8")
-    u_gen1 = {
-        "file": str(f_gen_nl),
-        "start": 5,
-        "end": 7,
-        "name": "gen_a:For",
-        "kind": "compound_block",
-    }
-    u_gen2 = {
-        "file": str(f_gen_nl),
-        "start": 14,
-        "end": 16,
-        "name": "gen_b:For",
-        "kind": "compound_block",
-    }
+    u_gen1 = {"file": str(f_gen_nl), "start": 5, "end": 7, "name": "gen_a:For", "kind": "compound_block"}
+    u_gen2 = {"file": str(f_gen_nl), "start": 14, "end": 16, "name": "gen_b:For", "kind": "compound_block"}
     assert collect_downstream_read_names(gen_nl_src, u_gen1, candidates={"total", "x"}) == {"total"}
     ds_nl_all = collect_downstream_read_names(gen_nl_src, u_gen1, candidates=None)
     assert ds_nl_all is not None and "total" in ds_nl_all
     sc_gen_nl = inspect_single_unit_scope(u_gen1, repo_root=str(tmp_path))
     assert "severed_closure_cell" in sc_gen_nl["control_flow_hazards"]
-    assert (
-        generate_refactoring_patch(
-            [(1.0, u_gen1, u_gen2)], repo_root=str(tmp_path), replace_clones=True
-        )
-        == ""
-    )
+    assert generate_refactoring_patch([(1.0, u_gen1, u_gen2)], repo_root=str(tmp_path), replace_clones=True) == ""
 
-    # Synchronous nonlocal mutation without suspension safely refactors
     sync_nl_src = (
         "def outer_a(items):\n"
         "    total = 0\n"
@@ -2588,8 +2566,7 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
         "        for x in items:\n"
         "            total += x * 2\n"
         "            log(x)\n"
-        "    return worker_a, lambda: total\n"
-        "\n"
+        "    return worker_a, lambda: total\n\n"
         "def outer_b(items):\n"
         "    total = 10\n"
         "    def worker_b():\n"
@@ -2601,28 +2578,18 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
     )
     f_sync_nl = tmp_path / "sync_nl.py"
     f_sync_nl.write_text(sync_nl_src, encoding="utf-8")
-    u_sync1 = {
-        "file": str(f_sync_nl),
-        "start": 5,
-        "end": 7,
-        "name": "worker_a:For",
-        "kind": "compound_block",
-    }
-    u_sync2 = {
-        "file": str(f_sync_nl),
-        "start": 14,
-        "end": 16,
-        "name": "worker_b:For",
-        "kind": "compound_block",
-    }
+    u_sync1 = {"file": str(f_sync_nl), "start": 5, "end": 7, "name": "worker_a:For", "kind": "compound_block"}
+    u_sync2 = {"file": str(f_sync_nl), "start": 14, "end": 16, "name": "worker_b:For", "kind": "compound_block"}
     sc_sync1 = inspect_single_unit_scope(u_sync1, repo_root=str(tmp_path))
     assert "severed_closure_cell" not in sc_sync1["control_flow_hazards"]
-    patch_sync_nl = generate_refactoring_patch(
-        [(1.0, u_sync1, u_sync2)], repo_root=str(tmp_path), replace_clones=True
-    )
+    patch_sync_nl = generate_refactoring_patch([(1.0, u_sync1, u_sync2)], repo_root=str(tmp_path), replace_clones=True)
     assert "total = _shared_" in patch_sync_nl
 
-    # 2. Conditional store to pre-bound nonlocal promotes variable to input instead of None
+
+def test_prebound_nonlocal_promotion_and_unbound_hazard() -> None:
+    """Verifies pre-bound nonlocals promote conditional stores to inputs while unbound or loop-deleted ones fail."""
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
+
     cond_nl_src = (
         "def run_a(items):\n"
         "    total = 5\n"
@@ -2649,7 +2616,6 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
     assert "total" not in sc_cond_nl["conditional_outputs"]
     assert "severed_closure_cell" not in sc_cond_nl["control_flow_hazards"]
 
-    # Unbound nonlocal is not promoted to input and triggers severed_closure_cell
     unbound_nl_src = (
         "def outer_unb():\n"
         "    def inner_unb(items):\n"
@@ -2674,88 +2640,6 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
     assert "total" in sc_unbound_nl["conditional_outputs"]
     assert "severed_closure_cell" in sc_unbound_nl["control_flow_hazards"]
 
-    # Branch-only or deleted pre-unit nonlocal (including post-def del or sibling del) is not promoted to input
-    for bad_init_stmt, post_stmt in (
-        ("if flag:\n        total = 5", "return inner_bd"),
-        ("total = 5\n    del total", "return inner_bd"),
-        ("total = 5", "del total\n    return inner_bd"),
-        (
-            "total = 5\n    def clear():\n        nonlocal total\n        del total",
-            "return inner_bd, clear",
-        ),
-    ):
-        branch_or_del_nl_src = (
-            "def outer_bd(items, flag):\n"
-            f"    {bad_init_stmt}\n"
-            "    def inner_bd():\n"
-            "        nonlocal total\n"
-            "        for x in items:\n"
-            "            if x > 0:\n"
-            "                total = x * 2\n"
-            f"    {post_stmt}\n"
-        )
-        bd_tree = ast.parse(branch_or_del_nl_src)
-        for_node = next(n for n in ast.walk(bd_tree) if isinstance(n, ast.For))
-        sc_bd_nl = inspect_single_unit_scope(
-            {
-                "start": for_node.lineno,
-                "end": for_node.end_lineno,
-                "kind": "compound_block",
-                "source_text": branch_or_del_nl_src,
-                "source_code": "for x in items:\n    if x > 0:\n        total = x * 2\n",
-            },
-            tree=bd_tree,
-        )
-        assert "total" not in sc_bd_nl["inputs"]
-        assert "total" in sc_bd_nl["conditional_outputs"]
-        assert "severed_closure_cell" in sc_bd_nl["control_flow_hazards"]
-
-    # Lexical shadowing (mid local unbound at inner) and global in mid do not promote outer cell
-    for shadow_or_glob_src in (
-        (
-            "def outer_sg():\n"
-            "    total = 5\n"
-            "    def mid():\n"
-            "        def inner(items):\n"
-            "            nonlocal total\n"
-            "            for x in items:\n"
-            "                if x > 0:\n"
-            "                    total = x * 2\n"
-            "        total = 0\n"
-            "        return inner\n"
-            "    return mid\n"
-        ),
-        (
-            "def outer_sg():\n"
-            "    def mid():\n"
-            "        global total\n"
-            "        total = 10\n"
-            "        def inner(items):\n"
-            "            nonlocal total\n"
-            "            for x in items:\n"
-            "                if x > 0:\n"
-            "                    total = x * 2\n"
-            "        return inner\n"
-            "    total = 5\n"
-            "    return mid\n"
-        ),
-    ):
-        sg_tree = ast.parse(shadow_or_glob_src)
-        sg_for = next(n for n in ast.walk(sg_tree) if isinstance(n, ast.For))
-        sc_sg = inspect_single_unit_scope(
-            {
-                "start": sg_for.lineno,
-                "end": sg_for.end_lineno,
-                "kind": "compound_block",
-                "source_text": shadow_or_glob_src,
-                "source_code": "for x in items:\n    if x > 0:\n        total = x * 2\n",
-            },
-            tree=sg_tree,
-        )
-        assert "total" not in sc_sg["inputs"]
-        assert "severed_closure_cell" in sc_sg["control_flow_hazards"]
-
-    # Post-span del inside enclosing loop unbinds nonlocal for subsequent iterations
     loop_post_del_src = (
         "def outer_loop_del():\n"
         "    total = 5\n"
@@ -2781,63 +2665,133 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
     assert "total" not in sc_lpd["inputs"]
     assert "severed_closure_cell" in sc_lpd["control_flow_hazards"]
 
-    # Conditional live-in read/AugAssign followed by unconditional write or branch-only pre_bound
-    for cond_live_nl_src, u_s, u_e, u_code in (
-        (
-            "def outer_late_nl():\n"
-            "    def inner(items):\n"
-            "        nonlocal total\n"
-            "        for x in items:\n"
-            "            if x > 0:\n"
-            "                total += x * 2\n"
-            "        total = 0\n"
-            "    total = 10\n"
-            "    return inner\n",
+
+@pytest.mark.parametrize(
+    ("bad_init_stmt", "post_stmt"),
+    [
+        pytest.param("if flag:\n        total = 5", "return inner_bd", id="branch_only_init"),
+        pytest.param("total = 5\n    del total", "return inner_bd", id="pre_def_del"),
+        pytest.param("total = 5", "del total\n    return inner_bd", id="post_def_del"),
+        pytest.param(
+            "total = 5\n    def clear():\n        nonlocal total\n        del total",
+            "return inner_bd, clear",
+            id="sibling_nonlocal_del",
+        ),
+    ],
+)
+def test_branch_or_deleted_nonlocal_not_promoted_to_input(
+    bad_init_stmt: str, post_stmt: str
+) -> None:
+    """Verifies branch-only or deleted pre-unit nonlocals remain conditional outputs with severed_closure_cell."""
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
+
+    src = (
+        "def outer_bd(items, flag):\n"
+        f"    {bad_init_stmt}\n"
+        "    def inner_bd():\n"
+        "        nonlocal total\n"
+        "        for x in items:\n"
+        "            if x > 0:\n"
+        "                total = x * 2\n"
+        f"    {post_stmt}\n"
+    )
+    bd_tree = ast.parse(src)
+    for_node = next(n for n in ast.walk(bd_tree) if isinstance(n, ast.For))
+    sc = inspect_single_unit_scope(
+        {
+            "start": for_node.lineno,
+            "end": for_node.end_lineno,
+            "kind": "compound_block",
+            "source_text": src,
+            "source_code": "for x in items:\n    if x > 0:\n        total = x * 2\n",
+        },
+        tree=bd_tree,
+    )
+    assert "total" not in sc["inputs"]
+    assert "total" in sc["conditional_outputs"]
+    assert "severed_closure_cell" in sc["control_flow_hazards"]
+
+
+@pytest.mark.parametrize(
+    ("src", "u_s", "u_e", "u_code"),
+    [
+        pytest.param(
+            "def outer_sg():\n    total = 5\n    def mid():\n        def inner(items):\n"
+            "            nonlocal total\n            for x in items:\n"
+            "                if x > 0:\n                    total = x * 2\n"
+            "        total = 0\n        return inner\n    return mid\n",
+            6,
+            8,
+            "for x in items:\n    if x > 0:\n        total = x * 2\n",
+            id="lexical_mid_shadowing",
+        ),
+        pytest.param(
+            "def outer_sg():\n    def mid():\n        global total\n        total = 10\n"
+            "        def inner(items):\n            nonlocal total\n            for x in items:\n"
+            "                if x > 0:\n                    total = x * 2\n"
+            "        return inner\n    total = 5\n    return mid\n",
+            7,
+            9,
+            "for x in items:\n    if x > 0:\n        total = x * 2\n",
+            id="mid_global_blocks_outer",
+        ),
+        pytest.param(
+            "def outer_late_nl():\n    def inner(items):\n        nonlocal total\n"
+            "        for x in items:\n            if x > 0:\n                total += x * 2\n"
+            "        total = 0\n    total = 10\n    return inner\n",
             4,
             7,
             "for x in items:\n    if x > 0:\n        total += x * 2\ntotal = 0\n",
+            id="unbound_augassign_with_tail_store",
         ),
-        (
-            "def outer_branch_aug(items, flag):\n"
-            "    if flag:\n"
-            "        total = 5\n"
-            "    def inner():\n"
-            "        nonlocal total\n"
-            "        for x in items:\n"
-            "            if x > 0:\n"
-            "                total += x * 2\n"
-            "    return inner\n",
+        pytest.param(
+            "def outer_branch_aug(items, flag):\n    if flag:\n        total = 5\n"
+            "    def inner():\n        nonlocal total\n        for x in items:\n"
+            "            if x > 0:\n                total += x * 2\n    return inner\n",
             6,
             8,
             "for x in items:\n    if x > 0:\n        total += x * 2\n",
+            id="branch_only_prebound_augassign",
         ),
-    ):
-        sc_cl = inspect_single_unit_scope(
-            {
-                "start": u_s,
-                "end": u_e,
-                "kind": "compound_block",
-                "source_text": cond_live_nl_src,
-                "source_code": u_code,
-            },
-            tree=ast.parse(cond_live_nl_src),
-        )
-        assert "total" not in sc_cl["inputs"]
-        assert "severed_closure_cell" in sc_cl["control_flow_hazards"]
+    ],
+)
+def test_shadowed_global_or_conditional_augassign_blocks_nonlocal_promotion(
+    src: str, u_s: int, u_e: int, u_code: str
+) -> None:
+    """Verifies lexical shadowing, mid globals, and conditional augassign block unsafe nonlocal promotion."""
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
 
-    # synthesize_shared_helper_code(closure_strictness='lenient') does not mutate caller unit dicts
-    lenient_u1 = dict(u_sync1)
-    lenient_u2 = dict(u_sync2)
-    _ = synthesize_shared_helper_code(
-        lenient_u1,
-        lenient_u2,
-        repo_root=str(tmp_path),
-        closure_strictness="lenient",
+    sc = inspect_single_unit_scope(
+        {"start": u_s, "end": u_e, "kind": "compound_block", "source_text": src, "source_code": u_code},
+        tree=ast.parse(src),
     )
+    assert "total" not in sc["inputs"]
+    assert "severed_closure_cell" in sc["control_flow_hazards"]
+
+
+def test_precomputed_scope_closure_strictness_and_caller_immutability(tmp_path: Path) -> None:
+    """Verifies caller unit dicts stay unmutated and precomputed scopes recompute across strict/lenient modes."""
+    from pydoppelgangerhunt.fixer import (
+        generate_refactoring_patch,
+        inspect_single_unit_scope,
+        resolve_clone_pair_outputs,
+        synthesize_shared_helper_code,
+    )
+
+    f_sync = tmp_path / "sync_immut.py"
+    f_sync.write_text(
+        "def run_a(items):\n    total = 0\n    def w():\n        nonlocal total\n        for x in items:\n"
+        "            total += x\n            log(x)\n    return w\n\n"
+        "def run_b(items):\n    total = 1\n    def w():\n        nonlocal total\n        for x in items:\n"
+        "            total += x\n            log(x)\n    return w\n",
+        encoding="utf-8",
+    )
+    lenient_u1 = {"file": str(f_sync), "start": 5, "end": 7, "name": "run_a:For", "kind": "compound_block"}
+    lenient_u2 = {"file": str(f_sync), "start": 14, "end": 16, "name": "run_b:For", "kind": "compound_block"}
+    _ = synthesize_shared_helper_code(lenient_u1, lenient_u2, repo_root=str(tmp_path), closure_strictness="lenient")
     assert "skip_pre_unit_closures" not in lenient_u1
     assert "skip_pre_unit_closures" not in lenient_u2
 
-    # Precomputed scopes respect changed closure_strictness and skip_pre_unit_closures
     pre_clos_gen_src = (
         "def gen_pre_a(items):\n"
         "    step = 1\n"
@@ -2845,8 +2799,7 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
         "    for x in items:\n"
         "        step = x + 1\n"
         "        yield step\n"
-        "    return cb\n"
-        "\n"
+        "    return cb\n\n"
         "def gen_pre_b(items):\n"
         "    step = 2\n"
         "    cb = lambda: step\n"
@@ -2858,20 +2811,12 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
     f_pre_clos = tmp_path / "pre_clos_gen.py"
     f_pre_clos.write_text(pre_clos_gen_src, encoding="utf-8")
     u_pre_g1 = {
-        "file": str(f_pre_clos),
-        "start": 4,
-        "end": 6,
-        "name": "gen_pre_a:For",
-        "kind": "compound_block",
-        "source_code": "for x in items:\n    step = x + 1\n    yield step\n",
+        "file": str(f_pre_clos), "start": 4, "end": 6, "name": "gen_pre_a:For",
+        "kind": "compound_block", "source_code": "for x in items:\n    step = x + 1\n    yield step\n",
     }
     u_pre_g2 = {
-        "file": str(f_pre_clos),
-        "start": 12,
-        "end": 14,
-        "name": "gen_pre_b:For",
-        "kind": "compound_block",
-        "source_code": "for x in items:\n    step = x + 1\n    yield step\n",
+        "file": str(f_pre_clos), "start": 12, "end": 14, "name": "gen_pre_b:For",
+        "kind": "compound_block", "source_code": "for x in items:\n    step = x + 1\n    yield step\n",
     }
     strict_sc1 = inspect_single_unit_scope(u_pre_g1, repo_root=str(tmp_path))
     strict_sc2 = inspect_single_unit_scope(u_pre_g2, repo_root=str(tmp_path))
@@ -2881,7 +2826,6 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
     assert strict_sc1["skip_pre_unit_closures"] is False
     assert "severed_closure_cell" in strict_sc1["control_flow_hazards"]
 
-    # Lenient synthesis and output resolution with strict precomputed scopes matches uncached lenient
     synth_lenient_no_pre = synthesize_shared_helper_code(
         u_pre_g1, u_pre_g2, repo_root=str(tmp_path), closure_strictness="lenient"
     )
@@ -2897,85 +2841,57 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
     assert synth_lenient_no_pre != ""
     assert synth_lenient_with_pre == synth_lenient_no_pre
 
-    lenient_sc1 = inspect_single_unit_scope(
-        {**u_pre_g1, "skip_pre_unit_closures": True}, repo_root=str(tmp_path)
-    )
-    lenient_sc2 = inspect_single_unit_scope(
-        {**u_pre_g2, "skip_pre_unit_closures": True}, repo_root=str(tmp_path)
-    )
+    lenient_sc1 = inspect_single_unit_scope({**u_pre_g1, "skip_pre_unit_closures": True}, repo_root=str(tmp_path))
+    lenient_sc2 = inspect_single_unit_scope({**u_pre_g2, "skip_pre_unit_closures": True}, repo_root=str(tmp_path))
     assert lenient_sc1["skip_pre_unit_closures"] is True
     assert "severed_closure_cell" not in lenient_sc1["control_flow_hazards"]
 
     res_lenient_matching_pre = resolve_clone_pair_outputs(
-        u_pre_g1,
-        u_pre_g2,
-        lenient_sc1,
-        lenient_sc2,
-        repo_root=str(tmp_path),
-        skip_pre_unit_closures=True,
-        return_details=True,
+        u_pre_g1, u_pre_g2, lenient_sc1, lenient_sc2,
+        repo_root=str(tmp_path), skip_pre_unit_closures=True, return_details=True,
     )
     res_lenient_with_strict_pre = resolve_clone_pair_outputs(
-        u_pre_g1,
-        u_pre_g2,
-        strict_sc1,
-        strict_sc2,
-        repo_root=str(tmp_path),
-        skip_pre_unit_closures=True,
-        return_details=True,
+        u_pre_g1, u_pre_g2, strict_sc1, strict_sc2,
+        repo_root=str(tmp_path), skip_pre_unit_closures=True, return_details=True,
     )
     assert res_lenient_matching_pre.outputs is not None
     assert res_lenient_with_strict_pre == res_lenient_matching_pre
 
-    # Strict resolution and synthesis with lenient precomputed scopes matches uncached strict
     strict_combined_from_lenient = analyze_unit_variable_scope(
-        u_pre_g1,
-        u_pre_g2,
-        repo_root=str(tmp_path),
-        scope1=lenient_sc1,
-        scope2=lenient_sc2,
+        u_pre_g1, u_pre_g2, repo_root=str(tmp_path), scope1=lenient_sc1, scope2=lenient_sc2
     )
     assert strict_combined_from_lenient["skip_pre_unit_closures"] is False
     assert "severed_closure_cell" in strict_combined_from_lenient["control_flow_hazards"]
     res_strict_with_lenient_pre = resolve_clone_pair_outputs(
-        u_pre_g1,
-        u_pre_g2,
-        lenient_sc1,
-        lenient_sc2,
-        repo_root=str(tmp_path),
-        skip_pre_unit_closures=False,
-        return_details=True,
+        u_pre_g1, u_pre_g2, lenient_sc1, lenient_sc2,
+        repo_root=str(tmp_path), skip_pre_unit_closures=False, return_details=True,
     )
     assert res_strict_with_lenient_pre.outputs is None
     assert res_strict_with_lenient_pre.skip_reason == "severed closure cell"
     assert (
         synthesize_shared_helper_code(
-            u_pre_g1,
-            u_pre_g2,
-            repo_root=str(tmp_path),
-            scope1=lenient_sc1,
-            scope2=lenient_sc2,
-            closure_strictness="strict",
+            u_pre_g1, u_pre_g2, repo_root=str(tmp_path),
+            scope1=lenient_sc1, scope2=lenient_sc2, closure_strictness="strict",
         )
         == ""
     )
     assert (
         generate_refactoring_patch(
-            [
-                (
-                    1.0,
-                    {**u_pre_g1, "skip_pre_unit_closures": True},
-                    {**u_pre_g2, "skip_pre_unit_closures": True},
-                )
-            ],
-            repo_root=str(tmp_path),
-            replace_clones=True,
-            closure_strictness="strict",
+            [(1.0, {**u_pre_g1, "skip_pre_unit_closures": True}, {**u_pre_g2, "skip_pre_unit_closures": True})],
+            repo_root=str(tmp_path), replace_clones=True, closure_strictness="strict",
         )
         == ""
     )
 
-    # ClassDef immediate scope with nonlocal declaration in collect_downstream_read_names
+
+def test_skip_reasons_severed_closure_cell_vs_cleanup_hazard(tmp_path: Path) -> None:
+    """Verifies ClassDef immediate nonlocal reads and skip reason precedence across cell and cleanup hazards."""
+    from pydoppelgangerhunt.fixer import (
+        inspect_single_unit_scope,
+        resolve_clone_pair_outputs,
+        synthesize_shared_helper_code,
+    )
+
     cls_nl_src = (
         "def outer_cls_nl(items):\n"
         "    total = 0\n"
@@ -2985,13 +2901,8 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
         "            total = x * 2\n"
         "    return Box, total\n"
     )
-    assert collect_downstream_read_names(
-        cls_nl_src,
-        {"start": 5, "end": 6},
-        candidates={"total", "x"},
-    ) == {"total"}
+    assert collect_downstream_read_names(cls_nl_src, {"start": 5, "end": 6}, candidates={"total", "x"}) == {"total"}
 
-    # 3. Late-bound closure cell end-to-end skip reason and helper synthesis block
     late_cell_src = (
         "def build_a(items):\n"
         "    callbacks = []\n"
@@ -3000,8 +2911,7 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
         "            return x * scale + item\n"
         "        callbacks.append(cb)\n"
         "    scale = 10\n"
-        "    return [f(2) for f in callbacks]\n"
-        "\n"
+        "    return [f(2) for f in callbacks]\n\n"
         "def build_b(items):\n"
         "    callbacks = []\n"
         "    for item in items:\n"
@@ -3013,20 +2923,8 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
     )
     f_late = tmp_path / "late_cell.py"
     f_late.write_text(late_cell_src, encoding="utf-8")
-    u_late1 = {
-        "file": str(f_late),
-        "start": 3,
-        "end": 6,
-        "name": "build_a:For",
-        "kind": "compound_block",
-    }
-    u_late2 = {
-        "file": str(f_late),
-        "start": 12,
-        "end": 15,
-        "name": "build_b:For",
-        "kind": "compound_block",
-    }
+    u_late1 = {"file": str(f_late), "start": 3, "end": 6, "name": "build_a:For", "kind": "compound_block"}
+    u_late2 = {"file": str(f_late), "start": 12, "end": 15, "name": "build_b:For", "kind": "compound_block"}
     sc_late1 = inspect_single_unit_scope(u_late1, repo_root=str(tmp_path))
     sc_late2 = inspect_single_unit_scope(u_late2, repo_root=str(tmp_path))
     assert "severed_closure_cell" in sc_late1["control_flow_hazards"]
@@ -3037,7 +2935,6 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
     assert res_late.outputs is None
     assert res_late.skip_reason == "severed closure cell"
 
-    # 8. Enclosing with cleanup vs severed closure cell skip reasons
     global_with_src = (
         "def run_glob(ctx, items):\n"
         "    global shared_total\n"
@@ -3046,22 +2943,14 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
         "            shared_total += x\n"
     )
     u_glob_with = {
-        "start": 4,
-        "end": 5,
-        "kind": "compound_block",
-        "source_text": global_with_src,
-        "source_code": "for x in items:\n    shared_total += x\n",
+        "start": 4, "end": 5, "kind": "compound_block",
+        "source_text": global_with_src, "source_code": "for x in items:\n    shared_total += x\n",
     }
     sc_glob = inspect_single_unit_scope(u_glob_with, tree=ast.parse(global_with_src))
     assert "severed_closure_cell" in sc_glob["control_flow_hazards"]
     res_glob = resolve_clone_pair_outputs(
-        u_glob_with,
-        u_glob_with,
-        sc_glob,
-        sc_glob,
-        source_text1=global_with_src,
-        source_text2=global_with_src,
-        return_details=True,
+        u_glob_with, u_glob_with, sc_glob, sc_glob,
+        source_text1=global_with_src, source_text2=global_with_src, return_details=True,
     )
     assert res_glob.outputs is None
     assert res_glob.skip_reason == "severed closure cell"
@@ -3077,27 +2966,18 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
         "    return run_nl\n"
     )
     u_nl_with = {
-        "start": 6,
-        "end": 7,
-        "kind": "compound_block",
-        "source_text": nl_with_src,
-        "source_code": "for x in items:\n    shared_total += x\n",
+        "start": 6, "end": 7, "kind": "compound_block",
+        "source_text": nl_with_src, "source_code": "for x in items:\n    shared_total += x\n",
     }
     sc_nl_with = inspect_single_unit_scope(u_nl_with, tree=ast.parse(nl_with_src))
     assert "severed_closure_cell" not in sc_nl_with["control_flow_hazards"]
     res_nl_with = resolve_clone_pair_outputs(
-        u_nl_with,
-        u_nl_with,
-        sc_nl_with,
-        sc_nl_with,
-        source_text1=nl_with_src,
-        source_text2=nl_with_src,
-        return_details=True,
+        u_nl_with, u_nl_with, sc_nl_with, sc_nl_with,
+        source_text1=nl_with_src, source_text2=nl_with_src, return_details=True,
     )
     assert res_nl_with.outputs is None
     assert res_nl_with.skip_reason == "enclosing try or with cleanup hazard"
 
-    # Multi-level generator with severed closure cell prioritizes severed closure cell reason
     multilevel_cell_src = (
         "def outer_chain(items):\n"
         "    scale = 1\n"
@@ -3110,26 +2990,15 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
         "    return inner_chain\n"
     )
     u_ml = {
-        "start": 5,
-        "end": 7,
-        "kind": "compound_block",
+        "start": 5, "end": 7, "kind": "compound_block",
         "source_text": multilevel_cell_src,
-        "source_code": (
-            "for item in items:\n"
-            "    cbs.append(lambda x, item=item: x * scale + item)\n"
-            "    yield item\n"
-        ),
+        "source_code": "for item in items:\n    cbs.append(lambda x, item=item: x * scale + item)\n    yield item\n",
     }
     sc_ml = inspect_single_unit_scope(u_ml, tree=ast.parse(multilevel_cell_src))
     assert "severed_closure_cell" in sc_ml["control_flow_hazards"]
     res_ml_gen = resolve_clone_pair_outputs(
-        u_ml,
-        u_ml,
-        sc_ml,
-        sc_ml,
-        source_text1=multilevel_cell_src,
-        source_text2=multilevel_cell_src,
-        return_details=True,
+        u_ml, u_ml, sc_ml, sc_ml,
+        source_text1=multilevel_cell_src, source_text2=multilevel_cell_src, return_details=True,
     )
     assert res_ml_gen.outputs is None
     assert res_ml_gen.skip_reason == "severed closure cell"
@@ -3950,3 +3819,274 @@ def test_closure_strictness_three_tier_monotonicity_across_scenario_table() -> N
 
     assert witnessed_lenient_lt_strict is True
     assert witnessed_strict_lt_pedantic is True
+
+
+def test_enclosing_chain_method_receiver_propagates_sibling_reads_into_post_reads() -> None:
+    """Verifies self.<method>() calls on enclosing local classes propagate sibling cell reads into child post_reads."""
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _build_enclosing_chain_cell_infos,
+    )
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _find_enclosing_function_chain,
+    )
+
+    pos_src = (
+        "def outer():\n"
+        "    total = 0\n"
+        "    class Worker:\n"
+        "        def peek(self):\n"
+        "            return total\n"
+        "        def run(self, items):\n"
+        "            nonlocal total\n"
+        "            for x in items:\n"
+        "                total += x\n"
+        "            return self.peek()\n"
+        "    return Worker\n"
+    )
+    pos_lines = pos_src.splitlines()
+    for_line = next(
+        idx for idx, ln in enumerate(pos_lines, start=1) if "for x in items" in ln
+    )
+    body_line = next(
+        idx for idx, ln in enumerate(pos_lines, start=1) if "total += x" in ln
+    )
+    pos_tree = ast.parse(pos_src)
+    pos_chain = _find_enclosing_function_chain(pos_tree, for_line, body_line)
+    pos_infos = _build_enclosing_chain_cell_infos(
+        pos_chain,
+        for_line,
+        body_line,
+        None,
+        None,
+        frozenset({"total"}),
+        mod_tree=pos_tree,
+    )
+    run_info = pos_infos[-1]
+    assert "self" in run_info.post_reads
+    assert "total" in run_info.post_reads
+
+    # End-to-end check on sibling method reading mutated cell via self.peek() in unit
+    unit_src = (
+        "def outer(items, sink):\n"
+        "    total = 0\n"
+        "    class Worker:\n"
+        "        def peek(self):\n"
+        "            return total\n"
+        "        def run(self):\n"
+        "            nonlocal total\n"
+        "            for x in items:\n"
+        "                total += x\n"
+        "                sink(self.peek())\n"
+        "    return Worker\n"
+    )
+    u_lines = unit_src.splitlines()
+    for_start = next(idx for idx, ln in enumerate(u_lines, start=1) if "for x in items" in ln)
+    for_end = next(idx for idx, ln in enumerate(u_lines, start=1) if "sink(self.peek())" in ln)
+    sc_pos = inspect_single_unit_scope(
+        {
+            "start": for_start,
+            "end": for_end,
+            "kind": "compound_block",
+            "source_text": unit_src,
+            "closure_strictness": "lenient",
+        },
+        tree=ast.parse(unit_src),
+    )
+    assert "severed_closure_cell" in sc_pos["control_flow_hazards"]
+
+    # Negative control: self is not read after the unit in run(), even if another method calls self.peek()
+    neg_src = (
+        "def outer():\n"
+        "    total = 0\n"
+        "    class Worker:\n"
+        "        def peek(self):\n"
+        "            return total\n"
+        "        def inspect_state(self):\n"
+        "            return self.peek()\n"
+        "        def run(self, items):\n"
+        "            nonlocal total\n"
+        "            for x in items:\n"
+        "                total += x\n"
+        "            return 0\n"
+        "    return Worker\n"
+    )
+    neg_lines = neg_src.splitlines()
+    neg_for_line = next(
+        idx for idx, ln in enumerate(neg_lines, start=1) if "for x in items" in ln
+    )
+    neg_body_line = next(
+        idx for idx, ln in enumerate(neg_lines, start=1) if "total += x" in ln
+    )
+    neg_tree = ast.parse(neg_src)
+    neg_chain = _find_enclosing_function_chain(neg_tree, neg_for_line, neg_body_line)
+    neg_infos = _build_enclosing_chain_cell_infos(
+        neg_chain,
+        neg_for_line,
+        neg_body_line,
+        None,
+        None,
+        frozenset({"total"}),
+        mod_tree=neg_tree,
+    )
+    neg_run_info = neg_infos[-1]
+    assert "self" not in neg_run_info.post_reads
+    assert "total" not in neg_run_info.post_reads
+
+
+@pytest.mark.parametrize(
+    ("attach_snippet", "base_def", "method_body", "expect_hazard"),
+    [
+        pytest.param(
+            "    Worker.cb = lambda self: total\n    Worker().run()\n",
+            "    class Worker:\n",
+            "        def run(self):\n"
+            "            nonlocal total\n"
+            "            for x in items:\n"
+            "                total += x\n"
+            "                sink(self.cb())\n",
+            True,
+            id="class_attr_dynamic_closure_baseless_worker",
+        ),
+        pytest.param(
+            "    w = Worker()\n    w.cb = lambda: total\n    w.run()\n",
+            "    class Worker:\n",
+            "        def run(self):\n"
+            "            nonlocal total\n"
+            "            for x in items:\n"
+            "                total += x\n"
+            "                sink(self.cb())\n",
+            True,
+            id="instance_attr_dynamic_closure_baseless_worker",
+        ),
+        pytest.param(
+            "    Alias = Worker\n"
+            "    w = Alias()\n"
+            "    w2 = w\n"
+            "    def read_total():\n"
+            "        return total\n"
+            "    w2.cb = read_total\n"
+            "    w2.run()\n",
+            "    class Worker:\n",
+            "        def run(self):\n"
+            "            nonlocal total\n"
+            "            for x in items:\n"
+            "                total += x\n"
+            "                sink(self.cb())\n",
+            True,
+            id="aliased_class_and_instance_helper_closure",
+        ),
+        pytest.param(
+            "    def make_w():\n"
+            "        return Worker()\n"
+            "    w = make_w()\n"
+            "    w.cb = lambda: total\n"
+            "    w.run()\n",
+            "    class Worker:\n",
+            "        def run(self):\n"
+            "            nonlocal total\n"
+            "            for x in items:\n"
+            "                total += x\n"
+            "                sink(self.cb())\n",
+            True,
+            id="factory_returned_instance_dynamic_closure",
+        ),
+        pytest.param(
+            "    a = Worker\n"
+            "    b = a\n"
+            "    a = b\n"
+            "    w = b()\n"
+            "    w2 = w\n"
+            "    w = w2\n"
+            "    w2.cb = lambda: total\n"
+            "    w2.run()\n",
+            "    class Worker:\n",
+            "        def run(self):\n"
+            "            nonlocal total\n"
+            "            for x in items:\n"
+            "                total += x\n"
+            "                sink(self.cb())\n",
+            True,
+            id="cyclic_aliases_with_instance_dynamic_closure",
+        ),
+        pytest.param(
+            "    w = Worker()\n    w.cb = lambda: total\n    w.run()\n",
+            "    class Base:\n        pass\n    class Worker(Base):\n",
+            "        def run(self):\n"
+            "            nonlocal total\n"
+            "            for x in items:\n"
+            "                total += x\n"
+            "                sink(self.cb())\n",
+            True,
+            id="baseful_worker_instance_dynamic_closure",
+        ),
+        pytest.param(
+            "    w = Worker()\n    w.tag = 'ok'\n    Worker.label = 'v1'\n    w.compare(w)\n    w.run()\n",
+            "    class Worker:\n",
+            "        def safe(self):\n"
+            "            return 1\n"
+            "        def unused(self):\n"
+            "            return total\n"
+            "        def run(self):\n"
+            "            nonlocal total\n"
+            "            for x in items:\n"
+            "                total += x\n"
+            "                sink(self.safe())\n",
+            False,
+            id="control_scalar_attr_and_uncalled_method_stay_safe",
+        ),
+        pytest.param(
+            "    a = Worker\n"
+            "    b = a\n"
+            "    a = b\n"
+            "    w = b()\n"
+            "    w2 = w\n"
+            "    w = w2\n"
+            "    w.tag = 1\n"
+            "    w.run()\n",
+            "    class Worker:\n",
+            "        def safe(self):\n"
+            "            return 1\n"
+            "        def unused(self):\n"
+            "            return total\n"
+            "        def run(self):\n"
+            "            nonlocal total\n"
+            "            for x in items:\n"
+            "                total += x\n"
+            "                sink(self.safe())\n",
+            False,
+            id="control_cyclic_aliases_without_closure_attachment",
+        ),
+    ],
+)
+def test_local_class_external_dynamic_receiver_closures(
+    attach_snippet: str,
+    base_def: str,
+    method_body: str,
+    expect_hazard: bool,
+) -> None:
+    """Verifies local classes detect dynamically attached class/instance closures while ignoring unrelated controls."""
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
+
+    unit_src = (
+        "def outer(items, sink):\n"
+        "    total = 0\n"
+        f"{base_def}"
+        f"{method_body}"
+        f"{attach_snippet}"
+    )
+    u_lines = unit_src.splitlines()
+    for_start = next(idx for idx, ln in enumerate(u_lines, start=1) if "for x in items" in ln)
+    for_end = next(idx for idx, ln in enumerate(u_lines, start=1) if "sink(self." in ln)
+    sc = inspect_single_unit_scope(
+        {
+            "start": for_start,
+            "end": for_end,
+            "kind": "compound_block",
+            "source_text": unit_src,
+            "closure_strictness": "lenient",
+        },
+        tree=ast.parse(unit_src),
+    )
+    hazards = sc["control_flow_hazards"]
+    assert ("severed_closure_cell" in hazards) is expect_hazard

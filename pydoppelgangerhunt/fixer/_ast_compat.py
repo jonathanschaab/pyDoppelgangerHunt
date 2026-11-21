@@ -20,6 +20,9 @@ AST_MATCH_STAR_TYPES: Tuple[Type[ast.AST], ...] = (
 AST_MATCH_MAPPING_TYPES: Tuple[Type[ast.AST], ...] = (
     (ast.MatchMapping,) if hasattr(ast, "MatchMapping") else ()
 )
+AST_MATCH_CLASS_TYPES: Tuple[Type[ast.AST], ...] = (
+    (ast.MatchClass,) if hasattr(ast, "MatchClass") else ()
+)
 AST_MATCH_OR_TYPES: Tuple[Type[ast.AST], ...] = (
     (ast.MatchOr,) if hasattr(ast, "MatchOr") else ()
 )
@@ -59,6 +62,11 @@ def is_match_mapping_node(node: object) -> bool:
     return bool(
         AST_MATCH_MAPPING_TYPES and isinstance(node, AST_MATCH_MAPPING_TYPES)
     )
+
+
+def is_match_class_node(node: object) -> bool:
+    """Returns True when *node* is an ast.MatchClass pattern (Python 3.10+)."""
+    return bool(AST_MATCH_CLASS_TYPES and isinstance(node, AST_MATCH_CLASS_TYPES))
 
 
 def is_match_or_node(node: object) -> bool:

@@ -11,6 +11,7 @@ from pydoppelgangerhunt.config import canonical_path_key, find_python_files
 from pydoppelgangerhunt.source_lines import (
     extract_notebook_code_cell_text,
     resolve_unit_line_bounds,
+    split_source_lines,
 )
 
 
@@ -42,10 +43,17 @@ def compute_repository_dry_stats(
                             if cell_code is not None:
                                 count += sum(
                                     1
-                                    for line in cell_code.splitlines()
+                                    for line in split_source_lines(cell_code)
                                     if line.strip() and not line.strip().startswith("#")
                                 )
-                except (json.JSONDecodeError, OSError):
+                except (
+                    json.JSONDecodeError,
+                    OSError,
+                    UnicodeDecodeError,
+                    ValueError,
+                    TypeError,
+                    RecursionError,
+                ):
                     count = 0
             else:
                 with open(p, "r", encoding="utf-8", errors="replace") as fh:

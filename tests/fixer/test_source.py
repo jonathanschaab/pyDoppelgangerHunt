@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -13,15 +14,17 @@ from pydoppelgangerhunt import (
     replace_unit_in_source,
     synthesize_shared_helper_code,
 )
-from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
+from pydoppelgangerhunt.fixer.source import (  # pylint: disable=protected-access
     _detect_indent_step,
-    _extract_required_typing_imports,
     _extract_unit_body_lines,
     _find_module_helper_insertion_index,
     _get_module_imported_names,
     _insert_imports_into_module,
+    find_enclosing_function_is_async,
 )
-from pydoppelgangerhunt.fixer.source import find_enclosing_function_is_async
+from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access
+    _extract_required_typing_imports,
+)
 
 
 def test_fixer_feedback_and_advanced_robustness(tmp_path: Path) -> None:
@@ -371,7 +374,7 @@ def test_extract_unit_body_lines_single_line_function() -> None:
 
 def test_insert_imports_into_module_deduplicates_within_import_lines() -> None:
     """Verifies that _insert_imports_into_module eliminates duplicate imports present in import_lines."""
-    from pydoppelgangerhunt.fixer import _insert_imports_into_module  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.source import _insert_imports_into_module  # pylint: disable=import-outside-toplevel
 
     orig = ["def foo(): pass\n"]
     imports = ["from typing import Any", "from typing import Any", "from typing import Tuple"]
@@ -381,7 +384,7 @@ def test_insert_imports_into_module_deduplicates_within_import_lines() -> None:
 
 def test_extract_unit_body_lines_and_scope_method_kind(tmp_path: Path) -> None:
     """Verifies that units with kind='method' strip headers/docstrings and preserve method parameters."""
-    from pydoppelgangerhunt.fixer import _extract_unit_body_lines  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.source import _extract_unit_body_lines  # pylint: disable=import-outside-toplevel
 
     code = (
         "class Calculator:\n"
@@ -413,7 +416,7 @@ def test_extract_unit_body_lines_and_scope_method_kind(tmp_path: Path) -> None:
 
 def test_find_module_helper_insertion_index_with_try_except_and_conditional_imports() -> None:
     """Verifies that _find_module_helper_insertion_index places helpers after try/except and conditional imports."""
-    from pydoppelgangerhunt.fixer import _find_module_helper_insertion_index  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.source import _find_module_helper_insertion_index  # pylint: disable=import-outside-toplevel
 
     lines = [
         '"""Module docstring."""\n',
@@ -433,7 +436,7 @@ def test_find_module_helper_insertion_index_with_try_except_and_conditional_impo
 
 def test_is_docstring_node_and_extract_docstring_end_line() -> None:
     """Verifies that _is_docstring_node and _extract_docstring_end_line accurately detect docstrings."""
-    from pydoppelgangerhunt.fixer import (  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
         _extract_docstring_end_line,
         _is_docstring_node,
     )
@@ -462,7 +465,7 @@ def test_is_docstring_node_and_extract_docstring_end_line() -> None:
 
 def test_batch_82_get_module_imported_names_guarded_imports() -> None:
     """Verifies that _get_module_imported_names inspects top-level If and Try import blocks."""
-    from pydoppelgangerhunt.fixer import _get_module_imported_names  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.source import _get_module_imported_names  # pylint: disable=import-outside-toplevel
 
     code = (
         "import sys\n"
@@ -490,7 +493,7 @@ def test_batch_82_get_module_imported_names_guarded_imports() -> None:
 
 def test_slice_unit_token_lines_single_line_bounds() -> None:
     """Verifies defensive single-line column bounds check in _slice_unit_token_lines."""
-    from pydoppelgangerhunt.fixer import _slice_unit_token_lines  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines  # pylint: disable=import-outside-toplevel
 
     line = ["    total = sum(x for x in data)"]
     # Normal column slice
@@ -500,12 +503,12 @@ def test_slice_unit_token_lines_single_line_bounds() -> None:
     )
     assert res_normal == ["sum(x for x in data)"]
 
-    # Inverted column bounds (e_col < s_col) must fail closed rather than slicing to EOL
+    # Inverted column bounds (e_col < s_col) must fail closed by returning None rather than slicing to EOL
     res_inverted = _slice_unit_token_lines(
         {"kind": "comprehension", "start_col": 12, "end_col": 5},
         list(line),
     )
-    assert res_inverted == []
+    assert res_inverted is None
 
 
 def test_insert_imports_orders_future_annotations_first() -> None:
@@ -708,18 +711,29 @@ def test_is_subroutine_unit_comprehension_with_source() -> None:
 
 
 def test_slice_unit_token_lines_invalid_or_negative_start_col() -> None:
-    """Verifies that _slice_unit_token_lines returns lines untouched on negative
-    or non-numeric start_col offsets."""
+    """Verifies that _slice_unit_token_lines fails closed (returns None) on negative or non-numeric column offsets."""
     from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
 
     lines = ["    res = [x for x in data]\n"]
-    # Negative start_col
-    u_neg = {"kind": "comprehension", "start_col": -5, "end_col": 10}
-    assert _slice_unit_token_lines(u_neg, lines) == lines
-
-    # Non-int start_col
-    u_bad = {"kind": "comprehension", "start_col": "invalid", "end_col": 10}
-    assert _slice_unit_token_lines(u_bad, lines) == lines
+    # Negative start_col and negative end_col both fail closed, even on col-sliced buffers.
+    for bad_unit in (
+        {"kind": "comprehension", "start_col": -5, "end_col": 10},
+        {"kind": "comprehension", "start_col": 4, "end_col": -2},
+        {
+            "kind": "comprehension",
+            "start_col": -5,
+            "end_col": 10,
+            "source_lines_is_col_sliced": True,
+        },
+        {
+            "kind": "comprehension",
+            "start_col": 4,
+            "end_col": -2,
+            "source_lines_is_col_sliced": True,
+        },
+        {"kind": "comprehension", "start_col": "invalid", "end_col": 10},
+    ):
+        assert _slice_unit_token_lines(bad_unit, lines) is None
 
 
 def test_is_sliced_excerpt_for_file_starts_at_line_one() -> None:
@@ -787,7 +801,7 @@ def test_load_unit_file_text_prioritizes_unsliced_source_lines_over_disk(tmp_pat
 
 
 def test_slice_unit_token_lines_offset_aliases() -> None:
-    """Verifies that _slice_unit_token_lines respects start_col_offset and end_col_offset."""
+    """Verifies that _slice_unit_token_lines respects start_col_offset, col_offset, and end_col_offset."""
     from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
 
     lines = ["    total = [x * 2 for x in items]\n"]
@@ -798,6 +812,15 @@ def test_slice_unit_token_lines_offset_aliases() -> None:
     }
     sliced = _slice_unit_token_lines(u_aliases, list(lines))
     assert sliced == ["[x * 2 for x in items]"]
+
+    u_col_offset = {
+        "kind": "comprehension",
+        "col_offset": 12,
+        "end_col": 34,
+    }
+    assert _slice_unit_token_lines(u_col_offset, list(lines)) == [
+        "[x * 2 for x in items]"
+    ]
 
     # Multi-line unit with offset aliases
     multi_lines = [
@@ -811,6 +834,7 @@ def test_slice_unit_token_lines_offset_aliases() -> None:
         "end_col_offset": 5,
     }
     sliced_multi = _slice_unit_token_lines(u_multi, list(multi_lines))
+    assert sliced_multi is not None
     assert sliced_multi[0] == "(\n"
     assert sliced_multi[1] == "        [x * 2 for x in items]\n"
     assert sliced_multi[2] == "    )"
@@ -889,3 +913,201 @@ def test_extract_unit_body_lines_indented_method_col0_multiline_string() -> None
     cr_text = "    x = '''header\rcol0_line'''\r    y = 1\r"
     assert _find_multiline_string_continuation_lines(cr_text) == {2}
     assert dedent_source_text(cr_text) == "x = '''header\rcol0_line'''\ry = 1\r"
+
+
+@pytest.mark.parametrize(
+    ("case_id", "src", "unit_template"),
+    [
+        pytest.param(
+            "utf8_multibyte_same_line_bytes_vs_chars",
+            "# header café\nval = 'αβ🚀' + target_expr\n",
+            {"start": 2, "end": 2, "kind": "complex_expr"},
+            id="utf8_multibyte_same_line",
+        ),
+        pytest.param(
+            "crlf_line_endings_preserved_across_lines",
+            "x = 1\r\nres = 'π' + target_expr\r\nz = 3\r\n",
+            {"start": 2, "end": 2, "kind": "complex_expr"},
+            id="crlf_line_endings",
+        ),
+        pytest.param(
+            "lone_cr_line_endings_preserved_across_lines",
+            "x = 1\rres = 'é' + target_expr\rz = 3\r",
+            {"start": 2, "end": 2, "kind": "complex_expr"},
+            id="lone_cr_line_endings",
+        ),
+    ],
+)
+def test_utf8_byte_and_char_offsets_and_line_ending_preservation(
+    case_id: str,
+    src: str,
+    unit_template: dict[str, object],
+) -> None:
+    """Verifies UTF-8 byte vs character offsets and CRLF/lone-CR replacement span integrity."""
+    from pydoppelgangerhunt import compute_unit_byte_offsets, compute_unit_char_offsets
+
+    expr = "target_expr"
+    start_val = unit_template["start"]
+    assert isinstance(start_val, int)
+    target_line_idx = start_val - 1
+    from pydoppelgangerhunt.source_lines import split_source_lines
+
+    line_str = split_source_lines(src)[target_line_idx]
+    char_start = line_str.index(expr)
+    byte_start = len(line_str[:char_start].encode("utf-8"))
+    byte_end = byte_start + len(expr.encode("utf-8"))
+    unit = {
+        **unit_template,
+        "start_col": byte_start,
+        "end_col": byte_end,
+        "source_text": src,
+    }
+    sb, eb = compute_unit_byte_offsets(src, unit)
+    sc, ec = compute_unit_char_offsets(src, unit)
+    assert src.encode("utf-8")[sb:eb].decode("utf-8") == expr, case_id
+    assert src[sc:ec] == expr, case_id
+    replaced = replace_unit_in_source(src, unit, "replacement_call()")
+    assert replaced.replace("replacement_call()", expr) == src, case_id
+
+
+def test_column_slicing_exact_eof_col_oob_col_and_no_double_slicing() -> None:
+    """Verifies exact end_col==len, end_col==len+1 rejection, and source_lines_is_col_sliced non-double-slicing."""
+    from pydoppelgangerhunt.fixer.scope import _has_out_of_bounds_unit_cols
+    from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
+
+    full_line = "val = x + y\n"
+    code_bytes = len(full_line.rstrip("\n").encode("utf-8"))  # 11
+
+    # Exact end_col == code_bytes succeeds cleanly
+    sliced_exact = _slice_unit_token_lines(
+        {"kind": "complex_expr", "start": 1, "end": 1, "start_col": 6, "end_col": code_bytes},
+        [full_line],
+    )
+    assert sliced_exact == ["x + y"]
+
+    # end_col == code_bytes + 1 fails closed in both _slice_unit_token_lines and _has_out_of_bounds_unit_cols
+    assert (
+        _slice_unit_token_lines(
+            {"kind": "complex_expr", "start": 1, "end": 1, "start_col": 6, "end_col": code_bytes + 1},
+            [full_line],
+        )
+        is None
+    )
+    assert (
+        _has_out_of_bounds_unit_cols(
+            {"kind": "complex_expr", "start": 1, "end": 1, "start_col": 6, "end_col": code_bytes + 1},
+            [full_line],
+            is_placeholder_origin=False,
+            explicit_col_sliced=False,
+        )
+        is True
+    )
+
+    # source_lines_is_col_sliced=True prevents double slicing already trimmed excerpts
+    already_trimmed = ["x + y"]
+    no_reslice = _slice_unit_token_lines(
+        {
+            "kind": "complex_expr",
+            "start": 1,
+            "end": 1,
+            "start_col": 6,
+            "end_col": code_bytes,
+            "source_lines_is_col_sliced": True,
+        },
+        already_trimmed,
+    )
+    assert no_reslice == already_trimmed
+
+
+def test_col_offset_alias_across_slicing_normalization_synthesis_and_patch(
+    tmp_path: Path,
+) -> None:
+    """Verifies 'col_offset' acts consistently as 'start_col' across slicing, validation, synthesis, and patching."""
+    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch
+    from pydoppelgangerhunt.fixer.source import (
+        _slice_unit_token_lines,
+        validate_unit_schema,
+    )
+    from pydoppelgangerhunt.fixer.synthesis import synthesize_shared_helper_code
+    from pydoppelgangerhunt.source_lines import (
+        normalize_unit_coordinates,
+        parse_unit_coord,
+    )
+
+    line_text = "result = (alpha + beta) * 2\n"
+    expr = "(alpha + beta) * 2"
+    col_start = line_text.index(expr)
+    col_end = col_start + len(expr)
+
+    # Direct token slicing respects col_offset and strips leading assignment prefix
+    sliced = _slice_unit_token_lines(
+        {
+            "kind": "complex_expr",
+            "start": 1,
+            "end": 1,
+            "col_offset": col_start,
+            "end_col": col_end,
+        },
+        [line_text],
+    )
+    assert sliced == [expr]
+
+    norm_u = normalize_unit_coordinates(
+        {"start": 1, "end": 1, "col_offset": col_start, "end_col_offset": col_end}
+    )
+    assert norm_u["start_col"] == col_start
+    assert norm_u["end_col"] == col_end
+    assert parse_unit_coord({"col_offset": col_start}, "start_col", default=None) == col_start
+
+    # Conflicting start_col vs col_offset fails validation cleanly
+    with pytest.raises(ValueError, match="Conflicting coordinate aliases"):
+        validate_unit_schema(
+            {"start": 1, "end": 1, "start_col": col_start + 1, "col_offset": col_start}
+        )
+
+    # End-to-end synthesis & patch generation with col_offset-only expression units
+    src = (
+        "def fn_one(a, b):\n"
+        "    out = (a + b) * 2 + 1\n"
+        "    return out\n"
+        "\n"
+        "def fn_two(c, d):\n"
+        "    val = (c + d) * 2 + 1\n"
+        "    return val\n"
+    )
+    mod_file = tmp_path / "expr_mod.py"
+    mod_file.write_text(src, encoding="utf-8")
+    lines = src.splitlines(keepends=True)
+    e1 = "(a + b) * 2 + 1"
+    e2 = "(c + d) * 2 + 1"
+    u1: dict[str, Any] = {
+        "file": str(mod_file),
+        "name": "fn_one",
+        "kind": "complex_expr",
+        "start": 2,
+        "end": 2,
+        "col_offset": lines[1].index(e1),
+        "end_col": lines[1].index(e1) + len(e1),
+    }
+    u2: dict[str, Any] = {
+        "file": str(mod_file),
+        "name": "fn_two",
+        "kind": "complex_expr",
+        "start": 6,
+        "end": 6,
+        "col_offset": lines[5].index(e2),
+        "end_col": lines[5].index(e2) + len(e2),
+    }
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "def _shared_" in helper
+    assert "return " in helper
+    ast.parse(helper)
+
+    patch_text = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert "def _shared_" in patch_text
+    assert "_shared_" in patch_text
+    assert "out = _shared_" in patch_text
+    assert "val = _shared_" in patch_text

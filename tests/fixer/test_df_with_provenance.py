@@ -6,6 +6,7 @@ import ast
 from collections.abc import Set as AbstractSet
 from pathlib import Path
 import sys
+from typing import Any
 
 import pytest
 
@@ -73,10 +74,10 @@ from pydoppelgangerhunt.fixer import (
             "shadowed_type_and_object_dunder_refs_and_comprehension_shadow",
             (
                 "def clean(type, object):\n"
-                "    ref_a = type.__setattr__\n"
-                "    ref_b = object.__delattr__\n"
+                "    type.__setattr__('label', 1)\n"
+                "    object.__delattr__('label')\n"
                 "    vals = [eval(i) for eval in (lambda x: x,) for i in (1, 2)]\n"
-                "    fn = lambda setattr: setattr(ref_a, '__exit__', ref_b)\n"
+                "    fn = lambda setattr: setattr(object(), '__exit__', type)\n"
                 "    return vals, fn\n"
             ),
             False,
@@ -96,6 +97,17 @@ from pydoppelgangerhunt.fixer import (
             False,
             frozenset(),
             id="pure_setattr_safe_attr_only",
+        ),
+        pytest.param(
+            "class_body_assign_setattr_exposes_class_attr",
+            (
+                "class C:\n"
+                "    sa = setattr\n"
+                "    sa(Obj, 'safe_label', 1)\n"
+            ),
+            True,
+            frozenset(),
+            id="class_body_assign_setattr_exposes_class_attr",
         ),
         pytest.param(
             "positive_module_alias_eval_call",
@@ -1306,6 +1318,7 @@ def test_nested_raises_and_nested_safe_return_inside_suppress() -> None:
     assert term_ris is False
 
     nested_safe_ret_src = (
+        "from contextlib import suppress\n"
         "with suppress(ValueError):\n"
         "    with suppress(KeyError):\n"
         "        x = 10\n"
@@ -1313,11 +1326,11 @@ def test_nested_raises_and_nested_safe_return_inside_suppress() -> None:
         "    risky_unreachable()\n"
     )
     nested_safe_ret_stmts = ast.parse(nested_safe_ret_src).body
-    assert _block_terminates([nested_safe_ret_stmts[0]]) is True
+    assert _block_terminates(nested_safe_ret_stmts) is True
     bound_nsr, term_nsr = _extract_block_definite_bindings_and_term(
         nested_safe_ret_stmts, None
     )
-    assert bound_nsr == {"x"}
+    assert bound_nsr == {"suppress", "x"}
     assert term_nsr is True
 
 
@@ -3992,18 +4005,19 @@ def test_runtime_exit_protocol_patch_strict_mode_classification(
 
 
 @pytest.mark.parametrize(
-    "module_src",
+    ("module_src", "expected_pedantic_safe"),
     [
-        pytest.param(_PROVEN_EXIT_CLASS + _WITH_MGR_RUN, id="unpatched_local_class"),
+        pytest.param(_PROVEN_EXIT_CLASS + _WITH_MGR_RUN, True, id="unpatched_local_class"),
         pytest.param(
             _PROVEN_EXIT_CLASS
             + "setattr(config, 'name', 1)\n"
             "holder.value = 1\n"
             "holder.__setattr__('name', 2)\n"
             + _WITH_MGR_RUN,
+            True,
             id="unrelated_attribute_mutations",
         ),
-        pytest.param("import contextlib\n" + _WITH_NULLCONTEXT_RUN, id="unpatched_stdlib"),
+        pytest.param("import contextlib\n" + _WITH_NULLCONTEXT_RUN, True, id="unpatched_stdlib"),
         pytest.param(
             _PROVEN_EXIT_CLASS
             + "Mgr.__exit__ = lambda self, *a: True\n"
@@ -4012,14 +4026,58 @@ def test_runtime_exit_protocol_patch_strict_mode_classification(
             "        v = compute()\n"
             "    cb = lambda: v\n"
             "    return cb()\n",
+            True,
             id="builtin_open_remains_proven_despite_patch",
+        ),
+        pytest.param(
+            "exec('pass')\n"
+            "def run(compute, path):\n"
+            "    with open(path):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            True,
+            id="builtin_open_remains_proven_despite_exec",
+        ),
+        pytest.param(
+            "type(inst).__exit__ = lambda self, *a: True\n"
+            "setattr(get_cls(), '__exit__', lambda self, *a: True)\n"
+            "def run(compute, path):\n"
+            "    with open(path):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            True,
+            id="builtin_open_remains_proven_despite_untargeted_exit_patch",
+        ),
+        pytest.param(
+            "import builtins\n"
+            "builtins.open = custom_open\n"
+            "def run(compute, path):\n"
+            "    with open(path):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="neg_rebound_builtins_open_fails_closed",
+        ),
+        pytest.param(
+            "def run(compute, path, open=custom_open):\n"
+            "    with open(path):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="neg_shadowed_open_param_fails_closed",
         ),
     ],
 )
-def test_exit_protocol_patch_negative_controls_keep_positive_proofs(module_src: str) -> None:
-    """Verifies unrelated attribute mutations and unpatchable builtin open keep non-suppression proofs in pedantic mode."""
+def test_exit_protocol_patch_negative_controls_keep_positive_proofs(
+    module_src: str, expected_pedantic_safe: bool
+) -> None:
+    """Verifies unrelated attribute mutations and untargeted exit patches keep builtin open proven while explicit open rebinding/shadowing fails closed."""
     safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
-    assert safety["pedantic"] is True
+    assert safety["pedantic"] is expected_pedantic_safe
 
 
 @pytest.mark.parametrize(
@@ -5018,8 +5076,12 @@ def test_exit_protocol_shadowed_eval_and_benign_alias_keep_proven_ctx_manager() 
         "    s(item, 'tag', 'ok')\n"
         + _WITH_MGR_RUN
     )
-    safety = _late_bound_capture_safety_by_mode(src, "        v = compute()")
+    safety = _late_bound_capture_safety_by_mode(src, "    cb = lambda: v")
     assert safety["pedantic"] is True
+    # Negative control: patching Mgr.__exit__ withdraws the non-suppression proof on the same capture unit
+    patched_src = _PROVEN_EXIT_CLASS + "Mgr.__exit__ = lambda self, *a: True\n" + _WITH_MGR_RUN
+    patched_safety = _late_bound_capture_safety_by_mode(patched_src, "    cb = lambda: v")
+    assert patched_safety["pedantic"] is False
 
 
 @pytest.mark.parametrize(
@@ -5111,3 +5173,5958 @@ def test_exit_protocol_indirect_and_walrus_setattr_record_patched_names(
         assert "Mgr" not in scan.patched_names
     safety = _late_bound_capture_safety_by_mode(src, "    cb = lambda: v")
     assert safety["strict"] is expected_strict_safe
+
+
+@pytest.mark.parametrize(
+    ("case_id", "src", "unit_line_text", "expected_safe_by_mode"),
+    [
+        pytest.param(
+            "multi_item_with_second_suppressor_taints_block",
+            (
+                "import contextlib\n"
+                "def run(compute):\n"
+                "    with contextlib.nullcontext() as a, contextlib.suppress(RuntimeError) as b:\n"
+                "        v = compute(a, b)\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            {"strict": False, "pedantic": False},
+            id="multi_item_with_second_suppressor",
+        ),
+        pytest.param(
+            "multi_item_with_both_proven_safe",
+            (
+                "import contextlib\n"
+                "def run(compute):\n"
+                "    with contextlib.nullcontext() as a, contextlib.nullcontext() as b:\n"
+                "        v = compute(a, b)\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            {"strict": True, "pedantic": True},
+            id="multi_item_with_both_proven_safe",
+        ),
+        pytest.param(
+            "unpacking_with_target_under_outer_suppress",
+            (
+                "import contextlib\n"
+                "def run(pair_cm, compute):\n"
+                "    with contextlib.suppress(ValueError, TypeError):\n"
+                "        with pair_cm() as (a, b):\n"
+                "            v = compute(a, b)\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            {"strict": False, "pedantic": False},
+            id="unpacking_with_target_under_outer_suppress",
+        ),
+        pytest.param(
+            "nested_try_finally_rebinding_cm_alias_invalidates_proof",
+            (
+                "import contextlib\n"
+                "from external_pkg import NeutralCM\n"
+                "def run(compute):\n"
+                "    cm = contextlib.nullcontext\n"
+                "    try:\n"
+                "        cm = NeutralCM\n"
+                "    finally:\n"
+                "        pass\n"
+                "    with cm():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            {"strict": True, "pedantic": False},
+            id="try_finally_rebinding_cm_alias_neutral",
+        ),
+        pytest.param(
+            "nested_try_finally_rebinding_cm_to_local_suppressor",
+            (
+                "import contextlib\n"
+                "class CustomSup:\n"
+                "    def __enter__(self): return self\n"
+                "    def __exit__(self, *a): return True\n"
+                "def run(compute):\n"
+                "    cm = contextlib.nullcontext\n"
+                "    try:\n"
+                "        cm = CustomSup\n"
+                "    finally:\n"
+                "        pass\n"
+                "    with cm():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            {"strict": False, "pedantic": False},
+            id="try_finally_rebinding_cm_to_local_suppressor",
+        ),
+        pytest.param(
+            "loop_rebinding_cm_alias_across_iterations",
+            (
+                "import contextlib\n"
+                "class CustomSup:\n"
+                "    def __enter__(self): return self\n"
+                "    def __exit__(self, *a): return True\n"
+                "def run(items):\n"
+                "    cm = contextlib.nullcontext\n"
+                "    for item in items:\n"
+                "        with cm():\n"
+                "            v = item\n"
+                "        cm = CustomSup\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            {"strict": False, "pedantic": False},
+            id="loop_rebinding_cm_alias",
+        ),
+        pytest.param(
+            "outer_suppress_catches_inner_cm_enter_failure",
+            (
+                "import contextlib\n"
+                + _PROVEN_EXIT_CLASS
+                + "def run(compute):\n"
+                "    with contextlib.suppress(ValueError):\n"
+                "        with Mgr():\n"
+                "            v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            {"strict": False, "pedantic": False},
+            id="outer_suppress_catches_inner_enter_raise",
+        ),
+        pytest.param(
+            "outer_suppress_does_not_suppress_outer_pre_with_assignment",
+            (
+                "import contextlib\n"
+                + _PROVEN_EXIT_CLASS
+                + "def run(compute):\n"
+                "    with Mgr():\n"
+                "        with contextlib.nullcontext():\n"
+                "            v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            {"strict": True, "pedantic": True},
+            id="nested_proven_non_suppressing_withs",
+        ),
+    ],
+)
+def test_with_provenance_multi_item_unpacking_rebinding_and_outer_suppress_interactions(
+    case_id: str,
+    src: str,
+    unit_line_text: str,
+    expected_safe_by_mode: dict[str, bool],
+) -> None:
+    """Verifies multi-item with, unpacking targets, try/loop CM rebinding, and outer suppress wrapping __enter__/__exit__."""
+    safety = _late_bound_capture_safety_by_mode(src, unit_line_text)
+    for mode, expected_safe in expected_safe_by_mode.items():
+        assert safety[mode] is expected_safe, (case_id, mode, safety)
+
+
+@pytest.mark.parametrize(
+    ("case_id", "patch_block"),
+    [
+        pytest.param(
+            "builtin_setattr_alias_setter",
+            "setter = setattr\nsetter(Mgr, '__exit__', lambda *a: True)",
+            id="builtin_setattr_alias",
+        ),
+        pytest.param(
+            "builtins_module_alias_setattr",
+            "b = builtins\nb.setattr(Mgr, '__exit__', lambda *a: True)",
+            id="builtins_module_alias",
+        ),
+        pytest.param(
+            "global_setattr_call",
+            "global setattr\nsetattr(Mgr, '__exit__', lambda *a: True)",
+            id="global_setattr_call",
+        ),
+        pytest.param(
+            "dynamic_attribute_name_setattr",
+            "attr_name = '__exit__'\nsetattr(Mgr, attr_name, lambda *a: True)",
+            id="dynamic_attr_name_setattr",
+        ),
+        pytest.param(
+            "rebind_and_restore_exit_protocol",
+            "orig = Mgr.__exit__\nMgr.__exit__ = lambda *a: True\nMgr.__exit__ = orig",
+            id="rebind_and_restore_exit_protocol",
+        ),
+        pytest.param(
+            "imported_builtins_alias_setattr",
+            "from builtins import setattr as patch_attr\npatch_attr(Mgr, '__exit__', lambda *a: True)",
+            id="imported_builtins_alias_setattr",
+        ),
+    ],
+)
+def test_exit_protocol_aliases_globals_dynamic_names_and_restoration(
+    case_id: str,
+    patch_block: str,
+) -> None:
+    """Verifies runtime exit-protocol invalidation catches aliases, globals, dynamic attr names, and restore pairs."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    clear_dataflow_cache()
+    indented = "\n".join(f"    {ln}" for ln in patch_block.splitlines())
+    src = (
+        "import builtins\n"
+        + _PROVEN_EXIT_CLASS
+        + "def patch_mgr():\n"
+        + f"{indented}\n"
+        + _WITH_MGR_RUN
+    )
+    scan = scan_exit_protocol_patches(ast.parse(src))
+    assert scan.has_patch is True, case_id
+    safety = _late_bound_capture_safety_by_mode(src, "    cb = lambda: v")
+    assert safety["pedantic"] is False, (case_id, safety)
+    assert safety["strict"] is False, (case_id, safety)
+
+
+@pytest.mark.parametrize(
+    ("case_id", "src", "expect_has_patch", "expected_patched_names"),
+    [
+        pytest.param(
+            "pep227_module_eval_alias_method_self_name",
+            (
+                "flag = eval\n"
+                "class Runner:\n"
+                "    def flag(self, cmd: str):\n"
+                "        return flag(cmd)\n"
+            ),
+            True,
+            frozenset(),
+            id="pep227_module_eval_alias_method_self_name",
+        ),
+        pytest.param(
+            "pep227_enclosing_fn_eval_alias_method_self_name",
+            (
+                "def outer():\n"
+                "    flag = eval\n"
+                "    class Runner:\n"
+                "        def flag(self, cmd: str):\n"
+                "            return flag(cmd)\n"
+                "    return Runner\n"
+            ),
+            True,
+            frozenset(),
+            id="pep227_enclosing_fn_eval_alias_method_self_name",
+        ),
+        pytest.param(
+            "pep227_method_named_eval_calls_builtin_eval",
+            (
+                "class Runner:\n"
+                "    def eval(self, cmd: str):\n"
+                "        return eval(cmd)\n"
+            ),
+            True,
+            frozenset(),
+            id="pep227_method_named_eval_calls_builtin_eval",
+        ),
+        pytest.param(
+            "pep227_method_named_sa_calls_outer_setattr",
+            (
+                "sa = setattr\n"
+                "class Runner:\n"
+                "    def sa(self, mgr):\n"
+                "        sa(mgr, '__exit__', lambda *a: True)\n"
+            ),
+            True,
+            frozenset({"mgr"}),
+            id="pep227_method_named_sa_calls_outer_setattr",
+        ),
+        pytest.param(
+            "control_nested_recursive_fn_shadows_module_setattr_alias",
+            (
+                "sa = setattr\n"
+                "def outer():\n"
+                "    def sa(n):\n"
+                "        return sa(n - 1) if n > 0 else 0\n"
+                "    return sa\n"
+                "sa(obj, 'normal_label', 1)\n"
+            ),
+            False,
+            frozenset(),
+            id="control_nested_recursive_fn_shadows_module_setattr_alias",
+        ),
+        pytest.param(
+            "control_nested_recursive_fn_named_eval_shadows_builtin",
+            (
+                "def outer():\n"
+                "    def eval(n: int) -> int:\n"
+                "        return eval(n - 1) if n > 0 else 0\n"
+                "    return eval(2)\n"
+            ),
+            False,
+            frozenset(),
+            id="control_nested_recursive_fn_named_eval_shadows_builtin",
+        ),
+        pytest.param(
+            "control_unrelated_method_self_name",
+            (
+                "class Runner:\n"
+                "    def flag(self, cmd: str):\n"
+                "        return cmd.strip()\n"
+            ),
+            False,
+            frozenset(),
+            id="control_unrelated_method_self_name",
+        ),
+        pytest.param(
+            "class_body_walrus_setattr_exposes_class_attr",
+            (
+                "class Box:\n"
+                "    _ = (s := setattr)(obj, 'normal_label', 1)\n"
+            ),
+            True,
+            frozenset(),
+            id="class_body_walrus_setattr_exposes_class_attr",
+        ),
+        pytest.param(
+            "nested_fn_class_body_walrus_setattr_exposes_class_attr",
+            (
+                "def outer(obj):\n"
+                "    class Box:\n"
+                "        _ = (s := setattr)(obj, 'normal_label', 1)\n"
+                "    return Box\n"
+            ),
+            True,
+            frozenset(),
+            id="nested_fn_class_body_walrus_setattr_exposes_class_attr",
+        ),
+        pytest.param(
+            "class_body_walrus_setattr_alias_then_patches_exit",
+            (
+                "class Mgr:\n"
+                "    pass\n"
+                "class Box:\n"
+                "    _ = (s := setattr)(Mgr, 'normal_label', 1)\n"
+                "    _p = s(Mgr, '__exit__', lambda *a: True)\n"
+            ),
+            True,
+            frozenset({"Mgr"}),
+            id="class_body_walrus_setattr_alias_then_patches_exit",
+        ),
+        pytest.param(
+            "control_function_local_walrus_setattr_safe_attr",
+            (
+                "def helper(obj):\n"
+                "    return (s := setattr)(obj, 'normal_label', 1)\n"
+            ),
+            False,
+            frozenset(),
+            id="control_function_local_walrus_setattr_safe_attr",
+        ),
+    ],
+)
+def test_exit_protocol_pep227_method_self_name_and_class_walrus(
+    case_id: str,
+    src: str,
+    expect_has_patch: bool,
+    expected_patched_names: frozenset[str],
+) -> None:
+    """Verifies PEP 227 method self-name scoping and class-body walrus attribute disqualification."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    clear_dataflow_cache()
+    scan = scan_exit_protocol_patches(ast.parse(src))
+    assert scan.has_patch is expect_has_patch, case_id
+    assert expected_patched_names <= scan.patched_names, case_id
+
+
+def test_exit_protocol_pep227_and_class_walrus_withdraw_proven_cm_proofs() -> None:
+    """Verifies PEP 227 outer eval/setattr calls and class-body walrus setattr leaks withdraw Mgr proofs."""
+    src_pep227_eval = (
+        _PROVEN_EXIT_CLASS
+        + "flag = eval\n"
+        + "class Runner:\n"
+        + "    def flag(self, cmd: str):\n"
+        + "        return flag(cmd)\n"
+        + _WITH_MGR_RUN
+    )
+    safety_pep227_eval = _late_bound_capture_safety_by_mode(src_pep227_eval, "    cb = lambda: v")
+    assert safety_pep227_eval["pedantic"] is False
+    assert safety_pep227_eval["strict"] is True
+
+    src_pep227_targeted = (
+        _PROVEN_EXIT_CLASS
+        + "sa = setattr\n"
+        + "class Runner:\n"
+        + "    def sa(self):\n"
+        + "        sa(Mgr, '__exit__', lambda *a: True)\n"
+        + _WITH_MGR_RUN
+    )
+    safety_pep227_targeted = _late_bound_capture_safety_by_mode(
+        src_pep227_targeted, "    cb = lambda: v"
+    )
+    assert safety_pep227_targeted["pedantic"] is False
+    assert safety_pep227_targeted["strict"] is False
+
+    src_walrus_exposed = (
+        _PROVEN_EXIT_CLASS
+        + "class Box:\n"
+        + "    _ = (s := setattr)(Mgr, 'normal_label', 1)\n"
+        + _WITH_MGR_RUN
+    )
+    safety_walrus_exposed = _late_bound_capture_safety_by_mode(
+        src_walrus_exposed, "    cb = lambda: v"
+    )
+    assert safety_walrus_exposed["pedantic"] is False
+    assert safety_walrus_exposed["strict"] is True
+
+    src_walrus_targeted = (
+        _PROVEN_EXIT_CLASS
+        + "class Box:\n"
+        + "    _ = (s := setattr)(Mgr, 'normal_label', 1)\n"
+        + "    _p = s(Mgr, '__exit__', lambda *a: True)\n"
+        + _WITH_MGR_RUN
+    )
+    safety_walrus_targeted = _late_bound_capture_safety_by_mode(
+        src_walrus_targeted, "    cb = lambda: v"
+    )
+    assert safety_walrus_targeted["pedantic"] is False
+    assert safety_walrus_targeted["strict"] is False
+
+    src_safe_control = (
+        _PROVEN_EXIT_CLASS
+        + "class Other:\n"
+        + "    pass\n"
+        + "sa = setattr\n"
+        + "def outer():\n"
+        + "    def sa(n):\n"
+        + "        return sa(n - 1) if n > 0 else 0\n"
+        + "    return sa\n"
+        + "sa(Other, 'normal_label', 1)\n"
+        + _WITH_MGR_RUN
+    )
+    safety_safe = _late_bound_capture_safety_by_mode(src_safe_control, "    cb = lambda: v")
+    assert safety_safe["pedantic"] is True
+    assert safety_safe["strict"] is True
+
+
+@pytest.mark.parametrize(
+    ("case_id", "src", "expect_has_patch"),
+    [
+        pytest.param(
+            "module_unused_setattr_alias_escapes",
+            "s = setattr\n",
+            True,
+            id="module_unused_setattr_alias_escapes",
+        ),
+        pytest.param(
+            "local_unused_delattr_alias_escapes",
+            "def setup():\n    d = delattr\n    return 0\n",
+            True,
+            id="local_unused_delattr_alias_escapes",
+        ),
+        pytest.param(
+            "chained_unused_setattr_aliases_escape",
+            "s1 = setattr\ns2 = s1\n",
+            True,
+            id="chained_unused_setattr_aliases_escape",
+        ),
+        pytest.param(
+            "walrus_called_then_alias_passed_to_callback_escapes",
+            "def f(cb, obj):\n    _ = (s := setattr)(obj, 'normal_label', 1)\n    cb(s)\n",
+            True,
+            id="walrus_called_then_alias_passed_to_callback_escapes",
+        ),
+        pytest.param(
+            "safe_called_only_setattr_alias",
+            "s = setattr\ns(obj, 'normal_label', 1)\n",
+            False,
+            id="safe_called_only_setattr_alias",
+        ),
+        pytest.param(
+            "safe_direct_walrus_setattr_call",
+            "def f(obj):\n    return (s := setattr)(obj, 'normal_label', 1)\n",
+            False,
+            id="safe_direct_walrus_setattr_call",
+        ),
+    ],
+)
+def test_exit_protocol_unreferenced_setattr_aliases_escape(
+    case_id: str,
+    src: str,
+    expect_has_patch: bool,
+) -> None:
+    """Verifies unused setattr/delattr aliases are treated as escaping while direct call-only aliases stay exempt."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    clear_dataflow_cache()
+    scan = scan_exit_protocol_patches(ast.parse(src))
+    assert scan.has_patch is expect_has_patch, case_id
+
+    if case_id in (
+        "module_unused_setattr_alias_escapes",
+        "safe_called_only_setattr_alias",
+        "safe_direct_walrus_setattr_call",
+    ):
+        safety = _late_bound_capture_safety_by_mode(
+            _PROVEN_EXIT_CLASS + "obj = object()\n" + src + _WITH_MGR_RUN,
+            "    cb = lambda: v",
+        )
+        assert safety["pedantic"] is (not expect_has_patch), case_id
+        assert safety["strict"] is True, case_id
+
+
+@pytest.mark.parametrize(
+    ("module_src", "expected_safe"),
+    [
+        pytest.param(
+            "from contextlib import nullcontext\n"
+            "def install():\n"
+            "    import contextlib as cl\n"
+            "    cl.nullcontext = lambda *a: True\n"
+            "def run(compute):\n"
+            "    with nullcontext():\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="helper_scoped_cl_alias_invalidates_from_import_nullcontext",
+        ),
+        pytest.param(
+            "import contextlib\n"
+            "def install():\n"
+            "    import contextlib as cl\n"
+            "    cl.nullcontext = lambda *a: True\n"
+            "def run(compute):\n"
+            "    with contextlib.nullcontext():\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="helper_scoped_cl_alias_invalidates_contextlib_attr_nullcontext",
+        ),
+        pytest.param(
+            "import contextlib\n"
+            "def run(compute):\n"
+            "    with contextlib.nullcontext():\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n"
+            "import contextlib as cl\n"
+            "cl.nullcontext = lambda *a: True\n",
+            False,
+            id="post_unit_module_alias_rebinding",
+        ),
+        pytest.param(
+            "import contextlib as cl\n"
+            "m = cl\n"
+            "m.nullcontext = lambda *a: True\n"
+            "def run(compute):\n"
+            "    with cl.nullcontext():\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="chained_module_variable_alias_rebinding",
+        ),
+        pytest.param(
+            "def install():\n"
+            "    import builtins as b\n"
+            "    b.open = lambda *a: True\n"
+            "def run(compute):\n"
+            "    with open('x'):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="helper_scoped_builtins_alias_open_rebinding",
+        ),
+        pytest.param(
+            "import io\n"
+            "def patch(name, fn):\n"
+            "    import io as iomod\n"
+            "    setattr(iomod, name, fn)\n"
+            "def run(compute):\n"
+            "    with io.open('x'):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="helper_scoped_io_dynamic_setattr_rebinding",
+        ),
+        pytest.param(
+            "import unittest\n"
+            "unittest.mock.patch = lambda *a: True\n"
+            "def run(compute):\n"
+            "    with unittest.mock.patch('pkg.fn'):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="unittest_import_dotted_mock_patch_rebinding",
+        ),
+        pytest.param(
+            "import unittest.mock\n"
+            "unittest.mock.patch = lambda *a: True\n"
+            "def run(compute):\n"
+            "    with unittest.mock.patch('pkg.fn'):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="unittest_mock_import_dotted_patch_rebinding",
+        ),
+        pytest.param(
+            "import unittest as ut\n"
+            "ut.mock.patch = lambda *a: True\n"
+            "def run(compute):\n"
+            "    with unittest.mock.patch('pkg.fn'):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="unittest_alias_dotted_mock_patch_rebinding",
+        ),
+        pytest.param(
+            "def install():\n"
+            "    from unittest import mock\n"
+            "    mock.patch = lambda *a: True\n"
+            "def run(compute):\n"
+            "    import unittest.mock\n"
+            "    with unittest.mock.patch('pkg.fn'):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="from_unittest_import_mock_patch_rebinding",
+        ),
+        pytest.param(
+            "import unittest\n"
+            "m = unittest.mock\n"
+            "m.patch = lambda *a: True\n"
+            "def run(compute):\n"
+            "    import unittest.mock\n"
+            "    with unittest.mock.patch('pkg.fn'):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            False,
+            id="assigned_unittest_mock_patch_rebinding",
+        ),
+        pytest.param(
+            "import unittest.mock\n"
+            "class C:\n"
+            "    def update(self):\n"
+            "        self.conn.patch = lambda *a: True\n"
+            "def run(compute):\n"
+            "    with unittest.mock.patch('pkg.fn'):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            True,
+            id="control_nested_self_conn_patch_assignment",
+        ),
+        pytest.param(
+            "import contextlib as cl\n"
+            "def f(cl):\n"
+            "    cl.nullcontext = lambda *a: True\n"
+            "def run(compute):\n"
+            "    with cl.nullcontext():\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            True,
+            id="control_shadowed_local_param_cl_nullcontext",
+        ),
+        pytest.param(
+            "import unittest.mock\n"
+            "def f(unittest):\n"
+            "    unittest.mock.patch = lambda *a: True\n"
+            "def run(compute):\n"
+            "    with unittest.mock.patch('pkg.fn'):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            True,
+            id="control_shadowed_local_param_unittest_mock_patch",
+        ),
+        pytest.param(
+            "import unittest.mock\n"
+            "def run(compute):\n"
+            "    with unittest.mock.patch('pkg.fn'):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            True,
+            id="control_benign_unittest_mock_patch",
+        ),
+        pytest.param(
+            "from unittest import mock\n"
+            "def run(compute):\n"
+            "    with mock.patch('pkg.fn'):\n"
+            "        v = compute()\n"
+            "    cb = lambda: v\n"
+            "    return cb()\n",
+            True,
+            id="control_benign_from_unittest_import_mock_patch",
+        ),
+    ],
+)
+def test_stdlib_scoped_aliases_and_dotted_chains_provenance_safety(
+    module_src: str, expected_safe: bool
+) -> None:
+    """Verifies scoped/post-unit/chained stdlib aliases and dotted attribute chains withdraw non-suppression proofs."""
+    safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
+    assert safety == {"strict": expected_safe, "pedantic": expected_safe}
+
+
+@pytest.mark.parametrize(
+    ("module_src", "expected_has_patch", "expected_patched_names"),
+    [
+        pytest.param(
+            "fn = cm.__setattr__\nfn('__class__', Suppressor)\n",
+            True,
+            frozenset({"cm"}),
+            id="bound_instance_setattr_exit_protocol_call",
+        ),
+        pytest.param(
+            "fn = Mgr.__delattr__\nfn('__exit__')\n",
+            True,
+            frozenset({"Mgr"}),
+            id="bound_class_delattr_exit_protocol_call",
+        ),
+        pytest.param(
+            "def f(type):\n    return type.__setattr__\n",
+            True,
+            frozenset(),
+            id="escaping_param_setattr_reference",
+        ),
+        pytest.param(
+            "def f(type):\n    return type.__name__\n",
+            False,
+            frozenset(),
+            id="control_escaping_param_non_mutation_dunder",
+        ),
+        pytest.param(
+            "cm.__setattr__('label', 1)\nMgr.__delattr__('label')\n",
+            False,
+            frozenset(),
+            id="control_direct_safe_attr_dunder_calls",
+        ),
+        pytest.param(
+            (
+                "def f(code):\n"
+                "    global eval\n"
+                "    _ = [(eval := eval) for _ in (1,)]\n"
+                "    eval(code)\n"
+            ),
+            True,
+            frozenset(),
+            id="global_eval_comprehension_walrus_keeps_builtin_binding",
+        ),
+        pytest.param(
+            (
+                "def outer(code):\n"
+                "    fn = lambda x: x\n"
+                "    def set_fn():\n"
+                "        nonlocal fn\n"
+                "        _ = [(fn := eval) for _ in (1,)]\n"
+                "    set_fn()\n"
+                "    fn(code)\n"
+            ),
+            True,
+            frozenset(),
+            id="nonlocal_eval_alias_comprehension_walrus",
+        ),
+        pytest.param(
+            (
+                "def outer(code):\n"
+                "    fn = lambda x: x\n"
+                "    _ = [(fn := fn) for _ in (1,)]\n"
+                "    return fn(code)\n"
+            ),
+            False,
+            frozenset(),
+            id="control_local_comprehension_walrus_stays_clean",
+        ),
+    ],
+)
+def test_bound_dunder_aliases_and_comprehension_walrus_exit_protocol_scan(
+    module_src: str,
+    expected_has_patch: bool,
+    expected_patched_names: frozenset[str],
+) -> None:
+    """Verifies bound dunder aliases and global/nonlocal comprehension walrus targets during exit-protocol scans."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    scan = scan_exit_protocol_patches(ast.parse(module_src))
+    assert scan.has_patch is expected_has_patch
+    assert scan.patched_names == expected_patched_names
+
+
+@pytest.mark.parametrize(
+    ("module_src", "expected_strict", "expected_pedantic"),
+    [
+        pytest.param(
+            (
+                "class Mgr:\n"
+                "    def __enter__(self):\n"
+                "        return self\n"
+                "    def __exit__(self, *exc):\n"
+                "        return False\n"
+                "class Suppressor:\n"
+                "    def __exit__(self, *exc):\n"
+                "        return True\n"
+                "def evil(cm):\n"
+                "    fn = cm.__setattr__\n"
+                "    fn('__class__', Suppressor)\n"
+                "def run(compute):\n"
+                "    cm = Mgr()\n"
+                "    evil(cm)\n"
+                "    with cm:\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            True,
+            False,
+            id="bound_cm_setattr_class_rebind_withdraws_local_mgr_proof",
+        ),
+        pytest.param(
+            (
+                "def run(compute):\n"
+                "    class Mgr:\n"
+                "        def __enter__(self):\n"
+                "            return self\n"
+                "        def __exit__(self, *exc):\n"
+                "            return False\n"
+                "    fn = Mgr.__setattr__\n"
+                "    fn('__exit__', lambda self, *a: True)\n"
+                "    with Mgr():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            False,
+            id="direct_class_bound_setattr_rebind_invalidates_both_modes",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "cm = contextlib.nullcontext()\n"
+                "contextlib.nullcontext = lambda *a: True\n"
+                "def run(compute):\n"
+                "    with cm:\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            False,
+            id="prebound_nullcontext_instance_invalidated_by_factory_rebind",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "cm = contextlib.nullcontext()\n"
+                "cm2 = cm\n"
+                "contextlib.nullcontext = lambda *a: True\n"
+                "def run(compute):\n"
+                "    with cm2:\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            False,
+            id="chained_prebound_nullcontext_alias_invalidated_by_factory_rebind",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def rebind():\n"
+                "    contextlib.nullcontext = lambda *a: True\n"
+                "def run(compute):\n"
+                "    cm = contextlib.nullcontext()\n"
+                "    with cm:\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            False,
+            id="in_function_prebound_nullcontext_invalidated_before_subroutine",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "cm = contextlib.nullcontext()\n"
+                "cm2 = cm\n"
+                "def run(compute):\n"
+                "    with cm2:\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            True,
+            True,
+            id="control_prebound_nullcontext_chain_without_rebind",
+        ),
+        pytest.param(
+            (
+                "import tempfile\n"
+                "from tempfile import TemporaryDirectory\n"
+                "td = TemporaryDirectory\n"
+                "td2 = td\n"
+                "tempfile.TemporaryDirectory = lambda *a: True\n"
+                "def run(compute):\n"
+                "    with td2():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            False,
+            id="general_stdlib_factory_alias_invalidated_by_rebind",
+        ),
+        pytest.param(
+            (
+                "from tempfile import TemporaryDirectory\n"
+                "td = TemporaryDirectory\n"
+                "td2 = td\n"
+                "def run(compute):\n"
+                "    with td2():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            True,
+            True,
+            id="control_general_stdlib_factory_alias_without_rebind",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "cm = contextlib.nullcontext()\n"
+                "payload = {'k': 1, 'cm': True}\n"
+                "match payload:\n"
+                "    case {'k': 1, **cm}:\n"
+                "        pass\n"
+                "def run(compute):\n"
+                "    with cm:\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            True,
+            False,
+            id="module_level_match_mapping_rest_rebinds_cm",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "cm = contextlib.nullcontext()\n"
+                "payload = {'k': 1, 'other': True}\n"
+                "match payload:\n"
+                "    case {'k': 1, **other}:\n"
+                "        pass\n"
+                "def run(compute):\n"
+                "    with cm:\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            True,
+            True,
+            id="control_module_level_match_mapping_rest_unrelated_target",
+        ),
+    ],
+)
+def test_rebound_prebound_instances_factory_aliases_and_mapping_rest(
+    module_src: str, expected_strict: bool, expected_pedantic: bool
+) -> None:
+    """Verifies bound dunder rebinding, prebound stdlib instances, factory aliases, and mapping rest bindings."""
+    safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
+    assert safety == {"strict": expected_strict, "pedantic": expected_pedantic}
+
+
+@pytest.mark.parametrize(
+    ("src", "expect_has_patch"),
+    [
+        pytest.param(
+            (
+                "class Patcher:\n"
+                "    def setattr(self, target, handler):\n"
+                "        setattr(target, '__exit__', handler)\n"
+            ),
+            True,
+            id="pep227_method_named_setattr_calls_builtin_setattr",
+        ),
+        pytest.param(
+            (
+                "def outer():\n"
+                "    class Patcher:\n"
+                "        def eval(self, code):\n"
+                "            return eval(code)\n"
+            ),
+            True,
+            id="pep227_nested_method_named_eval_calls_builtin_eval",
+        ),
+        pytest.param(
+            (
+                "def outer(flag):\n"
+                "    def eval(x):\n"
+                "        return x if not flag else eval(False)\n"
+                "    return eval(1)\n"
+            ),
+            False,
+            id="control_nested_function_named_eval_shadows_in_enclosing_fn",
+        ),
+        pytest.param(
+            (
+                "s = setattr\n"
+                "def run(target, handler):\n"
+                "    class C:\n"
+                "        x = (s := 1)\n"
+                "    return s(target, '__exit__', handler)\n"
+            ),
+            True,
+            id="class_body_walrus_does_not_shadow_enclosing_fn_alias",
+        ),
+        pytest.param(
+            (
+                "def run():\n"
+                "    s = lambda *a: None\n"
+                "    class C:\n"
+                "        x = (s := 1)\n"
+                "    return s(1, '__exit__', 2)\n"
+            ),
+            False,
+            id="control_class_body_walrus_leaves_enclosing_local_shadow_intact",
+        ),
+    ],
+)
+def test_pep227_method_self_name_and_class_walrus_exit_protocol_scan(
+    src: str, expect_has_patch: bool
+) -> None:
+    """Verifies PEP 227 method self-names do not shadow builtins and class-body walruses do not shadow enclosing locals."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    clear_dataflow_cache()
+    scan = scan_exit_protocol_patches(ast.parse(src))
+    assert scan.has_patch is expect_has_patch
+
+
+def test_try_except_finally_unhandled_exception_preserves_handler_base() -> None:
+    """Verifies finally sees unhandled-exception handler_base provenance and post-try preserves it only on jump suppression."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _EMPTY_SUPPRESS_PROVENANCE,
+        _block_terminates,
+        _update_suppress_provenance_from_stmts,
+    )
+
+    with_finally_return_src = (
+        "import contextlib\n"
+        "def run(may_raise, step):\n"
+        "    cm = contextlib.suppress\n"
+        "    try:\n"
+        "        may_raise()\n"
+        "        cm = contextlib.nullcontext\n"
+        "    except ValueError:\n"
+        "        cm = contextlib.nullcontext\n"
+        "    finally:\n"
+        "        with cm(KeyError):\n"
+        "            x = step()\n"
+        "        return 1\n"
+    )
+    tree = ast.parse(with_finally_return_src)
+    mod_prov = _update_suppress_provenance_from_stmts(
+        tree.body[:1], _EMPTY_SUPPRESS_PROVENANCE, in_branch=False
+    )
+    fn = tree.body[1]
+    assert isinstance(fn, ast.FunctionDef)
+    prov_after = _update_suppress_provenance_from_stmts(
+        fn.body, mod_prov, in_branch=False
+    )
+    assert "cm" in prov_after.suppressors
+    assert "cm" not in prov_after.non_suppressors
+
+    # Without return/break/continue, unhandled exceptions re-raise on exit from finally
+    without_jump_src = with_finally_return_src.replace("        return 1\n", "        step()\n")
+    no_jump_tree = ast.parse(without_jump_src)
+    no_jump_prov = _update_suppress_provenance_from_stmts(
+        no_jump_tree.body[:1], _EMPTY_SUPPRESS_PROVENANCE, in_branch=False
+    )
+    no_jump_fn = no_jump_tree.body[1]
+    assert isinstance(no_jump_fn, ast.FunctionDef)
+    no_jump_after = _update_suppress_provenance_from_stmts(
+        no_jump_fn.body, no_jump_prov, in_branch=False
+    )
+    assert "cm" not in no_jump_after.suppressors
+    assert "cm" in no_jump_after.non_suppressors
+
+    # Inside finally, with cm(KeyError) returning inside body does not guarantee termination because cm may still be suppress
+    finally_return_inside_with = (
+        "import contextlib\n"
+        "def run(may_raise, step):\n"
+        "    cm = contextlib.suppress\n"
+        "    try:\n"
+        "        may_raise()\n"
+        "        cm = contextlib.nullcontext\n"
+        "    except ValueError:\n"
+        "        cm = contextlib.nullcontext\n"
+        "    finally:\n"
+        "        with cm(KeyError):\n"
+        "            x = step()\n"
+        "            return x\n"
+    )
+    term_tree = ast.parse(finally_return_inside_with)
+    term_mod_prov = _update_suppress_provenance_from_stmts(
+        term_tree.body[:1], _EMPTY_SUPPRESS_PROVENANCE, in_branch=False
+    )
+    term_fn = term_tree.body[1]
+    assert isinstance(term_fn, ast.FunctionDef)
+    assert _block_terminates(term_fn.body, suppress_aliases=term_mod_prov) is False
+
+    loop_break_src = (
+        "import contextlib\n"
+        "def run(items, check, may_raise, compute):\n"
+        "    for _ in items:\n"
+        "        cm = contextlib.suppress\n"
+        "        try:\n"
+        "            may_raise()\n"
+        "            cm = contextlib.nullcontext\n"
+        "        except ValueError:\n"
+        "            cm = contextlib.nullcontext\n"
+        "        finally:\n"
+        "            if check():\n"
+        "                break\n"
+        "    with cm(KeyError):\n"
+        "        v = compute()\n"
+        "    cb = lambda: v\n"
+        "    return cb()\n"
+    )
+    break_safety = _late_bound_capture_safety_by_mode(loop_break_src, "    cb = lambda: v")
+    assert break_safety == {"strict": False, "pedantic": False}
+
+    loop_break_unknown_src = (
+        "import contextlib\n"
+        "def run(items, check, may_raise, CustomCtx, compute):\n"
+        "    for _ in items:\n"
+        "        cm = CustomCtx\n"
+        "        try:\n"
+        "            may_raise()\n"
+        "            cm = contextlib.nullcontext\n"
+        "        except ValueError:\n"
+        "            cm = contextlib.nullcontext\n"
+        "        finally:\n"
+        "            if check():\n"
+        "                break\n"
+        "    with cm():\n"
+        "        v = compute()\n"
+        "    cb = lambda: v\n"
+        "    return cb()\n"
+    )
+    unknown_safety = _late_bound_capture_safety_by_mode(
+        loop_break_unknown_src, "    cb = lambda: v"
+    )
+    assert unknown_safety["pedantic"] is False
+
+    # Control: when try body has no raising prefix before rebinding, cm is nullcontext on all paths into finally
+    safe_prefix_only_src = (
+        "import contextlib\n"
+        "def run(compute):\n"
+        "    cm = contextlib.suppress\n"
+        "    try:\n"
+        "        cm = contextlib.nullcontext\n"
+        "    except ValueError:\n"
+        "        cm = contextlib.nullcontext\n"
+        "    finally:\n"
+        "        pass\n"
+        "    with cm():\n"
+        "        v = compute()\n"
+        "    cb = lambda: v\n"
+        "    return cb()\n"
+    )
+    safe_prefix_safety = _late_bound_capture_safety_by_mode(
+        safe_prefix_only_src, "    cb = lambda: v"
+    )
+    assert safe_prefix_safety == {"strict": True, "pedantic": True}
+
+
+@pytest.mark.parametrize(
+    ("extra_src", "expect_has_patch", "expect_pedantic_safe"),
+    [
+        pytest.param(
+            (
+                "def eval(model):\n"
+                "    return model(1)\n"
+                "def caller(m):\n"
+                "    return eval(m)\n"
+            ),
+            False,
+            True,
+            id="module_level_def_eval_shadows_builtin",
+        ),
+        pytest.param(
+            (
+                "eval = False\n"
+                "def caller():\n"
+                "    return 1 if eval else 0\n"
+            ),
+            False,
+            True,
+            id="module_level_var_eval_shadows_builtin",
+        ),
+        pytest.param(
+            (
+                "setattr = lambda *a: None\n"
+                "def configure(obj):\n"
+                "    return setattr(obj, '__exit__', True)\n"
+            ),
+            False,
+            True,
+            id="module_level_var_setattr_shadows_builtin",
+        ),
+        pytest.param(
+            (
+                "class Config:\n"
+                "    eval = False\n"
+                "    enabled = bool(eval)\n"
+            ),
+            False,
+            True,
+            id="class_body_eval_shadows_direct_class_load",
+        ),
+        pytest.param(
+            (
+                "class PatchCfg:\n"
+                "    setattr = lambda *a: None\n"
+                "    applied = setattr(object(), '__exit__', True)\n"
+            ),
+            False,
+            True,
+            id="class_body_setattr_shadows_direct_class_call",
+        ),
+        pytest.param(
+            (
+                "class Config:\n"
+                "    eval = False\n"
+                "    def method(self, code):\n"
+                "        return eval(code)\n"
+            ),
+            True,
+            False,
+            id="negative_pep227_method_bypasses_class_eval_shadow",
+        ),
+        pytest.param(
+            (
+                "my_eval = eval\n"
+                "def caller(code):\n"
+                "    return my_eval(code)\n"
+            ),
+            True,
+            False,
+            id="negative_unshadowed_module_eval_alias",
+        ),
+        pytest.param(
+            (
+                "def caller(target, fn):\n"
+                "    global setattr\n"
+                "    setattr(target, '__exit__', fn)\n"
+            ),
+            True,
+            False,
+            id="negative_global_setattr_without_module_binding",
+        ),
+        pytest.param(
+            (
+                "def installer():\n"
+                "    global custom_alias\n"
+                "    custom_alias = setattr\n"
+                "def caller(target, fn):\n"
+                "    custom_alias(target, '__exit__', fn)\n"
+            ),
+            True,
+            False,
+            id="negative_global_setattr_alias_created_inside_function",
+        ),
+    ],
+)
+def test_module_and_class_body_shadowed_builtins_exit_protocol_scan(
+    extra_src: str, expect_has_patch: bool, expect_pedantic_safe: bool
+) -> None:
+    """Verifies module-level and direct class-body bindings shadow builtins while keeping PEP 227/global escapes sound."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    module_src = _PROVEN_EXIT_CLASS + extra_src + _WITH_MGR_RUN
+    clear_dataflow_cache()
+    scan = scan_exit_protocol_patches(ast.parse(module_src))
+    assert scan.has_patch is expect_has_patch
+    safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
+    assert safety["pedantic"] is expect_pedantic_safe
+
+
+@pytest.mark.parametrize(
+    ("mut_stmt", "ctx_open_line", "expect_pedantic_safe"),
+    [
+        pytest.param(
+            "    setattr(self.conn, 'connect', fn)\n",
+            "    with sqlite3.connect(path):\n",
+            True,
+            id="compound_receiver_setattr_connect_does_not_invalidate_sqlite3",
+        ),
+        pytest.param(
+            "    setattr(get_door(), 'open', False)\n",
+            "    with open(path):\n",
+            True,
+            id="call_receiver_setattr_open_does_not_invalidate_builtin_open",
+        ),
+        pytest.param(
+            "    self.conn.__setattr__('open', False)\n",
+            "    with open(path):\n",
+            True,
+            id="compound_receiver_dunder_setattr_open_does_not_invalidate_open",
+        ),
+        pytest.param(
+            "    setattr(importlib.import_module('sqlite3'), 'connect', fn)\n",
+            "    with sqlite3.connect(path):\n",
+            False,
+            id="negative_importlib_setattr_connect_invalidates_sqlite3",
+        ),
+        pytest.param(
+            "    setattr(sys.modules['builtins'], 'open', fn)\n",
+            "    with open(path):\n",
+            False,
+            id="negative_sys_modules_builtins_setattr_open_invalidates_open",
+        ),
+    ],
+)
+def test_compound_receiver_setattr_stdlib_factory_attr_scoping(
+    mut_stmt: str, ctx_open_line: str, expect_pedantic_safe: bool
+) -> None:
+    """Verifies setattr/dunder on compound non-module receivers does not wildcard-invalidate stdlib factories."""
+    module_src = (
+        "import importlib\n"
+        "import sqlite3\n"
+        "import sys\n"
+        "def mutate(self, fn, get_door):\n"
+        f"{mut_stmt}"
+        "def run(path, compute):\n"
+        f"{ctx_open_line}"
+        "        v = compute()\n"
+        "    cb = lambda: v\n"
+        "    return cb()\n"
+    )
+    safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
+    assert safety["pedantic"] is expect_pedantic_safe
+
+
+@pytest.mark.parametrize(
+    ("extra_src", "expect_has_patch", "expect_pedantic_safe"),
+    [
+        pytest.param(
+            (
+                "def outer(eval=False):\n"
+                "    def inner():\n"
+                "        global eval\n"
+                "        return [eval('1 + 1') for _ in (1,)]\n"
+                "    return inner()\n"
+            ),
+            True,
+            False,
+            id="ancestor_global_eval_escapes_outer_param_in_comprehension",
+        ),
+        pytest.param(
+            (
+                "def outer(setattr=False):\n"
+                "    def inner():\n"
+                "        global setattr\n"
+                "        fn = lambda obj, cb: setattr(obj, '__exit__', cb)\n"
+                "        return fn(object(), None)\n"
+                "    return inner()\n"
+            ),
+            True,
+            False,
+            id="ancestor_global_setattr_escapes_outer_param_in_lambda",
+        ),
+        pytest.param(
+            (
+                "def outer():\n"
+                "    eval = lambda x: x\n"
+                "    def mid():\n"
+                "        global eval\n"
+                "        def leaf(code):\n"
+                "            return eval(code)\n"
+                "        return leaf('1')\n"
+                "    return mid()\n"
+            ),
+            True,
+            False,
+            id="ancestor_global_eval_escapes_outer_local_in_nested_def",
+        ),
+        pytest.param(
+            (
+                "custom_eval = eval\n"
+                "def outer(custom_eval=False):\n"
+                "    def mid():\n"
+                "        global custom_eval\n"
+                "        return [custom_eval('1 + 1') for _ in (1,)]\n"
+                "    return mid()\n"
+            ),
+            True,
+            False,
+            id="ancestor_global_module_alias_escapes_outer_param_in_comprehension",
+        ),
+        pytest.param(
+            (
+                "def outer(eval=False):\n"
+                "    def inner():\n"
+                "        return [eval('1 + 1') for _ in (1,)]\n"
+                "    return inner()\n"
+            ),
+            False,
+            True,
+            id="negative_comprehension_without_ancestor_global_stays_shadowed",
+        ),
+        pytest.param(
+            (
+                "def outer(eval=False):\n"
+                "    def mid():\n"
+                "        global eval\n"
+                "        def leaf(eval=lambda x: x):\n"
+                "            return eval('1')\n"
+                "        return leaf()\n"
+                "    return mid()\n"
+            ),
+            False,
+            True,
+            id="negative_inner_param_re_shadows_ancestor_global_decl",
+        ),
+        pytest.param(
+            (
+                "eval = lambda x: x\n"
+                "def outer(eval=False):\n"
+                "    def mid():\n"
+                "        global eval\n"
+                "        return [eval('1') for _ in (1,)]\n"
+                "    return mid()\n"
+            ),
+            False,
+            True,
+            id="negative_module_shadow_prevents_ancestor_global_builtin_match",
+        ),
+    ],
+)
+def test_ancestor_global_decl_escapes_outer_shadow_exit_protocol_scan(
+    extra_src: str, expect_has_patch: bool, expect_pedantic_safe: bool
+) -> None:
+    """Verifies ancestor global declarations bypass enclosing lexical shadows in nested scopes."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    module_src = _PROVEN_EXIT_CLASS + extra_src + _WITH_MGR_RUN
+    clear_dataflow_cache()
+    scan = scan_exit_protocol_patches(ast.parse(module_src))
+    assert scan.has_patch is expect_has_patch
+    safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
+    assert safety["pedantic"] is expect_pedantic_safe
+
+
+@pytest.mark.parametrize(
+    ("module_src", "unit_src", "expect_pedantic_safe"),
+    [
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def run(may_raise, compute):\n"
+                "    cm = contextlib.nullcontext\n"
+                "    def flip():\n"
+                "        nonlocal cm\n"
+                "        cm = contextlib.suppress\n"
+                "        return ValueError\n"
+                "    try:\n"
+                "        may_raise()\n"
+                "    except flip():\n"
+                "        with cm(RuntimeError):\n"
+                "            v = compute()\n"
+                "        cb = lambda: v\n"
+                "        return cb()\n"
+            ),
+            "        cb = lambda: v",
+            False,
+            id="except_header_cross_scope_mutator_invalidates_handler_body",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def run(may_raise, compute):\n"
+                "    cm = contextlib.nullcontext\n"
+                "    def flip():\n"
+                "        nonlocal cm\n"
+                "        cm = contextlib.suppress\n"
+                "        return KeyError\n"
+                "    try:\n"
+                "        may_raise()\n"
+                "    except flip():\n"
+                "        pass\n"
+                "    except ValueError:\n"
+                "        def inner():\n"
+                "            with cm(RuntimeError):\n"
+                "                v = compute()\n"
+                "            cb = lambda: v\n"
+                "            return cb()\n"
+                "        return inner()\n"
+            ),
+            "            cb = lambda: v",
+            False,
+            id="prior_except_header_cross_scope_mutator_invalidates_later_handler_seed",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def run(payload, compute):\n"
+                "    cm = contextlib.nullcontext\n"
+                "    def flip():\n"
+                "        nonlocal cm\n"
+                "        cm = contextlib.suppress\n"
+                "        return True\n"
+                "    match payload:\n"
+                "        case 1 if flip():\n"
+                "            with cm(RuntimeError):\n"
+                "                v = compute()\n"
+                "            cb = lambda: v\n"
+                "            return cb()\n"
+            ),
+            "            cb = lambda: v",
+            False,
+            id="match_guard_cross_scope_mutator_invalidates_own_case_body",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def run(payload, compute):\n"
+                "    cm = contextlib.nullcontext\n"
+                "    def flip():\n"
+                "        nonlocal cm\n"
+                "        cm = contextlib.suppress\n"
+                "        return False\n"
+                "    match payload:\n"
+                "        case 1 if flip():\n"
+                "            pass\n"
+                "        case _:\n"
+                "            with cm(RuntimeError):\n"
+                "                v = compute()\n"
+                "            cb = lambda: v\n"
+                "            return cb()\n"
+            ),
+            "            cb = lambda: v",
+            False,
+            id="prior_match_guard_cross_scope_mutator_invalidates_later_case_body",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def run(payload, compute):\n"
+                "    cm = contextlib.nullcontext\n"
+                "    def flip():\n"
+                "        nonlocal cm\n"
+                "        cm = contextlib.suppress\n"
+                "        return False\n"
+                "    match payload:\n"
+                "        case 1 if flip():\n"
+                "            pass\n"
+                "        case _:\n"
+                "            def inner():\n"
+                "                with cm(RuntimeError):\n"
+                "                    v = compute()\n"
+                "                cb = lambda: v\n"
+                "                return cb()\n"
+                "            return inner()\n"
+            ),
+            "                cb = lambda: v",
+            False,
+            id="prior_match_guard_cross_scope_mutator_invalidates_later_case_nested_seed",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def run(payload, compute):\n"
+                "    cm = contextlib.nullcontext\n"
+                "    def flip():\n"
+                "        nonlocal cm\n"
+                "        cm = contextlib.suppress\n"
+                "        return False\n"
+                "    match payload:\n"
+                "        case 1 if flip():\n"
+                "            cm = contextlib.nullcontext\n"
+                "        case _:\n"
+                "            pass\n"
+                "    with cm(RuntimeError):\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            False,
+            id="prior_match_guard_mutator_with_taken_restore_still_invalidates_post_match",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def run(payload, compute):\n"
+                "    cm = contextlib.nullcontext\n"
+                "    def check():\n"
+                "        return False\n"
+                "    match payload:\n"
+                "        case cm if check():\n"
+                "            pass\n"
+                "        case _:\n"
+                "            def inner():\n"
+                "                with cm(RuntimeError):\n"
+                "                    v = compute()\n"
+                "                cb = lambda: v\n"
+                "                return cb()\n"
+                "            return inner()\n"
+            ),
+            "                cb = lambda: v",
+            False,
+            id="prior_match_pattern_binding_cm_before_failed_guard_invalidates_later_seed",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def run(payload, may_raise, compute):\n"
+                "    cm = contextlib.nullcontext\n"
+                "    def exc_type():\n"
+                "        return ValueError\n"
+                "    def ok():\n"
+                "        return False\n"
+                "    try:\n"
+                "        may_raise()\n"
+                "    except exc_type():\n"
+                "        pass\n"
+                "    except TypeError:\n"
+                "        match payload:\n"
+                "            case 1 if ok():\n"
+                "                pass\n"
+                "            case _:\n"
+                "                def inner():\n"
+                "                    with cm():\n"
+                "                        v = compute()\n"
+                "                    cb = lambda: v\n"
+                "                    return cb()\n"
+                "                return inner()\n"
+            ),
+            "                    cb = lambda: v",
+            True,
+            id="control_benign_except_header_and_match_guard_preserve_proven_cm",
+        ),
+    ],
+)
+def test_clause_header_and_prior_match_guard_cross_scope_invalidation(
+    module_src: str, unit_src: str, expect_pedantic_safe: bool
+) -> None:
+    """Verifies except headers and match guards propagate cross-scope mutator invalidation."""
+    safety = _late_bound_capture_safety_by_mode(module_src, unit_src)
+    assert safety["pedantic"] is expect_pedantic_safe
+
+
+@pytest.mark.parametrize(
+    ("prefix_src", "ctx_expr", "expect_safe", "expect_rebound"),
+    [
+        pytest.param(
+            "def trigger(code):\n    exec(code)\n",
+            "open(path)",
+            {"strict": True, "pedantic": True},
+            True,
+            id="exec_keeps_builtin_open_trusted",
+        ),
+        pytest.param(
+            "def trigger(code):\n    return eval(code)\n",
+            "builtins.open(path)",
+            {"strict": True, "pedantic": True},
+            True,
+            id="eval_keeps_builtins_open_trusted",
+        ),
+        pytest.param(
+            "def trigger(code):\n    exec(code)\n",
+            "contextlib.nullcontext()",
+            {"strict": False, "pedantic": False},
+            True,
+            id="exec_still_withdraws_and_invalidates_contextlib_nullcontext",
+        ),
+        pytest.param(
+            "def trigger(get_cls, fn):\n    setattr(get_cls(), '__exit__', fn)\n",
+            "open(path)",
+            {"strict": True, "pedantic": True},
+            False,
+            id="setattr_dynamic_receiver_exit_keeps_open_trusted",
+        ),
+        pytest.param(
+            "s = setattr\n",
+            "open(path)",
+            {"strict": True, "pedantic": True},
+            True,
+            id="uncalled_setattr_keeps_builtin_open_trusted",
+        ),
+        pytest.param(
+            "def trigger(fn):\n    patch_m = Mgr.__setattr__\n    patch_m('__exit__', fn)\n",
+            "open(path)",
+            {"strict": True, "pedantic": True},
+            True,
+            id="bound_mgr_dunder_setattr_keeps_open_trusted",
+        ),
+        pytest.param(
+            "builtins.open = lambda *a: True\n",
+            "open(path)",
+            {"strict": False, "pedantic": False},
+            True,
+            id="negative_direct_builtins_open_rebind_invalidates_open",
+        ),
+        pytest.param(
+            "import builtins as b\nb.open = lambda *a: True\n",
+            "open(path)",
+            {"strict": False, "pedantic": False},
+            True,
+            id="negative_aliased_builtins_open_rebind_invalidates_open",
+        ),
+        pytest.param(
+            "def patch(attr_name, fn):\n    setattr(builtins, attr_name, fn)\n",
+            "open(path)",
+            {"strict": False, "pedantic": False},
+            True,
+            id="negative_setattr_builtins_dynamic_attr_invalidates_open",
+        ),
+        pytest.param(
+            "def patch(fn):\n    builtins.__dict__['open'] = fn\n",
+            "open(path)",
+            {"strict": False, "pedantic": False},
+            True,
+            id="negative_builtins_dict_open_rebind_invalidates_open",
+        ),
+        pytest.param(
+            "def patch(fn):\n    __builtins__['open'] = fn\n",
+            "open(path)",
+            {"strict": False, "pedantic": False},
+            True,
+            id="negative_dunder_builtins_open_rebind_invalidates_open",
+        ),
+        pytest.param(
+            "def patch(fn):\n    vars(builtins)['open'] = fn\n",
+            "open(path)",
+            {"strict": False, "pedantic": False},
+            True,
+            id="negative_vars_builtins_open_rebind_invalidates_open",
+        ),
+        pytest.param(
+            "io.open = lambda *a: True\n",
+            "open(path)",
+            {"strict": True, "pedantic": True},
+            True,
+            id="io_open_rebind_leaves_bare_builtin_open_trusted",
+        ),
+        pytest.param(
+            "io.open = lambda *a: True\n",
+            "io.open(path)",
+            {"strict": False, "pedantic": False},
+            True,
+            id="negative_io_open_rebind_invalidates_io_open",
+        ),
+    ],
+)
+def test_builtin_open_trusted_despite_exec_eval_and_untargeted_patches(
+    prefix_src: str,
+    ctx_expr: str,
+    expect_safe: dict[str, bool],
+    expect_rebound: bool,
+) -> None:
+    """Verifies builtin open remains trusted on exec/eval/untargeted patches unless open/builtins itself is rebound."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    module_src = (
+        "import builtins\n"
+        "import contextlib\n"
+        "import io\n"
+        + _PROVEN_EXIT_CLASS
+        + prefix_src
+        + "def run(path, compute):\n"
+        + f"    with {ctx_expr}:\n"
+        + "        v = compute()\n"
+        + "    cb = lambda: v\n"
+        + "    return cb()\n"
+    )
+    clear_dataflow_cache()
+    scan = scan_exit_protocol_patches(ast.parse(module_src))
+    assert bool(scan.rebound_attrs) is expect_rebound
+    safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
+    assert safety == expect_safe
+
+
+@pytest.mark.parametrize(
+    ("stmt", "expect_has_patch", "expect_rebound", "expect_pedantic_safe"),
+    [
+        pytest.param(
+            "    getattr(builtins, 'setattr')(Mgr, 'normal_label', 1)\n",
+            False,
+            False,
+            True,
+            id="immediate_getattr_builtins_setattr_safe_attr",
+        ),
+        pytest.param(
+            "    builtins.__dict__['setattr'](Mgr, 'normal_label', 1)\n",
+            False,
+            False,
+            True,
+            id="immediate_builtins_dict_subscript_setattr_safe_attr",
+        ),
+        pytest.param(
+            "    vars(builtins)['setattr'](Mgr, 'normal_label', 1)\n",
+            False,
+            False,
+            True,
+            id="immediate_vars_builtins_subscript_setattr_safe_attr",
+        ),
+        pytest.param(
+            "    vars(builtins).get('setattr')(Mgr, 'normal_label', 1)\n",
+            False,
+            False,
+            True,
+            id="immediate_vars_builtins_get_setattr_safe_attr",
+        ),
+        pytest.param(
+            "    importlib.import_module('builtins').setattr(Mgr, 'normal_label', 1)\n",
+            False,
+            False,
+            True,
+            id="immediate_importlib_builtins_setattr_safe_attr",
+        ),
+        pytest.param(
+            "    globals()['__builtins__']['setattr'](Mgr, 'normal_label', 1)\n",
+            False,
+            False,
+            True,
+            id="immediate_globals_dunder_builtins_setattr_safe_attr",
+        ),
+        pytest.param(
+            "    getattr(builtins, 'setattr')(Mgr, '__exit__', lambda *a: True)\n",
+            True,
+            False,
+            False,
+            id="negative_immediate_getattr_setattr_exit_protocol_patch",
+        ),
+        pytest.param(
+            "    fn = getattr(builtins, 'setattr')\n    fn(Mgr, 'normal_label', 1)\n",
+            True,
+            True,
+            False,
+            id="negative_uncalled_getattr_builtins_setattr_still_flags",
+        ),
+        pytest.param(
+            "    (fn := getattr(builtins, 'setattr'))(Mgr, 'normal_label', 1)\n",
+            True,
+            True,
+            False,
+            id="negative_walrus_getattr_builtins_setattr_still_flags",
+        ),
+        pytest.param(
+            "    (ns := vars(builtins))['setattr'](Mgr, 'normal_label', 1)\n",
+            True,
+            True,
+            False,
+            id="negative_walrus_vars_builtins_escape_still_flags",
+        ),
+        pytest.param(
+            "    getattr(builtins, 'eval')('1 + 1')\n",
+            True,
+            True,
+            False,
+            id="negative_immediate_getattr_builtins_eval_still_flags",
+        ),
+        pytest.param(
+            "    getattr(eval('builtins'), 'setattr')(Mgr, 'normal_label', 1)\n",
+            True,
+            True,
+            False,
+            id="negative_nested_eval_inside_getattr_receiver_still_flags",
+        ),
+    ],
+)
+def test_immediate_safe_indirect_setattr_callees_keep_module_proofs_intact(
+    stmt: str,
+    expect_has_patch: bool,
+    expect_rebound: bool,
+    expect_pedantic_safe: bool,
+) -> None:
+    """Verifies immediate getattr/namespace setattr callees with safe attrs leave module proofs intact."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    module_src = (
+        "import builtins\n"
+        "import importlib\n"
+        + _PROVEN_EXIT_CLASS
+        + "def configure():\n"
+        + stmt
+        + _WITH_MGR_RUN
+    )
+    clear_dataflow_cache()
+    scan = scan_exit_protocol_patches(ast.parse(module_src))
+    assert scan.has_patch is expect_has_patch
+    assert bool(scan.rebound_attrs) is expect_rebound
+    safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
+    assert safety["pedantic"] is expect_pedantic_safe
+
+
+@pytest.mark.parametrize(
+    (
+        "extra_src",
+        "expect_has_patch",
+        "expect_patched_names",
+        "expect_strict_safe",
+        "expect_pedantic_safe",
+    ),
+    [
+        pytest.param(
+            (
+                "def top(b=False):\n"
+                "    def outer():\n"
+                "        global b\n"
+                "        import builtins as b\n"
+                "        def inner(code):\n"
+                "            return b.eval(code)\n"
+                "        return inner('1')\n"
+                "    return outer()\n"
+            ),
+            True,
+            set(),
+            True,
+            False,
+            id="global_import_builtins_nested_eval_beats_outer_shadow",
+        ),
+        pytest.param(
+            (
+                "def outer(swallow):\n"
+                "    global b\n"
+                "    _ = (b := __import__('builtins'))\n"
+                "    def inner(obj):\n"
+                "        b.setattr(obj, '__exit__', swallow)\n"
+                "    return inner(Mgr)\n"
+            ),
+            True,
+            {"obj"},
+            True,
+            False,
+            id="global_walrus_dunder_import_builtins_nested_setattr",
+        ),
+        pytest.param(
+            (
+                "def grand():\n"
+                "    b = False\n"
+                "    def outer():\n"
+                "        nonlocal b\n"
+                "        import builtins as b\n"
+                "        def inner(obj, swallow):\n"
+                "            b.setattr(obj, '__exit__', swallow)\n"
+                "        return inner(Mgr, lambda *a: True)\n"
+                "    return outer()\n"
+            ),
+            True,
+            {"obj"},
+            True,
+            False,
+            id="nonlocal_import_builtins_nested_setattr",
+        ),
+        pytest.param(
+            (
+                "import sys\n"
+                "def patch(swallow):\n"
+                "    sys.modules.get('builtins').setattr(Mgr, '__exit__', swallow)\n"
+            ),
+            True,
+            {"Mgr"},
+            False,
+            False,
+            id="sys_modules_get_builtins_setattr_exit_records_mgr",
+        ),
+        pytest.param(
+            (
+                "import sys\n"
+                "def configure():\n"
+                "    sys.modules.get('builtins').setattr(Mgr, 'normal_label', 1)\n"
+            ),
+            False,
+            set(),
+            True,
+            True,
+            id="control_sys_modules_get_builtins_safe_attr",
+        ),
+        pytest.param(
+            (
+                "def patch(swallow):\n"
+                "    b = globals().get('__builtins__')\n"
+                "    b.setattr(Mgr, '__exit__', swallow)\n"
+            ),
+            True,
+            {"Mgr"},
+            False,
+            False,
+            id="globals_get_dunder_builtins_alias_setattr_records_mgr",
+        ),
+        pytest.param(
+            (
+                "def patch(swallow):\n"
+                "    b = vars().get('__builtins__')\n"
+                "    b.setattr(Mgr, '__exit__', swallow)\n"
+            ),
+            True,
+            {"Mgr"},
+            False,
+            False,
+            id="vars_get_dunder_builtins_alias_setattr_records_mgr",
+        ),
+        pytest.param(
+            "def patch(vals):\n    setattr(Mgr, '__exit__', *vals)\n",
+            True,
+            {"Mgr"},
+            False,
+            False,
+            id="setattr_starred_value_arg_records_target_mgr",
+        ),
+        pytest.param(
+            "def patch(vals):\n    Mgr.__setattr__('__exit__', *vals)\n",
+            True,
+            {"Mgr"},
+            False,
+            False,
+            id="dunder_setattr_starred_value_arg_records_bound_mgr",
+        ),
+        pytest.param(
+            "def patch(args):\n    type.__setattr__(Mgr, *args)\n",
+            True,
+            {"Mgr"},
+            False,
+            False,
+            id="type_dunder_setattr_starred_args_records_target_mgr",
+        ),
+        pytest.param(
+            "def patch(fn):\n    setattr(Mgr, attr='__exit__', value=fn)\n",
+            True,
+            {"Mgr"},
+            False,
+            False,
+            id="setattr_keyword_args_records_target_mgr",
+        ),
+        pytest.param(
+            "def patch(vals):\n    setattr(Other, '__exit__', *vals)\n",
+            True,
+            {"Other"},
+            True,
+            False,
+            id="control_setattr_starred_on_other_leaves_mgr_unpatched_in_strict",
+        ),
+    ],
+)
+def test_global_import_walrus_dot_get_and_starred_setattr_exit_protocol(
+    extra_src: str,
+    expect_has_patch: bool,
+    expect_patched_names: set[str],
+    expect_strict_safe: bool,
+    expect_pedantic_safe: bool,
+) -> None:
+    """Verifies global/nonlocal imports/walrus, .get() namespace lookups, and starred setattr targets."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    module_src = "class Other:\n    pass\n" + _PROVEN_EXIT_CLASS + extra_src + _WITH_MGR_RUN
+    clear_dataflow_cache()
+    scan = scan_exit_protocol_patches(ast.parse(module_src))
+    assert scan.has_patch is expect_has_patch
+    assert expect_patched_names.issubset(scan.patched_names)
+    safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
+    assert safety == {"strict": expect_strict_safe, "pedantic": expect_pedantic_safe}
+
+
+@pytest.mark.parametrize(
+    ("module_src", "unit_line", "extra_non_suppressing", "expected_safety"),
+    [
+        pytest.param(
+            (
+                "def my_transaction():\n"
+                "    return ExternalTx()\n"
+                "def run(compute):\n"
+                "    with my_transaction():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            frozenset({"my_transaction"}),
+            {"strict": True, "pedantic": True},
+            id="module_def_allowlisted_helper_trusted_in_pedantic",
+        ),
+        pytest.param(
+            (
+                "from contextlib import contextmanager\n"
+                "@contextmanager\n"
+                "def my_transaction():\n"
+                "    yield\n"
+                "def run(compute):\n"
+                "    with my_transaction():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            frozenset({"my_transaction"}),
+            {"strict": True, "pedantic": True},
+            id="module_generator_contextmanager_allowlisted_trusted_in_pedantic",
+        ),
+        pytest.param(
+            (
+                "async def my_transaction():\n"
+                "    return ExternalTx()\n"
+                "async def run(compute):\n"
+                "    async with my_transaction():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            frozenset({"my_transaction"}),
+            {"strict": True, "pedantic": True},
+            id="module_async_def_allowlisted_trusted_in_pedantic",
+        ),
+        pytest.param(
+            (
+                "def run(compute):\n"
+                "    def my_transaction():\n"
+                "        return ExternalTx()\n"
+                "    with my_transaction():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            frozenset({"my_transaction"}),
+            {"strict": True, "pedantic": True},
+            id="local_def_allowlisted_helper_before_with_trusted_in_pedantic",
+        ),
+        pytest.param(
+            (
+                "def my_transaction():\n"
+                "    return ExternalTx()\n"
+                "def run(compute):\n"
+                "    with my_transaction():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            frozenset(),
+            {"strict": True, "pedantic": False},
+            id="negative_unallowlisted_helper_fails_closed_in_pedantic",
+        ),
+        pytest.param(
+            (
+                "def my_transaction():\n"
+                "    return ExternalTx()\n"
+                "def run(my_transaction, compute):\n"
+                "    with my_transaction():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            frozenset({"my_transaction"}),
+            {"strict": True, "pedantic": False},
+            id="negative_param_shadowing_allowlisted_def_stays_rejected",
+        ),
+        pytest.param(
+            (
+                "def my_transaction():\n"
+                "    return ExternalTx()\n"
+                "def run(flag, unknown_cm, compute):\n"
+                "    if flag:\n"
+                "        def my_transaction():\n"
+                "            return unknown_cm\n"
+                "    with my_transaction():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            frozenset({"my_transaction"}),
+            {"strict": True, "pedantic": False},
+            id="negative_conditional_def_rebind_invalidates_allowlisted_helper",
+        ),
+        pytest.param(
+            (
+                "def open(path):\n"
+                "    return ExternalTx(path)\n"
+                "def run(path, compute):\n"
+                "    with open(path):\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            frozenset({"open"}),
+            {"strict": False, "pedantic": False},
+            id="negative_def_open_marks_shadowable_builtin_unsafe",
+        ),
+        pytest.param(
+            (
+                "def get_cm():\n"
+                "    return SwallowErrors()\n"
+                "def run(compute):\n"
+                "    with get_cm():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            frozenset(),
+            {"strict": False, "pedantic": False},
+            id="def_returning_suspicious_manager_flags_strict_and_pedantic",
+        ),
+        pytest.param(
+            (
+                "def get_cm():\n"
+                "    cm = SwallowErrors()\n"
+                "    return cm\n"
+                "def run(compute):\n"
+                "    with get_cm():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            frozenset(),
+            {"strict": False, "pedantic": False},
+            id="def_returning_indirect_suspicious_alias_flags_strict_and_pedantic",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def get_cm():\n"
+                "    return contextlib.suppress(RuntimeError)\n"
+                "def run(compute):\n"
+                "    with get_cm():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            "    cb = lambda: v",
+            frozenset({"get_cm"}),
+            {"strict": False, "pedantic": False},
+            id="negative_allowlisted_name_returning_explicit_suppress_stays_unsafe",
+        ),
+    ],
+)
+def test_local_ctx_manager_function_allowlist_and_suspicious_return(
+    module_src: str,
+    unit_line: str,
+    extra_non_suppressing: frozenset[str],
+    expected_safety: dict[str, bool],
+) -> None:
+    """Verifies local helper def/async def allowlist unshadowing and suspicious/suppressor return propagation."""
+    line_num = next(
+        idx
+        for idx, ln in enumerate(module_src.splitlines(), start=1)
+        if ln == unit_line
+    )
+    tree = ast.parse(module_src)
+    got: dict[str, bool] = {}
+    for mode in ("strict", "pedantic"):
+        clear_dataflow_cache()
+        sc = inspect_single_unit_scope(
+            {
+                "start": line_num,
+                "end": line_num,
+                "kind": "basic_block",
+                "source_text": module_src,
+                "source_code": unit_line + "\n",
+                "closure_strictness": mode,
+                "non_suppressing_ctx_managers": set(extra_non_suppressing),
+            },
+            tree=tree,
+        )
+        got[mode] = bool(sc["is_control_flow_safe"])
+    assert got == expected_safety
+
+
+@pytest.mark.parametrize(
+    ("module_src", "target_marker", "expected_safety"),
+    [
+        pytest.param(
+            (
+                "from my_suppressors import SuppressAll as cm\n"
+                "\n"
+                "class Worker:\n"
+                "    from contextlib import nullcontext as cm\n"
+                "\n"
+                "    def run(self, compute):\n"
+                "        with cm():\n"
+                "            val = compute()\n"
+                "        cb = lambda: val\n"
+                "        return cb()\n"
+            ),
+            "        cb = lambda: val",
+            {"strict": False, "pedantic": False},
+            id="class_body_nullcontext_does_not_mask_module_suppressor",
+        ),
+        pytest.param(
+            (
+                "class FileService:\n"
+                "    def open(self):\n"
+                "        return 1\n"
+                "\n"
+                "    def read_items(self, path, compute):\n"
+                "        with open(path) as fh:\n"
+                "            val = compute(fh)\n"
+                "        cb = lambda: val\n"
+                "        return cb()\n"
+            ),
+            "        cb = lambda: val",
+            {"strict": True, "pedantic": True},
+            id="sibling_method_open_does_not_shadow_builtin_open",
+        ),
+        pytest.param(
+            (
+                "class FileService:\n"
+                "    def open(self, path, compute):\n"
+                "        with open(path) as fh:\n"
+                "            val = compute(fh)\n"
+                "        cb = lambda: val\n"
+                "        return cb()\n"
+            ),
+            "        cb = lambda: val",
+            {"strict": True, "pedantic": True},
+            id="method_named_open_uses_builtin_open_not_class_entry",
+        ),
+        pytest.param(
+            (
+                "def outer(flag):\n"
+                "    from my_suppressors import SuppressAll as cm\n"
+                "    class Worker:\n"
+                "        from contextlib import nullcontext as cm\n"
+                "        def run(self, compute):\n"
+                "            with cm():\n"
+                "                val = compute()\n"
+                "            cb = lambda: val\n"
+                "            return cb()\n"
+                "    return Worker()\n"
+            ),
+            "            cb = lambda: val",
+            {"strict": False, "pedantic": False},
+            id="outer_fn_suppressor_not_masked_by_inner_class_binding",
+        ),
+        pytest.param(
+            (
+                "from my_suppressors import SuppressAll as cm\n"
+                "\n"
+                "class Outer:\n"
+                "    if True:\n"
+                "        from contextlib import nullcontext as cm\n"
+                "        def run(self, compute):\n"
+                "            with cm():\n"
+                "                val = compute()\n"
+                "            cb = lambda: val\n"
+                "            return cb()\n"
+            ),
+            "            cb = lambda: val",
+            {"strict": False, "pedantic": False},
+            id="conditional_class_body_nullcontext_does_not_mask_module_cm",
+        ),
+        pytest.param(
+            (
+                "from contextlib import nullcontext as cm\n"
+                "from my_suppressors import SuppressAll\n"
+                "\n"
+                "class Worker:\n"
+                "    global cm\n"
+                "    cm = SuppressAll()\n"
+                "\n"
+                "    def run(self, compute):\n"
+                "        with cm:\n"
+                "            val = compute()\n"
+                "        cb = lambda: val\n"
+                "        return cb()\n"
+            ),
+            "        cb = lambda: val",
+            {"strict": False, "pedantic": False},
+            id="adversarial_class_global_rebind_still_invalidates_module_cm",
+        ),
+        pytest.param(
+            (
+                "class FileService:\n"
+                "    global open\n"
+                "    def open(self):\n"
+                "        return 1\n"
+                "\n"
+                "    def read_items(self, path, compute):\n"
+                "        with open(path) as fh:\n"
+                "            val = compute(fh)\n"
+                "        cb = lambda: val\n"
+                "        return cb()\n"
+            ),
+            "        cb = lambda: val",
+            {"strict": False, "pedantic": False},
+            id="adversarial_class_global_open_still_shadows_builtin_open",
+        ),
+        pytest.param(
+            (
+                "from my_suppressors import SuppressAll as cm\n"
+                "\n"
+                "class Worker:\n"
+                "    from contextlib import nullcontext as cm\n"
+                "    with cm():\n"
+                "        val = compute()\n"
+                "    cb = lambda: val\n"
+            ),
+            "    cb = lambda: val",
+            {"strict": True, "pedantic": True},
+            id="control_direct_class_body_block_sees_class_local_nullcontext",
+        ),
+    ],
+)
+def test_class_scope_pep227_provenance_isolation(
+    module_src: str,
+    target_marker: str,
+    expected_safety: dict[str, bool],
+) -> None:
+    """Verifies PEP 227 class-body bindings neither spoof outer context managers nor shadow builtins in sibling methods."""
+    line_num = next(
+        idx
+        for idx, ln in enumerate(module_src.splitlines(), start=1)
+        if ln == target_marker
+    )
+    tree = ast.parse(module_src)
+    got: dict[str, bool] = {}
+    for mode in ("strict", "pedantic"):
+        clear_dataflow_cache()
+        sc = inspect_single_unit_scope(
+            {
+                "start": line_num,
+                "end": line_num,
+                "kind": "basic_block",
+                "source_text": module_src,
+                "source_code": target_marker + "\n",
+                "closure_strictness": mode,
+            },
+            tree=tree,
+        )
+        got[mode] = bool(sc["is_control_flow_safe"])
+    assert got == expected_safety
+
+
+@pytest.mark.parametrize(
+    ("cm_body", "use_async", "expected_safe"),
+    [
+        pytest.param(
+            (
+                "    def __enter__(self):\n"
+                "        return self\n"
+                "    def __exit__(self, *a):\n"
+                "        return False\n"
+                "    def helper(self, x=patch_cm()):\n"
+                "        return x\n"
+            ),
+            False,
+            False,
+            id="method_positional_default_call_invalidates_cm_proof",
+        ),
+        pytest.param(
+            (
+                "    def __enter__(self):\n"
+                "        return self\n"
+                "    def __exit__(self, *a):\n"
+                "        return False\n"
+                "    def helper(self, *, cb=patch_cm()):\n"
+                "        return cb\n"
+            ),
+            False,
+            False,
+            id="method_kwonly_default_call_invalidates_cm_proof",
+        ),
+        pytest.param(
+            (
+                "    def __enter__(self):\n"
+                "        return self\n"
+                "    def __exit__(self, *a, _=patch_cm()):\n"
+                "        return False\n"
+            ),
+            False,
+            False,
+            id="exit_method_default_call_invalidates_cm_proof",
+        ),
+        pytest.param(
+            (
+                "    async def __aenter__(self):\n"
+                "        return self\n"
+                "    async def __aexit__(self, *a, _=patch_cm()):\n"
+                "        return False\n"
+            ),
+            True,
+            False,
+            id="async_aexit_method_default_call_invalidates_cm_proof",
+        ),
+        pytest.param(
+            (
+                "    def __enter__(self):\n"
+                "        return self\n"
+                "    def __exit__(self, *a):\n"
+                "        return False\n"
+                "    def helper(self, x: patch_cm()):\n"
+                "        return x\n"
+            ),
+            False,
+            False,
+            id="method_param_annotation_call_invalidates_cm_proof",
+        ),
+        pytest.param(
+            (
+                "    def __enter__(self):\n"
+                "        return self\n"
+                "    def __exit__(self, *a):\n"
+                "        return False\n"
+                "    def helper(self, *args: patch_cm(), **kwargs: int):\n"
+                "        return args\n"
+            ),
+            False,
+            False,
+            id="method_vararg_annotation_call_invalidates_cm_proof",
+        ),
+        pytest.param(
+            (
+                "    def __enter__(self):\n"
+                "        return self\n"
+                "    def __exit__(self, *a):\n"
+                "        return False\n"
+                "    def helper(self) -> patch_cm():\n"
+                "        return None\n"
+            ),
+            False,
+            False,
+            id="method_return_annotation_call_invalidates_cm_proof",
+        ),
+        pytest.param(
+            (
+                "    def __enter__(self):\n"
+                "        return self\n"
+                "    def __exit__(self, *a):\n"
+                "        return False\n"
+                "    def helper(self, x: [patch_cm() for _ in (1,)]):\n"
+                "        return x\n"
+            ),
+            False,
+            False,
+            id="adversarial_annotation_comprehension_invalidates_cm_proof",
+        ),
+        pytest.param(
+            (
+                "    def __enter__(self):\n"
+                "        return self\n"
+                "    def __exit__(self, *a):\n"
+                "        return False\n"
+                "    def helper(\n"
+                "        self,\n"
+                "        x: Optional[int] = None,\n"
+                "        *args: str,\n"
+                "        flag: bool = False,\n"
+                "        **kwargs: int,\n"
+                "    ) -> bool:\n"
+                "        return flag\n"
+            ),
+            False,
+            True,
+            id="control_static_defaults_and_call_free_annotations_stay_safe",
+        ),
+    ],
+)
+def test_class_body_method_defaults_and_annotations_affect_cm_provenance(
+    cm_body: str,
+    use_async: bool,
+    expected_safe: bool,
+) -> None:
+    """Verifies eager method defaults and annotations on class context managers invalidate class-body non-suppression proof."""
+    def_hdr = "async def run(compute):" if use_async else "def run(compute):"
+    with_hdr = "    async with CM():" if use_async else "    with CM():"
+    module_src = (
+        "def patch_cm():\n"
+        "    return 1\n"
+        "\n"
+        "class CM:\n"
+        f"{cm_body}"
+        "\n"
+        f"{def_hdr}\n"
+        f"{with_hdr}\n"
+        "        val = compute()\n"
+        "    cb = lambda: val\n"
+        "    return cb()\n"
+    )
+    target_marker = "    cb = lambda: val"
+    line_num = next(
+        idx
+        for idx, ln in enumerate(module_src.splitlines(), start=1)
+        if ln == target_marker
+    )
+    tree = ast.parse(module_src)
+    safety: dict[str, bool] = {}
+    for mode in ("strict", "pedantic"):
+        clear_dataflow_cache()
+        sc = inspect_single_unit_scope(
+            {
+                "start": line_num,
+                "end": line_num,
+                "kind": "basic_block",
+                "source_text": module_src,
+                "source_code": target_marker + "\n",
+                "closure_strictness": mode,
+            },
+            tree=tree,
+        )
+        safety[mode] = bool(sc["is_control_flow_safe"])
+    assert safety == {"strict": True, "pedantic": expected_safe}
+
+
+@pytest.mark.parametrize(
+    ("try_block_src", "expect_safe", "expect_cm_non_suppressor"),
+    [
+        pytest.param(
+            (
+                "    cm = nullcontext()\n"
+                "    try:\n"
+                "        risky()\n"
+                "    except ValueError:\n"
+                "        cm = suppress(Exception)\n"
+                "        return None\n"
+            ),
+            True,
+            True,
+            id="handler_ending_in_return_excluded_from_fallthrough_provenance",
+        ),
+        pytest.param(
+            (
+                "    cm = nullcontext()\n"
+                "    try:\n"
+                "        risky()\n"
+                "    except ValueError:\n"
+                "        cm = suppress(Exception)\n"
+                "        raise\n"
+            ),
+            True,
+            True,
+            id="handler_ending_in_raise_excluded_from_fallthrough_provenance",
+        ),
+        pytest.param(
+            (
+                "    try:\n"
+                "        cm = suppress(Exception)\n"
+                "        return None\n"
+                "    except ValueError:\n"
+                "        cm = nullcontext()\n"
+            ),
+            True,
+            True,
+            id="terminating_try_body_excluded_when_handler_falls_through",
+        ),
+        pytest.param(
+            (
+                "    cm = nullcontext()\n"
+                "    try:\n"
+                "        return None\n"
+                "    except ValueError:\n"
+                "        pass\n"
+                "    else:\n"
+                "        cm = suppress(Exception)\n"
+            ),
+            True,
+            True,
+            id="unreachable_orelse_ignored_after_terminating_try_body",
+        ),
+        pytest.param(
+            (
+                "    cm = nullcontext()\n"
+                "    try:\n"
+                "        risky()\n"
+                "    except ValueError:\n"
+                "        cm = suppress(Exception)\n"
+            ),
+            False,
+            False,
+            id="negative_control_fallthrough_handler_invalidates_cm_proof",
+        ),
+        pytest.param(
+            (
+                "    cm = nullcontext()\n"
+                "    try:\n"
+                "        risky()\n"
+                "    except ValueError:\n"
+                "        cm = suppress(Exception)\n"
+                "        with suppress(RuntimeError):\n"
+                "            raise RuntimeError('swallowed')\n"
+            ),
+            False,
+            False,
+            id="adversarial_suppressed_raise_does_not_terminate_handler",
+        ),
+        pytest.param(
+            (
+                "    cm = nullcontext()\n"
+                "    try:\n"
+                "        risky()\n"
+                "    except ValueError:\n"
+                "        cm = suppress(Exception)\n"
+                "        return None\n"
+                "    finally:\n"
+                "        risky()\n"
+            ),
+            True,
+            True,
+            id="handler_ending_in_return_with_pass_through_finally_keeps_proof",
+        ),
+        pytest.param(
+            (
+                "    cm = nullcontext()\n"
+                "    try:\n"
+                "        return None\n"
+                "    except ValueError:\n"
+                "        cm = suppress(Exception)\n"
+                "        raise\n"
+            ),
+            False,
+            False,
+            id="control_all_paths_terminating_retains_conservative_fallback",
+        ),
+    ],
+)
+def test_update_try_stmt_provenance_skips_terminating_branches(
+    try_block_src: str,
+    expect_safe: bool,
+    expect_cm_non_suppressor: bool,
+) -> None:
+    """Verifies standalone provenance updates skip terminating try/orelse/handler branches like _analyze_try_stmt_assignment."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _EMPTY_SUPPRESS_PROVENANCE,
+        _update_suppress_provenance_from_stmts,
+    )
+
+    module_src = (
+        "from contextlib import nullcontext, suppress\n"
+        "\n"
+        "def run(risky, compute):\n"
+        f"{try_block_src}"
+        "    with cm:\n"
+        "        val = compute()\n"
+        "    cb = lambda: val\n"
+        "    return cb()\n"
+    )
+    tree = ast.parse(module_src)
+    mod_prov = _update_suppress_provenance_from_stmts(
+        tree.body[:1], _EMPTY_SUPPRESS_PROVENANCE, in_branch=False
+    )
+    fn_node = tree.body[1]
+    assert isinstance(fn_node, ast.FunctionDef)
+    out_prov = _update_suppress_provenance_from_stmts(
+        fn_node.body[:-3], mod_prov, in_branch=False
+    )
+    assert ("cm" in out_prov.non_suppressor_instances) is expect_cm_non_suppressor, out_prov
+    if expect_cm_non_suppressor:
+        assert "cm" not in out_prov.suppressors
+
+    target_marker = "    cb = lambda: val"
+    line_num = next(
+        idx
+        for idx, ln in enumerate(module_src.splitlines(), start=1)
+        if ln == target_marker
+    )
+    clear_dataflow_cache()
+    sc = inspect_single_unit_scope(
+        {
+            "start": line_num,
+            "end": line_num,
+            "kind": "basic_block",
+            "source_text": module_src,
+            "source_code": target_marker + "\n",
+            "closure_strictness": "pedantic",
+        },
+        tree=tree,
+    )
+    assert bool(sc["is_control_flow_safe"]) is expect_safe, sc
+
+
+@pytest.mark.parametrize(
+    ("extra_src", "expect_has_patch", "expect_patched", "expect_rebound", "expect_pedantic_safe"),
+    [
+        pytest.param(
+            "b, _ = builtins, 1\nb.setattr(Mgr, '__exit__', swallow)\n",
+            True,
+            {"Mgr"},
+            set(),
+            False,
+            id="unpack_builtins_setattr",
+        ),
+        pytest.param(
+            "[t, _] = [type, 1]\nt.__setattr__(Mgr, '__exit__', swallow)\n",
+            True,
+            {"Mgr"},
+            set(),
+            False,
+            id="unpack_list_type_dunder_setattr",
+        ),
+        pytest.param(
+            "(v, g) = (vars, globals)\nv(builtins)['setattr'](Mgr, '__exit__', swallow)\n",
+            True,
+            {"Mgr"},
+            set(),
+            False,
+            id="unpack_vars_globals_subscript_setattr",
+        ),
+        pytest.param(
+            "b, *rest = builtins, 1, 2\nb.setattr(Mgr, '__exit__', swallow)\n",
+            True,
+            {"Mgr"},
+            set(),
+            False,
+            id="starred_unpack_builtins_setattr",
+        ),
+        pytest.param(
+            "pair = (builtins, type)\nb, t = pair\nt.__setattr__(Mgr, '__exit__', swallow)\n",
+            True,
+            {"Mgr"},
+            set(),
+            False,
+            id="aliased_tuple_unpack_type_dunder_setattr",
+        ),
+        pytest.param(
+            "c, _ = contextlib, 1\nc.nullcontext = swallow\n",
+            False,
+            set(),
+            {("contextlib", "nullcontext")},
+            True,
+            id="unpack_stdlib_module_alias_rebinds_factory",
+        ),
+        pytest.param(
+            "def benign(m, attr, fn):\n    return (m, attr, fn)\na, _ = benign, 1\na(Mgr, '__exit__', swallow)\n",
+            False,
+            set(),
+            set(),
+            True,
+            id="negative_unrelated_unpack_call_stays_safe",
+        ),
+        pytest.param(
+            "x, y = Mgr, swallow\nx.label = 1\n",
+            False,
+            set(),
+            set(),
+            True,
+            id="negative_unpack_unrelated_attribute_write_stays_safe",
+        ),
+    ],
+)
+def test_unpacking_assignments_track_builtin_module_and_type_aliases(
+    extra_src: str,
+    expect_has_patch: bool,
+    expect_patched: set[str],
+    expect_rebound: set[tuple[str, str]],
+    expect_pedantic_safe: bool,
+) -> None:
+    """Verifies tuple/list unpacking and container aliases propagate builtin, module, and type slots."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    module_src = (
+        "import builtins\n"
+        "import contextlib\n"
+        + _PROVEN_EXIT_CLASS
+        + "def swallow(*a):\n    return True\n"
+        + extra_src
+        + "def run(compute):\n"
+        + "    with Mgr():\n"
+        + "        v = compute()\n"
+        + "    cb = lambda: v\n"
+        + "    return cb()\n"
+    )
+    clear_dataflow_cache()
+    scan = scan_exit_protocol_patches(ast.parse(module_src))
+    assert scan.has_patch is expect_has_patch, scan
+    assert expect_patched.issubset(scan.patched_names), scan
+    for pair in expect_rebound:
+        assert pair in scan.rebound_attrs, scan
+    safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
+    assert safety["pedantic"] is expect_pedantic_safe
+
+
+@pytest.mark.parametrize(
+    (
+        "patch_src",
+        "ctx_expr",
+        "expect_has_patch",
+        "expect_patched",
+        "expect_rebound_pair",
+        "expect_pedantic_safe",
+    ),
+    [
+        pytest.param(
+            "contextlib.__dict__['nullcontext'] = swallow\n",
+            "contextlib.nullcontext()",
+            False,
+            set(),
+            ("contextlib", "nullcontext"),
+            False,
+            id="contextlib_dunder_dict_subscript_rebind",
+        ),
+        pytest.param(
+            "del vars(contextlib)['nullcontext']\n",
+            "contextlib.nullcontext()",
+            False,
+            set(),
+            ("contextlib", "nullcontext"),
+            False,
+            id="vars_contextlib_subscript_delete",
+        ),
+        pytest.param(
+            "vars(contextlib).update({'nullcontext': swallow})\n",
+            "contextlib.nullcontext()",
+            False,
+            set(),
+            ("contextlib", "nullcontext"),
+            False,
+            id="vars_contextlib_update_rebind",
+        ),
+        pytest.param(
+            "d = contextlib.__dict__\nd.setdefault('nullcontext', swallow)\n",
+            "contextlib.nullcontext()",
+            False,
+            set(),
+            ("contextlib", "nullcontext"),
+            False,
+            id="aliased_contextlib_dict_setdefault",
+        ),
+        pytest.param(
+            "contextlib.__dict__.pop('nullcontext', None)\n",
+            "contextlib.nullcontext()",
+            False,
+            set(),
+            ("contextlib", "nullcontext"),
+            False,
+            id="contextlib_dict_pop",
+        ),
+        pytest.param(
+            "vars(unittest.mock)['patch'] = swallow\n",
+            "unittest.mock.patch('x')",
+            False,
+            set(),
+            ("unittest.mock", "patch"),
+            False,
+            id="vars_dotted_stdlib_subscript_rebind",
+        ),
+        pytest.param(
+            "globals()['open'] = swallow\n",
+            "open('f')",
+            False,
+            set(),
+            ("builtins", "open"),
+            False,
+            id="globals_subscript_rebinds_open",
+        ),
+        pytest.param(
+            "globals().update({'open': swallow})\n",
+            "open('f')",
+            False,
+            set(),
+            ("builtins", "open"),
+            False,
+            id="globals_update_rebinds_open",
+        ),
+        pytest.param(
+            "Mgr.__dict__['__exit__'] = swallow\n",
+            "Mgr()",
+            True,
+            {"Mgr"},
+            None,
+            False,
+            id="mgr_dunder_dict_exit_rebind",
+        ),
+        pytest.param(
+            "vars(Mgr).update(__exit__=swallow)\n",
+            "Mgr()",
+            True,
+            {"Mgr"},
+            None,
+            False,
+            id="vars_mgr_update_kwarg_exit_rebind",
+        ),
+        pytest.param(
+            "contextlib.__dict__.get('nullcontext')\n",
+            "contextlib.nullcontext()",
+            False,
+            set(),
+            None,
+            True,
+            id="control_readonly_contextlib_dict_get",
+        ),
+        pytest.param(
+            "v = vars(Other)\nv['x'] = 1\nv.update({'label': 2})\n",
+            "contextlib.nullcontext()",
+            False,
+            set(),
+            None,
+            True,
+            id="control_non_factory_vars_dict_mutation_safe",
+        ),
+        pytest.param(
+            "local_d = {}\nlocal_d['nullcontext'] = 1\nlocal_d.update({'__exit__': 1})\n",
+            "contextlib.nullcontext()",
+            False,
+            set(),
+            None,
+            True,
+            id="control_ordinary_dict_mutation_ignored",
+        ),
+        pytest.param(
+            "class Helper:\n    def sync(self, data):\n        self.__dict__.update(data)\n",
+            "Mgr()",
+            False,
+            set(),
+            None,
+            True,
+            id="control_instance_dict_update_dynamic_safe",
+        ),
+    ],
+)
+def test_namespace_dict_and_vars_mutations_withdraw_factory_and_exit_proofs(
+    patch_src: str,
+    ctx_expr: str,
+    expect_has_patch: bool,
+    expect_patched: set[str],
+    expect_rebound_pair: tuple[str, str] | None,
+    expect_pedantic_safe: bool,
+) -> None:
+    """Verifies __dict__/vars(mod)/globals() mutations invalidate targeted proofs without breaking controls."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    module_src = (
+        "import contextlib\n"
+        "import unittest.mock\n"
+        "class Other:\n    pass\n"
+        + _PROVEN_EXIT_CLASS
+        + "def swallow(*a):\n    return True\n"
+        + patch_src
+        + "def run(compute):\n"
+        + f"    with {ctx_expr}:\n"
+        + "        v = compute()\n"
+        + "    cb = lambda: v\n"
+        + "    return cb()\n"
+    )
+    clear_dataflow_cache()
+    scan = scan_exit_protocol_patches(ast.parse(module_src))
+    assert scan.has_patch is expect_has_patch, scan
+    assert expect_patched.issubset(scan.patched_names), scan
+    if expect_rebound_pair is not None:
+        assert expect_rebound_pair in scan.rebound_attrs, scan
+    safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
+    assert safety["pedantic"] is expect_pedantic_safe
+
+
+@pytest.mark.parametrize(
+    ("src", "min_py", "expect_has_patch"),
+    [
+        pytest.param(
+            (
+                "def f(obj):\n"
+                "    from builtins import setattr\n"
+                "    sa = setattr\n"
+                "    sa(obj, 'safe_label', 1)\n"
+            ),
+            (3, 9),
+            False,
+            id="from_builtins_import_setattr_local_pure_alias_benign",
+        ),
+        pytest.param(
+            (
+                "def swallow(*a):\n"
+                "    return True\n"
+                "def f(cls):\n"
+                "    from mod import eval as other\n"
+                "    return eval('1')\n"
+            ),
+            (3, 9),
+            True,
+            id="import_eval_as_other_does_not_shadow_builtin_eval",
+        ),
+        pytest.param(
+            (
+                "def swallow(*a):\n"
+                "    return True\n"
+                "def f(cls):\n"
+                "    from mod import setattr as sa\n"
+                "    setattr(cls, '__exit__', swallow)\n"
+            ),
+            (3, 9),
+            True,
+            id="import_setattr_as_sa_does_not_shadow_builtin_setattr",
+        ),
+        pytest.param(
+            (
+                "def outer():\n"
+                "    def inner[eval](x: eval):\n"
+                "        return x\n"
+                "    return eval('1')\n"
+            ),
+            (3, 12),
+            True,
+            id="pep695_type_param_named_eval_does_not_shadow_enclosing_eval",
+        ),
+        pytest.param(
+            (
+                "type Alias[eval] = int\n"
+                "eval('1')\n"
+            ),
+            (3, 12),
+            True,
+            id="pep695_type_alias_type_param_named_eval_does_not_shadow_module_eval",
+        ),
+        pytest.param(
+            (
+                "type eval = int\n"
+                "x = eval\n"
+            ),
+            (3, 12),
+            False,
+            id="pep695_type_alias_named_eval_shadows_module_eval",
+        ),
+    ],
+)
+def test_exit_protocol_import_alias_type_alias_and_pep695_type_params(
+    src: str,
+    min_py: tuple[int, int],
+    expect_has_patch: bool,
+) -> None:
+    """Verifies ast.alias children, TypeAlias, and PEP 695 type parameters are handled accurately in exit-protocol scans."""
+    import sys
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    if sys.version_info < min_py:
+        pytest.skip(f"Requires Python {min_py[0]}.{min_py[1]}+ syntax")
+    clear_dataflow_cache()
+    scan = scan_exit_protocol_patches(ast.parse(src))
+    assert scan.has_patch is expect_has_patch
+
+
+@pytest.mark.parametrize(
+    ("setup_src", "ctx_line", "expect_safe"),
+    [
+        pytest.param(
+            (
+                "    box = {}\n"
+                "    cm = contextlib.suppress\n"
+                "    box[(cm := contextlib.nullcontext)] = alias = cm\n"
+            ),
+            "    with alias():\n",
+            False,
+            id="target_walrus_nullcontext_does_not_poison_rhs_suppress_into_alias",
+        ),
+        pytest.param(
+            (
+                "    box = {}\n"
+                "    cm = contextlib.suppress\n"
+                "    box[(cm := contextlib.nullcontext)] = alias = cm\n"
+            ),
+            "    with cm():\n",
+            True,
+            id="target_walrus_nullcontext_still_updates_cm_after_rhs_snapshot",
+        ),
+        pytest.param(
+            (
+                "    box = {}\n"
+                "    cm = contextlib.nullcontext\n"
+                "    box[(cm := contextlib.suppress)] = alias = cm\n"
+            ),
+            "    with alias():\n",
+            True,
+            id="control_target_walrus_suppress_does_not_poison_rhs_nullcontext_into_alias",
+        ),
+        pytest.param(
+            (
+                "    box = {}\n"
+                "    cm = contextlib.nullcontext\n"
+                "    box[(cm := contextlib.suppress)] = alias = cm\n"
+            ),
+            "    with cm():\n",
+            False,
+            id="control_target_walrus_suppress_marks_cm_suppressing",
+        ),
+        pytest.param(
+            (
+                "    box = {}\n"
+                "    cm = contextlib.nullcontext\n"
+                "    cm = box[(cm := contextlib.suppress)] = contextlib.nullcontext\n"
+            ),
+            "    with cm():\n",
+            False,
+            id="target_order_left_to_right_walrus_in_second_target_overrides_first_target_bind",
+        ),
+        pytest.param(
+            (
+                "    cm = contextlib.suppress\n"
+                "    alias: (cm := contextlib.nullcontext) = cm\n"
+            ),
+            "    with alias():\n",
+            False,
+            id="annassign_annotation_walrus_does_not_poison_rhs_suppress",
+        ),
+    ],
+)
+def test_assign_and_annassign_target_walrus_does_not_poison_rhs_provenance(
+    setup_src: str,
+    ctx_line: str,
+    expect_safe: bool,
+) -> None:
+    """Verifies Assign/AnnAssign targets cannot walrus-poison rhs_prov before binding targets."""
+    module_src = (
+        "import contextlib\n"
+        "def run(step):\n"
+        + setup_src
+        + ctx_line
+        + "        v = step()\n"
+        + "    cb = lambda: v\n"
+        + "    return cb()\n"
+    )
+    safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
+    assert safety == {"strict": expect_safe, "pedantic": expect_safe}
+
+
+@pytest.mark.parametrize(
+    ("module_src", "expect_safety"),
+    [
+        pytest.param(
+            (
+                "def contextlib():\n"
+                "    return object()\n"
+                "def run(step):\n"
+                "    with contextlib.nullcontext():\n"
+                "        v = step()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            {"strict": True, "pedantic": False},
+            id="local_def_contextlib_does_not_trust_implicit_nullcontext",
+        ),
+        pytest.param(
+            (
+                "import math as contextlib\n"
+                "def run(step):\n"
+                "    with contextlib.nullcontext():\n"
+                "        v = step()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            {"strict": True, "pedantic": False},
+            id="unrelated_stdlib_aliased_as_contextlib_fails_closed",
+        ),
+        pytest.param(
+            (
+                "class AbstractContextManager:\n"
+                "    def __exit__(self, *a):\n"
+                "        return True\n"
+                "class CustomCM(AbstractContextManager):\n"
+                "    def __enter__(self):\n"
+                "        return self\n"
+                "def run(step):\n"
+                "    with CustomCM():\n"
+                "        v = step()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            {"strict": False, "pedantic": False},
+            id="local_class_shadowing_abstract_context_manager_fails_closed",
+        ),
+        pytest.param(
+            (
+                "from evil_pkg import AbstractContextManager\n"
+                "class CustomCM(AbstractContextManager):\n"
+                "    def __enter__(self):\n"
+                "        return self\n"
+                "    def __exit__(self, *a):\n"
+                "        return False\n"
+                "def run(step):\n"
+                "    with CustomCM():\n"
+                "        v = step()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            {"strict": True, "pedantic": False},
+            id="non_stdlib_import_abstract_context_manager_fails_closed",
+        ),
+        pytest.param(
+            (
+                "import contextlib as cl\n"
+                "class SafeCM(cl.AbstractContextManager):\n"
+                "    def __enter__(self):\n"
+                "        return self\n"
+                "    def __exit__(self, *a):\n"
+                "        return False\n"
+                "def run(step):\n"
+                "    with SafeCM():\n"
+                "        v = step()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            {"strict": True, "pedantic": True},
+            id="aliased_stdlib_contextlib_base_remains_trusted",
+        ),
+        pytest.param(
+            (
+                "def property():\n"
+                "    return lambda fn: fn\n"
+                "class CustomCM:\n"
+                "    @property\n"
+                "    def helper(self):\n"
+                "        return True\n"
+                "    def __enter__(self):\n"
+                "        return self\n"
+                "    def __exit__(self, *a):\n"
+                "        return False\n"
+                "def run(step):\n"
+                "    with CustomCM():\n"
+                "        v = step()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            {"strict": True, "pedantic": False},
+            id="shadowed_property_decorator_fails_closed_for_custom_cm",
+        ),
+    ],
+)
+def test_shadowed_or_non_stdlib_decorators_bases_and_factories_fail_closed(
+    module_src: str,
+    expect_safety: dict[str, bool],
+) -> None:
+    """Verifies non-stdlib imports or defs shadowing contextlib, base classes, and decorators are never positively proven."""
+    safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
+    assert safety == expect_safety
+
+
+@pytest.mark.parametrize(
+    ("min_py", "header_stmt", "expect_safe"),
+    [
+        pytest.param(
+            (3, 9),
+            "    if mutator():\n        pass\n",
+            False,
+            id="if_test_cross_scope_mutator_invalidates_proven_cm",
+        ),
+        pytest.param(
+            (3, 9),
+            "    while mutator():\n        pass\n",
+            False,
+            id="while_test_cross_scope_mutator_invalidates_proven_cm",
+        ),
+        pytest.param(
+            (3, 9),
+            "    for cm in (contextlib.suppress,):\n        pass\n",
+            False,
+            id="for_target_clears_cm_and_invalidates_nullcontext",
+        ),
+        pytest.param(
+            (3, 10),
+            "    match mutator():\n        case _:\n            pass\n",
+            False,
+            id="match_subject_cross_scope_mutator_invalidates_proven_cm",
+        ),
+        pytest.param(
+            (3, 9),
+            "    if (flag := 1):\n        pass\n",
+            True,
+            id="call_free_if_test_walrus_preserves_proven_nullcontext",
+        ),
+    ],
+)
+def test_block_assignment_headers_track_cross_scope_mutators_and_for_targets(
+    min_py: tuple[int, int],
+    header_stmt: str,
+    expect_safe: bool,
+) -> None:
+    """Verifies If/While/For/Match headers apply cross-scope invalidation and for-target clearing."""
+    if sys.version_info < min_py:
+        pytest.skip(f"Requires Python {min_py[0]}.{min_py[1]}+")
+    module_src = (
+        "import contextlib\n"
+        "def run(step):\n"
+        "    cm = contextlib.nullcontext\n"
+        "    def mutator():\n"
+        "        nonlocal cm\n"
+        "        cm = contextlib.suppress\n"
+        "        return False\n"
+        + header_stmt
+        + "    with cm():\n"
+        + "        v = step()\n"
+        + "    cb = lambda: v\n"
+        + "    return cb()\n"
+    )
+    safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
+    assert safety == {"strict": expect_safe, "pedantic": expect_safe}
+
+
+def test_annassign_without_value_applies_annotation_walrus_in_block_assignment() -> None:
+    """Verifies bare AnnAssign records annotation walrus bindings as conditional rather than definite."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import _analyze_block_assignment
+
+    ann_stmt = ast.AnnAssign(
+        target=ast.Name(id="x", ctx=ast.Store()),
+        annotation=ast.NamedExpr(
+            target=ast.Name(id="y", ctx=ast.Store()),
+            value=ast.Constant(value=1),
+        ),
+        value=None,
+        simple=1,
+    )
+    ast.fix_missing_locations(ann_stmt)
+    definite, conditional = _analyze_block_assignment([ann_stmt])
+    assert "y" not in definite
+    assert "y" in conditional
+    assert "x" not in definite
+    assert "x" not in conditional
+
+
+@pytest.mark.parametrize(
+    ("with_header", "body_line", "expect_safe"),
+    [
+        pytest.param(
+            "        with contextlib.nullcontext(1, 2):\n",
+            "            v = step()\n",
+            False,
+            id="nullcontext_too_many_positional_args_raises_type_error",
+        ),
+        pytest.param(
+            "        with contextlib.nullcontext(1, enter_result=2):\n",
+            "            v = step()\n",
+            False,
+            id="nullcontext_mixed_pos_and_kw_args_raises_type_error",
+        ),
+        pytest.param(
+            "        with contextlib.nullcontext(unexpected=1):\n",
+            "            v = step()\n",
+            False,
+            id="nullcontext_unknown_keyword_raises_type_error",
+        ),
+        pytest.param(
+            "        with contextlib.nullcontext(*items):\n",
+            "            v = step()\n",
+            False,
+            id="nullcontext_starred_args_may_raise_type_error",
+        ),
+        pytest.param(
+            "        with contextlib.nullcontext(**kw):\n",
+            "            v = step()\n",
+            False,
+            id="nullcontext_double_starred_kwargs_may_raise_type_error",
+        ),
+        pytest.param(
+            "        with contextlib.suppress(exc=ValueError):\n",
+            "            v = step()\n",
+            False,
+            id="suppress_keyword_arg_raises_type_error",
+        ),
+        pytest.param(
+            "        with contextlib.nullcontext(enter_result=1):\n",
+            "            v = 1\n",
+            True,
+            id="valid_nullcontext_enter_result_keyword_and_pure_body_is_safe",
+        ),
+    ],
+)
+def test_nested_suppress_rejects_invalid_nullcontext_and_suppress_signatures(
+    with_header: str,
+    body_line: str,
+    expect_safe: bool,
+) -> None:
+    """Verifies _is_non_raising_suppress_or_null_with enforces exact call signatures inside suppress."""
+    module_src = (
+        "import contextlib\n"
+        "def run(step, items, kw):\n"
+        "    with contextlib.suppress(ValueError):\n"
+        + with_header
+        + body_line
+        + "    cb = lambda: v\n"
+        + "    return cb()\n"
+    )
+    safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
+    assert safety == {"strict": expect_safe, "pedantic": expect_safe}
+
+
+@pytest.mark.parametrize(
+    (
+        "hazard_exit_targets",
+        "hazard_has_exit_patch",
+        "hazard_rebound_targets",
+        "expected_non_suppressors",
+        "expected_suspicious",
+        "expected_has_exit_patch",
+    ),
+    [
+        pytest.param(
+            frozenset({"SafeMgr"}),
+            True,
+            frozenset({(None, None)}),
+            frozenset(),
+            frozenset({"SafeMgr"}),
+            True,
+            id="exit_patch_demotes_base_positive_proofs_and_preserves_targets",
+        ),
+        pytest.param(
+            frozenset(),
+            False,
+            frozenset({("contextlib", "nullcontext")}),
+            frozenset({"other_lock"}),
+            frozenset(),
+            False,
+            id="rebound_factory_invalidates_matching_imported_binding_only",
+        ),
+        pytest.param(
+            frozenset(),
+            False,
+            frozenset(),
+            frozenset({"my_null", "other_lock"}),
+            frozenset(),
+            False,
+            id="control_clean_hazard_src_preserves_positive_bindings",
+        ),
+    ],
+)
+def test_merge_hazard_provenance_preserves_exit_patch_and_rebound_factories(
+    hazard_exit_targets: frozenset[str],
+    hazard_has_exit_patch: bool,
+    hazard_rebound_targets: frozenset[tuple[str | None, str | None]],
+    expected_non_suppressors: frozenset[str],
+    expected_suspicious: frozenset[str],
+    expected_has_exit_patch: bool,
+) -> None:
+    """Verifies _merge_hazard_provenance preserves exit_patch_targets, has_exit_patch, and rebound_factory_targets."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _SuppressProvenance,
+        _merge_hazard_provenance,
+    )
+
+    base = _SuppressProvenance(
+        non_suppressors=frozenset({"my_null", "other_lock"}),
+        imported_symbols=frozenset(
+            {
+                ("my_null", "contextlib.nullcontext"),
+                ("other_lock", "threading.Lock"),
+            }
+        ),
+    )
+    hazard_src = _SuppressProvenance(
+        exit_patch_targets=hazard_exit_targets,
+        has_exit_patch=hazard_has_exit_patch,
+        rebound_factory_targets=hazard_rebound_targets,
+    )
+    merged = _merge_hazard_provenance(base, hazard_src)
+    assert merged.has_exit_patch is expected_has_exit_patch
+    assert merged.exit_patch_targets == hazard_exit_targets
+    assert merged.rebound_factory_targets == hazard_rebound_targets
+    assert merged.non_suppressors == expected_non_suppressors
+    assert merged.suspicious_aliases == expected_suspicious
+
+
+@pytest.mark.parametrize(
+    ("loop_src", "var_name", "expect_definite", "expect_conditional"),
+    [
+        pytest.param(
+            "for arr[(x := 1)] in empty_seq:\n    pass\n",
+            "x",
+            False,
+            True,
+            id="for_target_walrus_is_conditional_on_zero_iterations",
+        ),
+        pytest.param(
+            "async for arr[(x := 1)] in empty_aiter:\n    pass\n",
+            "x",
+            False,
+            True,
+            id="async_for_target_walrus_is_conditional_on_zero_iterations",
+        ),
+        pytest.param(
+            "for _ in (y := [1]):\n    pass\n",
+            "y",
+            True,
+            False,
+            id="control_for_iter_walrus_is_definite",
+        ),
+        pytest.param(
+            "async for _ in (y := empty_aiter):\n    pass\n",
+            "y",
+            True,
+            False,
+            id="control_async_for_iter_walrus_is_definite",
+        ),
+    ],
+)
+def test_for_and_async_for_target_walrus_is_conditional_while_iter_walrus_is_definite(
+    loop_src: str,
+    var_name: str,
+    expect_definite: bool,
+    expect_conditional: bool,
+) -> None:
+    """Verifies For/AsyncFor target walruses are conditional (0-iteration safe) while iter walruses are definite."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import _analyze_block_assignment
+
+    wrapper = f"async def _probe(arr, empty_seq, empty_aiter):\n    " + loop_src.replace(
+        "\n", "\n    "
+    )
+    fn_node = ast.parse(wrapper).body[0]
+    assert isinstance(fn_node, ast.AsyncFunctionDef)
+    definite, conditional = _analyze_block_assignment(fn_node.body)
+    assert (var_name in definite) is expect_definite
+    assert (var_name in conditional) is expect_conditional
+
+
+@pytest.mark.parametrize(
+    ("stmt_src", "expect_has_patch"),
+    [
+        pytest.param("getattr(*args)\n", True, id="starred_first_arg"),
+        pytest.param("getattr(*pair, None)\n", True, id="starred_first_arg_with_default"),
+        pytest.param("getattr(obj, *rest)\n", True, id="starred_second_arg"),
+        pytest.param(
+            "import builtins\ngetattr(builtins, *rest)\n",
+            True,
+            id="builtins_with_starred_second_arg",
+        ),
+        pytest.param(
+            "getattr(obj, (k := '__setattr__'))\n",
+            True,
+            id="walrus_wrapped_mutation_attr_name",
+        ),
+        pytest.param(
+            "getattr(obj, 'label', *defaults)\n",
+            False,
+            id="control_literal_benign_attr_with_starred_default",
+        ),
+        pytest.param(
+            "import builtins\ngetattr(builtins, 'len', *defaults)\n",
+            False,
+            id="control_builtins_benign_literal_with_starred_default",
+        ),
+    ],
+)
+def test_exit_protocol_scanner_starred_getattr_args(
+    stmt_src: str,
+    expect_has_patch: bool,
+) -> None:
+    """Verifies getattr(*args) and getattr(obj, *rest) invalidate proofs while safe starred defaults do not."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    scan = scan_exit_protocol_patches(ast.parse(stmt_src))
+    assert scan.has_patch is expect_has_patch
+
+
+@pytest.mark.parametrize(
+    ("shape", "depth", "max_calls"),
+    [
+        pytest.param("nested_try_prov", 30, 120, id="nested_try_provenance_linear"),
+        pytest.param("nested_try_terminating_handler", 30, 180, id="nested_try_terminating_handler_linear"),
+        pytest.param("nested_loop_finally_no_break", 30, 180, id="nested_loop_finally_no_break_linear"),
+        pytest.param("nested_loop_finally_with_break", 25, 2500, id="nested_loop_finally_with_break_polynomial"),
+    ],
+)
+def test_deeply_nested_try_and_loop_finally_avoid_exponential_blowup(
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+    depth: int,
+    max_calls: int,
+) -> None:
+    """Verifies deeply nested try and loop try/finally blocks run in polynomial call counts with exact semantics."""
+    import pydoppelgangerhunt.fixer._df_with_provenance as prov_mod
+
+    prov_calls = 0
+    flow_calls = 0
+    real_prov_stmt = prov_mod._update_prov_and_term_from_stmt
+    real_flow_impl = prov_mod._analyze_block_assignment_impl
+
+    def _spy_prov_stmt(*args: Any, **kwargs: Any) -> Any:
+        nonlocal prov_calls
+        prov_calls += 1
+        return real_prov_stmt(*args, **kwargs)
+
+    def _spy_flow_impl(*args: Any, **kwargs: Any) -> Any:
+        nonlocal flow_calls
+        flow_calls += 1
+        return real_flow_impl(*args, **kwargs)
+
+    monkeypatch.setattr(prov_mod, "_update_prov_and_term_from_stmt", _spy_prov_stmt)
+    monkeypatch.setattr(prov_mod, "_analyze_block_assignment_impl", _spy_flow_impl)
+
+    if shape == "nested_try_prov":
+        lines = ["import contextlib\n", "cm = contextlib.nullcontext\n"]
+        for idx in range(depth):
+            lines.append("    " * idx + "try:\n")
+            lines.append("    " * (idx + 1) + "step()\n")
+        lines.append("    " * depth + "cm = contextlib.suppress\n")
+        for idx in range(depth - 1, -1, -1):
+            lines.append("    " * idx + "except Exception:\n")
+            lines.append("    " * (idx + 1) + "pass\n")
+        stmts = ast.parse("".join(lines)).body
+        out_prov = prov_mod._update_suppress_provenance_from_stmts(
+            stmts, prov_mod._EMPTY_SUPPRESS_PROVENANCE, in_branch=False
+        )
+        assert "cm" in out_prov.suppressors
+        assert "cm" not in out_prov.non_suppressors
+        assert prov_calls <= max_calls
+        assert flow_calls == 0
+    elif shape == "nested_try_terminating_handler":
+        lines = ["import contextlib\n", "cm = contextlib.nullcontext\n"]
+        for idx in range(depth):
+            lines.append("    " * idx + "try:\n")
+            lines.append("    " * (idx + 1) + "step()\n")
+        for idx in range(depth - 1, -1, -1):
+            lines.append("    " * idx + "except Exception:\n")
+            lines.append("    " * (idx + 1) + "cm = contextlib.suppress\n")
+            lines.append("    " * (idx + 1) + "raise\n")
+        stmts = ast.parse("".join(lines)).body
+        out_prov = prov_mod._update_suppress_provenance_from_stmts(
+            stmts, prov_mod._EMPTY_SUPPRESS_PROVENANCE, in_branch=False
+        )
+        assert "cm" in out_prov.non_suppressors
+        assert "cm" not in out_prov.suppressors
+        assert prov_calls <= max_calls
+        assert flow_calls == 0
+    elif shape == "nested_loop_finally_no_break":
+        lines = ["for _ in items:\n"]
+        for idx in range(depth):
+            lines.append("    " * (idx + 1) + "try:\n")
+            lines.append("    " * (idx + 2) + "x = step()\n")
+            lines.append("    " * (idx + 1) + "finally:\n")
+        lines.append("    " * (depth + 1) + "done = 1\n")
+        stmts = ast.parse("".join(lines)).body
+        definite, conditional = prov_mod._analyze_block_assignment(stmts)
+        assert "done" in conditional and "done" not in definite
+        assert flow_calls <= max_calls
+    else:
+        lines = ["for _ in items:\n"]
+        for idx in range(depth):
+            lines.append("    " * (idx + 1) + "try:\n")
+            lines.append("    " * (idx + 2) + "if flag:\n")
+            lines.append("    " * (idx + 3) + "break\n")
+            lines.append("    " * (idx + 1) + "finally:\n")
+        lines.append("    " * (depth + 1) + "done = 1\n")
+        lines.append("    " * (depth + 1) + "if flag:\n")
+        lines.append("    " * (depth + 2) + "break\n")
+        stmts = ast.parse("".join(lines)).body
+        definite, conditional = prov_mod._analyze_block_assignment(stmts)
+        assert "done" in conditional and "done" not in definite
+        assert flow_calls <= max_calls
+
+
+@pytest.mark.parametrize(
+    ("except_body", "unit_marker", "expect_safe"),
+    [
+        pytest.param(
+            "        with cm():\n            v = step()\n        cb = lambda: v\n",
+            "        cb = lambda: v",
+            False,
+            id="handler_observes_intermediate_suppressor_before_restore",
+        ),
+        pytest.param(
+            "        raise\n    with cm():\n        v = step()\n    cb = lambda: v\n",
+            "    cb = lambda: v",
+            True,
+            id="control_post_try_sees_restored_nullcontext_when_handler_raises",
+        ),
+    ],
+)
+def test_try_body_single_pass_mid_prov_preserves_intermediate_suppressor_hazards(
+    except_body: str,
+    unit_marker: str,
+    expect_safe: bool,
+) -> None:
+    """Verifies single-pass try-body provenance retains mid-body suppressor hazards for except handlers while restoring normal completion."""
+    module_src = (
+        "import contextlib\n"
+        "def run(step):\n"
+        "    cm = contextlib.nullcontext\n"
+        "    try:\n"
+        "        step()\n"
+        "        cm = contextlib.suppress\n"
+        "        step()\n"
+        "        cm = contextlib.nullcontext\n"
+        "    except Exception:\n"
+        + except_body
+        + "    return cb()\n"
+    )
+    safety = _late_bound_capture_safety_by_mode(module_src, unit_marker)
+    assert safety == {"strict": expect_safe, "pedantic": expect_safe}
+
+
+@pytest.mark.parametrize(
+    ("module_src", "expect_safe"),
+    [
+        pytest.param(
+            (
+                "from contextlib import nullcontext\n"
+                "from evil import *\n"
+                "def run(compute):\n"
+                "    with nullcontext():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            id="star_import_invalidates_prior_from_import_nullcontext",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "from evil import *\n"
+                "def run(compute):\n"
+                "    with contextlib.nullcontext():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            id="star_import_invalidates_prior_stdlib_module_alias",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "cm = contextlib.nullcontext()\n"
+                "from evil import *\n"
+                "def run(compute):\n"
+                "    with cm:\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            id="star_import_invalidates_prior_instance_alias",
+        ),
+        pytest.param(
+            (
+                "from contextlib import nullcontext\n"
+                "def run(compute):\n"
+                "    with nullcontext():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+                "from evil import *\n"
+            ),
+            False,
+            id="post_def_star_import_invalidates_prior_nullcontext",
+        ),
+        pytest.param(
+            (
+                "from contextlib import nullcontext\n"
+                "if flag:\n"
+                "    from evil import *\n"
+                "def run(compute):\n"
+                "    with nullcontext():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            id="conditional_star_import_invalidates_prior_nullcontext",
+        ),
+        pytest.param(
+            (
+                "from evil import *\n"
+                "from contextlib import nullcontext\n"
+                "def run(compute):\n"
+                "    with nullcontext():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            True,
+            id="control_explicit_import_after_star_import_remains_proven",
+        ),
+        pytest.param(
+            (
+                "from evil import *\n"
+                "def run(compute):\n"
+                "    from contextlib import nullcontext\n"
+                "    with nullcontext():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            True,
+            id="control_function_local_import_after_module_star_import_remains_proven",
+        ),
+    ],
+)
+def test_wildcard_star_import_invalidates_prior_non_suppression_proofs(
+    module_src: str,
+    expect_safe: bool,
+) -> None:
+    """Verifies wildcard imports withdraw prior positive non-suppression proofs in strict and pedantic modes while preserving later explicit imports."""
+    safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
+    assert safety == {"strict": expect_safe, "pedantic": expect_safe}
+
+
+@pytest.mark.parametrize(
+    ("src", "expect_has_patch", "expected_patched_names"),
+    [
+        pytest.param(
+            "type(Mgr).__setattr__(Mgr, '__exit__', swallow)\n",
+            True,
+            frozenset({"Mgr"}),
+            id="type_call_dunder_setattr_records_target",
+        ),
+        pytest.param(
+            "import builtins\nbuiltins.type(Mgr).__setattr__(Mgr, '__exit__', swallow)\n",
+            True,
+            frozenset({"Mgr"}),
+            id="builtins_type_call_dunder_setattr_records_target",
+        ),
+        pytest.param(
+            "T = type\nT(Mgr).__setattr__(Mgr, '__aexit__', swallow)\n",
+            True,
+            frozenset({"Mgr"}),
+            id="aliased_type_call_dunder_setattr_records_target",
+        ),
+        pytest.param(
+            "getattr(type(Mgr), '__setattr__')(Mgr, '__exit__', swallow)\n",
+            True,
+            frozenset({"Mgr"}),
+            id="getattr_type_call_dunder_setattr_records_target",
+        ),
+        pytest.param(
+            "patch = type(Mgr).__setattr__\npatch(Mgr, '__exit__', swallow)\n",
+            True,
+            frozenset({"Mgr"}),
+            id="stored_type_call_dunder_setattr_alias_records_target",
+        ),
+        pytest.param(
+            "type(Mgr).__setattr__(Mgr, 'benign_label', 1)\n",
+            False,
+            frozenset(),
+            id="control_type_call_dunder_setattr_non_exit_attr_ignored",
+        ),
+        pytest.param(
+            "object().__setattr__('__class__', Suppressor)\n",
+            True,
+            frozenset(),
+            id="control_bound_object_instance_dunder_setattr_class_detected",
+        ),
+        pytest.param(
+            "O = object\nO().__setattr__('__class__', Suppressor)\n",
+            True,
+            frozenset(),
+            id="control_aliased_object_instance_dunder_setattr_class_detected",
+        ),
+        pytest.param(
+            "O = object\nO().__setattr__('benign_label', 1)\n",
+            False,
+            frozenset(),
+            id="control_aliased_object_instance_benign_attr_ignored",
+        ),
+    ],
+)
+def test_type_call_dunder_setattr_records_patched_target_and_filters_benign_attrs(
+    src: str,
+    expect_has_patch: bool,
+    expected_patched_names: frozenset[str],
+) -> None:
+    """Verifies type(Mgr).__setattr__(Mgr, ...) uses unbound argument indexing to record patched targets and ignore non-exit attributes."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    clear_dataflow_cache()
+    scan = scan_exit_protocol_patches(ast.parse(src))
+    assert scan.has_patch is expect_has_patch
+    assert scan.patched_names == expected_patched_names
+
+
+@pytest.mark.parametrize(
+    ("loop_body_src", "expect_definite"),
+    [
+        pytest.param(
+            (
+                "import contextlib\n"
+                "if cond:\n"
+                "    cm = contextlib.nullcontext\n"
+                "    for i in items:\n"
+                "        if i > 0:\n"
+                "            with cm(ValueError):\n"
+                "                return compute()\n"
+                "            break\n"
+                "        cm = contextlib.suppress\n"
+                "    else:\n"
+                "        return 0\n"
+                "else:\n"
+                "    v = 1\n"
+            ),
+            False,
+            id="for_loop_rebinding_after_with_enables_iteration2_break_fallthrough",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "if cond:\n"
+                "    cm = contextlib.nullcontext\n"
+                "    while flag:\n"
+                "        if ready:\n"
+                "            with cm(ValueError):\n"
+                "                return compute()\n"
+                "            break\n"
+                "        cm = contextlib.suppress\n"
+                "    else:\n"
+                "        return 0\n"
+                "else:\n"
+                "    v = 1\n"
+            ),
+            False,
+            id="while_loop_rebinding_after_with_enables_iteration2_break_fallthrough",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "if cond:\n"
+                "    cm = contextlib.nullcontext\n"
+                "    for i in items:\n"
+                "        cm = contextlib.nullcontext\n"
+                "        if i > 0:\n"
+                "            with cm():\n"
+                "                return compute()\n"
+                "            break\n"
+                "        cm = contextlib.suppress\n"
+                "    else:\n"
+                "        return 0\n"
+                "else:\n"
+                "    v = 1\n"
+            ),
+            True,
+            id="control_unconditional_in_loop_restore_before_with_keeps_termination",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "if cond:\n"
+                "    cm = contextlib.nullcontext\n"
+                "    for i in items:\n"
+                "        if i > 0:\n"
+                "            with cm():\n"
+                "                return compute()\n"
+                "            break\n"
+                "    else:\n"
+                "        return 0\n"
+                "else:\n"
+                "    v = 1\n"
+            ),
+            True,
+            id="control_unmodified_cm_in_loop_keeps_termination",
+        ),
+    ],
+)
+def test_loop_carried_ctx_manager_rebinding_invalidates_block_definite_binding(
+    loop_body_src: str,
+    expect_definite: bool,
+) -> None:
+    """Verifies loop-body context-manager rebinding propagates across loop back-edges in _analyze_block_assignment."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import _analyze_block_assignment
+
+    stmts = ast.parse(loop_body_src).body
+    for strict_mode in (False, True):
+        definite, conditional = _analyze_block_assignment(
+            stmts, strict_with_suppression=strict_mode
+        )
+        assert ("v" in definite) is expect_definite
+        assert ("v" in conditional) is (not expect_definite)
+
+
+@pytest.mark.parametrize(
+    ("module_src", "expect_pre_bound"),
+    [
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def run(items, compute):\n"
+                "    cm = contextlib.nullcontext\n"
+                "    for i in items:\n"
+                "        if i > 0:\n"
+                "            with cm(ValueError):\n"
+                "                v = compute()\n"
+                "            res = v + 1\n"
+                "            return res\n"
+                "        cm = contextlib.suppress\n"
+            ),
+            False,
+            id="for_enclosing_loop_rebinding_after_unit_clears_pre_bound",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def run(conds, compute):\n"
+                "    cm = contextlib.nullcontext\n"
+                "    while conds:\n"
+                "        if conds.pop():\n"
+                "            with cm(ValueError):\n"
+                "                v = compute()\n"
+                "            res = v + 1\n"
+                "            return res\n"
+                "        cm = contextlib.suppress\n"
+            ),
+            False,
+            id="while_enclosing_loop_rebinding_after_unit_clears_pre_bound",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def run(items, compute):\n"
+                "    cm = contextlib.nullcontext\n"
+                "    for i in items:\n"
+                "        cm = contextlib.nullcontext\n"
+                "        if i > 0:\n"
+                "            with cm():\n"
+                "                v = compute()\n"
+                "            res = v + 1\n"
+                "            return res\n"
+                "        cm = contextlib.suppress\n"
+            ),
+            True,
+            id="control_for_enclosing_loop_restores_cm_before_with",
+        ),
+    ],
+)
+def test_enclosing_loop_carried_ctx_manager_rebinding_invalidates_pre_unit_with(
+    module_src: str,
+    expect_pre_bound: bool,
+) -> None:
+    """Verifies cell traversal propagates loop-body context-manager rebinding into pre-unit with statements."""
+    from pydoppelgangerhunt.fixer._df_cell_traversal import _analyze_enclosing_fn_cells
+
+    tree = ast.parse(module_src)
+    fn_node = next(n for n in tree.body if isinstance(n, ast.FunctionDef))
+    unit_line = next(
+        idx for idx, ln in enumerate(module_src.splitlines(), start=1) if "res = v + 1" in ln
+    )
+    for strict_mode in (False, True):
+        clear_dataflow_cache()
+        info = _analyze_enclosing_fn_cells(
+            fn_node,
+            (unit_line, unit_line, None, None),
+            mod_tree=tree,
+            strict_with_suppression=strict_mode,
+        )
+        assert ("v" in info.pre_bound) is expect_pre_bound
+
+
+@pytest.mark.parametrize(
+    ("loop_lines", "expect_safe"),
+    [
+        pytest.param(
+            (
+                "            if i > 0:\n"
+                "                with cm(ValueError):\n"
+                "                    return compute()\n"
+                "                break\n"
+                "            cm = contextlib.suppress\n"
+            ),
+            False,
+            id="post_loop_capture_unsafe_when_iteration2_rebinding_enables_break",
+        ),
+        pytest.param(
+            (
+                "            cm = contextlib.nullcontext\n"
+                "            if i > 0:\n"
+                "                with cm():\n"
+                "                    return compute()\n"
+                "                break\n"
+                "            cm = contextlib.suppress\n"
+            ),
+            True,
+            id="control_post_loop_capture_safe_when_cm_restored_before_with",
+        ),
+    ],
+)
+def test_loop_carried_ctx_manager_rebinding_end_to_end_scope_safety(
+    loop_lines: str,
+    expect_safe: bool,
+) -> None:
+    """Verifies end-to-end scope safety rejects post-loop late-bound capture when loop-carried rebinding makes break reachable."""
+    module_src = (
+        "import contextlib\n"
+        "def run(cond, items, compute):\n"
+        "    if cond:\n"
+        "        cm = contextlib.nullcontext\n"
+        "        for i in items:\n"
+        + loop_lines
+        + "        else:\n"
+        "            return 0\n"
+        "    else:\n"
+        "        v = 1\n"
+        "    cb = lambda: v\n"
+        "    return cb()\n"
+    )
+    safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
+    assert safety == {"strict": expect_safe, "pedantic": expect_safe}
+
+
+@pytest.mark.parametrize(
+    ("del_stmt_src", "expect_non_raising"),
+    [
+        pytest.param("del x, x\n", False, id="duplicate_delete_target_pair"),
+        pytest.param("del x, y, x\n", False, id="duplicate_delete_target_non_adjacent"),
+        pytest.param("del x, y\n", True, id="control_distinct_delete_targets"),
+    ],
+)
+def test_duplicate_delete_target_in_suppress_is_not_non_raising(
+    del_stmt_src: str,
+    expect_non_raising: bool,
+) -> None:
+    """Verifies duplicate ast.Delete targets like 'del x, x' are treated as raising inside suppress blocks."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _analyze_block_assignment,
+        _stmt_cannot_raise_in_suppress,
+    )
+
+    del_stmt = ast.parse(del_stmt_src).body[0]
+    assert (
+        _stmt_cannot_raise_in_suppress(del_stmt, safe_names=frozenset({"x", "y"}))
+        is expect_non_raising
+    )
+    block_src = (
+        "from contextlib import suppress\n"
+        "x = 1\n"
+        "y = 2\n"
+        "with suppress(UnboundLocalError):\n"
+        f"    {del_stmt_src}"
+        "    v = 99\n"
+    )
+    definite, conditional = _analyze_block_assignment(ast.parse(block_src).body)
+    assert ("v" in definite) is expect_non_raising
+    assert ("v" in conditional) is (not expect_non_raising)
+
+
+@pytest.mark.parametrize(
+    ("stmt_src", "active_nonlocals", "fn_globals", "expect_deleted"),
+    [
+        pytest.param("del x\n", set(), frozenset(), False, id="class_local_delete_ignored"),
+        pytest.param(
+            "del x\n", None, frozenset({"x"}), False, id="global_delete_ignored"
+        ),
+        pytest.param(
+            "try:\n    op()\nexcept Exception as x:\n    pass\n",
+            set(),
+            frozenset(),
+            False,
+            id="class_local_except_as_ignored",
+        ),
+        pytest.param(
+            "del x\n", {"x"}, frozenset(), True, id="control_nonlocal_delete_tracked"
+        ),
+        pytest.param(
+            "del x\n", None, frozenset(), True, id="control_function_local_delete_tracked"
+        ),
+    ],
+)
+@pytest.mark.parametrize("hit_depth_limit", [False, True], ids=["normal", "depth_bailout"])
+def test_delete_and_except_handler_respect_active_nonlocals_and_fn_globals(
+    stmt_src: str,
+    active_nonlocals: set[str] | None,
+    fn_globals: frozenset[str],
+    expect_deleted: bool,
+    hit_depth_limit: bool,
+) -> None:
+    """Verifies ast.Delete and depth-limit deletion flow filter names via active_nonlocals and fn_globals."""
+    from pydoppelgangerhunt.fixer import _df_with_provenance as prov_mod
+
+    stmts = ast.parse(stmt_src).body
+    may_del: set[str] = set()
+    must_del: set[str] = set()
+    live_in_del: set[str] = set()
+    depth = prov_mod._MAX_AST_RECURSION_DEPTH + 1 if hit_depth_limit else 0
+    definite, _conditional, _term, _prov = prov_mod._analyze_block_assignment_impl(
+        stmts,
+        definite={"x"},
+        may_deleted=may_del,
+        must_deleted=must_del,
+        live_in_deleted=live_in_del,
+        active_nonlocals=active_nonlocals,
+        fn_globals=fn_globals,
+        _depth=depth,
+    )
+    assert ("x" not in definite) is expect_deleted
+    assert ("x" in may_del) is expect_deleted
+
+
+@pytest.mark.parametrize(
+    ("block_src", "expect_cm_proven", "expect_v_definite"),
+    [
+        pytest.param(
+            (
+                "import contextlib\n"
+                "try:\n"
+                "    raise ValueError()\n"
+                "except ValueError as cm:\n"
+                "    cm = contextlib.nullcontext\n"
+                "with cm():\n"
+                "    v = compute()\n"
+            ),
+            False,
+            False,
+            id="handler_rebound_as_name_cleared_on_exit_when_try_terminates",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "cm = contextlib.nullcontext\n"
+                "try:\n"
+                "    may_raise()\n"
+                "except ValueError as cm:\n"
+                "    cm = contextlib.nullcontext\n"
+                "with cm():\n"
+                "    v = compute()\n"
+            ),
+            False,
+            False,
+            id="handler_rebound_as_name_clears_pre_try_proof_on_exit",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "cm = contextlib.nullcontext\n"
+                "try:\n"
+                "    may_raise()\n"
+                "except ValueError as cm:\n"
+                "    cm = contextlib.nullcontext\n"
+                "finally:\n"
+                "    with cm():\n"
+                "        v = compute()\n"
+            ),
+            False,
+            False,
+            id="handler_as_name_cleared_before_finally_on_normal_handler_exit",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "cm = contextlib.nullcontext\n"
+                "for _ in items:\n"
+                "    try:\n"
+                "        may_raise()\n"
+                "    except ValueError as cm:\n"
+                "        cm = contextlib.nullcontext\n"
+                "        raise\n"
+                "    finally:\n"
+                "        with cm():\n"
+                "            v = compute()\n"
+                "        break\n"
+            ),
+            False,
+            False,
+            id="handler_as_name_cleared_before_finally_when_finally_suppresses_via_break",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "cm = contextlib.nullcontext\n"
+                "try:\n"
+                "    may_raise()\n"
+                "except ValueError as cm:\n"
+                "    cm = contextlib.nullcontext\n"
+                "    raise\n"
+                "finally:\n"
+                "    pass\n"
+                "with cm():\n"
+                "    v = compute()\n"
+            ),
+            True,
+            True,
+            id="control_reraising_handler_does_not_affect_post_try_finally_fallthrough",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "cm = contextlib.nullcontext\n"
+                "try:\n"
+                "    may_raise()\n"
+                "except ValueError as err:\n"
+                "    err = contextlib.suppress\n"
+                "with cm():\n"
+                "    v = compute()\n"
+            ),
+            True,
+            True,
+            id="control_unrelated_handler_as_name_preserves_cm_proof",
+        ),
+    ],
+)
+def test_except_handler_name_cleared_from_provenance_on_handler_exit(
+    block_src: str,
+    expect_cm_proven: bool,
+    expect_v_definite: bool,
+) -> None:
+    """Verifies ExceptHandler.name is cleared from suppression provenance after handler exit in both provenance and flow walks."""
+    from pydoppelgangerhunt.fixer import _df_with_provenance as prov_mod
+
+    stmts = ast.parse(block_src).body
+    prov_walk = prov_mod._update_suppress_provenance_from_stmts(
+        stmts,
+        prov_mod._EMPTY_SUPPRESS_PROVENANCE,
+        in_branch=False,
+        strict_with_suppression=True,
+    )
+    assert ("cm" in prov_walk.non_suppressors) is expect_cm_proven
+
+    definite, _cond, _term, flow_prov = prov_mod._analyze_block_assignment_impl(
+        stmts,
+        strict_with_suppression=True,
+    )
+    assert ("cm" in flow_prov.non_suppressors) is expect_cm_proven
+    assert ("v" in definite) is expect_v_definite
+
+
+@pytest.mark.parametrize(
+    ("src", "expect_has_patch", "expected_patched_names"),
+    [
+        pytest.param(
+            "import builtins\nbuiltins.type.__setattr__(Mgr, '__exit__', swallow)\n",
+            True,
+            frozenset({"Mgr"}),
+            id="builtins_type_dunder_setattr_records_target",
+        ),
+        pytest.param(
+            "import builtins\nbuiltins.object.__setattr__(Mgr, '__aexit__', swallow)\n",
+            True,
+            frozenset({"Mgr"}),
+            id="builtins_object_dunder_setattr_records_target",
+        ),
+        pytest.param(
+            "import builtins\ngetattr(builtins.type, '__setattr__')(Mgr, '__exit__', swallow)\n",
+            True,
+            frozenset({"Mgr"}),
+            id="getattr_builtins_type_dunder_setattr_records_target",
+        ),
+        pytest.param(
+            "import builtins\npatch = builtins.type.__setattr__\npatch(Mgr, '__exit__', swallow)\n",
+            True,
+            frozenset({"Mgr"}),
+            id="stored_builtins_type_dunder_setattr_alias_records_target",
+        ),
+        pytest.param(
+            "import builtins\nbuiltins.type.__setattr__(Mgr, 'benign_label', 1)\n",
+            False,
+            frozenset(),
+            id="control_builtins_type_dunder_setattr_benign_attr_ignored",
+        ),
+        pytest.param(
+            "import builtins\nbuiltins.object.__setattr__(Mgr, 'benign_label', 1)\n",
+            False,
+            frozenset(),
+            id="control_builtins_object_dunder_setattr_benign_attr_ignored",
+        ),
+        pytest.param(
+            "import builtins\npatch = builtins.type.__setattr__\npatch(Mgr, 'benign_label', 1)\n",
+            False,
+            frozenset(),
+            id="control_stored_builtins_type_dunder_setattr_benign_attr_ignored",
+        ),
+        pytest.param(
+            "import builtins\nbuiltins.object().__setattr__('__class__', Suppressor)\n",
+            True,
+            frozenset(),
+            id="control_builtins_object_instance_class_mutation_detected",
+        ),
+        pytest.param(
+            "import builtins\nbuiltins.object().__setattr__('benign_label', 1)\n",
+            False,
+            frozenset(),
+            id="control_builtins_object_instance_benign_attr_ignored",
+        ),
+    ],
+)
+def test_builtins_type_and_object_dunder_setattr_records_target_and_filters_benign(
+    src: str,
+    expect_has_patch: bool,
+    expected_patched_names: frozenset[str],
+) -> None:
+    """Verifies builtins.type.__setattr__ and builtins.object.__setattr__ resolve unbound targets without benign false positives."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    clear_dataflow_cache()
+    scan = scan_exit_protocol_patches(ast.parse(src))
+    assert scan.has_patch is expect_has_patch
+    assert scan.patched_names == expected_patched_names
+
+
+@pytest.mark.parametrize(
+    ("src", "expect_has_patch", "min_python"),
+    [
+        pytest.param(
+            (
+                "s = setattr\n"
+                "def mutate():\n"
+                "    global s\n"
+                "    try:\n"
+                "        op()\n"
+                "    except Exception as s:\n"
+                "        pass\n"
+                "s(Mgr, 'label', 1)\n"
+            ),
+            True,
+            (3, 9),
+            id="global_except_as_disqualifies_pure_setattr_alias",
+        ),
+        pytest.param(
+            (
+                "def outer():\n"
+                "    s = setattr\n"
+                "    def mutate():\n"
+                "        nonlocal s\n"
+                "        try:\n"
+                "            op()\n"
+                "        except Exception as s:\n"
+                "            pass\n"
+                "    s(Mgr, 'label', 1)\n"
+            ),
+            True,
+            (3, 9),
+            id="nonlocal_except_as_disqualifies_pure_setattr_alias",
+        ),
+        pytest.param(
+            (
+                "s = setattr\n"
+                "def mutate(v):\n"
+                "    global s\n"
+                "    match v:\n"
+                "        case s:\n"
+                "            pass\n"
+                "s(Mgr, 'label', 1)\n"
+            ),
+            True,
+            (3, 10),
+            id="global_match_as_disqualifies_pure_setattr_alias",
+        ),
+        pytest.param(
+            (
+                "def outer():\n"
+                "    s = setattr\n"
+                "    def unrelated():\n"
+                "        try:\n"
+                "            op()\n"
+                "        except Exception as s:\n"
+                "            pass\n"
+                "    s(Mgr, 'label', 1)\n"
+            ),
+            False,
+            (3, 9),
+            id="control_local_except_as_does_not_disqualify_enclosing_pure_setattr_alias",
+        ),
+    ],
+)
+def test_exit_protocol_except_and_match_bindings_resolve_global_nonlocal_slots(
+    src: str,
+    expect_has_patch: bool,
+    min_python: tuple[int, int],
+) -> None:
+    """Verifies ExceptHandler and match-pattern writes honor global/nonlocal lexical resolution in exit-protocol scanning."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    if sys.version_info < min_python:
+        pytest.skip(f"requires Python {min_python[0]}.{min_python[1]}+")
+    clear_dataflow_cache()
+    scan = scan_exit_protocol_patches(ast.parse(src))
+    assert scan.has_patch is expect_has_patch
+
+
+@pytest.mark.parametrize(
+    ("src", "expect_terminates"),
+    [
+        pytest.param(
+            (
+                "import contextlib\n"
+                "with contextlib.suppress(NameError):\n"
+                "    with suppress(KeyError):\n"
+                "        return 1\n"
+            ),
+            False,
+            id="unimported_bare_suppress_may_raise_name_error",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress as outer_sup\n"
+                "with outer_sup(NameError):\n"
+                "    with contextlib.suppress(KeyError):\n"
+                "        return 1\n"
+            ),
+            False,
+            id="unimported_contextlib_attr_may_raise_name_error",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "from custom_pkg import suppress\n"
+                "with contextlib.suppress(RuntimeError):\n"
+                "    with suppress(KeyError):\n"
+                "        return 1\n"
+            ),
+            False,
+            id="custom_imported_suppress_is_not_assumed_non_raising",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "with suppress(ValueError):\n"
+                "    with suppress(KeyError):\n"
+                "        return 1\n"
+            ),
+            True,
+            id="control_imported_contextlib_suppress_proves_termination",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "with contextlib.suppress(ValueError):\n"
+                "    with contextlib.suppress(KeyError):\n"
+                "        return 1\n"
+            ),
+            True,
+            id="control_imported_contextlib_module_suppress_proves_termination",
+        ),
+    ],
+)
+def test_nested_suppress_requires_proven_contextlib_import_for_non_raising_proof(
+    src: str,
+    expect_terminates: bool,
+) -> None:
+    """Verifies nested with suppress(...) non-raising proof requires proven contextlib provenance instead of assuming bare or unimported names."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import _block_terminates
+
+    assert _block_terminates(ast.parse(src).body) is expect_terminates
+
+
+@pytest.mark.parametrize(
+    ("module_src", "allowlist", "expect_pedantic", "expect_strict"),
+    [
+        pytest.param(
+            (
+                "from pkg.tx import atomic\n"
+                "exec(code)\n"
+                "def run(compute):\n"
+                "    with atomic():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            ["pkg.tx.atomic"],
+            True,
+            True,
+            id="allowlisted_from_imported_name_stays_trusted_under_exec",
+        ),
+        pytest.param(
+            (
+                "import pkg.tx\n"
+                "exec(code)\n"
+                "def run(compute):\n"
+                "    with pkg.tx.atomic():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            ["pkg.tx.atomic"],
+            True,
+            True,
+            id="allowlisted_attribute_chain_stays_trusted_under_exec",
+        ),
+        pytest.param(
+            (
+                "from pkg.tx import atomic\n"
+                "eval(code)\n"
+                "def run(compute):\n"
+                "    with atomic:\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            ["pkg.tx.atomic"],
+            True,
+            True,
+            id="allowlisted_instance_name_stays_trusted_under_eval",
+        ),
+        pytest.param(
+            (
+                "from pkg.tx import atomic\n"
+                "atomic.__exit__ = swallow\n"
+                "def run(compute):\n"
+                "    with atomic():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            ["pkg.tx.atomic"],
+            False,
+            False,
+            id="control_directly_patched_allowlisted_name_fails_closed",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "from contextlib import nullcontext\n"
+                "contextlib.nullcontext = bad_cm\n"
+                "def run(compute):\n"
+                "    with nullcontext():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            ["contextlib.nullcontext"],
+            False,
+            False,
+            id="control_targeted_factory_rebind_revokes_allowlisted_name",
+        ),
+        pytest.param(
+            (
+                "from contextlib import nullcontext\n"
+                "exec(code)\n"
+                "def run(compute):\n"
+                "    with nullcontext():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            [],
+            False,
+            False,
+            id="control_unallowlisted_imported_factory_revoked_under_exec",
+        ),
+    ],
+)
+def test_explicit_allowlist_name_remains_trusted_under_exec_eval_and_fails_on_targeted_rebind(
+    module_src: str,
+    allowlist: list[str],
+    expect_pedantic: bool,
+    expect_strict: bool,
+) -> None:
+    """Verifies ast.Name and ast.Attribute explicit allowlist entries stay trusted under untargeted exec/eval while targeted patches fail closed."""
+    unit_line = next(
+        idx
+        for idx, ln in enumerate(module_src.splitlines(), start=1)
+        if ln == "    cb = lambda: v"
+    )
+    tree = ast.parse(module_src)
+    for mode, expected in (("strict", expect_strict), ("pedantic", expect_pedantic)):
+        clear_dataflow_cache()
+        sc = inspect_single_unit_scope(
+            {
+                "start": unit_line,
+                "end": unit_line,
+                "kind": "basic_block",
+                "source_text": module_src,
+                "source_code": "    cb = lambda: v\n",
+                "closure_strictness": mode,
+                "non_suppressing_ctx_managers": allowlist,
+            },
+            tree=tree,
+        )
+        assert bool(sc["is_control_flow_safe"]) is expected, (mode, sc)
+
+
+@pytest.mark.parametrize(
+    ("try_src", "var_name", "expect_live_in_deleted"),
+    [
+        pytest.param(
+            "try:\n    risky()\n    x = 1\nfinally:\n    del x\n",
+            "x",
+            True,
+            id="try_risky_before_assign_finally_del_marks_live_in_deleted",
+        ),
+        pytest.param(
+            "try:\n    risky()\n    x = 1\nexcept ValueError:\n    x = 2\nfinally:\n    del x\n",
+            "x",
+            True,
+            id="try_with_narrow_except_finally_del_marks_live_in_deleted",
+        ),
+        pytest.param(
+            "try:\n    x = 1\nexcept RuntimeError:\n    y = 3\nelse:\n    risky()\n    y = 2\nfinally:\n    del y\n",
+            "y",
+            True,
+            id="try_else_risky_before_assign_finally_del_marks_live_in_deleted",
+        ),
+        pytest.param(
+            "try:\n    if True:\n        return\n    x = 1\nfinally:\n    del x\n",
+            "x",
+            True,
+            id="try_early_return_before_assign_finally_del_marks_live_in_deleted",
+        ),
+        pytest.param(
+            "try:\n    x = 1\n    risky()\nfinally:\n    del x\n",
+            "x",
+            False,
+            id="control_non_raising_prefix_binds_var_before_risky",
+        ),
+        pytest.param(
+            "try:\n    x = 1\n    if True:\n        return\nfinally:\n    del x\n",
+            "x",
+            False,
+            id="control_non_raising_prefix_binds_var_before_early_return",
+        ),
+        pytest.param(
+            "try:\n    risky()\n    x = 1\nfinally:\n    x = 2\n    del x\n",
+            "x",
+            False,
+            id="control_finally_rebinds_var_before_delete",
+        ),
+        pytest.param(
+            "try:\n    x = 1\nfinally:\n    del x\n",
+            "x",
+            False,
+            id="control_non_raising_try_body_binds_var_unconditionally",
+        ),
+    ],
+)
+def test_try_finally_delete_records_live_in_deleted_on_abrupt_exception_entry(
+    try_src: str,
+    var_name: str,
+    expect_live_in_deleted: bool,
+) -> None:
+    """Verifies try/finally deletion records live_in_deleted on abrupt exits before try-body binding."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import _analyze_block_assignment
+
+    live_in_del: set[str] = set()
+    _analyze_block_assignment(ast.parse(try_src).body, live_in_deleted=live_in_del)
+    assert (var_name in live_in_del) is expect_live_in_deleted
+
+    indented = "\n".join(f"    {ln}" for ln in try_src.splitlines())
+    fn_src = f"def outer(risky):\n{indented}\n"
+    fn_lines = fn_src.splitlines()
+    start_line = next(i + 1 for i, ln in enumerate(fn_lines) if ln.strip() == "try:")
+    end_line = len(fn_lines)
+    clear_dataflow_cache()
+    sc = inspect_single_unit_scope(
+        {
+            "start": start_line,
+            "end": end_line,
+            "kind": "compound_block",
+            "source_text": fn_src,
+            "source_code": indented + "\n",
+        },
+        tree=ast.parse(fn_src),
+    )
+    assert (var_name in sc["inputs"]) is expect_live_in_deleted, sc
+    assert (
+        "deleted_output" in sc["control_flow_hazards"]
+    ) is expect_live_in_deleted, sc
+
+
+@pytest.mark.parametrize(
+    ("fn_src", "expect_strict_definite", "expect_pedantic_definite"),
+    [
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def outer(items, risky):\n"
+                "    cm = suppress\n"
+                "    for cm in items:\n"
+                "        pass\n"
+                "    with cm(ValueError):\n"
+                "        x = risky()\n"
+                "    return x\n"
+            ),
+            False,
+            False,
+            id="for_zero_trip_preserves_outer_suppressor",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "async def outer(items, risky):\n"
+                "    cm = suppress\n"
+                "    async for cm in items:\n"
+                "        pass\n"
+                "    with cm(ValueError):\n"
+                "        x = risky()\n"
+                "    return x\n"
+            ),
+            False,
+            False,
+            id="async_for_zero_trip_preserves_outer_suppressor",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def outer(items, risky):\n"
+                "    cm = suppress\n"
+                "    for cm in items:\n"
+                "        pass\n"
+                "    else:\n"
+                "        with cm(ValueError):\n"
+                "            x = risky()\n"
+                "    return x\n"
+            ),
+            False,
+            False,
+            id="for_else_zero_trip_preserves_outer_suppressor",
+        ),
+        pytest.param(
+            (
+                "from contextlib import nullcontext, suppress\n"
+                "def outer(items, risky):\n"
+                "    cm = suppress\n"
+                "    for cm in items:\n"
+                "        cm = nullcontext\n"
+                "    with cm(ValueError):\n"
+                "        x = risky()\n"
+                "    return x\n"
+            ),
+            False,
+            False,
+            id="for_zero_trip_preserves_suppressor_despite_body_rebind_to_nullcontext",
+        ),
+        pytest.param(
+            (
+                "from contextlib import nullcontext\n"
+                "def outer(items, risky):\n"
+                "    cm = nullcontext\n"
+                "    for cm in items:\n"
+                "        pass\n"
+                "    with cm():\n"
+                "        x = risky()\n"
+                "    return x\n"
+            ),
+            True,
+            False,
+            id="for_rebind_clears_nullcontext_proof_in_pedantic",
+        ),
+        pytest.param(
+            (
+                "from contextlib import nullcontext\n"
+                "def outer(items, risky):\n"
+                "    cm = nullcontext\n"
+                "    for other in items:\n"
+                "        pass\n"
+                "    with cm():\n"
+                "        x = risky()\n"
+                "    return x\n"
+            ),
+            True,
+            True,
+            id="control_unrelated_for_target_preserves_nullcontext_proof",
+        ),
+    ],
+)
+def test_for_loop_zero_trip_preserves_outer_suppressor_in_block_assignment(
+    fn_src: str,
+    expect_strict_definite: bool,
+    expect_pedantic_definite: bool,
+) -> None:
+    """Verifies For/AsyncFor keeps post-iter provenance as the zero-trip baseline so outer suppressors are not erased."""
+    lines = fn_src.splitlines()
+    start_ln = next(
+        idx for idx, ln in enumerate(lines, start=1) if ln.strip().startswith("cm = ")
+    )
+    end_ln = next(
+        idx for idx, ln in enumerate(lines, start=1) if ln.strip().startswith("return ")
+    ) - 1
+    body_code = "\n".join(lines[start_ln - 1 : end_ln]) + "\n"
+    tree = ast.parse(fn_src)
+    for mode, expect_def in (
+        ("strict", expect_strict_definite),
+        ("pedantic", expect_pedantic_definite),
+    ):
+        clear_dataflow_cache()
+        sc = inspect_single_unit_scope(
+            {
+                "start": start_ln,
+                "end": end_ln,
+                "kind": "compound_block",
+                "source_text": fn_src,
+                "source_code": body_code,
+                "closure_strictness": mode,
+            },
+            tree=tree,
+        )
+        assert ("x" in sc["definite_stores"]) is expect_def, (mode, sc)
+
+
+@pytest.mark.parametrize(
+    ("fn_src", "expect_strict_safe", "expect_pedantic_safe"),
+    [
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def outer(items, compute):\n"
+                "    cm = suppress\n"
+                "    for cm in items:\n"
+                "        pass\n"
+                "    else:\n"
+                "        with cm(ValueError):\n"
+                "            val = compute()\n"
+                "        cb = lambda: val\n"
+                "    return cb()\n"
+            ),
+            False,
+            False,
+            id="enclosing_for_else_zero_trip_preserves_outer_suppressor",
+        ),
+        pytest.param(
+            (
+                "from contextlib import nullcontext\n"
+                "def outer(items, compute):\n"
+                "    cm = nullcontext\n"
+                "    for cm in items:\n"
+                "        pass\n"
+                "    else:\n"
+                "        with cm():\n"
+                "            val = compute()\n"
+                "        cb = lambda: val\n"
+                "    return cb()\n"
+            ),
+            True,
+            False,
+            id="enclosing_for_else_clears_nullcontext_proof_in_pedantic",
+        ),
+        pytest.param(
+            (
+                "from contextlib import nullcontext\n"
+                "def outer(items, compute):\n"
+                "    cm = nullcontext\n"
+                "    for other in items:\n"
+                "        pass\n"
+                "    else:\n"
+                "        with cm():\n"
+                "            val = compute()\n"
+                "        cb = lambda: val\n"
+                "    return cb()\n"
+            ),
+            True,
+            True,
+            id="control_enclosing_for_else_unrelated_target_keeps_nullcontext_proof",
+        ),
+    ],
+)
+def test_enclosing_for_else_zero_trip_preserves_outer_suppressor_in_cell_traversal(
+    fn_src: str,
+    expect_strict_safe: bool,
+    expect_pedantic_safe: bool,
+) -> None:
+    """Verifies enclosing for/else traversal preserves outer suppressor provenance on the zero-trip path into else."""
+    lines = fn_src.splitlines()
+    unit_line = next(
+        idx for idx, ln in enumerate(lines, start=1) if ln.strip() == "cb = lambda: val"
+    )
+    tree = ast.parse(fn_src)
+    for mode, expect_safe in (
+        ("strict", expect_strict_safe),
+        ("pedantic", expect_pedantic_safe),
+    ):
+        clear_dataflow_cache()
+        sc = inspect_single_unit_scope(
+            {
+                "start": unit_line,
+                "end": unit_line,
+                "kind": "basic_block",
+                "source_text": fn_src,
+                "source_code": lines[unit_line - 1] + "\n",
+                "closure_strictness": mode,
+            },
+            tree=tree,
+        )
+        assert bool(sc["is_control_flow_safe"]) is expect_safe, (mode, sc)
+
+
+@pytest.mark.parametrize(
+    ("mod_src", "expect_has_patch", "expect_patched_name", "expect_rebound"),
+    [
+        pytest.param(
+            (
+                "from sys import modules\n"
+                "def patch(Mgr, swallow):\n"
+                "    modules['builtins'].setattr(Mgr, '__exit__', swallow)\n"
+            ),
+            True,
+            "Mgr",
+            None,
+            id="from_sys_import_modules_builtins_setattr_exit_patch",
+        ),
+        pytest.param(
+            (
+                "from sys import modules as mods\n"
+                "def patch(Mgr, swallow):\n"
+                "    mods.get('builtins').setattr(Mgr, '__exit__', swallow)\n"
+            ),
+            True,
+            "Mgr",
+            None,
+            id="from_sys_import_modules_alias_get_builtins_setattr",
+        ),
+        pytest.param(
+            (
+                "import sys\n"
+                "def patch(Mgr, swallow):\n"
+                "    m = sys.modules\n"
+                "    m['builtins'].setattr(Mgr, '__exit__', swallow)\n"
+            ),
+            True,
+            "Mgr",
+            None,
+            id="local_alias_sys_modules_builtins_setattr_exit_patch",
+        ),
+        pytest.param(
+            (
+                "import sys\n"
+                "def patch(Mgr, swallow):\n"
+                "    m = getattr(sys, 'modules')\n"
+                "    m['builtins'].setattr(Mgr, '__exit__', swallow)\n"
+            ),
+            True,
+            "Mgr",
+            None,
+            id="getattr_sys_modules_alias_builtins_setattr",
+        ),
+        pytest.param(
+            (
+                "import sys\n"
+                "def patch(swallow):\n"
+                "    m = sys.modules\n"
+                "    m2 = m\n"
+                "    m2['contextlib'].nullcontext = swallow\n"
+            ),
+            False,
+            None,
+            ("contextlib", "nullcontext"),
+            id="transitive_alias_sys_modules_stdlib_factory_rebind",
+        ),
+        pytest.param(
+            (
+                "from sys import modules\n"
+                "def patch(swallow):\n"
+                "    modules['contextlib'].nullcontext = swallow\n"
+            ),
+            False,
+            None,
+            ("contextlib", "nullcontext"),
+            id="from_sys_import_modules_stdlib_factory_rebind",
+        ),
+        pytest.param(
+            (
+                "from sys import modules\n"
+                "def benign(Mgr):\n"
+                "    modules['builtins'].setattr(Mgr, 'label', 1)\n"
+            ),
+            False,
+            None,
+            None,
+            id="control_from_sys_import_modules_safe_attr_exempt",
+        ),
+        pytest.param(
+            (
+                "from custom_pkg import modules\n"
+                "def benign(Mgr, fn):\n"
+                "    modules['builtins'].setattr(Mgr, '__exit__', fn)\n"
+            ),
+            False,
+            None,
+            None,
+            id="control_non_sys_modules_import_not_flagged",
+        ),
+    ],
+)
+def test_exit_protocol_scanner_tracks_sys_modules_imports_and_aliases(
+    mod_src: str,
+    expect_has_patch: bool,
+    expect_patched_name: str | None,
+    expect_rebound: tuple[str, str] | None,
+) -> None:
+    """Verifies exit-protocol and stdlib-factory scanning tracks `from sys import modules` and local `sys.modules` aliases."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    clear_dataflow_cache()
+    scan = scan_exit_protocol_patches(ast.parse(mod_src))
+    assert scan.has_patch is expect_has_patch, scan
+    if expect_patched_name is not None:
+        assert expect_patched_name in scan.patched_names, scan
+    if expect_rebound is not None:
+        assert expect_rebound in scan.rebound_attrs, scan
+    elif not expect_has_patch:
+        assert not scan.rebound_attrs, scan
+
+
+@pytest.mark.parametrize(
+    ("depth",),
+    [
+        pytest.param(3, id="shallow_nested_try_finally_in_loop"),
+        pytest.param(22, id="deep_nested_try_finally_in_loop_avoids_exponential_blowup"),
+    ],
+)
+def test_deeply_nested_try_finally_in_loop_with_break_stays_linear(depth: int) -> None:
+    """Verifies deeply nested try/finally blocks with break inside loops do not trigger O(3^N) blowup."""
+    import time
+    from pydoppelgangerhunt.fixer._df_with_provenance import _analyze_block_assignment
+
+    lines = ["for _ in items:"]
+    indent = "    "
+    for level in range(depth):
+        lines.append(f"{indent}try:")
+        lines.append(f"{indent}    if cond:")
+        lines.append(f"{indent}        v_{level} = 1")
+        lines.append(f"{indent}        break")
+        lines.append(f"{indent}finally:")
+        indent += "    "
+    lines.append(f"{indent}if cond:")
+    lines.append(f"{indent}    break")
+    stmts = ast.parse("\n".join(lines) + "\n").body
+
+    t0 = time.perf_counter()
+    definite, conditional = _analyze_block_assignment(stmts)
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 2.0, f"Nested try/finally loop took {elapsed:.2f}s at depth={depth}"
+    assert "v_0" not in definite
+    assert "v_0" in conditional
+    assert f"v_{depth - 1}" in conditional
+
+
+@pytest.mark.parametrize(
+    ("fn_src", "mode_expected_definite"),
+    [
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def outer():\n"
+                "    with suppress(NameError):\n"
+                "        x: (w := 1) = 2\n"
+                "        y = w\n"
+                "    return y\n"
+            ),
+            False,
+            id="annotation_walrus_does_not_mark_var_safe_in_suppress_block",
+        ),
+        pytest.param(
+            (
+                "from contextlib import nullcontext, suppress\n"
+                "def outer(risky):\n"
+                "    cm = suppress\n"
+                "    x: (cm := nullcontext) = 1\n"
+                "    with cm(ValueError):\n"
+                "        y = risky()\n"
+                "    return y\n"
+            ),
+            False,
+            id="annotation_walrus_does_not_promote_suppressor_to_nullcontext",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def outer():\n"
+                "    with suppress(NameError):\n"
+                "        x: None = (w := 1)\n"
+                "        y = w\n"
+                "    return y\n"
+            ),
+            True,
+            id="control_rhs_value_walrus_marks_var_safe_in_suppress_block",
+        ),
+    ],
+)
+def test_annassign_annotation_walrus_neither_grants_non_raising_safe_nor_positive_provenance(
+    fn_src: str,
+    mode_expected_definite: bool,
+) -> None:
+    """Verifies AnnAssign.annotation walruses neither seed cur_safe nor grant positive non-suppression provenance."""
+    lines = fn_src.splitlines()
+    start_ln = next(i for i, ln in enumerate(lines, start=1) if ln.startswith("def outer")) + 1
+    end_ln = next(i for i, ln in enumerate(lines, start=1) if ln.strip().startswith("return ")) - 1
+    body_code = "\n".join(lines[start_ln - 1 : end_ln]) + "\n"
+    tree = ast.parse(fn_src)
+    for mode in ("strict", "pedantic"):
+        clear_dataflow_cache()
+        sc = inspect_single_unit_scope(
+            {
+                "start": start_ln,
+                "end": end_ln,
+                "kind": "compound_block",
+                "source_text": fn_src,
+                "source_code": body_code,
+                "closure_strictness": mode,
+            },
+            tree=tree,
+        )
+        assert ("y" in sc["definite_stores"]) is mode_expected_definite, (mode, sc)
+
+
+@pytest.mark.parametrize(
+    ("module_src", "expect_pedantic_safe"),
+    [
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def build(flag):\n"
+                "    if flag:\n"
+                "        import evil as contextlib\n"
+                "    class Mgr(contextlib.AbstractContextManager):\n"
+                "        def __enter__(self):\n"
+                "            return self\n"
+                "        def __exit__(self, *a):\n"
+                "            return False\n"
+                "    with Mgr():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            id="branch_import_evil_as_contextlib_invalidates_base",
+        ),
+        pytest.param(
+            (
+                "def build(flag):\n"
+                "    if flag:\n"
+                "        from evil import property\n"
+                "    class Mgr:\n"
+                "        @property\n"
+                "        def label(self):\n"
+                "            return 1\n"
+                "        def __enter__(self):\n"
+                "            return self\n"
+                "        def __exit__(self, *a):\n"
+                "            return False\n"
+                "    with Mgr():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            id="branch_import_evil_property_invalidates_decorator",
+        ),
+        pytest.param(
+            (
+                "def build(flag):\n"
+                "    if flag:\n"
+                "        from evil import object\n"
+                "    class Mgr(object):\n"
+                "        def __enter__(self):\n"
+                "            return self\n"
+                "        def __exit__(self, *a):\n"
+                "            return False\n"
+                "    with Mgr():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            id="branch_import_evil_object_invalidates_base",
+        ),
+        pytest.param(
+            (
+                "def build(flag):\n"
+                "    if flag:\n"
+                "        from evil import AbstractContextManager\n"
+                "    else:\n"
+                "        from contextlib import AbstractContextManager\n"
+                "    class Mgr(AbstractContextManager):\n"
+                "        def __enter__(self):\n"
+                "            return self\n"
+                "        def __exit__(self, *a):\n"
+                "            return False\n"
+                "    with Mgr():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            id="branch_divergent_abstract_context_manager_invalidates_base",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def build():\n"
+                "    property = contextlib.nullcontext\n"
+                "    class Mgr:\n"
+                "        @property\n"
+                "        def label(self):\n"
+                "            return 1\n"
+                "        def __enter__(self):\n"
+                "            return self\n"
+                "        def __exit__(self, *a):\n"
+                "            return False\n"
+                "    with Mgr():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            id="positive_non_suppressor_rebind_of_property_invalidates_decorator",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def build():\n"
+                "    object = contextlib.nullcontext\n"
+                "    class Mgr(object):\n"
+                "        def __enter__(self):\n"
+                "            return self\n"
+                "        def __exit__(self, *a):\n"
+                "            return False\n"
+                "    with Mgr():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            id="positive_non_suppressor_rebind_of_object_invalidates_base",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def build():\n"
+                "    contextlib = contextlib.nullcontext\n"
+                "    class Mgr(contextlib.AbstractContextManager):\n"
+                "        def __enter__(self):\n"
+                "            return self\n"
+                "        def __exit__(self, *a):\n"
+                "            return False\n"
+                "    with Mgr():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            id="positive_non_suppressor_rebind_of_contextlib_invalidates_base",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def build(flag):\n"
+                "    if flag:\n"
+                "        other = 1\n"
+                "    class Mgr(contextlib.AbstractContextManager):\n"
+                "        @property\n"
+                "        def label(self):\n"
+                "            return 1\n"
+                "        def __enter__(self):\n"
+                "            return self\n"
+                "        def __exit__(self, *a):\n"
+                "            return False\n"
+                "    with Mgr():\n"
+                "        v = compute()\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            True,
+            id="control_unshadowed_contextlib_base_and_property_stay_proven",
+        ),
+    ],
+)
+def test_branch_divergent_and_positive_binding_shadowing_blocks_cm_proofs(
+    module_src: str,
+    expect_pedantic_safe: bool,
+) -> None:
+    """Verifies branch-divergent imports and positive non-suppressor bindings shadow builtin decorators, bases, and implicit stdlib modules."""
+    clear_dataflow_cache()
+    safety = _late_bound_capture_safety_by_mode(module_src, "    cb = lambda: v")
+    assert safety["pedantic"] is expect_pedantic_safe, safety
+
+
+@pytest.mark.parametrize(
+    ("mutation_stmt", "expect_has_patch", "expect_pedantic_safe"),
+    [
+        pytest.param(
+            "Mgr.__bases__ = (Suppressor,)\n",
+            True,
+            False,
+            id="direct_bases_assignment",
+        ),
+        pytest.param(
+            "setattr(Mgr, '__bases__', (Suppressor,))\n",
+            True,
+            False,
+            id="setattr_bases_mutation",
+        ),
+        pytest.param(
+            "delattr(Mgr, '__bases__')\n",
+            True,
+            False,
+            id="delattr_bases_mutation",
+        ),
+        pytest.param(
+            "vars(Mgr)['__bases__'] = (Suppressor,)\n",
+            True,
+            False,
+            id="vars_dict_bases_mutation",
+        ),
+        pytest.param(
+            "setattr(Mgr, 'label', 1)\n",
+            False,
+            True,
+            id="control_benign_setattr_non_protocol_attr",
+        ),
+    ],
+)
+def test_exit_protocol_bases_mutation_withdraws_non_suppression_proofs(
+    mutation_stmt: str,
+    expect_has_patch: bool,
+    expect_pedantic_safe: bool,
+) -> None:
+    """Verifies runtime __bases__ mutations trigger exit-protocol patch detection and withdraw class non-suppression proofs."""
+    from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
+
+    src = _PROVEN_EXIT_CLASS + mutation_stmt + _WITH_MGR_RUN
+    clear_dataflow_cache()
+    scan = scan_exit_protocol_patches(ast.parse(src))
+    assert scan.has_patch is expect_has_patch
+    safety = _late_bound_capture_safety_by_mode(src, "    cb = lambda: v")
+    assert safety["pedantic"] is expect_pedantic_safe, safety
+
+
+@pytest.mark.parametrize(
+    ("module_src", "expect_strict", "expect_pedantic"),
+    [
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f(d):\n"
+                "    cm, other = suppress, 1\n"
+                "    with cm(KeyError):\n"
+                "        v = d['k']\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            False,
+            id="tuple_unpack_direct_suppress",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f(d):\n"
+                "    [cm, other] = [suppress, 1]\n"
+                "    with cm(KeyError):\n"
+                "        v = d['k']\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            False,
+            id="list_unpack_direct_suppress",
+        ),
+        pytest.param(
+            (
+                "import contextlib\n"
+                "def f(d):\n"
+                "    (a, (cm, b)) = (1, (contextlib.suppress, 2))\n"
+                "    with cm(KeyError):\n"
+                "        v = d['k']\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            False,
+            id="nested_tuple_unpack_suppress",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f(d):\n"
+                "    cm1, x = cm2, y = suppress, 1\n"
+                "    with cm2(KeyError):\n"
+                "        v = d['k']\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            False,
+            id="chained_tuple_unpack_suppress",
+        ),
+        pytest.param(
+            (
+                "from contextlib import nullcontext, suppress\n"
+                "def f(d):\n"
+                "    a, b = suppress, nullcontext\n"
+                "    a, b = b, a\n"
+                "    with b(KeyError):\n"
+                "        v = d['k']\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            False,
+            id="simultaneous_swap_tracks_swapped_suppressor",
+        ),
+        pytest.param(
+            (
+                "from contextlib import nullcontext, suppress\n"
+                "def f(d):\n"
+                "    a, b = suppress, nullcontext\n"
+                "    a, b = b, a\n"
+                "    with a():\n"
+                "        v = d['k']\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            True,
+            True,
+            id="control_simultaneous_swap_preserves_swapped_nullcontext",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f(d):\n"
+                "    cm, *rest = [suppress, 1, 2]\n"
+                "    with cm(KeyError):\n"
+                "        v = d['k']\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            False,
+            id="starred_target_prefix_suppress",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f(d):\n"
+                "    *head, cm = [1, 2, suppress]\n"
+                "    with cm(KeyError):\n"
+                "        v = d['k']\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            False,
+            id="starred_target_suffix_suppress",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f(d):\n"
+                "    head, *rest = [1, suppress]\n"
+                "    cm, = rest\n"
+                "    with cm(KeyError):\n"
+                "        v = d['k']\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            False,
+            id="starred_target_middle_propagates_suspicious_alias",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f(d):\n"
+                "    cm, other = [suppress] * 2\n"
+                "    with cm(KeyError):\n"
+                "        v = d['k']\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            False,
+            id="fallback_repeated_list_carrying_suppress",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f(d):\n"
+                "    cm, other = (*[suppress], 1)\n"
+                "    with cm(KeyError):\n"
+                "        v = d['k']\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            False,
+            id="fallback_starred_rhs_carrying_suppress",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f(d):\n"
+                "    cm, other = [suppress for _ in range(2)]\n"
+                "    with cm(KeyError):\n"
+                "        v = d['k']\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            False,
+            id="fallback_listcomp_carrying_suppress",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f(d, make_pair):\n"
+                "    cm, other = make_pair(suppress)\n"
+                "    with cm(KeyError):\n"
+                "        v = d['k']\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            False,
+            False,
+            id="fallback_call_arg_carrying_suppress",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f(d):\n"
+                "    for cm, other in [(suppress, 1)]:\n"
+                "        with cm(KeyError):\n"
+                "            v = d['k']\n"
+                "        cb = lambda: v\n"
+                "        return cb()\n"
+            ),
+            False,
+            False,
+            id="for_loop_tuple_unpack_carrying_suppress",
+        ),
+        pytest.param(
+            (
+                "from contextlib import nullcontext\n"
+                "def f(d):\n"
+                "    cm, other = nullcontext, 1\n"
+                "    with cm():\n"
+                "        v = d['k']\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            True,
+            True,
+            id="control_tuple_unpack_preserves_nullcontext_proof",
+        ),
+        pytest.param(
+            (
+                "def f(d, make_pair):\n"
+                "    cm, other = make_pair(suppress_errors=False)\n"
+                "    with cm():\n"
+                "        v = d['k']\n"
+                "    cb = lambda: v\n"
+                "    return cb()\n"
+            ),
+            True,
+            False,
+            id="control_benign_kwarg_named_suppress_does_not_taint_strict_unpack",
+        ),
+    ],
+)
+def test_tuple_and_list_unpacking_preserves_suppressor_and_non_suppressor_provenance(
+    module_src: str,
+    expect_strict: bool,
+    expect_pedantic: bool,
+) -> None:
+    """Verifies tuple/list, nested, starred, and loop unpacking preserve suppressor and non-suppressor provenance."""
+    target_line = next(
+        ln for ln in module_src.splitlines() if ln.strip() == "cb = lambda: v"
+    )
+    clear_dataflow_cache()
+    safety = _late_bound_capture_safety_by_mode(module_src, target_line)
+    assert safety["strict"] is expect_strict, safety
+    assert safety["pedantic"] is expect_pedantic, safety
+
+
+@pytest.mark.parametrize(
+    ("module_src", "target_fn_name", "expect_terminates"),
+    [
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f(cond):\n"
+                "    if cond:\n"
+                "        ValueError = TypeError\n"
+                "    with suppress(UnboundLocalError):\n"
+                "        with suppress(ValueError):\n"
+                "            return 1\n"
+            ),
+            "f",
+            False,
+            id="conditionally_bound_exception_name_can_raise_unbound_local",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f():\n"
+                "    ValueError = TypeError\n"
+                "    del ValueError\n"
+                "    with suppress(UnboundLocalError):\n"
+                "        with suppress(ValueError):\n"
+                "            return 1\n"
+            ),
+            "f",
+            False,
+            id="deleted_local_exception_name_can_raise_unbound_local",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f():\n"
+                "    with suppress(UnboundLocalError):\n"
+                "        with suppress(ValueError):\n"
+                "            return 1\n"
+                "    ValueError = TypeError\n"
+            ),
+            "f",
+            False,
+            id="forward_local_binding_of_exception_name_can_raise_unbound_local",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f():\n"
+                "    ValueError = TypeError\n"
+                "    with suppress(UnboundLocalError):\n"
+                "        del ValueError\n"
+                "        with suppress(ValueError):\n"
+                "            return 1\n"
+            ),
+            "f",
+            False,
+            id="del_inside_outer_suppress_invalidates_nested_exception_name",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def outer(cond):\n"
+                "    if cond:\n"
+                "        ValueError = TypeError\n"
+                "    def inner():\n"
+                "        with suppress(NameError):\n"
+                "            with suppress(ValueError):\n"
+                "                return 1\n"
+            ),
+            "inner",
+            False,
+            id="conditionally_bound_enclosing_freevar_exception_name_can_raise",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "from other_mod import *\n"
+                "def f():\n"
+                "    with suppress(NameError):\n"
+                "        with suppress(ValueError):\n"
+                "            return 1\n"
+            ),
+            "f",
+            False,
+            id="star_import_prevents_unshadowed_builtin_exception_assumption",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f():\n"
+                "    with suppress(TypeError):\n"
+                "        with suppress(ValueError):\n"
+                "            return 1\n"
+            ),
+            "f",
+            True,
+            id="control_unshadowed_exception_name_proves_termination",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f():\n"
+                "    ValueError = TypeError\n"
+                "    with suppress(UnboundLocalError):\n"
+                "        with suppress(ValueError):\n"
+                "            return 1\n"
+            ),
+            "f",
+            True,
+            id="control_definitely_bound_shadowed_exception_name_proves_termination",
+        ),
+    ],
+)
+def test_nested_suppress_non_raising_proof_respects_shadowed_and_unbound_exception_names(
+    module_src: str,
+    target_fn_name: str,
+    expect_terminates: bool,
+) -> None:
+    """Verifies _stmt_cannot_raise_in_suppress does not assume shadowed, deleted, or unbound exception names cannot raise."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _analyze_block_assignment_impl,
+        _seed_scope_suppress_aliases,
+    )
+
+    mod = ast.parse(module_src)
+    fn_node = next(
+        n
+        for n in ast.walk(mod)
+        if isinstance(n, ast.FunctionDef) and n.name == target_fn_name
+    )
+    clear_dataflow_cache()
+    prov = _seed_scope_suppress_aliases(fn_node, mod_tree=mod)
+    param_names = {a.arg for a in fn_node.args.args}
+    _, _, term, _ = _analyze_block_assignment_impl(
+        fn_node.body,
+        definite=set(param_names),
+        suppress_aliases=prov,
+    )
+    assert term is expect_terminates
+
+
+@pytest.mark.parametrize(
+    ("module_src", "expect_terminates", "expect_x_definite"),
+    [
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f(cond):\n"
+                "    if cond:\n"
+                "        cm = suppress\n"
+                "    with suppress(UnboundLocalError):\n"
+                "        x = cm\n"
+                "        return 1\n"
+            ),
+            False,
+            False,
+            id="conditional_suppress_alias_not_assumed_safe_inside_suppress",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f(cond):\n"
+                "    if cond:\n"
+                "        from contextlib import suppress as cm\n"
+                "    with suppress(UnboundLocalError):\n"
+                "        x = cm\n"
+                "        return 1\n"
+            ),
+            False,
+            False,
+            id="conditional_suppress_import_not_assumed_safe_inside_suppress",
+        ),
+        pytest.param(
+            (
+                "from contextlib import suppress\n"
+                "def f():\n"
+                "    cm = suppress\n"
+                "    with suppress(UnboundLocalError):\n"
+                "        x = cm\n"
+                "        return 1\n"
+            ),
+            True,
+            True,
+            id="control_unconditional_suppress_alias_remains_safe_inside_suppress",
+        ),
+    ],
+)
+def test_conditional_suppressor_alias_is_not_assumed_bound_inside_suppress_body(
+    module_src: str,
+    expect_terminates: bool,
+    expect_x_definite: bool,
+) -> None:
+    """Verifies may-bound entries in suppressors are not unioned into cur_safe when proving non-raising prefixes."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _analyze_block_assignment_impl,
+        _seed_scope_suppress_aliases,
+    )
+
+    mod = ast.parse(module_src)
+    fn_node = next(
+        n for n in mod.body if isinstance(n, ast.FunctionDef) and n.name == "f"
+    )
+    clear_dataflow_cache()
+    prov = _seed_scope_suppress_aliases(fn_node, mod_tree=mod)
+    param_names = {a.arg for a in fn_node.args.args}
+    definite, _, term, _ = _analyze_block_assignment_impl(
+        fn_node.body,
+        definite=set(param_names),
+        suppress_aliases=prov,
+    )
+    assert term is expect_terminates
+    assert ("x" in definite) is expect_x_definite
+
+
+
+

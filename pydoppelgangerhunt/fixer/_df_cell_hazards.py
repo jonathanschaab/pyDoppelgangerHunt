@@ -119,7 +119,11 @@ from typing import (
     Union,
 )
 
-from pydoppelgangerhunt.fixer._ast_compat import is_match_node
+from pydoppelgangerhunt.fixer._ast_compat import (
+    is_match_case_node,
+    is_match_class_node,
+    is_match_node,
+)
 from pydoppelgangerhunt.fixer._df_cache import (
     _ephemeral_unit_ast_context,
     _mark_ephemeral_unit_ast,
@@ -148,6 +152,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
 )
 from pydoppelgangerhunt.fixer._df_span_index import (
     _extract_direct_nonlocals,
+    _extract_type_alias_or_pattern_name,
     _find_enclosing_function_chain,
     _get_span_line_index,
     _has_invalid_lexical_scope_declarations,
@@ -329,10 +334,11 @@ def _collect_unshadowed_chain_closure_info(
             unshadowed_fn_locals & (set(info.post_reads) - inner_shadowed)
         )
         for s_name, s_reads, s_muts in info.sibling_closures:
-            if s_name is not None and s_name in inner_shadowed:
-                continue
+            eff_s_name = (
+                None if (s_name is not None and s_name in inner_shadowed) else s_name
+            )
             unshadowed_sibs.append(
-                (s_name, s_reads - inner_shadowed, s_muts - inner_shadowed)
+                (eff_s_name, s_reads - inner_shadowed, s_muts - inner_shadowed)
             )
         for t_name, src_names in info.alias_edges:
             if t_name in inner_shadowed:
@@ -782,6 +788,106 @@ def _collect_unit_closure_hazard_facts(
     return facts
 
 
+def _collect_returned_expr_containers(ret_node: ast.Return) -> Set[int]:
+    """Returns ids of ret_node.value and any non-starred literal containers wrapping it."""
+    allowed_ids: Set[int] = set()
+    if ret_node.value is None:
+        return allowed_ids
+    stack: List[ast.AST] = [ret_node.value]
+    while stack:
+        curr = stack.pop()
+        allowed_ids.add(id(curr))
+        if isinstance(curr, (ast.Tuple, ast.List, ast.Set)):
+            stack.extend(elt for elt in curr.elts if not isinstance(elt, ast.Starred))
+        elif isinstance(curr, ast.Dict):
+            for key, val in zip(curr.keys, curr.values):
+                if key is not None:
+                    stack.append(key)
+                    stack.append(val)
+    return allowed_ids
+
+
+def _add_deferred_genexp_subnodes(
+    gen: ast.GeneratorExp,
+    deferred_ids: Set[int],
+) -> None:
+    """Marks GeneratorExp body and deferred clauses while keeping generators[0].iter eager."""
+    deferred_roots: List[ast.AST] = [gen.elt]
+    if gen.generators:
+        first_comp = gen.generators[0]
+        deferred_roots.append(first_comp.target)
+        deferred_roots.extend(first_comp.ifs)
+        deferred_roots.extend(gen.generators[1:])
+    for root in deferred_roots:
+        for sub in ast.walk(root):
+            deferred_ids.add(id(sub))
+
+
+def _collect_unconsumed_genexp_deferred_node_ids(
+    candidate_stmts: Sequence[ast.stmt],
+) -> Set[int]:
+    """Collects node ids inside GeneratorExps provably unconsumed in candidate_stmts."""
+    parent_map: Dict[int, ast.AST] = {}
+    returned_slot_ids: Set[int] = set()
+    genexps: List[ast.GeneratorExp] = []
+    stack: List[ast.AST] = list(reversed(candidate_stmts))
+    while stack:
+        curr = stack.pop()
+        if isinstance(
+            curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+        ):
+            continue
+        if isinstance(curr, ast.Return):
+            returned_slot_ids.update(_collect_returned_expr_containers(curr))
+        elif isinstance(curr, ast.GeneratorExp):
+            genexps.append(curr)
+        children = list(ast.iter_child_nodes(curr))
+        for child in children:
+            parent_map[id(child)] = curr
+        stack.extend(reversed(children))
+    if not genexps:
+        return set()
+    name_nodes: Dict[str, List[ast.Name]] = {}
+    blocked_names: Set[str] = set()
+    for stmt in candidate_stmts:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Name):
+                name_nodes.setdefault(node.id, []).append(node)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                blocked_names.update(node.names)
+            else:
+                blocked_names.update(_extract_non_assign_bound_names(node))
+    deferred_ids: Set[int] = set()
+    for gen in genexps:
+        if id(gen) in returned_slot_ids:
+            _add_deferred_genexp_subnodes(gen, deferred_ids)
+            continue
+        parent = parent_map.get(id(gen))
+        target: Optional[ast.AST] = None
+        if (
+            isinstance(parent, ast.Assign)
+            and len(parent.targets) == 1
+            and parent.value is gen
+        ):
+            target = parent.targets[0]
+        elif (
+            isinstance(parent, ast.AnnAssign)
+            and parent.simple
+            and parent.value is gen
+        ):
+            target = parent.target
+        if not isinstance(target, ast.Name) or target.id in blocked_names:
+            continue
+        occ = name_nodes.get(target.id, ())
+        if len(occ) >= 2 and all(
+            id(n) == id(target)
+            or (isinstance(n.ctx, ast.Load) and id(n) in returned_slot_ids)
+            for n in occ
+        ):
+            _add_deferred_genexp_subnodes(gen, deferred_ids)
+    return deferred_ids
+
+
 def _has_unseeded_conditional_store_hazard(
     ctx: _UnitClosureHazardContext,
     mut: _UnitMutationSets,
@@ -958,6 +1064,8 @@ _IMMEDIATE_GLOBAL_HAZARD_NODES = (
     ast.YieldFrom,
     ast.AsyncFor,
     ast.Delete,
+    ast.Import,
+    ast.ImportFrom,
 )
 
 
@@ -971,7 +1079,7 @@ def _extract_immediate_bool_test_exprs(node: ast.AST) -> Tuple[ast.AST, ...]:
         return tuple(node.values)
     if isinstance(node, ast.comprehension):
         return tuple(node.ifs)
-    if type(node).__name__ == "match_case":
+    if is_match_case_node(node):
         guard = getattr(node, "guard", None)
         if isinstance(guard, ast.AST):
             return (guard,)
@@ -1253,17 +1361,40 @@ def _is_proven_primitive_bool_expr(
     return _is_proven_primitive_dunder_expr(expr, env, _depth=_depth + 1)
 
 
+def _is_safe_pedantic_except_type(
+    exc_type: ast.AST,
+    env: _PedanticPrimitiveEnv,
+    *,
+    _depth: int = 0,
+) -> bool:
+    """Returns True when an ExceptHandler.type only references unshadowed builtin exception types."""
+    if env.all_builtins_shadowed or _depth > _MAX_AST_RECURSION_DEPTH:
+        return False
+    if isinstance(exc_type, ast.Name):
+        return (
+            exc_type.id in _SAFE_EXCEPTION_TYPE_NAMES
+            and exc_type.id not in env.effective_shadowed
+        )
+    if isinstance(exc_type, ast.Tuple):
+        return all(
+            not isinstance(elt, ast.Starred)
+            and _is_safe_pedantic_except_type(elt, env, _depth=_depth + 1)
+            for elt in exc_type.elts
+        )
+    return False
+
+
 def _node_invokes_pedantic_dunder_protocol(
     node: ast.AST,
     env: _PedanticPrimitiveEnv,
 ) -> bool:
-    """Returns True when an immediate AST node may invoke user-defined dunder or import hooks in pedantic mode."""
+    """Returns True when an immediate AST node may invoke user-defined dunder hooks in pedantic mode."""
     if any(
         not _is_proven_primitive_bool_expr(b_expr, env)
         for b_expr in _extract_immediate_bool_test_exprs(node)
     ):
         return True
-    if isinstance(node, (ast.Attribute, ast.Import, ast.ImportFrom)):
+    if isinstance(node, ast.Attribute):
         return True
     if isinstance(node, ast.BinOp):
         return not _is_proven_primitive_dunder_expr(node, env)
@@ -1315,7 +1446,7 @@ def _node_invokes_pedantic_dunder_protocol(
             isinstance(subject, ast.AST)
             and _is_proven_primitive_dunder_expr(subject, env)
             and not any(
-                type(sub).__name__ == "MatchClass"
+                is_match_class_node(sub)
                 for case in getattr(node, "cases", ())
                 for sub in ast.walk(getattr(case, "pattern", node))
             )
@@ -1328,6 +1459,8 @@ def _node_invokes_pedantic_dunder_protocol(
             and node.exc.id not in env.effective_shadowed
             and node.cause is None
         )
+    if isinstance(node, ast.ExceptHandler) and node.type is not None:
+        return not _is_safe_pedantic_except_type(node.type, env)
     return False
 
 
@@ -1356,13 +1489,9 @@ def _extract_non_assign_bound_names(node: ast.AST) -> Set[str]:
         }
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         return {node.name}
-    cls_name = type(node).__name__
-    if cls_name in ("MatchAs", "MatchStar"):
-        m_name = getattr(node, "name", None)
-        return {m_name} if isinstance(m_name, str) else set()
-    if cls_name == "MatchMapping":
-        r_name = getattr(node, "rest", None)
-        return {r_name} if isinstance(r_name, str) else set()
+    pattern_or_alias_name = _extract_type_alias_or_pattern_name(node)
+    if pattern_or_alias_name is not None:
+        return {pattern_or_alias_name}
     return set()
 
 
@@ -1714,7 +1843,8 @@ def _unit_has_global_mutating_call(
     call entry. Any impure or user-defined call, setter/augmented-assignment
     protocol hook (``__setattr__``, ``__setitem__``, ``__iadd__``, etc.),
     class-body descriptor hook (``__set_name__`` invoked by ``type.__new__``),
-    context-manager protocol hook (``with`` / ``async with``), coroutine/generator
+    context-manager protocol hook (``with`` / ``async with``), import statement
+    (``import`` / ``from ... import``), coroutine/generator
     suspension point (``await``, ``yield``, ``yield from``, ``async for``, or async
     comprehensions), or deletion (``del``) executed during the unit could mutate the
     module-level global mid-execution, causing subsequent reads inside the helper to
@@ -1742,7 +1872,7 @@ def _unit_has_global_mutating_call(
     comprehension iteration (``__iter__``/``__next__``), sequence/iterable/mapping
     unpacking, f-string formatting (``__format__``/``__str__``/``__repr__``),
     ``set``/``dict`` hashing (``__hash__``), ``match`` class/dunder patterns,
-    ``import`` statements, non-builtin ``raise`` instantiation, and implicit boolean
+    non-builtin ``raise``/``except`` handlers, and implicit boolean
     truthiness (``__bool__``/``__len__``) — are rejected unless their operands are
     statically proven built-in primitives or literal containers.
     """
@@ -1759,6 +1889,7 @@ def _unit_has_global_mutating_call(
         shadowed_names
     ) | _extract_single_node_local_names(unit_stmt_mod, include_globals=True)
     immediate_nodes = tuple(_iter_immediate_unit_exec_nodes(candidate_stmts))
+    deferred_genexp_ids = _collect_unconsumed_genexp_deferred_node_ids(candidate_stmts)
     local_accumulators: Set[str] = (
         _collect_local_primitive_accumulators(candidate_stmts, immediate_nodes)
         if allow_heuristic_builtins
@@ -1799,6 +1930,8 @@ def _unit_has_global_mutating_call(
         all_builtins_shadowed=all_builtins_shadowed,
     )
     for node in immediate_nodes:
+        if id(node) in deferred_genexp_ids:
+            continue
         if isinstance(node, _IMMEDIATE_GLOBAL_HAZARD_NODES):
             return True
         if isinstance(node, ast.comprehension) and bool(node.is_async):
