@@ -17,7 +17,7 @@ import unicodedata
 
 
 def parse_notebook_cell_anchor(
-    path_str: Optional[Union[str, Path, CanonicalPath]],
+    path_str: Optional[Union[str, os.PathLike[str], CanonicalPath]],
 ) -> Optional[Tuple[str, int]]:
     """Extracts base path and 0-based cell index from an anchored notebook path.
 
@@ -26,14 +26,24 @@ def parse_notebook_cell_anchor(
     Literal filenames with hash fragments (e.g. `report.ipynb#cellular`) return None.
 
     Args:
-        path_str: Path string, Path object, or CanonicalPath that may contain a notebook cell fragment.
+        path_str: Path string, PathLike[str], or CanonicalPath that may contain a notebook cell fragment.
 
     Returns:
         (base_path, 0-based cell_index) if path has a valid notebook cell anchor, else None.
     """
     if path_str is None:
         return None
-    raw = str(getattr(path_str, "raw", path_str) or "").rstrip("\r\n")
+    raw_val: object = getattr(path_str, "raw", path_str)
+    if isinstance(raw_val, os.PathLike):
+        try:
+            fsp = os.fspath(raw_val)
+        except TypeError:
+            return None
+        if not isinstance(fsp, str):
+            return None
+        raw = fsp.rstrip("\r\n")
+    else:
+        raw = str(raw_val or "").rstrip("\r\n")
     if "#" not in raw:
         return None
     last_seg = raw.replace("\\", "/").rsplit("/", 1)[-1]
@@ -56,11 +66,13 @@ def parse_notebook_cell_anchor(
     return None
 
 
-def normalize_lexical_posix(path_str: Optional[str], strip_anchor: bool = False) -> str:
+def normalize_lexical_posix(
+    path_str: Optional[Union[str, os.PathLike[str]]], strip_anchor: bool = False
+) -> str:
     """Normalizes a path string to forward slashes with drive and anchor handling.
 
     Args:
-        path_str: Raw path string or stringifiable object.
+        path_str: Raw path string, str-backed os.PathLike, or stringifiable object.
         strip_anchor: When True, strips trailing `#anchor` (e.g. notebook cell fragments).
             When False, preserves `#` characters in filesystem directory/file names.
 
@@ -69,7 +81,16 @@ def normalize_lexical_posix(path_str: Optional[str], strip_anchor: bool = False)
     """
     if path_str is None:
         return ""
-    raw = str(path_str).rstrip("\r\n")
+    if isinstance(path_str, os.PathLike):
+        try:
+            fsp = os.fspath(path_str)
+        except TypeError:
+            return ""
+        if not isinstance(fsp, str):
+            return ""
+        raw = fsp.rstrip("\r\n")
+    else:
+        raw = str(path_str).rstrip("\r\n")
     if not raw or not raw.strip():
         return ""
 

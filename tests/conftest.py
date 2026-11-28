@@ -11,7 +11,9 @@ from pydoppelgangerhunt.fixer import clear_dataflow_cache
 
 @pytest.fixture(autouse=True)
 def auto_reset_downstream_reads_cache() -> Generator[None, None, None]:
-    """Resets the dataflow cache before and after each test."""
+    """Resets the immutable dataflow caches around each test."""
     clear_dataflow_cache()
-    yield
-    clear_dataflow_cache()
+    try:
+        yield
+    finally:
+        clear_dataflow_cache()

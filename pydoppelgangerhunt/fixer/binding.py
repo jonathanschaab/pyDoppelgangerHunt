@@ -10,15 +10,15 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.config import normalize_path_string, paths_match_boundary
 from pydoppelgangerhunt.fixer._df_cache import (
-    _extract_first_unit_coord,
     _extract_unit_end_col,
+    _extract_unit_start_col,
     _get_or_parse_tree,
 )
+from pydoppelgangerhunt.fixer._df_closures import _get_tree_scope_intervals
 from pydoppelgangerhunt.fixer._df_visitors import _is_ast_node_within_unit_bounds
 from pydoppelgangerhunt.fixer.scope import analyze_unit_variable_scope
 from pydoppelgangerhunt.fixer.source import (
     _find_innermost_enclosing_node,
-    _get_tree_scope_intervals,
     _load_unit_file_text,
     is_subroutine_unit,
     parse_unit_coord,
@@ -160,6 +160,18 @@ def find_enclosing_function(
     return meta
 
 
+def _resolve_binding_candidate_path(p: Path, root: Path) -> Path:
+    """Resolves relative paths against repo root before falling back to CWD."""
+    if p.is_absolute():
+        return p
+    rooted = root / p
+    if rooted.is_file() or rooted.is_symlink():
+        return rooted
+    if p.is_file() or p.is_symlink():
+        return p
+    return rooted
+
+
 def _normalize_file_path(
     f_str: str,
     repo_root: Optional[str] = None,
@@ -170,8 +182,7 @@ def _normalize_file_path(
         return ""
     root = Path(repo_root or os.getcwd())
     try:
-        p = Path(norm)
-        p_full = p if p.is_file() or p.is_absolute() else (root / p)
+        p_full = _resolve_binding_candidate_path(Path(norm), root)
         return str(p_full.resolve()).replace("\\", "/")
     except OSError:
         return norm
@@ -189,10 +200,8 @@ def _is_same_file_path(
     norm2 = normalize_path_string(f2_str)
     root = Path(repo_root or os.getcwd())
     try:
-        p1 = Path(norm1)
-        p2 = Path(norm2)
-        p1_full = p1 if p1.is_file() or p1.is_absolute() else (root / p1)
-        p2_full = p2 if p2.is_file() or p2.is_absolute() else (root / p2)
+        p1_full = _resolve_binding_candidate_path(Path(norm1), root)
+        p2_full = _resolve_binding_candidate_path(Path(norm2), root)
         if p1_full.is_symlink() or p2_full.is_symlink():
             return False
         if p1_full.is_file() and p2_full.is_file():
@@ -447,9 +456,7 @@ def _populate_unit_receiver_metadata(
                 if parsed_tree is not None:
                     u_start = parse_unit_coord(unit, "start", default=1)
                     u_end = parse_unit_coord(unit, "end", default=u_start)
-                    u_start_col = _extract_first_unit_coord(
-                        unit, ("start_col", "start_col_offset")
-                    )
+                    u_start_col = _extract_unit_start_col(unit)
                     u_end_col = _extract_unit_end_col(unit)
                     has_yield, has_await = _unit_ast_has_async_or_yield(
                         parsed_tree,

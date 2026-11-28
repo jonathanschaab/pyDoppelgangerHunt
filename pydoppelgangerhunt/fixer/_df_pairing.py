@@ -7,12 +7,14 @@ validating against downstream requirements and enforcing definite assignment saf
 from __future__ import annotations
 
 import ast
+import enum
 import logging
 from typing import (
     Any,
     Dict,
     List,
     Literal,
+    Mapping,
     NamedTuple,
     Optional,
     Sequence,
@@ -23,12 +25,12 @@ from typing import (
 )
 
 from pydoppelgangerhunt.fixer._df_cache import (
-    _extract_first_unit_coord,
     _extract_unit_end_col,
+    _extract_unit_start_col,
     _get_or_parse_tree,
     _get_valid_unit_bounds,
-    _resolve_unit_ast_end_col,
 )
+from pydoppelgangerhunt.fixer._df_span_index import _resolve_unit_ast_end_col
 from pydoppelgangerhunt.fixer._df_closures import (
     _classify_closure_position,
     _collect_scope_closures,
@@ -39,12 +41,18 @@ from pydoppelgangerhunt.fixer._df_hazards import (
     _resolve_downstream_scope_node,
     collect_downstream_read_names,
 )
-from pydoppelgangerhunt.config import resolve_closure_strictness_mode
+from pydoppelgangerhunt.config import resolve_pair_closure_policy
+from pydoppelgangerhunt.fixer.scope import ensure_unit_scope_closure_mode
 from pydoppelgangerhunt.fixer.source import (
     _load_unit_file_text,
     is_subroutine_unit,
     resolve_unit_declared_outputs,
 )
+from pydoppelgangerhunt.source_lines import (
+    resolve_in_memory_notebook_unit,
+    resolve_safe_unit_file_path,
+)
+from pydoppelgangerhunt.unit_boundary import unit_has_inline_source_buffers
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +97,98 @@ def _has_unordered_multiset_outputs(unit: Dict[str, Any]) -> bool:
     return False
 
 
+def _has_deleted_output_hazard(
+    scope1: Dict[str, Any],
+    scope2: Dict[str, Any],
+    outs1: Sequence[str],
+    outs2: Sequence[str],
+) -> bool:
+    """Returns True if either unit scope has a deleted_output hazard or deletes an effective output."""
+    return (
+        "deleted_output" in scope1.get("control_flow_hazards", ())
+        or "deleted_output" in scope2.get("control_flow_hazards", ())
+        or bool(set(outs1) & set(scope1.get("deleted_names", [])))
+        or bool(set(outs2) & set(scope2.get("deleted_names", [])))
+    )
+
+
+class PairSkipReason(str, enum.Enum):
+    """Canonical machine-readable reasons clone pair output resolution or safety validation fails."""
+
+    UNAVAILABLE_SOURCE_FOR_CLOSURE_MODE = "unavailable source for closure mode"
+    UNAVAILABLE_SOURCE_PLACEHOLDER = "unavailable source placeholder"
+    INVALID_UNIT_COLUMNS = "invalid unit columns"
+    SEVERED_CLOSURE_CELL = "severed closure cell"
+    STALE_SOURCE_CODE = "stale source code"
+    PATHOLOGICAL_AST = "pathological ast"
+    ENCLOSING_TRY_OR_WITH_CLEANUP_HAZARD = "enclosing try or with cleanup hazard"
+    DELETED_OUTPUT_HAZARD = "deleted output hazard"
+    ASYNC_GENERATOR_DELEGATION_HAZARD = "async generator delegation hazard"
+    INVALID_UNIT_BOUNDS = "invalid unit bounds"
+    GENERATOR_OUTPUT_CONFLICT = "generator output conflict"
+    GENERATOR_CLOSURE_CONFLICT = "generator closure conflict"
+    MISMATCHED_SUBROUTINE_KINDS = "mismatched subroutine kinds"
+    UNPAIRED_OUTPUTS = "unpaired outputs"
+    AMBIGUOUS_OUTPUTS = "ambiguous outputs"
+    OUTPUT_ARITY_MISMATCH = "output arity mismatch"
+    PERMUTED_OUTPUTS = "permuted outputs"
+
+    def __str__(self) -> str:
+        """Returns the underlying string value across Python 3.9+ Enum formatting rules."""
+        return self.value
+
+
+ENCLOSING_TRY_OR_WITH_CLEANUP_HAZARD_REASON = PairSkipReason.ENCLOSING_TRY_OR_WITH_CLEANUP_HAZARD
+DELETED_OUTPUT_HAZARD_REASON = PairSkipReason.DELETED_OUTPUT_HAZARD
+INVALID_UNIT_BOUNDS_REASON = PairSkipReason.INVALID_UNIT_BOUNDS
+GENERATOR_OUTPUT_CONFLICT_REASON = PairSkipReason.GENERATOR_OUTPUT_CONFLICT
+GENERATOR_CLOSURE_CONFLICT_REASON = PairSkipReason.GENERATOR_CLOSURE_CONFLICT
+ASYNC_GENERATOR_DELEGATION_HAZARD_REASON = PairSkipReason.ASYNC_GENERATOR_DELEGATION_HAZARD
+
+
+def _unit_has_backing_source_or_invalid_nb(
+    unit: Mapping[str, Any],
+    *,
+    repo_root: Optional[str] = None,
+) -> bool:
+    """Returns True when unit carries inline source, a malformed notebook anchor, or a readable disk file."""
+    if resolve_in_memory_notebook_unit(unit).is_invalid:
+        return True
+    if unit_has_inline_source_buffers(unit, ignore_empty_source_lines=True):
+        return True
+    unit_dict = unit if isinstance(unit, dict) else dict(unit)
+    if _load_unit_file_text(unit_dict, repo_root=repo_root) is not None:
+        return True
+    resolved_path = resolve_safe_unit_file_path(unit_dict, repo_root=repo_root)
+    if resolved_path is not None and resolved_path.suffix.lower() == ".ipynb":
+        return True
+    return False
+
+
+def allows_u2_source_placeholder(
+    *,
+    is_subroutine: bool,
+    requires_u2_edit: bool,
+    source_text2: Optional[str],
+    u2: Optional[Mapping[str, Any]] = None,
+    repo_root: Optional[str] = None,
+) -> bool:
+    """Returns True when missing u2 caller source placeholder is allowed for u1 host preview generation.
+
+    Preview-only non-subroutine extraction (``not is_subroutine``, ``not requires_u2_edit``,
+    and ``source_text2 is None``) permits building the host helper from ``u1`` while emitting
+    a manual-import note only when ``u2`` genuinely lacks backing source (no inline buffers,
+    no malformed notebook anchor, and no readable file on disk).
+    """
+    if is_subroutine or requires_u2_edit or source_text2 is not None:
+        return False
+    if u2 is not None and _unit_has_backing_source_or_invalid_nb(
+        u2, repo_root=repo_root
+    ):
+        return False
+    return True
+
+
 def _validate_try_cleanup_hazard(
     unit: Dict[str, Any],
     needed_outs: Sequence[str],
@@ -101,7 +201,7 @@ def _validate_try_cleanup_hazard(
     """Validates that needed outputs are not read in enclosing try/except/finally/with blocks."""
     if not needed_outs:
         return None
-    hazard = "enclosing try or with cleanup hazard"
+    hazard = ENCLOSING_TRY_OR_WITH_CLEANUP_HAZARD_REASON
     missing_inputs = source_text is None and tree is None
     scope_node = (
         None
@@ -287,6 +387,66 @@ def _extract_effective_unit_outputs(
     return list(dict.fromkeys(v for v in cands if v not in excluded))
 
 
+_BLOCKING_SCOPE_HAZARDS: Tuple[Tuple[str, PairSkipReason], ...] = (
+    ("unavailable_source_for_closure_mode", PairSkipReason.UNAVAILABLE_SOURCE_FOR_CLOSURE_MODE),
+    ("unavailable_source_placeholder", PairSkipReason.UNAVAILABLE_SOURCE_PLACEHOLDER),
+    ("invalid_unit_columns", PairSkipReason.INVALID_UNIT_COLUMNS),
+    ("severed_closure_cell", PairSkipReason.SEVERED_CLOSURE_CELL),
+    ("stale_source_code", PairSkipReason.STALE_SOURCE_CODE),
+    ("pathological_ast", PairSkipReason.PATHOLOGICAL_AST),
+)
+
+SAFETY_PAIR_SKIP_REASONS: frozenset[str] = frozenset(
+    {
+        *(reason for _, reason in _BLOCKING_SCOPE_HAZARDS),
+        PairSkipReason.ENCLOSING_TRY_OR_WITH_CLEANUP_HAZARD,
+        PairSkipReason.DELETED_OUTPUT_HAZARD,
+        PairSkipReason.ASYNC_GENERATOR_DELEGATION_HAZARD,
+        PairSkipReason.INVALID_UNIT_BOUNDS,
+        PairSkipReason.GENERATOR_CLOSURE_CONFLICT,
+    }
+)
+
+
+def _ensure_pair_scopes_closure_mode(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    scope1: Optional[Dict[str, Any]],
+    scope2: Optional[Dict[str, Any]],
+    *,
+    closure_strictness: Optional[str],
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    source_text1: Optional[str],
+    source_text2: Optional[str],
+    tree1: Optional[ast.AST],
+    tree2: Optional[ast.AST],
+    repo_root: Optional[str],
+) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
+    """Ensures both clone units' scopes match the requested closure strictness mode."""
+    pair_policy = resolve_pair_closure_policy(
+        u1,
+        u2,
+        closure_strictness=closure_strictness,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+    )
+    resolved_pair = [
+        ensure_unit_scope_closure_mode(
+            unit_item,
+            scope_item,
+            pair_policy.effective_mode,
+            non_suppressing_ctx_managers=u_policy.non_suppressing_ctx_managers,
+            source_text=src_item,
+            tree=tree_item,
+            repo_root=repo_root,
+        )
+        for unit_item, scope_item, src_item, tree_item, u_policy in (
+            (u1, scope1, source_text1, tree1, pair_policy.unit1),
+            (u2, scope2, source_text2, tree2, pair_policy.unit2),
+        )
+    ]
+    return resolved_pair[0], resolved_pair[1], pair_policy.effective_mode
+
+
 @overload
 def resolve_clone_generator_subroutine_outputs(
     u1: Dict[str, Any],
@@ -298,12 +458,13 @@ def resolve_clone_generator_subroutine_outputs(
     tree1: Optional[ast.AST] = None,
     tree2: Optional[ast.AST] = None,
     repo_root: Optional[str] = None,
-    skip_pre_unit_closures: bool = False,
     source_digest1: Optional[str] = None,
     source_digest2: Optional[str] = None,
     allow_permuted_outputs: bool = False,
     *,
     return_details: Literal[True],
+    closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> CloneOutputResolution: ...
 
 
@@ -318,11 +479,12 @@ def resolve_clone_generator_subroutine_outputs(
     tree1: Optional[ast.AST] = None,
     tree2: Optional[ast.AST] = None,
     repo_root: Optional[str] = None,
-    skip_pre_unit_closures: bool = False,
     source_digest1: Optional[str] = None,
     source_digest2: Optional[str] = None,
     allow_permuted_outputs: bool = False,
     return_details: Literal[False] = False,
+    closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Optional[Tuple[List[str], List[str]]]: ...
 
 
@@ -337,11 +499,12 @@ def resolve_clone_generator_subroutine_outputs(
     tree1: Optional[ast.AST] = None,
     tree2: Optional[ast.AST] = None,
     repo_root: Optional[str] = None,
-    skip_pre_unit_closures: bool = False,
     source_digest1: Optional[str] = None,
     source_digest2: Optional[str] = None,
     allow_permuted_outputs: bool = False,
     return_details: bool = False,
+    closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Union[Optional[Tuple[List[str], List[str]]], CloneOutputResolution]: ...
 
 
@@ -355,11 +518,12 @@ def resolve_clone_generator_subroutine_outputs(
     tree1: Optional[ast.AST] = None,
     tree2: Optional[ast.AST] = None,
     repo_root: Optional[str] = None,
-    skip_pre_unit_closures: bool = False,
     source_digest1: Optional[str] = None,
     source_digest2: Optional[str] = None,
     allow_permuted_outputs: bool = False,
     return_details: bool = False,
+    closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Union[Optional[Tuple[List[str], List[str]]], CloneOutputResolution]:
     """Resolves output variable bindings for clone generator subroutines across two code units.
 
@@ -375,44 +539,54 @@ def resolve_clone_generator_subroutine_outputs(
                     u_chk,
                 )
                 return (
-                    CloneOutputResolution(None, "invalid unit bounds")
+                    CloneOutputResolution(None, INVALID_UNIT_BOUNDS_REASON)
                     if return_details
                     else None
                 )
 
+    scope1, scope2, effective_strictness = _ensure_pair_scopes_closure_mode(
+        u1,
+        u2,
+        scope1,
+        scope2,
+        closure_strictness=closure_strictness,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        source_text1=source_text1,
+        source_text2=source_text2,
+        tree1=tree1,
+        tree2=tree2,
+        repo_root=repo_root,
+    )
+
+    def _reject_gen_pair(
+        reason: str, log_msg: str
+    ) -> Optional[CloneOutputResolution]:
+        logger.debug("Rejecting generator subroutine pair: %s", log_msg)
+        return CloneOutputResolution(None, reason) if return_details else None
+
     for u_chk, s_chk, side_lbl in ((u1, scope1, "u1"), (u2, scope2, "u2")):
         if _has_unordered_multiset_outputs(u_chk):
-            logger.debug(
-                "Rejecting generator subroutine pair: set-valued outputs lack positional ordering"
-            )
-            return (
-                CloneOutputResolution(None, "unpaired outputs")
-                if return_details
-                else None
+            return _reject_gen_pair(
+                PairSkipReason.UNPAIRED_OUTPUTS,
+                "set-valued outputs lack positional ordering",
             )
         if s_chk.get("outputs_ambiguous"):
-            logger.debug(
-                "Rejecting generator subroutine pair: ambiguous scope outputs "
-                "lack positional ordering"
+            return _reject_gen_pair(
+                PairSkipReason.AMBIGUOUS_OUTPUTS,
+                "ambiguous scope outputs lack positional ordering",
             )
-            return (
-                CloneOutputResolution(None, "ambiguous outputs")
-                if return_details
-                else None
-            )
-        if "deleted_output" in s_chk.get("control_flow_hazards", ()):
-            logger.debug(
-                "Rejecting generator subroutine pair: deleted output hazard on %s",
-                side_lbl,
-            )
-            return (
-                CloneOutputResolution(None, "deleted output hazard")
-                if return_details
-                else None
-            )
+        for hazard_key, reason_str in _BLOCKING_SCOPE_HAZARDS:
+            if hazard_key in s_chk.get("control_flow_hazards", ()):
+                return _reject_gen_pair(
+                    reason_str, f"{reason_str} on {side_lbl}"
+                )
 
     outs1 = _extract_effective_unit_outputs(u1, scope1)
     outs2 = _extract_effective_unit_outputs(u2, scope2)
+    if _has_deleted_output_hazard(scope1, scope2, outs1, outs2):
+        return _reject_gen_pair(
+            DELETED_OUTPUT_HAZARD_REASON, DELETED_OUTPUT_HAZARD_REASON
+        )
 
     u1_cond = set(scope1.get("conditional_outputs", [])) | set(
         scope1.get("deleted_names", [])
@@ -423,13 +597,13 @@ def resolve_clone_generator_subroutine_outputs(
     u1_def = (
         set(scope1.get("definite_stores", []))
         | (set(scope1.get("inputs", [])) - u1_cond)
-        if ("definite_stores" in scope1 or "inputs" in scope1)
+        if "definite_stores" in scope1 or "inputs" in scope1
         else set()
     )
     u2_def = (
         set(scope2.get("definite_stores", []))
         | (set(scope2.get("inputs", [])) - u2_cond)
-        if ("definite_stores" in scope2 or "inputs" in scope2)
+        if "definite_stores" in scope2 or "inputs" in scope2
         else set()
     )
 
@@ -465,7 +639,7 @@ def resolve_clone_generator_subroutine_outputs(
                 u_item,
                 candidates=cands,
                 tree=eff_tr,
-                skip_pre_unit_closures=skip_pre_unit_closures,
+                closure_strictness=effective_strictness,
                 source_digest=s_digest,
                 unit_inputs=unit_inps,
             )
@@ -480,7 +654,7 @@ def resolve_clone_generator_subroutine_outputs(
     )
     if resolved is None:
         return (
-            CloneOutputResolution(None, "generator output or closure conflict")
+            CloneOutputResolution(None, PairSkipReason.GENERATOR_OUTPUT_CONFLICT)
             if return_details
             else None
         )
@@ -502,38 +676,40 @@ def resolve_clone_generator_subroutine_outputs(
                 bounds = _get_valid_unit_bounds(u_item)
                 if scope_node is None or bounds is None:
                     return (
-                        CloneOutputResolution(None, "generator output or closure conflict")
+                        CloneOutputResolution(
+                            None, PairSkipReason.GENERATOR_CLOSURE_CONFLICT
+                        )
                         if return_details
                         else None
                     )
                 u_s, u_e = bounds
-                u_start_col = _extract_first_unit_coord(
-                    u_item, ("start_col", "start_col_offset")
-                )
+                u_start_col = _extract_unit_start_col(u_item)
                 u_end_col = _extract_unit_end_col(u_item)
                 if u_end_col is None:
                     u_end_col = _resolve_unit_ast_end_col(scope_node, u_item)
-                for c_pos, reads in _collect_scope_closures(scope_node, module_tree=eff_tr):
+                for c_pos, c_reads in _collect_scope_closures(scope_node, module_tree=eff_tr):
                     _, is_intra, _ = _classify_closure_position(
                         c_pos, u_s, u_e, u_start_col=u_start_col, u_end_col=u_end_col
                     )
-                    if is_intra and bool(reads & set(needed_outs)):
+                    if is_intra and bool(c_reads & set(needed_outs)):
                         c_line, _ = _normalize_closure_position(c_pos)
                         logger.debug(
                             "Rejecting generator subroutine pair: intra-unit closure at line %d "
                             "captures needed output(s) %r for unit %s",
                             c_line,
-                            reads & set(needed_outs),
+                            c_reads & set(needed_outs),
                             side_idx + 1,
                         )
                         return (
-                            CloneOutputResolution(None, "generator output or closure conflict")
+                            CloneOutputResolution(
+                                None, PairSkipReason.GENERATOR_CLOSURE_CONFLICT
+                            )
                             if return_details
                             else None
                         )
-    except (RecursionError, MemoryError):
+    except RecursionError:
         return (
-            CloneOutputResolution(None, "generator output or closure conflict")
+            CloneOutputResolution(None, PairSkipReason.PATHOLOGICAL_AST)
             if return_details
             else None
         )
@@ -552,7 +728,6 @@ def resolve_clone_pair_outputs(
     tree1: Optional[ast.AST] = None,
     tree2: Optional[ast.AST] = None,
     repo_root: Optional[str] = None,
-    skip_pre_unit_closures: bool = False,
     source_digest1: Optional[str] = None,
     source_digest2: Optional[str] = None,
     closure_strictness: Optional[str] = None,
@@ -560,6 +735,7 @@ def resolve_clone_pair_outputs(
     allow_permuted_outputs: bool = False,
     *,
     return_details: Literal[True],
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> CloneOutputResolution: ...
 
 
@@ -574,13 +750,13 @@ def resolve_clone_pair_outputs(
     tree1: Optional[ast.AST] = None,
     tree2: Optional[ast.AST] = None,
     repo_root: Optional[str] = None,
-    skip_pre_unit_closures: bool = False,
     source_digest1: Optional[str] = None,
     source_digest2: Optional[str] = None,
     closure_strictness: Optional[str] = None,
     require_pairing: Optional[bool] = None,
     allow_permuted_outputs: bool = False,
     return_details: Literal[False] = False,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Optional[Tuple[List[str], List[str]]]: ...
 
 
@@ -595,13 +771,13 @@ def resolve_clone_pair_outputs(
     tree1: Optional[ast.AST] = None,
     tree2: Optional[ast.AST] = None,
     repo_root: Optional[str] = None,
-    skip_pre_unit_closures: bool = False,
     source_digest1: Optional[str] = None,
     source_digest2: Optional[str] = None,
     closure_strictness: Optional[str] = None,
     require_pairing: Optional[bool] = None,
     allow_permuted_outputs: bool = False,
     return_details: bool = False,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Union[Optional[Tuple[List[str], List[str]]], CloneOutputResolution]: ...
 
 
@@ -615,13 +791,13 @@ def resolve_clone_pair_outputs(
     tree1: Optional[ast.AST] = None,
     tree2: Optional[ast.AST] = None,
     repo_root: Optional[str] = None,
-    skip_pre_unit_closures: bool = False,
     source_digest1: Optional[str] = None,
     source_digest2: Optional[str] = None,
     closure_strictness: Optional[str] = None,
     require_pairing: Optional[bool] = None,
     allow_permuted_outputs: bool = False,
     return_details: bool = False,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Union[Optional[Tuple[List[str], List[str]]], CloneOutputResolution]:
     """Resolves output variable bindings between two clone units, enforcing
     strict positional pairing and generator subroutine safety.
@@ -640,7 +816,7 @@ def resolve_clone_pair_outputs(
             is_sub2,
         )
         return (
-            CloneOutputResolution(None, "mismatched subroutine kinds")
+            CloneOutputResolution(None, PairSkipReason.MISMATCHED_SUBROUTINE_KINDS)
             if return_details
             else None
         )
@@ -660,10 +836,24 @@ def resolve_clone_pair_outputs(
             "lack positional ordering"
         )
         return (
-            CloneOutputResolution(None, "unpaired outputs")
+            CloneOutputResolution(None, PairSkipReason.UNPAIRED_OUTPUTS)
             if return_details
             else None
         )
+
+    scope1, scope2, effective_strictness = _ensure_pair_scopes_closure_mode(
+        u1,
+        u2,
+        scope1,
+        scope2,
+        closure_strictness=closure_strictness,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        source_text1=source_text1,
+        source_text2=source_text2,
+        tree1=tree1,
+        tree2=tree2,
+        repo_root=repo_root,
+    )
 
     if scope1.get("outputs_ambiguous") or scope2.get("outputs_ambiguous"):
         logger.debug(
@@ -671,15 +861,10 @@ def resolve_clone_pair_outputs(
             "lack positional ordering"
         )
         return (
-            CloneOutputResolution(None, "ambiguous outputs")
+            CloneOutputResolution(None, PairSkipReason.AMBIGUOUS_OUTPUTS)
             if return_details
             else None
         )
-
-    _, effective_skip_closures = resolve_closure_strictness_mode(
-        closure_strictness=closure_strictness,
-        skip_pre_unit_closures=skip_pre_unit_closures,
-    )
 
     has_yield = bool(scope1.get("has_yield") or scope2.get("has_yield"))
     if is_sub and has_yield:
@@ -693,26 +878,48 @@ def resolve_clone_pair_outputs(
             tree1=tree1,
             tree2=tree2,
             repo_root=repo_root,
-            skip_pre_unit_closures=effective_skip_closures,
             source_digest1=source_digest1,
             source_digest2=source_digest2,
+            closure_strictness=effective_strictness,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
             allow_permuted_outputs=allow_permuted_outputs,
             return_details=return_details,
         )
 
     outs1 = _extract_effective_unit_outputs(u1, scope1)
     outs2 = _extract_effective_unit_outputs(u2, scope2)
-    if is_sub and (
-        "deleted_output" in scope1.get("control_flow_hazards", ())
-        or "deleted_output" in scope2.get("control_flow_hazards", ())
-        or bool(set(outs1) & set(scope1.get("deleted_names", [])))
-        or bool(set(outs2) & set(scope2.get("deleted_names", [])))
-    ):
+    hazards1 = scope1.get("control_flow_hazards", ())
+    hazards2 = scope2.get("control_flow_hazards", ())
+    for hazard_key, reason_str in _BLOCKING_SCOPE_HAZARDS:
+        blocked = hazard_key in hazards1 or (
+            hazard_key in hazards2
+            and (
+                hazard_key != "unavailable_source_placeholder"
+                or not allows_u2_source_placeholder(
+                    is_subroutine=is_sub,
+                    requires_u2_edit=strict_pairing,
+                    source_text2=source_text2,
+                    u2=u2,
+                    repo_root=repo_root,
+                )
+            )
+        )
+        if blocked:
+            logger.debug(
+                "Rejecting clone pair output resolution: %s", reason_str
+            )
+            return (
+                CloneOutputResolution(None, reason_str)
+                if return_details
+                else None
+            )
+    if is_sub and _has_deleted_output_hazard(scope1, scope2, outs1, outs2):
         logger.debug(
-            "Rejecting clone pair output resolution: deleted output hazard"
+            "Rejecting clone pair output resolution: %s",
+            DELETED_OUTPUT_HAZARD_REASON,
         )
         return (
-            CloneOutputResolution(None, "deleted output hazard")
+            CloneOutputResolution(None, DELETED_OUTPUT_HAZARD_REASON)
             if return_details
             else None
         )
@@ -753,13 +960,13 @@ def resolve_clone_pair_outputs(
         return CloneOutputResolution(unpaired_res, None) if return_details else unpaired_res
 
     if len(outs1) != len(outs2):
-        skip_reason = "output arity mismatch"
+        skip_reason = PairSkipReason.OUTPUT_ARITY_MISMATCH
     elif not allow_permuted_outputs and any(
         outs1.index(n) != outs2.index(n) for n in (set(outs1) & set(outs2))
     ):
-        skip_reason = "permuted outputs"
+        skip_reason = PairSkipReason.PERMUTED_OUTPUTS
     else:
-        skip_reason = "unpaired outputs"
+        skip_reason = PairSkipReason.UNPAIRED_OUTPUTS
 
     logger.debug(
         "Rejecting clone pair output resolution: outputs could not be paired "

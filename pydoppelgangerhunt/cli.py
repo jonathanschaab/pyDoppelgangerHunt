@@ -3,36 +3,47 @@
 from __future__ import annotations
 
 import argparse
+import ast
+from collections import OrderedDict
 from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
+import warnings
 
+from pydoppelgangerhunt._baseline_calibration import (
+    _safe_bool,
+    _safe_index_frequency,
+    _safe_int,
+)
 from pydoppelgangerhunt.baseline import (
     BaselineFingerprints,
+    _derive_target_offsets,
     compute_calibration_config_hash,
     filter_clones_by_baseline,
     load_baseline,
     prune_baseline,
     record_baseline,
-    _derive_target_offsets,
-    _safe_bool,
-    _safe_index_frequency,
-    _safe_int,
 )
 from pydoppelgangerhunt.clustering import cluster_clone_families
 from pydoppelgangerhunt.config import (
     DEFAULT_EXCLUDES,
+    heuristic_ctx_manager_session,
     init_tool_configuration,
+    is_recognized_closure_strictness,
     load_tool_config,
+    normalize_non_suppressing_ctx_managers,
     normalize_path_string,
     resolve_closure_strictness_mode,
 )
 from pydoppelgangerhunt.canonical_path import CanonicalPathResolver
 from pydoppelgangerhunt.coverage import check_asymmetric_coverage, read_coverage_data
-from pydoppelgangerhunt.fixer import generate_refactoring_patch
+from pydoppelgangerhunt.fixer import (
+    analysis_session,
+    generate_refactoring_patch,
+)
 from pydoppelgangerhunt.git_diff import (
     DiffRangeMap,
     check_temporal_divergence,
@@ -59,10 +70,16 @@ from pydoppelgangerhunt.reporters import (
     format_sarif_report,
     generate_clone_diff,
     generate_html_report,
+    resolve_cached_unit_source_and_tree,
     supports_color,
     synthesize_refactoring_suggestion,
 )
-from pydoppelgangerhunt.source_lines import resolve_unit_line_bounds
+from pydoppelgangerhunt.source_lines import (
+    coerce_unit_file_str,
+    resolve_unit_line_bounds,
+    unit_file_str,
+    with_unit_source_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -191,18 +208,28 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         help="Module filename for shared utility extractions (default: '_common.py')",
     )
     parser.add_argument(
-        "--skip-pre-unit-closures",
-        action="store_true",
-        help="Skip scanning pre-unit closures for live variables during subroutine extraction",
-    )
-    parser.add_argument(
         "--closure-strictness",
         type=str,
         default=None,
-        choices=["strict", "lenient", "fail_closed", "fast", "skip"],
+        choices=[
+            "strict",
+            "lenient",
+            "pedantic",
+        ],
         help=(
-            "Closure strictness ('strict'/'fail_closed' vs 'lenient'/'fast'/'skip'; "
-            "takes precedence over --skip-pre-unit-closures)"
+            "Closure strictness ('strict' [heuristic with-suppression, default; '--patch' "
+            "defaults to 'pedantic' when unset], 'pedantic' [all unproven with-managers treated "
+            "as potentially suppressing], or 'lenient' [relax unreferenced sibling closure checks])"
+        ),
+    )
+    parser.add_argument(
+        "--non-suppressing-ctx-managers",
+        action="append",
+        default=[],
+        help=(
+            "Context manager names, '.Name' relative imports (any relative import "
+            "ending in Name), dotted paths, or '<module>.*.attr' / '*.attr' suffix "
+            "wildcards proven not to suppress exceptions (comma-separated or repeatable)"
         ),
     )
 
@@ -280,8 +307,8 @@ def _audit_clone_risk_warnings(
         asym = check_asymmetric_coverage(u1, u2, cov_data)
         if asym:
             c1, c2 = asym
-            f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
-            f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
+            f1 = normalize_path_string(unit_file_str(u1), strip_anchor=False)
+            f2 = normalize_path_string(unit_file_str(u2), strip_anchor=False)
             msg = f"{indent}[WARN] Asymmetric test coverage: {f1} ({c1:.0%}) vs {f2} ({c2:.0%})"
             print(colorize(msg, COLOR_YELLOW, use_color))
             lines.append(msg)
@@ -377,6 +404,71 @@ def _render_dry_scorecard(stats: Dict[str, Any], use_color: bool) -> None:
     print("=" * 55)
 
 
+def _emit_indented_suggestion(
+    lines: List[str], sug: str, *, indent: str, use_color: bool
+) -> None:
+    """Prints and records an indented suggestion block with optional ANSI styling."""
+    sug_colored = colorize(sug, COLOR_YELLOW, use_color)
+    print(indent + sug_colored.replace("\n", "\n" + indent))
+    lines.append(indent + sug.replace("\n", "\n" + indent))
+
+
+def _emit_indented_diff(lines: List[str], diff_out: str, *, indent: str) -> None:
+    """Prints and records an indented unified diff block."""
+    if not diff_out:
+        return
+    print(f"{indent}--- Diff ---")
+    print(indent + diff_out.replace("\n", "\n" + indent))
+    lines.append(f"{indent}--- Diff ---\n{indent}" + diff_out.replace("\n", "\n" + indent))
+
+
+def _append_preload_failure_lines(
+    lines: List[str],
+    exc: Exception,
+    args: argparse.Namespace,
+    *,
+    use_color: bool,
+    indent: str,
+) -> None:
+    """Emits diagnostic fallback lines for enabled render options when pair preload fails."""
+    if args.suggest:
+        sug = (
+            f"[REFACTOR SUGGESTION] Diagnostic: suggestion skipped due to "
+            f"{type(exc).__name__}: {exc}"
+        )
+        _emit_indented_suggestion(lines, sug, indent=indent, use_color=use_color)
+    if args.diff:
+        diff_out = f"# Diagnostic: diff skipped due to {type(exc).__name__}: {exc}"
+        _emit_indented_diff(lines, diff_out, indent=indent)
+
+
+def _run_pair_render_step(
+    render_fn: Callable[[], str],
+    *,
+    action_desc: str,
+    fallback_prefix: str,
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    on_diagnostic_error: Optional[Callable[[], None]],
+) -> str:
+    """Executes a pair rendering step, isolating unexpected errors except MemoryError."""
+    try:
+        return render_fn()
+    except MemoryError:
+        raise
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        if on_diagnostic_error is not None:
+            on_diagnostic_error()
+        logger.warning(
+            "Failed to %s for clone pair (%r, %r)",
+            action_desc,
+            u1.get("name") if isinstance(u1, dict) else u1,
+            u2.get("name") if isinstance(u2, dict) else u2,
+            exc_info=True,
+        )
+        return f"{fallback_prefix}{type(exc).__name__}: {exc}"
+
+
 def _render_pair_diff_and_suggestions(
     u1: Dict[str, Any],
     u2: Dict[str, Any],
@@ -386,23 +478,86 @@ def _render_pair_diff_and_suggestions(
     repo_root: Optional[str] = None,
     use_color: bool,
     indent: str = "    ",
+    closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    file_cache: Optional[
+        OrderedDict[Any, Tuple[Optional[str], Optional[ast.AST]]]
+    ] = None,
+    on_diagnostic_error: Optional[Callable[[], None]] = None,
 ) -> List[str]:
     """Renders optional refactoring suggestion and unified diff for a pair of clone units."""
     effective_root = repo_root or target_repo_root
     lines: List[str] = []
+    preloaded_sources = False
+    src1: Optional[str] = None
+    src2: Optional[str] = None
+    tree1: Optional[ast.AST] = None
+    tree2: Optional[ast.AST] = None
+    if (args.suggest or args.diff) and file_cache is not None:
+        try:
+            src1, tree1 = resolve_cached_unit_source_and_tree(
+                u1, repo_root=effective_root, file_cache=file_cache
+            )
+            src2, tree2 = resolve_cached_unit_source_and_tree(
+                u2, repo_root=effective_root, file_cache=file_cache
+            )
+            preloaded_sources = True
+        except MemoryError:
+            raise
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            if on_diagnostic_error is not None:
+                on_diagnostic_error()
+            logger.warning(
+                "Failed to preload cached source/AST for clone pair (%r, %r)",
+                u1.get("name") if isinstance(u1, dict) else u1,
+                u2.get("name") if isinstance(u2, dict) else u2,
+                exc_info=True,
+            )
+            _append_preload_failure_lines(
+                lines, exc, args, use_color=use_color, indent=indent
+            )
+            return lines
     if args.suggest:
-        sug = synthesize_refactoring_suggestion(u1, u2, repo_root=effective_root)
-        sug_colored = colorize(sug, COLOR_YELLOW, use_color)
-        print(indent + sug_colored.replace("\n", "\n" + indent))
-        lines.append(indent + sug.replace("\n", "\n" + indent))
-    if args.diff:
-        diff_out = generate_clone_diff(
-            u1, u2, repo_root=effective_root, color=use_color
+        sug_kwargs: Dict[str, Any] = {"repo_root": effective_root}
+        if preloaded_sources:
+            sug_kwargs["source_text1"] = src1
+            sug_kwargs["tree1"] = tree1
+            sug_kwargs["source_text2"] = src2
+            sug_kwargs["tree2"] = tree2
+        if closure_strictness is not None:
+            sug_kwargs["closure_strictness"] = closure_strictness
+        if non_suppressing_ctx_managers is not None:
+            sug_kwargs["non_suppressing_ctx_managers"] = non_suppressing_ctx_managers
+        sug = _run_pair_render_step(
+            lambda: synthesize_refactoring_suggestion(u1, u2, **sug_kwargs),
+            action_desc="synthesize refactoring suggestion",
+            fallback_prefix="[REFACTOR SUGGESTION] Diagnostic: suggestion skipped due to ",
+            u1=u1,
+            u2=u2,
+            on_diagnostic_error=on_diagnostic_error,
         )
-        if diff_out:
-            print(f"{indent}--- Diff ---")
-            print(indent + diff_out.replace("\n", "\n" + indent))
-            lines.append(f"{indent}--- Diff ---\n{indent}" + diff_out.replace("\n", "\n" + indent))
+        _emit_indented_suggestion(lines, sug, indent=indent, use_color=use_color)
+    if args.diff:
+        diff_kwargs: Dict[str, Any] = {
+            "repo_root": effective_root,
+            "color": use_color,
+        }
+        if preloaded_sources:
+            diff_kwargs["source_text1"] = src1
+            diff_kwargs["source_text2"] = src2
+        diff_out = _run_pair_render_step(
+            lambda: generate_clone_diff(
+                with_unit_source_text(u1, src1),
+                with_unit_source_text(u2, src2),
+                **diff_kwargs,
+            ),
+            action_desc="render unified diff",
+            fallback_prefix="# Diagnostic: diff skipped due to ",
+            u1=u1,
+            u2=u2,
+            on_diagnostic_error=on_diagnostic_error,
+        )
+        _emit_indented_diff(lines, diff_out, indent=indent)
     return lines
 
 
@@ -596,8 +751,10 @@ def _apply_baseline_and_diff_filters(
                 r_hit = False
                 for u in (u1, u2):
                     if isinstance(u, dict):
-                        f_raw = u.get("file") or u.get("file_a") or u.get("file_b") or ""
-                        f_norm = normalize_path_string(str(f_raw), strip_anchor=True)
+                        f_raw = coerce_unit_file_str(
+                            u.get("file") or u.get("file_a") or u.get("file_b")
+                        )
+                        f_norm = normalize_path_string(f_raw, strip_anchor=True)
                         if f_norm in modified_ranges.target_ranges:
                             t_hit = True
                         if f_norm in modified_ranges.repo_ranges:
@@ -635,11 +792,17 @@ def _render_text_violations(
     target_repo_root: str = ".",
     repo_root: Optional[str] = None,
     audit_tests_enabled: bool = False,
+    closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    on_diagnostic_error: Optional[Callable[[], None]] = None,
 ) -> List[str]:
     """Renders human-readable text output for clone violations (either clustered families or pairwise)."""
     effective_root = repo_root or target_repo_root
     report_lines: List[str] = []
     active_cov = cov_data or {}
+    file_cache: Optional[
+        OrderedDict[Any, Tuple[Optional[str], Optional[ast.AST]]]
+    ] = OrderedDict() if (args.suggest or args.diff) else None
     if args.cluster and families is not None:
         title = f"\n[VIOLATION] Clustered into {len(families)} Clone Family/Families (from {len(clones)} pairwise hits) >= {threshold:.0%}:\n"
         print(colorize(title, COLOR_BOLD + COLOR_RED, use_color))
@@ -660,7 +823,7 @@ def _render_text_violations(
                 else None
             )
             for m in fam.get("members", []):
-                m_file = normalize_path_string(str(m.get("file") or ""), strip_anchor=False)
+                m_file = normalize_path_string(unit_file_str(m), strip_anchor=False)
                 m_start, m_end = resolve_unit_line_bounds(m)
                 m_name = str(m.get("name") or "member")
                 m_tag = " [medoid]" if medoid_name and m_name == medoid_name else ""
@@ -687,6 +850,10 @@ def _render_text_violations(
                         target_repo_root=effective_root,
                         use_color=use_color,
                         indent="      ",
+                        closure_strictness=closure_strictness,
+                        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+                        file_cache=file_cache,
+                        on_diagnostic_error=on_diagnostic_error,
                     )
                 )
     else:
@@ -700,8 +867,8 @@ def _render_text_violations(
                 p_val = compute_priority_score(sim, u1, u2)
                 p_badge = colorize(f"[Priority {p_val:.1f}]", COLOR_BOLD + COLOR_MAGENTA, use_color)
                 prefix = f"  * {sim_badge} {p_badge}"
-            f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
-            f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
+            f1 = normalize_path_string(unit_file_str(u1), strip_anchor=False)
+            f2 = normalize_path_string(unit_file_str(u2), strip_anchor=False)
             s1, e1 = resolve_unit_line_bounds(u1)
             s2, e2 = resolve_unit_line_bounds(u2)
             n1 = str(u1.get("name") or "unit1")
@@ -732,6 +899,10 @@ def _render_text_violations(
                     target_repo_root=effective_root,
                     use_color=use_color,
                     indent="    ",
+                    closure_strictness=closure_strictness,
+                    non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+                    file_cache=file_cache,
+                    on_diagnostic_error=on_diagnostic_error,
                 )
             )
 
@@ -1055,8 +1226,396 @@ def _resolve_effective_config(
     )
 
 
+def _resolve_cli_closure_policy(
+    args: argparse.Namespace, tool_cfg: Dict[str, Any]
+) -> Tuple[Optional[str], bool]:
+    """Resolves single-knob closure_strictness across CLI flag and loaded tool config."""
+    cfg_strictness = tool_cfg.get("closure_strictness")
+    has_cfg_closure = is_recognized_closure_strictness(cfg_strictness)
+    cfg_resolved = (
+        resolve_closure_strictness_mode(cfg_strictness)
+        if cfg_strictness is not None
+        else None
+    )
+    if args.closure_strictness is not None:
+        cli_strictness_str = str(args.closure_strictness)
+        resolved = resolve_closure_strictness_mode(cli_strictness_str)
+        if has_cfg_closure and cfg_resolved != resolved:
+            logger.warning(
+                "Conflicting configuration: CLI flag --closure-strictness '%s' overrides "
+                "configured closure_strictness='%s'",
+                cli_strictness_str,
+                cfg_strictness,
+            )
+        return resolved, True
+    if has_cfg_closure:
+        return cfg_resolved, True
+    return None, False
+
+
+def _determine_cli_exit_code(*, has_clones: bool, diagnostic_errors: int) -> int:
+    """Computes CLI exit code separating usage errors (2) from diagnostic failures (3, 4)."""
+    if diagnostic_errors > 0:
+        return 4 if has_clones else 3
+    return 1 if has_clones else 0
+
+
+# INVARIANT (NO PROCESS-GLOBAL WARNING MUTATION IN LIBRARY CALLS):
+# CPython's ``warnings.filters`` list is process-global and unsafe to mutate inside
+# reusable library entrypoints (including programmatic ``main()`` calls from worker
+# threads). Warning suppression for noisy target-repo syntax escapes is restricted
+# exclusively to the standalone process entrypoint ``console_main()``.
+def console_main(argv: Optional[Sequence[str]] = None) -> int:
+    """Standalone console-script entrypoint that silences target-repo syntax escape warnings."""
+    warnings.filterwarnings("ignore", category=SyntaxWarning)
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*invalid escape sequence.*",
+        category=DeprecationWarning,
+    )
+    return main(argv)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """Main execution CLI entrypoint."""
+    """Main CLI execution entrypoint (does not mutate process-global warnings.filters)."""
+    return _main_impl(argv)
+
+
+def _load_and_validate_cli_config(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    """Loads pyproject/tool configuration for the CLI target and validates --top overrides."""
+    tool_cfg: Dict[str, Any] = {}
+    target_arg = args.target
+    try:
+        if args.config:
+            tool_cfg = load_tool_config(args.config)
+        else:
+            if target_arg:
+                t_dir = (
+                    target_arg
+                    if os.path.isdir(target_arg)
+                    else (os.path.dirname(target_arg) or ".")
+                )
+                if t_dir != ".":
+                    tool_cfg = load_tool_config(repo_root=t_dir)
+            if not tool_cfg:
+                tool_cfg = load_tool_config()
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if args.top is None and tool_cfg.get("top") is not None:
+        raw_top = tool_cfg["top"]
+        if isinstance(raw_top, (bool, float)):
+            parser.error("--top must be a positive integer (> 0)")
+        try:
+            args.top = int(raw_top)
+        except (ValueError, TypeError):
+            parser.error("--top must be a positive integer (> 0)")
+        if args.top <= 0:
+            parser.error("--top must be a positive integer (> 0)")
+    return tool_cfg
+
+
+def _load_cli_baseline_calibration(
+    args: argparse.Namespace,
+    tool_cfg: Dict[str, Any],
+    *,
+    target: str,
+    target_repo_root: str,
+    git_worktree_root: str,
+    use_color: bool,
+) -> Tuple[Optional[BaselineFingerprints], Optional[Dict[str, Any]], Optional[str]]:
+    """Preloads baseline fingerprints and checks whether stored corpus calibration aligns with target scope."""
+    baseline_path = args.baseline or tool_cfg.get("baseline")
+    if not (baseline_path and not args.record_baseline and os.path.exists(baseline_path)):
+        return None, None, None
+    preloaded_baseline = load_baseline(baseline_path)
+    calib_dict = getattr(preloaded_baseline, "corpus_calibration", None)
+    base_target = getattr(preloaded_baseline, "target", None)
+    base_target_rel = getattr(preloaded_baseline, "target_repo_relative", None)
+    target_val = target or getattr(args, "target", None) or target_repo_root
+    base_offset, scan_offset = _derive_target_offsets(
+        base_target, base_target_rel, git_worktree_root, target_val
+    )
+    if calib_dict and isinstance(calib_dict, dict) and (base_offset or "") != (scan_offset or ""):
+        if args.format == "text":
+            b_desc = base_offset if base_offset else "repository root"
+            s_desc = scan_offset if scan_offset else "repository root"
+            print(
+                colorize(
+                    f"Info: Active scan scope ({s_desc}) differs from baseline calibration scope ({b_desc}). "
+                    f"Skipping baseline corpus calibration reuse to prevent shingle frequency skew.",
+                    COLOR_YELLOW,
+                    use_color,
+                )
+            )
+        calib_dict = None
+    return preloaded_baseline, calib_dict, scan_offset
+
+
+def _emit_post_scan_calibration_diagnostics(
+    args: argparse.Namespace,
+    calib_dict: Optional[Dict[str, Any]],
+    preloaded_baseline: Optional[BaselineFingerprints],
+    *,
+    git_worktree_root: str,
+    use_color: bool,
+) -> None:
+    """Emits drift, config-mismatch, commit-skew, and novel-shingle budget diagnostics in text mode."""
+    if args.format != "text":
+        return
+    if calib_dict and isinstance(calib_dict, dict):
+        drift = calib_dict.get("unit_drift")
+        if drift is not None and drift >= 0.20:
+            curr_units = calib_dict.get("current_units")
+            base_units = calib_dict.get("total_units")
+            print(
+                colorize(
+                    f"Warning: Calibration drift detected: repository units drifted by {drift:.1%} from baseline calibration "
+                    f"(current: {curr_units}, baseline: {base_units}). "
+                    f"Consider re-running with --record-baseline to refresh calibration.",
+                    COLOR_BOLD + COLOR_YELLOW,
+                    use_color,
+                )
+            )
+    if calib_dict is None and preloaded_baseline is None:
+        return
+
+    discarded_mismatch = (
+        calib_dict.get("discarded_mismatch")
+        if isinstance(calib_dict, dict)
+        else (
+            getattr(preloaded_baseline, "corpus_calibration", {}).get("discarded_mismatch")
+            if preloaded_baseline
+            and isinstance(getattr(preloaded_baseline, "corpus_calibration", None), dict)
+            else None
+        )
+    )
+    if discarded_mismatch and getattr(args, "verbose", False):
+        print(
+            colorize(
+                f"Info: Corpus calibration was discarded due to configuration mismatch "
+                f"({discarded_mismatch}); falling back to full corpus scan.",
+                COLOR_YELLOW,
+                use_color,
+            ),
+            file=sys.stderr,
+        )
+
+    base_commit_raw = (
+        (calib_dict.get("recorded_commit") if isinstance(calib_dict, dict) else None)
+        or getattr(preloaded_baseline, "recorded_commit", None)
+    )
+    if base_commit_raw and getattr(args, "verbose", False):
+        base_commit = str(base_commit_raw)
+        curr_commit = get_git_head_commit(repo_root=git_worktree_root)
+        if curr_commit and base_commit.lower() != curr_commit.lower():
+            print(
+                colorize(
+                    f"Info: Repository HEAD commit {curr_commit[:8]} differs from baseline recorded commit {base_commit[:8]}.",
+                    COLOR_YELLOW,
+                    use_color,
+                )
+            )
+
+    skipped_novel = (
+        calib_dict.get("skipped_novel_shingles") if isinstance(calib_dict, dict) else None
+    )
+    if skipped_novel and getattr(args, "verbose", False):
+        print(
+            colorize(
+                f"Info: {skipped_novel} high-density novel shingle(s) exceeded candidate pair budget during differential scan.",
+                COLOR_YELLOW,
+                use_color,
+            )
+        )
+
+
+def _handle_record_baseline_command(
+    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
+    args: argparse.Namespace,
+    *,
+    target: str,
+    threshold: float,
+    recorded_calib: Optional[Dict[str, Any]],
+    git_worktree_root: str,
+    eff_cfg: EffectiveScanConfig,
+) -> int:
+    """Writes a new clone baseline file and prints size and calibration pruning metrics."""
+    bp = record_baseline(
+        clones,
+        args.record_baseline,
+        target,
+        threshold,
+        corpus_calibration=recorded_calib,
+        repo_root=git_worktree_root,
+    )
+    file_size_info = ""
+    try:
+        bp_path = Path(bp)
+        if bp_path.is_file():
+            sz_kb = bp_path.stat().st_size / 1024.0
+            sz_str = f"{sz_kb:.1f} KB" if sz_kb < 1024.0 else f"{sz_kb / 1024.0:.2f} MB"
+            file_size_info = f" [{sz_str}]"
+    except (OSError, ValueError):
+        pass
+
+    calib_info = ""
+    if isinstance(recorded_calib, dict) and (
+        recorded_calib.get("pruned_shingle_count", 0) > 0
+        or recorded_calib.get("min_frequency", 1) > 1
+    ):
+        pruned = int(recorded_calib.get("pruned_shingle_count", 0))
+        raw = int(recorded_calib.get("raw_shingle_count", pruned))
+        ratio = recorded_calib.get("shingle_reduction_ratio")
+        pct_val = (
+            (ratio * 100.0)
+            if ratio is not None
+            else ((pruned / raw * 100.0) if raw > 0 else 0.0)
+        )
+        comp_ratio = recorded_calib.get("shingle_compression_ratio")
+        comp_str = f", {comp_ratio:.2f}x compression" if comp_ratio is not None else ""
+        mf = recorded_calib.get("min_frequency", eff_cfg.min_frequency)
+        calib_info = (
+            f" (Calibration: {pruned:,} of {raw:,} shingles pruned, "
+            f"{pct_val:.1f}% reduction{comp_str} via min-frequency {mf})"
+        )
+    print(f"[OK] Recorded {len(clones)} clone baseline pair(s) to {bp}{file_size_info}{calib_info}")
+    return 0
+
+
+def _resolve_cli_diff_files(
+    args: argparse.Namespace,
+    *,
+    git_worktree_root: str,
+    target_repo_root: str,
+) -> Optional[Sequence[str]]:
+    """Collects and normalizes git-modified file paths when --diff-only is active."""
+    if not args.diff_only:
+        return None
+    raw_diff_files = _safe_call_git_diff_helper(
+        get_git_modified_files, args.since, git_worktree_root
+    )
+    if not raw_diff_files:
+        mod_ranges = _safe_call_git_diff_helper(
+            get_git_modified_line_ranges, args.since, git_worktree_root
+        )
+        if mod_ranges:
+            raw_diff_files = list(mod_ranges.keys())
+    if raw_diff_files:
+        return _normalize_git_paths_for_target(
+            raw_diff_files, git_worktree_root, target_repo_root
+        )
+    return []
+
+
+class _CliRunOptions(NamedTuple):
+    """Resolved target paths, thresholds, and refactoring policy flags for one CLI run."""
+
+    target: str
+    target_repo_root: str
+    git_worktree_root: str
+    threshold: float
+    cfg_exemptions: Optional[List[Tuple[str, ...]]]
+    method_binding: str
+    replace_clones: bool
+    type_merge_strategy: str
+    cross_file_strategy: str
+    shared_module_name: str
+    closure_strictness: Optional[str]
+    has_explicit_closure_cfg: bool
+    non_suppressing_ctx_managers: Tuple[str, ...]
+
+
+def _resolve_cli_run_options(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    tool_cfg: Dict[str, Any],
+) -> _CliRunOptions:
+    """Resolves scan paths, threshold, exemptions, and refactoring/closure policy options."""
+    cfg_target = str(tool_cfg.get("target") or "")
+    default_dir = (
+        cfg_target
+        if cfg_target and os.path.isdir(cfg_target)
+        else (
+            "pydoppelgangerhunt"
+            if os.path.isdir("pydoppelgangerhunt")
+            else ("src" if os.path.isdir("src") else ".")
+        )
+    )
+    target = args.target or default_dir
+    target_repo_root = (
+        target if os.path.isdir(target) else (os.path.dirname(target) or ".")
+    )
+    git_root = _safe_call_git_diff_helper(get_git_repo_root, None, target_repo_root)
+    git_worktree_root = (
+        git_root if git_root and os.path.exists(git_root) else target_repo_root
+    )
+    threshold = (
+        args.threshold
+        if args.threshold is not None
+        else float(tool_cfg.get("threshold", 0.90))
+    )
+    cfg_exemptions = (
+        [tuple(p) for p in tool_cfg["exemptions"]] if "exemptions" in tool_cfg else None
+    )
+    raw_binding = args.method_binding or str(tool_cfg.get("method_binding", "auto"))
+    method_binding = raw_binding if raw_binding in ("auto", "method", "module") else "auto"
+    replace_clones = args.replace_clones or bool(tool_cfg.get("replace_clones", False))
+    raw_strategy = args.type_merge_strategy or str(
+        tool_cfg.get("type_merge_strategy", "fallback_any")
+    )
+    type_merge_strategy = (
+        raw_strategy if raw_strategy in ("fallback_any", "union") else "fallback_any"
+    )
+    raw_cross_file = args.cross_file_strategy or str(
+        tool_cfg.get("cross_file_strategy", "auto")
+    )
+    cross_file_strategy = (
+        raw_cross_file
+        if raw_cross_file in ("auto", "shared_module", "host_module", "host", "shared", "skip")
+        else "auto"
+    )
+    shared_module_name = str(
+        args.shared_module_name or tool_cfg.get("shared_module_name", "_common.py")
+    )
+    closure_strictness, has_explicit_closure_cfg = _resolve_cli_closure_policy(
+        args, tool_cfg
+    )
+    try:
+        non_suppressing_ctx_managers = normalize_non_suppressing_ctx_managers(
+            tool_cfg.get("non_suppressing_ctx_managers"),
+            getattr(args, "non_suppressing_ctx_managers", ()),
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if closure_strictness == "lenient" and getattr(args, "patch", False):
+        logger.info(
+            "Lenient closure mode active; relaxing speculative unreferenced-sibling "
+            "and pre-unit generator closure checks during refactoring while retaining "
+            "captured-cell, intra-unit mutator, and referenced-sibling guards"
+        )
+    return _CliRunOptions(
+        target=target,
+        target_repo_root=target_repo_root,
+        git_worktree_root=git_worktree_root,
+        threshold=threshold,
+        cfg_exemptions=cfg_exemptions,
+        method_binding=method_binding,
+        replace_clones=replace_clones,
+        type_merge_strategy=type_merge_strategy,
+        cross_file_strategy=cross_file_strategy,
+        shared_module_name=shared_module_name,
+        closure_strictness=closure_strictness,
+        has_explicit_closure_cfg=has_explicit_closure_cfg,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+    )
+
+
+def _main_impl(argv: Optional[Sequence[str]] = None) -> int:
+    """Executes CLI argument parsing, scanning, reporting, and patch emission."""
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     if args.top is not None and args.top <= 0:
@@ -1070,140 +1629,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     use_color = supports_color(args.color)
+    tool_cfg = _load_and_validate_cli_config(parser, args)
+    opts = _resolve_cli_run_options(parser, args, tool_cfg)
 
-    # Load configuration from pyproject.toml / config file
-    tool_cfg: Dict[str, Any] = {}
-    if args.config:
-        tool_cfg = load_tool_config(args.config)
-    else:
-        if target_arg:
-            target_dir = (
-                target_arg
-                if os.path.isdir(target_arg)
-                else (os.path.dirname(target_arg) or ".")
-            )
-            if target_dir != ".":
-                tool_cfg = load_tool_config(repo_root=target_dir)
-        if not tool_cfg:
-            tool_cfg = load_tool_config()
-    if args.top is None and tool_cfg.get("top") is not None:
-        raw_top = tool_cfg["top"]
-        if isinstance(raw_top, (bool, float)):
-            parser.error("--top must be a positive integer (> 0)")
-        try:
-            args.top = int(raw_top)
-        except (ValueError, TypeError):
-            parser.error("--top must be a positive integer (> 0)")
-        if args.top <= 0:
-            parser.error("--top must be a positive integer (> 0)")
-    cfg_target = str(tool_cfg.get("target") or "")
-    default_dir = (
-        cfg_target
-        if cfg_target and os.path.isdir(cfg_target)
-        else (
-            "pydoppelgangerhunt"
-            if os.path.isdir("pydoppelgangerhunt")
-            else ("src" if os.path.isdir("src") else ".")
-        )
+    preloaded_baseline, calib_dict, scan_offset = _load_cli_baseline_calibration(
+        args,
+        tool_cfg,
+        target=opts.target,
+        target_repo_root=opts.target_repo_root,
+        git_worktree_root=opts.git_worktree_root,
+        use_color=use_color,
     )
-    target = target_arg or default_dir
-    target_dir = target if os.path.isdir(target) else (os.path.dirname(target) or ".")
-    target_repo_root = target_dir
-    git_root = _safe_call_git_diff_helper(get_git_repo_root, None, target_repo_root)
-    git_worktree_root = git_root if git_root and os.path.exists(git_root) else target_repo_root
-    threshold = args.threshold if args.threshold is not None else float(tool_cfg.get("threshold", 0.90))
-    cfg_exemptions = (
-        [tuple(p) for p in tool_cfg["exemptions"]] if "exemptions" in tool_cfg else None
-    )
-
-    raw_binding = args.method_binding or str(tool_cfg.get("method_binding", "auto"))
-    method_binding = raw_binding if raw_binding in ("auto", "method", "module") else "auto"
-    replace_clones = args.replace_clones or bool(tool_cfg.get("replace_clones", False))
-    raw_strategy = args.type_merge_strategy or str(tool_cfg.get("type_merge_strategy", "fallback_any"))
-    type_merge_strategy = raw_strategy if raw_strategy in ("fallback_any", "union") else "fallback_any"
-    raw_cross_file = args.cross_file_strategy or str(tool_cfg.get("cross_file_strategy", "auto"))
-    cross_file_strategy = (
-        raw_cross_file
-        if raw_cross_file in ("auto", "shared_module", "host_module", "host", "shared", "skip")
-        else "auto"
-    )
-    shared_module_name = str(
-        args.shared_module_name or tool_cfg.get("shared_module_name", "_common.py")
-    )
-    cfg_strictness = tool_cfg.get("closure_strictness")
-    cfg_skip = _safe_bool(tool_cfg.get("skip_pre_unit_closures", False))
-
-    if args.closure_strictness is not None:
-        cli_strictness: Optional[str] = args.closure_strictness
-        cli_skip: bool = _safe_bool(args.skip_pre_unit_closures)
-        if (
-            str(cli_strictness).strip().lower() in ("strict", "fail_closed")
-            and args.skip_pre_unit_closures
-        ):
-            cli_skip = False
-            logger.warning(
-                "Conflicting flags: --closure-strictness '%s' takes precedence over "
-                "--skip-pre-unit-closures",
-                cli_strictness,
-            )
-    elif args.skip_pre_unit_closures:
-        cli_strictness = "lenient"
-        cli_skip = True
-        if cfg_strictness is not None and str(cfg_strictness).strip().lower() in (
-            "strict",
-            "fail_closed",
-        ):
-            logger.warning(
-                "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
-                "configured closure_strictness='%s'",
-                cfg_strictness,
-            )
-    else:
-        cli_strictness = cfg_strictness
-        cli_skip = cfg_skip
-
-    closure_strictness, skip_pre_unit_closures = resolve_closure_strictness_mode(
-        closure_strictness=cli_strictness,
-        skip_pre_unit_closures=cli_skip,
-    )
-    if skip_pre_unit_closures and getattr(args, "patch", False):
-        logger.info(
-            "Lenient closure mode active; skipping pre-unit closure scan during refactoring"
-        )
-
-    baseline_path = args.baseline or tool_cfg.get("baseline")
-    preloaded_baseline: Optional[BaselineFingerprints] = None
-    calib_dict: Optional[Dict[str, Any]] = None
-    scan_offset: Optional[str] = None
-    if baseline_path and not args.record_baseline and os.path.exists(baseline_path):
-        preloaded_baseline = load_baseline(baseline_path)
-        calib_dict = getattr(preloaded_baseline, "corpus_calibration", None)
-        base_target = getattr(preloaded_baseline, "target", None)
-        base_target_rel = getattr(preloaded_baseline, "target_repo_relative", None)
-        target_val = target or getattr(args, "target", None) or target_repo_root
-        base_offset, scan_offset = _derive_target_offsets(
-            base_target, base_target_rel, git_worktree_root, target_val
-        )
-        if calib_dict and isinstance(calib_dict, dict):
-            if (base_offset or "") != (scan_offset or ""):
-                if args.format == "text":
-                    b_desc = base_offset if base_offset else "repository root"
-                    s_desc = scan_offset if scan_offset else "repository root"
-                    print(
-                        colorize(
-                            f"Info: Active scan scope ({s_desc}) differs from baseline calibration scope ({b_desc}). "
-                            f"Skipping baseline corpus calibration reuse to prevent shingle frequency skew.",
-                            COLOR_YELLOW,
-                            use_color,
-                        )
-                    )
-                calib_dict = None
-
     eff_cfg = _resolve_effective_config(args, tool_cfg, calib_dict)
-    excludes = eff_cfg.excludes
-    audit_tests_enabled = eff_cfg.audit_tests
 
-    if args.type4 and _run_type4_semantic_audit(target, excludes, args.strict_type4, use_color):
+    if args.type4 and _run_type4_semantic_audit(
+        opts.target, eff_cfg.excludes, args.strict_type4, use_color
+    ):
         return 1
 
     mode_desc = _format_scan_mode_description(
@@ -1213,59 +1654,50 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         strip_docstrings=eff_cfg.strip_docstrings,
         idioms_enabled=eff_cfg.idioms,
         call_seq_enabled=eff_cfg.call_sequences,
-        audit_tests_enabled=audit_tests_enabled,
+        audit_tests_enabled=eff_cfg.audit_tests,
         stop_shingles_enabled=eff_cfg.stop_shingles,
     )
-
     if args.format == "text":
-        print(f"\nScanning '{target}' for AST structural clones (threshold >= {threshold:.0%}, min_lines={eff_cfg.min_lines}, mode: {mode_desc})...")
-
+        print(
+            f"\nScanning '{opts.target}' for AST structural clones "
+            f"(threshold >= {opts.threshold:.0%}, min_lines={eff_cfg.min_lines}, mode: {mode_desc})..."
+        )
     sort_by = "priority" if args.priority else args.sort_by
 
     if calib_dict and isinstance(calib_dict, dict) and args.format == "text":
-        calib_hash = calib_dict.get("config_hash") or getattr(preloaded_baseline, "config_hash", None)
+        calib_hash = calib_dict.get("config_hash") or getattr(
+            preloaded_baseline, "config_hash", None
+        )
         if calib_hash:
-            active_cfg = eff_cfg.to_calibration_config(args, scope=scan_offset)
-            active_hash = compute_calibration_config_hash(active_cfg)
+            active_hash = compute_calibration_config_hash(
+                eff_cfg.to_calibration_config(args, scope=scan_offset)
+            )
             if calib_hash != active_hash:
                 print(
                     colorize(
-                        f"Warning: Active scan configuration does not match baseline calibration config (baseline: {calib_hash[:8]}, active: {active_hash[:8]}). Calibration shingle frequencies may not align with active scan settings.",
+                        f"Warning: Active scan configuration does not match baseline calibration config "
+                        f"(baseline: {calib_hash[:8]}, active: {active_hash[:8]}). "
+                        f"Calibration shingle frequencies may not align with active scan settings.",
                         COLOR_BOLD + COLOR_YELLOW,
                         use_color,
                     )
                 )
 
-    diff_files: Optional[Sequence[str]] = None
-    if args.diff_only:
-        git_diff_root = git_worktree_root
-        raw_diff_files = _safe_call_git_diff_helper(
-            get_git_modified_files, args.since, git_diff_root
-        )
-        if not raw_diff_files:
-            mod_ranges = _safe_call_git_diff_helper(
-                get_git_modified_line_ranges, args.since, git_diff_root
-            )
-            if mod_ranges:
-                raw_diff_files = list(mod_ranges.keys())
-        if raw_diff_files:
-            diff_files = _normalize_git_paths_for_target(
-                raw_diff_files, git_diff_root, target_repo_root
-            )
-        else:
-            diff_files = []
-
+    diff_files = _resolve_cli_diff_files(
+        args,
+        git_worktree_root=opts.git_worktree_root,
+        target_repo_root=opts.target_repo_root,
+    )
     has_baseline_filter = bool(args.baseline or tool_cfg.get("baseline"))
     scan_top_n = None if (has_baseline_filter or args.diff_only) else args.top
-
     scan_res = scan_target(
-        target,
-        repo_root=git_worktree_root,
+        opts.target,
+        repo_root=opts.git_worktree_root,
         diff_files=diff_files,
         min_lines=eff_cfg.min_lines,
         min_tokens=eff_cfg.min_tokens,
-        threshold=threshold,
-        excludes=excludes,
+        threshold=opts.threshold,
+        excludes=eff_cfg.excludes,
         functions_only=eff_cfg.functions_only,
         sliding_window=eff_cfg.sliding_window,
         window_size=eff_cfg.window_size,
@@ -1290,8 +1722,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         abstract_expressions=eff_cfg.abstract_expressions,
         gapped_tolerance=eff_cfg.gapped_tolerance,
         call_sequences=eff_cfg.call_sequences,
-        audit_tests=audit_tests_enabled,
-        exemptions=cfg_exemptions,
+        audit_tests=eff_cfg.audit_tests,
+        exemptions=opts.cfg_exemptions,
         workers=args.workers,
         sort_by=sort_by,
         top_n=scan_top_n,
@@ -1315,164 +1747,126 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         clones = []
 
-    if calib_dict and isinstance(calib_dict, dict) and args.format == "text":
-        drift = calib_dict.get("unit_drift")
-        if drift is not None and drift >= 0.20:
-            curr_units = calib_dict.get("current_units")
-            base_units = calib_dict.get("total_units")
-            print(
-                colorize(
-                    f"Warning: Calibration drift detected: repository units drifted by {drift:.1%} from baseline calibration "
-                    f"(current: {curr_units}, baseline: {base_units}). "
-                    f"Consider re-running with --record-baseline to refresh calibration.",
-                    COLOR_BOLD + COLOR_YELLOW,
-                    use_color,
-                )
-            )
-
-    if (calib_dict is not None or preloaded_baseline is not None) and args.format == "text":
-        discarded_mismatch = (
-            calib_dict.get("discarded_mismatch")
-            if isinstance(calib_dict, dict)
-            else (
-                getattr(preloaded_baseline, "corpus_calibration", {}).get("discarded_mismatch")
-                if preloaded_baseline
-                and isinstance(getattr(preloaded_baseline, "corpus_calibration", None), dict)
-                else None
-            )
-        )
-        if discarded_mismatch and getattr(args, "verbose", False):
-            print(
-                colorize(
-                    f"Info: Corpus calibration was discarded due to configuration mismatch "
-                    f"({discarded_mismatch}); falling back to full corpus scan.",
-                    COLOR_YELLOW,
-                    use_color,
-                ),
-                file=sys.stderr,
-            )
-
-        base_commit_raw = (
-            (calib_dict.get("recorded_commit") if isinstance(calib_dict, dict) else None)
-            or getattr(preloaded_baseline, "recorded_commit", None)
-        )
-        if base_commit_raw and getattr(args, "verbose", False):
-            base_commit = str(base_commit_raw)
-            curr_commit = get_git_head_commit(repo_root=git_worktree_root)
-            if curr_commit and base_commit.lower() != curr_commit.lower():
-                print(
-                    colorize(
-                        f"Info: Repository HEAD commit {curr_commit[:8]} differs from baseline recorded commit {base_commit[:8]}.",
-                        COLOR_YELLOW,
-                        use_color,
-                    )
-                )
-
-        skipped_novel = (
-            calib_dict.get("skipped_novel_shingles") if isinstance(calib_dict, dict) else None
-        )
-        if skipped_novel and getattr(args, "verbose", False):
-            print(
-                colorize(
-                    f"Info: {skipped_novel} high-density novel shingle(s) exceeded candidate pair budget during differential scan.",
-                    COLOR_YELLOW,
-                    use_color,
-                )
-            )
-
+    _emit_post_scan_calibration_diagnostics(
+        args,
+        calib_dict,
+        preloaded_baseline,
+        git_worktree_root=opts.git_worktree_root,
+        use_color=use_color,
+    )
     if args.record_baseline:
-        bp = record_baseline(
+        return _handle_record_baseline_command(
             clones,
-            args.record_baseline,
-            target,
-            threshold,
-            corpus_calibration=recorded_calib,
-            repo_root=git_worktree_root,
+            args,
+            target=opts.target,
+            threshold=opts.threshold,
+            recorded_calib=recorded_calib,
+            git_worktree_root=opts.git_worktree_root,
+            eff_cfg=eff_cfg,
         )
-        file_size_info = ""
-        try:
-            bp_path = Path(bp)
-            if bp_path.is_file():
-                sz_bytes = bp_path.stat().st_size
-                sz_kb = sz_bytes / 1024.0
-                sz_str = f"{sz_kb:.1f} KB" if sz_kb < 1024.0 else f"{sz_kb / 1024.0:.2f} MB"
-                file_size_info = f" [{sz_str}]"
-        except (OSError, ValueError):
-            pass
-
-        calib_info = ""
-        if isinstance(recorded_calib, dict) and (
-            recorded_calib.get("pruned_shingle_count", 0) > 0
-            or recorded_calib.get("min_frequency", 1) > 1
-        ):
-            pruned = int(recorded_calib.get("pruned_shingle_count", 0))
-            raw = int(recorded_calib.get("raw_shingle_count", pruned))
-            ratio = recorded_calib.get("shingle_reduction_ratio")
-            pct_val = (
-                (ratio * 100.0)
-                if ratio is not None
-                else ((pruned / raw * 100.0) if raw > 0 else 0.0)
-            )
-            comp_ratio = recorded_calib.get("shingle_compression_ratio")
-            comp_str = f", {comp_ratio:.2f}x compression" if comp_ratio is not None else ""
-            mf = recorded_calib.get("min_frequency", eff_cfg.min_frequency)
-            calib_info = (
-                f" (Calibration: {pruned:,} of {raw:,} shingles pruned, "
-                f"{pct_val:.1f}% reduction{comp_str} via min-frequency {mf})"
-            )
-
-        print(f"[OK] Recorded {len(clones)} clone baseline pair(s) to {bp}{file_size_info}{calib_info}")
-        return 0
 
     clones, early_exit = _apply_baseline_and_diff_filters(
         clones,
         args,
         tool_cfg,
-        target_repo_root=target_repo_root,
+        target_repo_root=opts.target_repo_root,
         preloaded_baseline=preloaded_baseline,
-        target=target,
-        repo_root=git_worktree_root,
+        target=opts.target,
+        repo_root=opts.git_worktree_root,
     )
     if early_exit is not None:
         return early_exit
-
     if args.top is not None and 0 < args.top < len(clones):
-        clones = clones[:args.top]
+        clones = clones[: args.top]
 
     families: Optional[List[Dict[str, Any]]] = None
     if args.cluster:
-        linkage_strategy = args.linkage or str(tool_cfg.get("linkage", "single"))
-        cluster_floor = (
-            args.min_cluster_similarity
-            if args.min_cluster_similarity is not None
-            else float(tool_cfg.get("min_cluster_similarity", threshold))
-        )
-        linkage_tol = (
-            args.linkage_tolerance
-            if args.linkage_tolerance is not None
-            else float(tool_cfg.get("linkage_tolerance", 0.0))
-        )
         families = cluster_clone_families(
             clones,
-            linkage=linkage_strategy,
-            min_similarity_floor=cluster_floor,
-            linkage_tolerance=linkage_tol,
+            linkage=args.linkage or str(tool_cfg.get("linkage", "single")),
+            min_similarity_floor=(
+                args.min_cluster_similarity
+                if args.min_cluster_similarity is not None
+                else float(tool_cfg.get("min_cluster_similarity", opts.threshold))
+            ),
+            linkage_tolerance=(
+                args.linkage_tolerance
+                if args.linkage_tolerance is not None
+                else float(tool_cfg.get("linkage_tolerance", 0.0))
+            ),
         )
 
     stats: Optional[Dict[str, Any]] = None
     if args.stats or args.summary or args.html:
         stats = compute_repository_dry_stats(
-            target,
+            opts.target,
             clones,
-            excludes=excludes,
+            excludes=eff_cfg.excludes,
             include_notebooks=getattr(args, "notebooks", False),
         )
         if args.summary:
-            _write_artifact_file(args.summary, format_markdown_summary(stats, target), "SUMMARY", args.format == "text")
+            _write_artifact_file(
+                args.summary,
+                format_markdown_summary(stats, opts.target),
+                "SUMMARY",
+                args.format == "text",
+            )
 
-    cov_data: Dict[str, Set[int]] = {}
-    if args.coverage:
-        cov_data = read_coverage_data(args.coverage)
+    cov_data: Dict[str, Set[int]] = (
+        read_coverage_data(args.coverage) if args.coverage else {}
+    )
+    with heuristic_ctx_manager_session(warn=True), analysis_session():
+        return _emit_scan_artifacts_and_report(
+            args=args,
+            clones=clones,
+            target=opts.target,
+            threshold=opts.threshold,
+            sort_by=sort_by,
+            families=families,
+            stats=stats,
+            cov_data=cov_data,
+            use_color=use_color,
+            git_worktree_root=opts.git_worktree_root,
+            audit_tests_enabled=eff_cfg.audit_tests,
+            type_merge_strategy=opts.type_merge_strategy,
+            replace_clones=opts.replace_clones,
+            method_binding=opts.method_binding,
+            cross_file_strategy=opts.cross_file_strategy,
+            shared_module_name=opts.shared_module_name,
+            closure_strictness=opts.closure_strictness,
+            has_explicit_closure_cfg=opts.has_explicit_closure_cfg,
+            non_suppressing_ctx_managers=opts.non_suppressing_ctx_managers,
+        )
+
+
+def _emit_scan_artifacts_and_report(
+    *,
+    args: argparse.Namespace,
+    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
+    target: str,
+    threshold: float,
+    sort_by: str,
+    families: Optional[List[Dict[str, Any]]],
+    stats: Optional[Dict[str, Any]],
+    cov_data: Dict[str, Set[int]],
+    use_color: bool,
+    git_worktree_root: str,
+    audit_tests_enabled: bool,
+    type_merge_strategy: str,
+    replace_clones: bool,
+    method_binding: str,
+    cross_file_strategy: str,
+    shared_module_name: str,
+    closure_strictness: Optional[str],
+    non_suppressing_ctx_managers: Tuple[str, ...],
+    has_explicit_closure_cfg: bool = False,
+) -> int:
+    """Emits HTML/patch/annotation artifacts and structured or text scan reports."""
+    diagnostic_errors = 0
+
+    def _record_diagnostic_error() -> None:
+        nonlocal diagnostic_errors
+        diagnostic_errors += 1
 
     if args.html:
         html_report = generate_html_report(
@@ -1482,10 +1876,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             families=families,
             stats=stats,
             repo_root=git_worktree_root,
+            closure_strictness=closure_strictness,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+            on_diagnostic_error=_record_diagnostic_error,
         )
         _write_artifact_file(args.html, html_report, "HTML", args.format == "text")
 
     if args.patch:
+        patch_closure_strictness = (
+            None if not has_explicit_closure_cfg else closure_strictness
+        )
         patch_text = (
             generate_refactoring_patch(
                 clones,
@@ -1495,8 +1895,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 method_binding=method_binding,
                 cross_file_strategy=cross_file_strategy,
                 shared_module_name=shared_module_name,
-                skip_pre_unit_closures=skip_pre_unit_closures,
-                closure_strictness=closure_strictness,
+                closure_strictness=patch_closure_strictness,
+                non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+                on_diagnostic_error=_record_diagnostic_error,
             )
             if clones
             else ""
@@ -1516,6 +1917,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if annotations:
             print("\n".join(annotations))
 
+    def _emit_diagnostic_error_summary() -> None:
+        if diagnostic_errors > 0:
+            print(
+                f"Warning: {diagnostic_errors} internal diagnostic error(s) occurred while "
+                f"rendering clone pair suggestions, diffs, HTML cards, or patches; see logs for details.",
+                file=sys.stderr,
+            )
+
     if args.format in ("sarif", "json"):
         report_data = (
             format_sarif_report(clones, target, threshold)
@@ -1525,21 +1934,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         emit_structured_report(
             report_data, "SARIF 2.1.0" if args.format == "sarif" else "JSON", args.output
         )
-        return 0 if not clones else 1
+        _emit_diagnostic_error_summary()
+        return _determine_cli_exit_code(
+            has_clones=bool(clones),
+            diagnostic_errors=diagnostic_errors,
+        )
 
-    # Text format
     if stats and args.stats:
         _render_dry_scorecard(stats, use_color)
 
     if not clones:
-        ok_msg = colorize(f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!", COLOR_BOLD + COLOR_GREEN, use_color)
+        ok_msg = colorize(
+            f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!",
+            COLOR_BOLD + COLOR_GREEN,
+            use_color,
+        )
         print(ok_msg)
         if args.output:
             out_p = Path(args.output)
             out_p.parent.mkdir(parents=True, exist_ok=True)
             with open(out_p, "w", encoding="utf-8") as fh:
-                fh.write(f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!\n")
-        return 0
+                fh.write(
+                    f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!\n"
+                )
+        _emit_diagnostic_error_summary()
+        return _determine_cli_exit_code(
+            has_clones=False,
+            diagnostic_errors=diagnostic_errors,
+        )
 
     report_lines = _render_text_violations(
         clones,
@@ -1551,6 +1973,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         use_color=use_color,
         target_repo_root=git_worktree_root,
         audit_tests_enabled=audit_tests_enabled,
+        closure_strictness=closure_strictness,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        on_diagnostic_error=_record_diagnostic_error,
     )
 
     if args.output:
@@ -1559,8 +1984,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         with open(out_p, "w", encoding="utf-8") as fh:
             fh.write("\n".join(report_lines) + "\n")
 
-    return 1
+    _emit_diagnostic_error_summary()
+
+    return _determine_cli_exit_code(
+        has_clones=True,
+        diagnostic_errors=diagnostic_errors,
+    )
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(console_main())

@@ -2,19 +2,161 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from collections.abc import Set as AbstractSet
+import contextlib
+import contextvars
+from dataclasses import dataclass, field
+import itertools
+import keyword
 import logging
 import os
 from pathlib import Path
 import sys
 import threading
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+import weakref
+from typing import (
+    Any,
+    Callable,
+    ContextManager,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
-from pydoppelgangerhunt.canonical_path import normalize_lexical_posix, parse_notebook_cell_anchor
+from pydoppelgangerhunt.canonical_path import (
+    normalize_lexical_posix,
+    parse_notebook_cell_anchor,
+)
 
 logger = logging.getLogger(__name__)
 
 _warned_closure_lock: threading.Lock = threading.Lock()
-_warned_closure_strictness_values: Set[str] = set()
+_MAX_WARNED_CLOSURE_EVENTS: int = 4096
+_MAX_HEURISTIC_CTX_MANAGERS: int = 16384
+_warned_closure_strictness_values: OrderedDict[str, None] = OrderedDict()
+_next_heuristic_session_id = itertools.count(1)
+_heuristic_collector_stack: contextvars.ContextVar[
+    Tuple[Tuple[Set[str], bool], ...]
+] = contextvars.ContextVar("_heuristic_collector_stack", default=())
+_wildcard_collector_stack: contextvars.ContextVar[
+    Tuple[Tuple[Set[Tuple[str, str]], bool], ...]
+] = contextvars.ContextVar("_wildcard_collector_stack", default=())
+
+
+@dataclass
+class _HeuristicSessionBucket:
+    """Bounded accumulator for unproven heuristic and wildcard context managers recorded in a session or thread."""
+
+    names: Set[str] = field(default_factory=set)
+    overflow_count: int = 0
+    wildcard_matches: Set[Tuple[str, str]] = field(default_factory=set)
+    wildcard_overflow_count: int = 0
+    defer_depth: int = 0
+    warn_on_summary: bool = True
+    closing: bool = False
+
+    def add(self, mgr_name: str) -> None:
+        """Records mgr_name up to _MAX_HEURISTIC_CTX_MANAGERS, counting overflow occurrences beyond cap."""
+        if mgr_name in self.names:
+            return
+        if len(self.names) < _MAX_HEURISTIC_CTX_MANAGERS:
+            self.names.add(mgr_name)
+        else:
+            self.overflow_count += 1
+
+    def add_wildcard(self, pattern: str, mgr_name: str) -> None:
+        """Records a (pattern, mgr_name) wildcard allowlist match up to _MAX_HEURISTIC_CTX_MANAGERS."""
+        entry = (pattern, mgr_name)
+        if entry in self.wildcard_matches:
+            return
+        if len(self.wildcard_matches) < _MAX_HEURISTIC_CTX_MANAGERS:
+            self.wildcard_matches.add(entry)
+        else:
+            self.wildcard_overflow_count += 1
+
+
+APP_VERSION = "2.0.0"
+
+_active_heuristic_sessions: Dict[int, _HeuristicSessionBucket] = {}
+_default_thread_buckets: weakref.WeakKeyDictionary[
+    threading.Thread, _HeuristicSessionBucket
+] = weakref.WeakKeyDictionary()
+_heuristic_session_stack: contextvars.ContextVar[Tuple[int, ...]] = (
+    contextvars.ContextVar("_heuristic_session_stack", default=())
+)
+
+
+def _find_active_session_bucket_locked(
+    sess_stack: Tuple[int, ...],
+    *,
+    skip_closing: bool = False,
+) -> Optional[_HeuristicSessionBucket]:
+    """Returns the innermost active session bucket along *sess_stack*, if any."""
+    for sid in reversed(sess_stack):
+        active = _active_heuristic_sessions.get(sid)
+        if active is not None and (not skip_closing or not active.closing):
+            return active
+    return None
+
+
+def _get_thread_bucket_locked() -> Optional[_HeuristicSessionBucket]:
+    """Returns the active session bucket or existing per-Thread fallback bucket without allocating."""
+    sess_stack = _heuristic_session_stack.get()
+    if sess_stack:
+        active = _find_active_session_bucket_locked(sess_stack, skip_closing=True)
+        if active is not None:
+            return active
+    return _default_thread_buckets.get(threading.current_thread())
+
+
+def _get_or_create_thread_bucket_locked() -> _HeuristicSessionBucket:
+    """Returns the active session bucket for the current context or a per-Thread fallback bucket."""
+    bucket = _get_thread_bucket_locked()
+    if bucket is not None:
+        return bucket
+    bucket = _HeuristicSessionBucket()
+    _default_thread_buckets[threading.current_thread()] = bucket
+    return bucket
+
+
+def normalize_heuristic_ctx_managers(*sources: Any) -> List[str]:
+    """Normalizes sequence/set heuristic context-manager names into sorted unique non-empty strings."""
+    merged: Set[str] = set()
+    for src in sources:
+        if not (
+            isinstance(src, AbstractSet)
+            or (isinstance(src, Sequence) and not isinstance(src, (str, bytes, bytearray)))
+        ):
+            continue
+        for item in src:
+            if isinstance(item, str) and item:
+                merged.add(item)
+    return sorted(merged)
+
+
+def normalize_wildcard_ctx_manager_matches(*sources: Any) -> List[Tuple[str, str]]:
+    """Normalizes sequence/set or JSON-deserialized wildcard match pairs into sorted unique 2-tuples."""
+    merged: Set[Tuple[str, str]] = set()
+    for src in sources:
+        if not (
+            isinstance(src, AbstractSet)
+            or (isinstance(src, Sequence) and not isinstance(src, (str, bytes, bytearray)))
+        ):
+            continue
+        for item in src:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                merged.add((str(item[0]), str(item[1])))
+    return sorted(merged)
+
 
 _CONFIG_KEY_NAMES: Tuple[str, ...] = (
     "threshold",
@@ -22,56 +164,711 @@ _CONFIG_KEY_NAMES: Tuple[str, ...] = (
     "exemptions",
     "exclude",
     "closure_strictness",
-    "skip_pre_unit_closures",
+    "non_suppressing_ctx_managers",
     "top",
 )
 
 
+# INVARIANT (SINGLE KNOB): ``closure_strictness`` ("lenient" | "strict" | "pedantic")
+# is the sole configuration knob controlling closure-cell and context-manager strictness
+# across CLI flags, pyproject.toml, UnitSchema, and Python APIs. Do NOT introduce
+# overlapping boolean flags (such as ``skip_pre_unit_closures`` or
+# ``strict_with_suppression``): overlapping knobs create cross-flag precedence drift,
+# conflicting override warnings, and contradictory defaults across entrypoints.
+_CANONICAL_CLOSURE_MODES: frozenset[str] = frozenset({"strict", "pedantic", "lenient"})
+_STRICTNESS_RANK: Mapping[str, int] = {
+    "lenient": 0,
+    "strict": 1,
+    "pedantic": 2,
+}
+
+
+class ResolvedClosurePolicy(NamedTuple):
+    """Canonical resolved closure strictness and context-manager allowlist for one unit."""
+
+    mode: str
+    non_suppressing_ctx_managers: Tuple[str, ...] = ()
+
+    @property
+    def is_lenient(self) -> bool:
+        """Returns True when speculative unreferenced-sibling closure checks are relaxed."""
+        return self.mode == "lenient"
+
+    @property
+    def is_strict(self) -> bool:
+        """Returns True when heuristic context-manager strict mode is active."""
+        return self.mode == "strict"
+
+    @property
+    def is_pedantic(self) -> bool:
+        """Returns True when all unproven context managers fail closed."""
+        return self.mode == "pedantic"
+
+
+class PairClosurePolicy(NamedTuple):
+    """Canonical resolved per-unit and combined closure policy for a clone pair."""
+
+    unit1: ResolvedClosurePolicy
+    unit2: ResolvedClosurePolicy
+    effective_mode: str
+
+    @property
+    def is_lenient(self) -> bool:
+        """Returns True only when both units resolve to lenient mode."""
+        return self.effective_mode == "lenient"
+
+    @property
+    def is_strict(self) -> bool:
+        """Returns True when the combined pair policy is strict mode."""
+        return self.effective_mode == "strict"
+
+    @property
+    def is_pedantic(self) -> bool:
+        """Returns True when either unit requires pedantic mode."""
+        return self.effective_mode == "pedantic"
+
+
+def should_warn_closure_event(event_key: str) -> bool:
+    """Returns True the first time *event_key* is seen since cache reset."""
+    with _warned_closure_lock:
+        if event_key in _warned_closure_strictness_values:
+            _warned_closure_strictness_values.move_to_end(event_key)
+            return False
+        while len(_warned_closure_strictness_values) >= _MAX_WARNED_CLOSURE_EVENTS:
+            _warned_closure_strictness_values.popitem(last=False)
+        _warned_closure_strictness_values[event_key] = None
+        return True
+
+
+def _warn_closure_event_once(event_key: str, msg: str, *args: Any) -> None:
+    """Logs a warning message the first time *event_key* is seen since cache reset."""
+    if should_warn_closure_event(event_key):
+        logger.warning(msg, *args)
+
+
+_T = TypeVar("_T")
+
+
+@contextlib.contextmanager
+def bind_contextvar(
+    var: contextvars.ContextVar[_T],
+    value: _T,
+) -> Iterator[_T]:
+    """Binds *var* to *value* for the block and restores its prior value safely across threads."""
+    prev = var.get()
+    token = var.set(value)
+    try:
+        yield value
+    finally:
+        try:
+            var.reset(token)
+        except ValueError:
+            var.set(prev)
+
+
+@contextlib.contextmanager
+def _collect_ctxvar_bucket(
+    stack_var: contextvars.ContextVar[Tuple[Tuple[Set[_T], bool], ...]],
+    *,
+    isolate: bool = False,
+) -> Iterator[Set[_T]]:
+    """Pushes a temporary set onto *stack_var* for the duration of the context block."""
+    bucket: Set[_T] = set()
+    prev_stack = stack_var.get()
+    with bind_contextvar(stack_var, (*prev_stack, (bucket, isolate))):
+        yield bucket
+
+
+def collect_heuristic_ctx_managers(*, isolate: bool = False) -> ContextManager[Set[str]]:
+    """Collects heuristic context-manager names recorded within this contextvars scope."""
+    return _collect_ctxvar_bucket(_heuristic_collector_stack, isolate=isolate)
+
+
+def collect_wildcard_ctx_managers(
+    *, isolate: bool = False
+) -> ContextManager[Set[Tuple[str, str]]]:
+    """Collects (pattern, manager_name) pairs matched via wildcard allowlist entries in this scope."""
+    return _collect_ctxvar_bucket(_wildcard_collector_stack, isolate=isolate)
+
+
+def _record_ctxvar_and_thread_bucket(
+    stack_var: contextvars.ContextVar[Tuple[Tuple[Set[_T], bool], ...]],
+    entry: _T,
+    record_fn: Callable[[_HeuristicSessionBucket], None],
+) -> None:
+    """Appends *entry* to active *stack_var* collectors and applies *record_fn* to the active thread bucket."""
+    collector_stack = stack_var.get()
+    with _warned_closure_lock:
+        isolated = False
+        for bucket, is_isolated in reversed(collector_stack):
+            if entry not in bucket and len(bucket) < _MAX_HEURISTIC_CTX_MANAGERS:
+                bucket.add(entry)
+            if is_isolated:
+                isolated = True
+                break
+        if not isolated:
+            record_fn(_get_or_create_thread_bucket_locked())
+
+
+def record_heuristic_non_suppressing_ctx_manager(mgr_name: str) -> None:
+    """Records an unproven context manager accepted by the strict-mode name heuristic."""
+    _record_ctxvar_and_thread_bucket(
+        _heuristic_collector_stack,
+        mgr_name,
+        lambda bucket: bucket.add(mgr_name),
+    )
+
+
+def record_wildcard_ctx_manager_match(pattern: str, mgr_name: str) -> None:
+    """Records a context manager accepted via a wildcard allowlist pattern (e.g. '*.atomic')."""
+    _record_ctxvar_and_thread_bucket(
+        _wildcard_collector_stack,
+        (pattern, mgr_name),
+        lambda bucket: bucket.add_wildcard(pattern, mgr_name),
+    )
+
+
+def peek_heuristic_non_suppressing_ctx_managers() -> Tuple[str, ...]:
+    """Returns sorted unproven context managers recorded in the active session or current thread without clearing."""
+    with _warned_closure_lock:
+        bucket = _get_thread_bucket_locked()
+        if bucket is None or not bucket.names:
+            return ()
+        return tuple(sorted(bucket.names))
+
+
+def peek_wildcard_ctx_manager_matches() -> Tuple[Tuple[str, str], ...]:
+    """Returns sorted (pattern, manager_name) wildcard matches recorded in the active session or thread without clearing."""
+    with _warned_closure_lock:
+        bucket = _get_thread_bucket_locked()
+        if bucket is None or not bucket.wildcard_matches:
+            return ()
+        return tuple(sorted(bucket.wildcard_matches))
+
+
+def format_heuristic_ctx_manager_comment(names: Sequence[str]) -> str:
+    """Formats a summary comment line for unproven context managers accepted via name heuristic."""
+    if not names:
+        return ""
+    preview = ", ".join(repr(n) for n in names[:10])
+    if len(names) > 10:
+        preview += f", ... ({len(names)} total)"
+    return (
+        f"# Note: {len(names)} unproven context manager(s) ({preview}) were treated as "
+        f"non-suppressing via name heuristic in strict mode; use --closure-strictness "
+        f"pedantic to fail closed or list known-safe managers in --non-suppressing-ctx-managers."
+    )
+
+
+def format_wildcard_ctx_manager_comment(
+    matches: Sequence[Tuple[str, str]],
+) -> str:
+    """Formats a summary comment line for context managers accepted via wildcard allowlist patterns."""
+    if not matches:
+        return ""
+    ordered = sorted(set(matches))
+    formatted = [f"{mgr!r} via {pat!r}" for pat, mgr in ordered[:10]]
+    preview = ", ".join(formatted)
+    if len(ordered) > 10:
+        preview += f", ... ({len(ordered)} total)"
+    patterns = sorted({pat for pat, _ in ordered})
+    patterns_preview = ", ".join(repr(p) for p in patterns[:10])
+    if len(patterns) > 10:
+        patterns_preview += f", ... ({len(patterns)} total)"
+    return (
+        f"# Note: {len(ordered)} context manager(s) matched wildcard allowlist pattern(s) "
+        f"[{patterns_preview}]: {preview}; use exact qualified names in "
+        f"--non-suppressing-ctx-managers when stronger provenance precision is desired."
+    )
+
+
+def format_ctx_manager_assumption_comments(
+    heuristic_names: Sequence[str],
+    wildcard_matches: Sequence[Tuple[str, str]] = (),
+) -> str:
+    """Formats combined # Note: comments for strict-mode heuristic and wildcard allowlist assumptions."""
+    lines = [
+        line
+        for line in (
+            format_heuristic_ctx_manager_comment(heuristic_names),
+            format_wildcard_ctx_manager_comment(wildcard_matches),
+        )
+        if line
+    ]
+    return "\n".join(lines)
+
+
+@contextlib.contextmanager
+def defer_heuristic_ctx_manager_summary() -> Iterator[None]:
+    """Defers mid-run log_heuristic_ctx_manager_summary() draining until an outer boundary."""
+    with _warned_closure_lock:
+        bucket = _get_or_create_thread_bucket_locked()
+        bucket.defer_depth += 1
+    try:
+        yield
+    finally:
+        with _warned_closure_lock:
+            bucket.defer_depth = max(0, bucket.defer_depth - 1)
+
+
+class _DrainedHeuristicSummary(NamedTuple):
+    """Snapshot drained atomically from a heuristic/wildcard session bucket for logging."""
+
+    names: Tuple[str, ...]
+    overflow: int
+    wildcard_matches: Tuple[Tuple[str, str], ...]
+    wildcard_overflow: int
+    use_warn: bool
+
+
+def _drain_bucket_locked(
+    bucket: _HeuristicSessionBucket,
+    *,
+    force: bool,
+    warn: Optional[bool],
+) -> Optional[_DrainedHeuristicSummary]:
+    """Drains bucket under _warned_closure_lock when non-empty and un-deferred (or forced)."""
+    if not bucket.names and not bucket.wildcard_matches:
+        return None
+    if bucket.defer_depth > 0 and not force:
+        return None
+    summary = _DrainedHeuristicSummary(
+        names=tuple(sorted(bucket.names)),
+        overflow=bucket.overflow_count,
+        wildcard_matches=tuple(sorted(bucket.wildcard_matches)),
+        wildcard_overflow=bucket.wildcard_overflow_count,
+        use_warn=bucket.warn_on_summary if warn is None else bool(warn),
+    )
+    bucket.names.clear()
+    bucket.overflow_count = 0
+    bucket.wildcard_matches.clear()
+    bucket.wildcard_overflow_count = 0
+    return summary
+
+
+def _emit_drained_heuristic_summary(summary: _DrainedHeuristicSummary) -> None:
+    """Logs consolidated heuristic and wildcard context-manager summaries outside locks."""
+    log_fn = logger.warning if summary.use_warn else logger.info
+    if summary.names:
+        distinct_count = len(summary.names)
+        preview = ", ".join(repr(n) for n in summary.names[:10])
+        if distinct_count > 10:
+            preview += f", ... ({distinct_count} retained)"
+        if summary.overflow > 0:
+            preview += f"; {summary.overflow} additional occurrence(s) omitted beyond cap"
+        log_fn(
+            "Summary: %d unproven context manager(s) (%s) were treated as non-suppressing via "
+            "name heuristic in strict mode; use --closure-strictness pedantic to fail closed or "
+            "list known-safe managers in --non-suppressing-ctx-managers.",
+            distinct_count,
+            preview,
+        )
+    if summary.wildcard_matches:
+        wc_count = len(summary.wildcard_matches)
+        wc_patterns = sorted({pat for pat, _ in summary.wildcard_matches})
+        pat_preview = ", ".join(repr(p) for p in wc_patterns[:10])
+        if len(wc_patterns) > 10:
+            pat_preview += f", ... ({len(wc_patterns)} patterns)"
+        match_preview = ", ".join(
+            f"{mgr!r} via {pat!r}" for pat, mgr in summary.wildcard_matches[:10]
+        )
+        if wc_count > 10:
+            match_preview += f", ... ({wc_count} retained)"
+        if summary.wildcard_overflow > 0:
+            match_preview += (
+                f"; {summary.wildcard_overflow} additional occurrence(s) omitted beyond cap"
+            )
+        log_fn(
+            "Summary: %d context manager(s) accepted via wildcard allowlist pattern(s) [%s]: %s; "
+            "consider replacing wildcard entries in --non-suppressing-ctx-managers with "
+            "explicit qualified names.",
+            wc_count,
+            pat_preview,
+            match_preview,
+        )
+
+
+@contextlib.contextmanager
+def heuristic_ctx_manager_session(*, warn: Optional[bool] = None) -> Iterator[None]:
+    """Scopes a batch CLI or patch-generation run in a context-isolated session keyed by session ID.
+
+    When ``warn`` is ``None``, outermost sessions default to ``True`` (consolidated
+    ``WARNING``) while nested sessions inherit the enclosing session's warning setting so
+    inner wrappers preserve an outer ``heuristic_ctx_manager_session(warn=False)`` context.
+    Passing an explicit ``warn=True`` on a nested session that records findings merges
+    those findings into the enclosing session and escalates the enclosing session's
+    consolidated summary to ``WARNING`` so explicit warning requests are never silently
+    downgraded.
+
+    Propagates across ``asyncio`` tasks automatically via ``contextvars`` and across worker
+    threads when tasks are submitted with ``contextvars.copy_context().run``; unassociated
+    threads record into their own isolated per-thread fallback bucket without cross-session leakage.
+    """
+    prev_stack = _heuristic_session_stack.get()
+    with _warned_closure_lock:
+        sid = next(_next_heuristic_session_id)
+        prev_parent = _find_active_session_bucket_locked(
+            prev_stack, skip_closing=True
+        )
+        is_outermost = prev_parent is None
+        effective_warn = (
+            (True if warn is None else bool(warn))
+            if prev_parent is None
+            else (prev_parent.warn_on_summary if warn is None else bool(warn))
+        )
+        bucket = _HeuristicSessionBucket(defer_depth=1, warn_on_summary=effective_warn)
+        _active_heuristic_sessions[sid] = bucket
+    token = _heuristic_session_stack.set((*prev_stack, sid))
+    try:
+        yield
+    finally:
+        drained: Optional[_DrainedHeuristicSummary] = None
+        with _warned_closure_lock:
+            bucket.defer_depth = max(0, bucket.defer_depth - 1)
+            parent_bucket = (
+                None
+                if is_outermost
+                else _find_active_session_bucket_locked(
+                    prev_stack, skip_closing=True
+                )
+            )
+            bucket.closing = True
+            _active_heuristic_sessions.pop(sid, None)
+            if parent_bucket is None:
+                drained = _drain_bucket_locked(
+                    bucket, force=True, warn=bucket.warn_on_summary
+                )
+            elif (
+                bucket.names
+                or bucket.overflow_count > 0
+                or bucket.wildcard_matches
+                or bucket.wildcard_overflow_count > 0
+            ):
+                for mgr_name in bucket.names:
+                    parent_bucket.add(mgr_name)
+                parent_bucket.overflow_count += bucket.overflow_count
+                for pat, mgr_name in bucket.wildcard_matches:
+                    parent_bucket.add_wildcard(pat, mgr_name)
+                parent_bucket.wildcard_overflow_count += (
+                    bucket.wildcard_overflow_count
+                )
+                if bucket.warn_on_summary:
+                    parent_bucket.warn_on_summary = True
+        try:
+            if drained is not None:
+                _emit_drained_heuristic_summary(drained)
+        finally:
+            try:
+                _heuristic_session_stack.reset(token)
+            except ValueError:
+                _heuristic_session_stack.set(prev_stack)
+
+
+def log_heuristic_ctx_manager_summary(
+    *, force: bool = False, warn: Optional[bool] = None
+) -> Tuple[str, ...]:
+    """Logs consolidated summaries for strict-mode heuristic and wildcard allowlist context managers.
+
+    Logs a single consolidated ``WARNING`` by default so assumptions remain visible without
+    per-item warning noise, or ``INFO`` when ``warn=False`` is explicitly active.
+
+    When called inside an active ``heuristic_ctx_manager_session()`` (or
+    ``defer_heuristic_ctx_manager_summary()``) with ``force=False``, flushing is deferred to
+    session exit: this function returns the currently buffered unproven heuristic manager names
+    without draining or logging. Wildcard allowlist matches are logged when drained and are
+    omitted from the returned tuple (use ``peek_wildcard_ctx_manager_matches()`` to inspect
+    buffered wildcard matches).
+    """
+    with _warned_closure_lock:
+        bucket = _get_thread_bucket_locked()
+        if bucket is None or (not bucket.names and not bucket.wildcard_matches):
+            return ()
+        if bucket.defer_depth > 0 and not force:
+            return tuple(sorted(bucket.names))
+        drained = _drain_bucket_locked(bucket, force=force, warn=warn)
+    if drained is None:
+        return ()
+    _emit_drained_heuristic_summary(drained)
+    return drained.names
+
+
+def validate_closure_strictness(value: Any) -> str:
+    """Validates a closure_strictness setting, returning canonical lowercase mode or raising ValueError."""
+    if not isinstance(value, str):
+        raise ValueError(
+            f"Invalid closure_strictness value {value!r}; expected one of "
+            f"{sorted(_CANONICAL_CLOSURE_MODES)}"
+        )
+    c_mode = value.strip().lower()
+    if c_mode not in _CANONICAL_CLOSURE_MODES:
+        raise ValueError(
+            f"Invalid closure_strictness value {value!r}; expected one of "
+            f"{sorted(_CANONICAL_CLOSURE_MODES)}"
+        )
+    return c_mode
+
+
+def is_recognized_closure_strictness(value: Any) -> bool:
+    """Returns True when value is a canonical closure_strictness mode name."""
+    if not isinstance(value, str):
+        return False
+    return value.strip().lower() in _CANONICAL_CLOSURE_MODES
+
+
+def _warn_unrecognized_strictness(
+    closure_strictness: Any,
+    fallback_mode: str,
+) -> None:
+    """Logs a deduplicated warning when an unrecognized closure_strictness value falls back."""
+    _warn_closure_event_once(
+        f"unrecognized_strictness:{closure_strictness}",
+        "Unrecognized closure_strictness '%s'; falling back to %s mode",
+        closure_strictness,
+        fallback_mode,
+    )
+
+
+def combine_closure_strictness(mode1: str, mode2: str) -> str:
+    """Returns the stricter of two canonical closure strictness modes (lenient < strict < pedantic)."""
+    c1 = validate_closure_strictness(mode1)
+    c2 = validate_closure_strictness(mode2)
+    return c1 if _STRICTNESS_RANK[c1] >= _STRICTNESS_RANK[c2] else c2
+
+
 def resolve_closure_strictness_mode(
     closure_strictness: Optional[str] = None,
-    skip_pre_unit_closures: bool = False,
-) -> Tuple[str, bool]:
-    """Resolves canonical closure strictness mode ('strict' or 'lenient') and boolean skip flag.
+    *,
+    default: str = "strict",
+) -> str:
+    """Resolves canonical closure strictness mode ('lenient', 'strict', or 'pedantic').
 
     Precision vs Soundness Trade-off:
-    'strict' (default; alias 'fail_closed') preserves soundness by inspecting escaping closures
-    and callbacks that might execute after the unit.
-    'lenient' (aliases 'fast', 'skip') reduces false-positive rejections by bypassing pre-unit
-    closure scanning, at the cost of soundness for escaping closures.
+    'strict' (default for reporting) is a pragmatic safety mode: it enforces all escaping
+    closure and callback hazard checks while using a closed name-and-provenance heuristic
+    for unproven unknown context managers and permitting common dunder-invoking built-ins
+    in global-reading units.
+    'pedantic' (default for --patch / generate_refactoring_patch when unset) is a
+    conservative static mode: it treats all unproven unknown context managers as
+    potentially exception-suppressing unless explicitly listed in
+    non_suppressing_ctx_managers, and rejects dunder-invoking built-ins and unproven
+    implicit-dunder AST operations in global-reading units.
+    'lenient' relaxes speculative unreferenced-sibling closure checks while still
+    enforcing direct cell-capture, intra-unit nonlocal mutator, and referenced-sibling
+    closure checks.
+
+    Unrecognized ``closure_strictness`` strings log a deduplicated warning and fall back
+    to ``default`` (validated as a canonical mode).
     """
+    fallback = validate_closure_strictness(default)
+    if closure_strictness is None:
+        return fallback
+    if isinstance(closure_strictness, str):
+        c_mode = closure_strictness.strip().lower()
+        if c_mode in _CANONICAL_CLOSURE_MODES:
+            return c_mode
+    _warn_unrecognized_strictness(closure_strictness, fallback)
+    return fallback
+
+
+def resolve_unit_closure_policy(
+    unit: Mapping[str, Any],
+    *,
+    closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    default: str = "strict",
+) -> ResolvedClosurePolicy:
+    """Resolves the canonical closure policy for a single unit.
+
+    Precedence Order:
+        1. Explicit recognized ``closure_strictness`` argument from the caller.
+        2. Recognized ``unit["closure_strictness"]`` field on the unit dict.
+        3. ``default`` (``"strict"`` for analysis/reporting; ``"pedantic"`` for patching).
+
+    Unrecognized caller or unit ``closure_strictness`` strings log a deduplicated
+    warning and fall back down the precedence order.
+    """
+    fallback_default = validate_closure_strictness(default)
+    raw_unit_mode = unit.get("closure_strictness")
+    unit_mode: Optional[str] = None
+    if raw_unit_mode is not None:
+        if is_recognized_closure_strictness(raw_unit_mode):
+            unit_mode = str(raw_unit_mode).strip().lower()
+        else:
+            _warn_unrecognized_strictness(raw_unit_mode, fallback_default)
+
     if closure_strictness is not None:
-        c_mode = str(closure_strictness).strip().lower()
-        if c_mode in ("lenient", "fast", "skip"):
-            return "lenient", True
-        if c_mode in ("strict", "fail_closed"):
-            if skip_pre_unit_closures:
-                logger.warning(
-                    "Conflicting configuration: closure_strictness '%s' takes precedence over "
-                    "skip_pre_unit_closures=True",
-                    closure_strictness,
-                )
-            return "strict", False
-        fallback = "lenient" if skip_pre_unit_closures else "strict"
-        raw_key = str(closure_strictness)
-        with _warned_closure_lock:
-            should_warn = raw_key not in _warned_closure_strictness_values
-            if should_warn:
-                _warned_closure_strictness_values.add(raw_key)
-        if should_warn:
-            logger.warning(
-                "Unrecognized closure_strictness '%s'; falling back to %s mode",
-                closure_strictness,
-                fallback,
+        if is_recognized_closure_strictness(closure_strictness):
+            resolved_mode = str(closure_strictness).strip().lower()
+        else:
+            # Fail closed on unrecognized caller strictness: never weaken below
+            # either the unit's explicit strictness or the entrypoint default.
+            resolved_mode = (
+                combine_closure_strictness(unit_mode, fallback_default)
+                if unit_mode is not None
+                else fallback_default
             )
-        return fallback, bool(skip_pre_unit_closures)
-    is_lenient = bool(skip_pre_unit_closures)
-    return ("lenient" if is_lenient else "strict"), is_lenient
+            _warn_unrecognized_strictness(closure_strictness, resolved_mode)
+    else:
+        resolved_mode = unit_mode if unit_mode is not None else fallback_default
+
+    eff_non_sup = normalize_non_suppressing_ctx_managers(
+        non_suppressing_ctx_managers,
+        unit.get("non_suppressing_ctx_managers"),
+    )
+    return ResolvedClosurePolicy(
+        mode=resolved_mode,
+        non_suppressing_ctx_managers=eff_non_sup,
+    )
+
+
+def resolve_pair_closure_policy(
+    u1: Mapping[str, Any],
+    u2: Mapping[str, Any],
+    *,
+    closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    default: str = "strict",
+) -> PairClosurePolicy:
+    """Resolves canonical per-unit and combined closure policy for two clone units."""
+    fallback_default = validate_closure_strictness(default)
+    caller_unrecognized = (
+        closure_strictness is not None
+        and not is_recognized_closure_strictness(closure_strictness)
+    )
+    effective_caller = None if caller_unrecognized else closure_strictness
+    p1 = resolve_unit_closure_policy(
+        u1,
+        closure_strictness=effective_caller,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        default=fallback_default,
+    )
+    p2 = resolve_unit_closure_policy(
+        u2,
+        closure_strictness=effective_caller,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        default=fallback_default,
+    )
+    if caller_unrecognized:
+        p1 = ResolvedClosurePolicy(
+            mode=combine_closure_strictness(p1.mode, fallback_default),
+            non_suppressing_ctx_managers=p1.non_suppressing_ctx_managers,
+        )
+        p2 = ResolvedClosurePolicy(
+            mode=combine_closure_strictness(p2.mode, fallback_default),
+            non_suppressing_ctx_managers=p2.non_suppressing_ctx_managers,
+        )
+    effective_mode = combine_closure_strictness(p1.mode, p2.mode)
+    if caller_unrecognized:
+        _warn_unrecognized_strictness(closure_strictness, effective_mode)
+    return PairClosurePolicy(
+        unit1=p1,
+        unit2=p2,
+        effective_mode=effective_mode,
+    )
+
+
+def _validate_ctx_manager_pattern(pattern: str) -> str:
+    """Validates one non_suppressing_ctx_managers entry, rejecting degenerate wildcards and invalid identifiers."""
+    if pattern == "." * len(pattern) or pattern.endswith("."):
+        raise ValueError(
+            f"Invalid non_suppressing_ctx_managers pattern {pattern!r}: trailing or empty dot segment"
+        )
+    prefix_dots = len(pattern) - len(pattern.lstrip("."))
+    rest = pattern[prefix_dots:]
+    parts = rest.split(".")
+    if any(not seg for seg in parts):
+        raise ValueError(
+            f"Invalid non_suppressing_ctx_managers pattern {pattern!r}: empty dotted segment"
+        )
+    if "*" in pattern:
+        if any("*" in seg and seg != "*" for seg in parts):
+            raise ValueError(
+                f"Invalid non_suppressing_ctx_managers pattern {pattern!r}: '*' must occupy a full dotted segment"
+            )
+        if parts.count("*") != 1:
+            raise ValueError(
+                f"Invalid non_suppressing_ctx_managers pattern {pattern!r}: multiple '*' wildcards are unsupported"
+            )
+        star_idx = parts.index("*")
+        if star_idx != len(parts) - 2 or (prefix_dots > 0 and star_idx == 0):
+            raise ValueError(
+                f"Invalid non_suppressing_ctx_managers pattern {pattern!r}: only '*.attr' or "
+                f"'<module>.*.attr' wildcards are supported"
+            )
+    if not all(
+        seg == "*" or (seg.isidentifier() and not keyword.iskeyword(seg))
+        for seg in parts
+    ):
+        raise ValueError(
+            f"Invalid non_suppressing_ctx_managers pattern {pattern!r}: "
+            f"segments must be valid identifiers (not Python keywords)"
+        )
+    return pattern
+
+
+def normalize_non_suppressing_ctx_managers(*sources: Any) -> Tuple[str, ...]:
+    """Normalizes context-manager allowlist sources into a sorted tuple, rejecting invalid wildcard patterns."""
+    collected: Set[str] = set()
+    seen_container_ids: Set[int] = set()
+    stack: List[Any] = list(sources)
+    while stack:
+        item = stack.pop()
+        if item is None:
+            continue
+        if isinstance(item, str):
+            for part in item.split(","):
+                cleaned = part.strip()
+                if cleaned:
+                    collected.add(_validate_ctx_manager_pattern(cleaned))
+        elif not isinstance(item, (bytes, bytearray, Mapping)) and isinstance(
+            item, (Sequence, AbstractSet)
+        ):
+            obj_id = id(item)
+            if obj_id in seen_container_ids:
+                continue
+            seen_container_ids.add(obj_id)
+            stack.extend(item)
+        else:
+            invalid_key = f"invalid_non_sup_type:{type(item).__name__}"
+            if should_warn_closure_event(invalid_key):
+                logger.warning(
+                    "Ignoring unsupported non_suppressing_ctx_managers value of type %s; "
+                    "expected string or sequence of strings",
+                    type(item).__name__,
+                )
+    return tuple(sorted(collected))
 
 
 def clear_closure_warning_cache() -> None:
-    """Clears the set of warned closure strictness values for multi-run lifecycle."""
+    """Clears warned closure strictness events and stale unassociated thread buckets without wiping active sessions."""
+    sess_stack = _heuristic_session_stack.get()
+    curr_thread = threading.current_thread()
+    discarded_threads: List[Tuple[str, Tuple[str, ...], Tuple[Tuple[str, str], ...]]] = []
     with _warned_closure_lock:
         _warned_closure_strictness_values.clear()
+        if (
+            not sess_stack
+            or _find_active_session_bucket_locked(sess_stack, skip_closing=True) is None
+        ):
+            _default_thread_buckets.pop(curr_thread, None)
+        for thr in list(_default_thread_buckets.keys()):
+            if not thr.is_alive():
+                bucket = _default_thread_buckets.pop(thr, None)
+                if bucket is not None and (bucket.names or bucket.wildcard_matches):
+                    discarded_threads.append(
+                        (
+                            thr.name,
+                            tuple(sorted(bucket.names)),
+                            tuple(sorted(bucket.wildcard_matches)),
+                        )
+                    )
+    for thr_name, heur_names, wc_matches in discarded_threads:
+        logger.debug(
+            "Cleared unassociated thread '%s' context-manager bucket (%d heuristic, %d wildcard)",
+            thr_name,
+            len(heur_names),
+            len(wc_matches),
+        )
 
 
 DEFAULT_EXCLUDES: List[str] = [
@@ -106,7 +903,9 @@ exclude = [
 ]
 call_sequences = true
 idioms = true
-# closure_strictness = "strict"  # Options: "strict", "lenient"
+# closure_strictness = "strict"  # Options: "strict", "pedantic", "lenient"
+# Prefer explicit qualified names or class names; use wildcards ("<module>.*.attr" or "*.attr") only as a last resort:
+# non_suppressing_ctx_managers = ["mylib.Transaction", "Transaction", "*.atomic"]
 """
 
 
@@ -121,8 +920,6 @@ def canonical_path_key(path_str: Optional[str], strip_anchor: bool = False) -> s
     if os.name == "nt" or sys.platform == "win32":
         return norm.lower()
     return norm
-
-
 
 
 def paths_match_boundary(
@@ -201,7 +998,8 @@ def find_python_files(
 
     target_clean = str(target_path).replace("\\", "/").strip("./")
     active_excludes = [
-        ex for ex in exclude_patterns
+        ex
+        for ex in exclude_patterns
         if ex.strip("./\\") and ex.replace("\\", "/").strip("./") not in target_clean
     ]
     if audit_tests:
@@ -236,6 +1034,15 @@ def find_python_files(
     return found_files
 
 
+# INVARIANT (TOML FALLBACK CONVERGENCE BOUNDARY):
+# When stdlib ``tomllib`` (Python 3.11+) or ``tomli`` is importable, it is the
+# sole authoritative TOML parser: ``_load_raw_toml_section`` MUST return directly
+# (including ``{}`` on absent sections or ``TOMLDecodeError``) and MUST NOT fall
+# through to this line scanner. These helpers exist solely as a bounded
+# zero-dependency fallback for Python < 3.11 without ``tomli`` (supporting flat
+# keys, ``[tool.<section>]`` headers, basic/literal strings, booleans, numbers,
+# and single/multiline arrays); per TOML 1.0, backslashes escape only inside
+# double-quoted basic strings, never inside single-quoted literal strings.
 def _strip_toml_inline_comment(line: str) -> str:
     """Strips trailing TOML comments starting with # outside quotes."""
     in_quote: Optional[str] = None
@@ -244,7 +1051,7 @@ def _strip_toml_inline_comment(line: str) -> str:
         if escaped:
             escaped = False
             continue
-        if ch == "\\" and in_quote is not None:
+        if ch == "\\" and in_quote == '"':
             escaped = True
             continue
         if ch in ('"', "'"):
@@ -266,7 +1073,7 @@ def _count_bracket_depth(text: str, initial_depth: int = 0) -> int:
         if escaped:
             escaped = False
             continue
-        if ch == "\\" and in_quote is not None:
+        if ch == "\\" and in_quote == '"':
             escaped = True
             continue
         if ch in ('"', "'"):
@@ -298,7 +1105,7 @@ def _parse_toml_array_value(val_str: str) -> List[Any]:
             curr.append(ch)
             escaped = False
             continue
-        if ch == "\\" and in_quote is not None:
+        if ch == "\\" and in_quote == '"':
             curr.append(ch)
             escaped = True
             continue
@@ -327,13 +1134,13 @@ def _parse_toml_array_value(val_str: str) -> List[Any]:
             continue
         if e_str.startswith("[") and e_str.endswith("]"):
             elems.append(_parse_toml_array_value(e_str))
-        elif (e_str.startswith('"') and e_str.endswith('"')) or (
-            e_str.startswith("'") and e_str.endswith("'")
-        ):
+        elif e_str.startswith('"') and e_str.endswith('"') and len(e_str) >= 2:
             parsed_str = e_str[1:-1]
-            if '\\"' in parsed_str or "\\'" in parsed_str:
-                parsed_str = parsed_str.replace('\\"', '"').replace("\\'", "'")
+            if '\\"' in parsed_str:
+                parsed_str = parsed_str.replace('\\"', '"')
             elems.append(parsed_str)
+        elif e_str.startswith("'") and e_str.endswith("'") and len(e_str) >= 2:
+            elems.append(e_str[1:-1])
         elif e_str.lower() == "true":
             elems.append(True)
         elif e_str.lower() == "false":
@@ -346,27 +1153,63 @@ def _parse_toml_array_value(val_str: str) -> List[Any]:
     return elems
 
 
-def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[str, Any]:
-    """Loads a specific tool configuration section from a TOML file with fallbacks."""
-    target_path = Path(target_file)
+def _validate_loaded_tool_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Validates closure policy fields in loaded TOML config, raising ValueError on invalid values."""
+    if not config:
+        return config
+    if "closure_strictness" in config and config["closure_strictness"] is not None:
+        config["closure_strictness"] = validate_closure_strictness(
+            config["closure_strictness"]
+        )
+    if (
+        "non_suppressing_ctx_managers" in config
+        and config["non_suppressing_ctx_managers"] is not None
+    ):
+        raw_mgrs = config["non_suppressing_ctx_managers"]
+        is_str = isinstance(raw_mgrs, str)
+        is_str_collection = (
+            not isinstance(raw_mgrs, (bytes, bytearray, Mapping))
+            and isinstance(raw_mgrs, (Sequence, AbstractSet))
+            and all(isinstance(item, str) for item in raw_mgrs)
+        )
+        if not (is_str or is_str_collection):
+            raise ValueError(
+                f"Invalid non_suppressing_ctx_managers value {raw_mgrs!r}; "
+                f"expected string or sequence of strings"
+            )
+        normalize_non_suppressing_ctx_managers(raw_mgrs)
+    return config
+
+
+def _load_raw_toml_section(target_path: Path, section_name: str) -> Dict[str, Any]:
+    """Parses a specific tool configuration section from TOML using tomllib/tomli or line fallback."""
     if not target_path.is_file():
         return {}
 
-    # Prefer standard library tomllib (Python 3.11+) or third-party tomli if installed
+    # Prefer standard library tomllib (Python 3.11+) or third-party tomli if installed.
+    # Once imported, the stdlib/tomli parser is authoritative: never fall through to the
+    # line scanner when the target section is absent or the file has TOML syntax errors.
+    tomllib_mod: Any = None
     try:
         if sys.version_info >= (3, 11):
-            import tomllib
+            import tomllib as tomllib_mod
         else:
-            import tomli as tomllib  # type: ignore
-        with open(target_path, "rb") as fh:
-            data = tomllib.load(fh)
+            import tomli as tomllib_mod  # type: ignore
+    except ImportError:
+        tomllib_mod = None
+
+    if tomllib_mod is not None:
+        try:
+            with open(target_path, "rb") as fh:
+                data = tomllib_mod.load(fh)
+        except (OSError, ValueError, TypeError):
+            return {}
         tool_sec = data.get("tool", {}) if isinstance(data, dict) else {}
         if isinstance(tool_sec, dict) and isinstance(tool_sec.get(section_name), dict):
             return dict(tool_sec[section_name])
         if isinstance(data, dict) and any(k in data for k in _CONFIG_KEY_NAMES):
             return dict(data)
-    except (ImportError, OSError, ValueError, TypeError):
-        pass
+        return {}
 
     # Built-in zero-dependency line parser fallback
     try:
@@ -396,7 +1239,9 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
                 multiline_tokens.append(stripped)
                 multiline_depth = _count_bracket_depth(stripped, multiline_depth)
                 if multiline_depth == 0:
-                    config[in_multiline_key] = _parse_toml_array_value(" ".join(multiline_tokens))
+                    config[in_multiline_key] = _parse_toml_array_value(
+                        " ".join(multiline_tokens)
+                    )
                     in_multiline_key = None
                     multiline_tokens = []
                 continue
@@ -449,6 +1294,14 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
         return {}
 
 
+def load_toml_section(
+    target_file: Union[str, Path], section_name: str
+) -> Dict[str, Any]:
+    """Loads and validates a specific tool configuration section from a TOML file."""
+    raw_cfg = _load_raw_toml_section(Path(target_file), section_name)
+    return _validate_loaded_tool_config(raw_cfg)
+
+
 def load_tool_config(
     config_path: Optional[str] = None,
     repo_root: Optional[str] = None,
@@ -459,10 +1312,12 @@ def load_tool_config(
     if config_path:
         candidates.append(Path(config_path))
     else:
-        candidates.extend([
-            root / "pyproject.toml",
-            root / ".pydoppelgangerhunt.toml",
-        ])
+        candidates.extend(
+            [
+                root / "pyproject.toml",
+                root / ".pydoppelgangerhunt.toml",
+            ]
+        )
 
     for candidate in candidates:
         if candidate.is_file():

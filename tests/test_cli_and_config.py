@@ -322,8 +322,8 @@ def test_cli_dynamic_target_resolution(tmp_path: Path, monkeypatch: Any) -> None
     assert (init_dir / ".pydoppelgangerhunt.toml").exists()
 
 
-def test_batch_48_cli_and_config_edge_cases(tmp_path: Path) -> None:
-    """Batch 48: Test CLI diff/suggest output, warnings, Type-4 execution, and config fallbacks."""
+def test_cli_and_config_edge_cases(tmp_path: Path) -> None:
+    """Verifies CLI diff/suggest output, warnings, Type-4 execution, and config fallbacks."""
     # pylint: disable=protected-access,import-outside-toplevel
     import os
     import sys
@@ -424,7 +424,7 @@ def test_batch_48_cli_and_config_edge_cases(tmp_path: Path) -> None:
     assert load_toml_section(tmp_path / "missing.toml", "tool") == {}
 
     flat_toml = tmp_path / "flat.toml"
-    flat_toml.write_text("threshold = 0.77\nmin_lines = 8\nunquoted = some_value\n", encoding="utf-8")
+    flat_toml.write_text("threshold = 0.77\nmin_lines = 8\n", encoding="utf-8")
     flat_cfg = load_toml_section(flat_toml, "pydoppelgangerhunt")
     assert flat_cfg.get("threshold") == 0.77
 
@@ -450,8 +450,8 @@ def test_batch_48_cli_and_config_edge_cases(tmp_path: Path) -> None:
     assert fallback_cfg.get("threshold") == 0.93
 
 
-def test_batch_52_toml_lists_and_quotes(tmp_path: Path, monkeypatch: Any) -> None:
-    """Batch 52: Test zero-dependency TOML parser with single quotes, lists, and typed elements."""
+def test_toml_lists_and_quotes(tmp_path: Path, monkeypatch: Any) -> None:
+    """Verifies zero-dependency TOML parser with single quotes, lists, and typed elements."""
     # pylint: disable=import-outside-toplevel
     import builtins
     from pydoppelgangerhunt import config
@@ -508,13 +508,13 @@ def test_batch_52_toml_lists_and_quotes(tmp_path: Path, monkeypatch: Any) -> Non
     assert check_asymmetric_coverage(u_a, u_b, cov_data, min_diff=0.40) is None
 
 
-def test_batch_53_cli_method_binding_and_repo_root(tmp_path: Path) -> None:
-    """Batch 53: Test CLI --method-binding, repo_root forwarding, and metrics clamping."""
+def test_cli_method_binding_and_repo_root(tmp_path: Path) -> None:
+    """Verifies CLI --method-binding, repo_root forwarding, and metrics clamping."""
     # pylint: disable=import-outside-toplevel
     from unittest import mock
     import pytest
     from pydoppelgangerhunt.cli import _audit_clone_risk_warnings, build_arg_parser
-    from pydoppelgangerhunt.fixer import _is_same_file_path
+    from pydoppelgangerhunt.fixer.binding import _is_same_file_path
     from pydoppelgangerhunt.metrics import compute_repository_dry_stats
     from pydoppelgangerhunt.reporters import extract_unit_source_code
 
@@ -599,8 +599,8 @@ def test_batch_53_cli_method_binding_and_repo_root(tmp_path: Path) -> None:
     assert dry_stats["grade"] == "F"
 
 
-def test_batch_55_baseline_prune_repo_root_and_html_reporter(tmp_path: Path) -> None:
-    """Batch 55: Test prune_baseline repo_root, generate_html_report repo_root, and deque AST walk."""
+def test_baseline_prune_repo_root_and_html_reporter(tmp_path: Path) -> None:
+    """Verifies prune_baseline repo_root, generate_html_report repo_root, and deque AST walk."""
     # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.baseline import prune_baseline, record_baseline
     from pydoppelgangerhunt.parser import _walk_ast_nodes
@@ -697,8 +697,8 @@ def test_batch_55_baseline_prune_repo_root_and_html_reporter(tmp_path: Path) -> 
         assert cli_prune_code == 0
 
 
-def test_batch_56_target_dir_config_and_pruneresult_export(tmp_path: Path) -> None:
-    """Batch 56: Test PruneResult public export and target directory config discovery."""
+def test_target_dir_config_and_pruneresult_export(tmp_path: Path) -> None:
+    """Verifies PruneResult public export and target directory config discovery."""
     # pylint: disable=import-outside-toplevel
     from unittest import mock
     from pydoppelgangerhunt import PruneResult
@@ -740,8 +740,8 @@ min_lines = 11
         assert kwargs.get("min_lines") == 11
 
 
-def test_batch_67_cli_and_fixer_decomposition(tmp_path: Path) -> None:
-    """Batch 67: Test extracted helper functions in cli.py and fixer.py."""
+def test_cli_and_fixer_helper_functions(tmp_path: Path) -> None:
+    """Verifies extracted helper functions in cli.py and fixer."""
     # pylint: disable=import-outside-toplevel
     import argparse
     from unittest import mock
@@ -751,7 +751,7 @@ def test_batch_67_cli_and_fixer_decomposition(tmp_path: Path) -> None:
         _render_pair_diff_and_suggestions,
         _run_type4_semantic_audit,
     )
-    from pydoppelgangerhunt.fixer import _format_helper_parameters
+    from pydoppelgangerhunt.fixer._synthesis_types import _format_helper_parameters
 
     # 1. Test _format_scan_mode_description
     parser = argparse.ArgumentParser()
@@ -947,8 +947,8 @@ def test_batch_67_cli_and_fixer_decomposition(tmp_path: Path) -> None:
     assert params_kwonly == ["*", "k1: int = 1"]
 
 
-def test_batch_68_cli_patch_replace_and_type_merge_strategy(tmp_path: Path) -> None:
-    """Batch 68: Test CLI --replace-clones and --type-merge-strategy flags and config propagation."""
+def test_cli_patch_replace_and_type_merge_strategy(tmp_path: Path) -> None:
+    """Verifies CLI --replace-clones and --type-merge-strategy flags and config propagation."""
     # pylint: disable=import-outside-toplevel
     from unittest import mock
     from pydoppelgangerhunt.cli import build_arg_parser
@@ -1066,8 +1066,8 @@ shared_module_name = "_my_common.py"
         assert kwargs_cfg.get("shared_module_name") == "_my_common.py"
 
 
-def test_batch_69_modular_decomposition(tmp_path: Path) -> None:
-    """Batch 69: Validate extracted single-responsibility helpers in cli.py and fixer.py."""
+def test_cli_and_fixer_single_responsibility_helpers(tmp_path: Path) -> None:
+    """Validates extracted single-responsibility helpers in cli.py and fixer."""
     # pylint: disable=import-outside-toplevel
     import argparse
     from unittest import mock
@@ -1075,10 +1075,10 @@ def test_batch_69_modular_decomposition(tmp_path: Path) -> None:
         _apply_baseline_and_diff_filters,
         _render_text_violations,
     )
-    from pydoppelgangerhunt.fixer import (
-        _infer_helper_return_type,
+    from pydoppelgangerhunt.fixer.patch import _build_unit_delegation_call
+    from pydoppelgangerhunt.fixer._synthesis_types import (
         _format_helper_docstring,
-        _build_unit_delegation_call,
+        _infer_helper_return_type,
     )
 
     # 1. Test _apply_baseline_and_diff_filters
@@ -1089,7 +1089,7 @@ def test_batch_69_modular_decomposition(tmp_path: Path) -> None:
     args_err1 = argparse.Namespace(
         prune_baseline=True, baseline=None, diff_only=False, format="text"
     )
-    clones_res, exit_code = _apply_baseline_and_diff_filters(
+    _, exit_code = _apply_baseline_and_diff_filters(
         sample_clones, args_err1, {}, "."
     )
     assert exit_code == 1
@@ -1419,12 +1419,12 @@ def test_load_toml_section_non_mapping_resilience(tmp_path: Path) -> None:
 
 
 def test_parse_toml_array_value_escaped_quotes_and_commas() -> None:
-    """Verifies that _parse_toml_array_value handles escaped quotes containing commas inside string elements."""
+    """Verifies _parse_toml_array_value handles basic-string escapes and TOML 1.0 literal strings."""
     from pydoppelgangerhunt.config import _parse_toml_array_value  # pylint: disable=import-outside-toplevel
 
-    raw = '["hello \\"world\\", here", "item2", \'another \\\'escaped\\\', comma\']'
+    raw = '["hello \\"world\\", here", "item2", \'literal, comma\', \'C:\\dir\\\']'
     parsed = _parse_toml_array_value(raw)
-    assert parsed == ['hello "world", here', 'item2', "another 'escaped', comma"]
+    assert parsed == ['hello "world", here', 'item2', 'literal, comma', 'C:\\dir\\']
 
 
 def test_cli_record_baseline_and_differential_scan_calibration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2700,27 +2700,29 @@ def test_cli_verbose_discarded_calibration_mismatch_advisory(
 
 
 def test_cli_closure_strictness_and_skip_closures_flags(tmp_path: Path) -> None:
-    """Verifies CLI accepts --skip-pre-unit-closures and --closure-strictness flags."""
+    """Verifies CLI accepts --closure-strictness as the sole closure strictness knob and rejects legacy flags."""
     from pydoppelgangerhunt.cli import (  # pylint: disable=import-outside-toplevel
         build_arg_parser,
         main,
     )
 
-    # 1. Test build_arg_parser defaults
+    # 1. Test build_arg_parser defaults and removal of legacy --skip-pre-unit-closures
     parser = build_arg_parser()
     args_default = parser.parse_args([])
-    assert args_default.skip_pre_unit_closures is False
     assert args_default.closure_strictness is None
+    assert not hasattr(args_default, "skip_pre_unit_closures")
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--skip-pre-unit-closures"])
 
     # 2. Test flag parsing
-    args_skip = parser.parse_args(["--skip-pre-unit-closures"])
-    assert args_skip.skip_pre_unit_closures is True
-
     args_strict = parser.parse_args(["--closure-strictness", "strict"])
     assert args_strict.closure_strictness == "strict"
 
     args_lenient = parser.parse_args(["--closure-strictness", "lenient"])
     assert args_lenient.closure_strictness == "lenient"
+
+    args_pedantic = parser.parse_args(["--closure-strictness", "pedantic"])
+    assert args_pedantic.closure_strictness == "pedantic"
 
     # 3. Test execution and propagation to generate_refactoring_patch
     repo = tmp_path / "patch_repo"
@@ -2748,7 +2750,6 @@ def test_cli_closure_strictness_and_skip_closures_flags(tmp_path: Path) -> None:
             assert exit_code == 1
             mock_patch.assert_called_once()
             _, kwargs = mock_patch.call_args
-            assert kwargs.get("skip_pre_unit_closures") is True
             assert kwargs.get("closure_strictness") == "lenient"
 
             # Unrecognized strictness string is rejected at parse time
@@ -2779,7 +2780,8 @@ def test_cli_main_omitted_top_does_not_raise(tmp_path: Path) -> None:
 def test_cli_closure_strictness_and_skip_closures_precedence_warning(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Verifies precedence diagnostics and fallback when CLI flags and config interact."""
+    """Verifies precedence diagnostics when CLI --closure-strictness overrides pyproject.toml."""
+    import logging  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
 
     repo = tmp_path / "precedence_repo"
@@ -2801,26 +2803,25 @@ def test_cli_closure_strictness_and_skip_closures_precedence_warning(
         with mock.patch(
             "pydoppelgangerhunt.cli.generate_refactoring_patch", return_value="# patch\n"
         ) as mock_patch:
-            # 1. Config strictness overridden by CLI --skip-pre-unit-closures
-            import logging  # pylint: disable=import-outside-toplevel
+            # 1. Config strictness overridden by CLI --closure-strictness lenient warns
             with caplog.at_level(logging.WARNING):
                 exit_code = main([
                     str(repo),
                     "--patch",
                     str(patch_out),
-                    "--skip-pre-unit-closures",
+                    "--closure-strictness",
+                    "lenient",
                 ])
             assert exit_code == 1
             mock_patch.assert_called_once()
             _, kwargs = mock_patch.call_args
-            assert kwargs.get("skip_pre_unit_closures") is True
             assert kwargs.get("closure_strictness") == "lenient"
             assert any(
                 "overrides configured closure_strictness='strict'" in r.message
                 for r in caplog.records
             )
 
-            # 2. CLI --closure-strictness strict overrides CLI --skip-pre-unit-closures
+            # 2. Matching CLI --closure-strictness strict does not warn
             caplog.clear()
             mock_patch.reset_mock()
             with caplog.at_level(logging.WARNING):
@@ -2830,19 +2831,15 @@ def test_cli_closure_strictness_and_skip_closures_precedence_warning(
                     str(patch_out),
                     "--closure-strictness",
                     "strict",
-                    "--skip-pre-unit-closures",
                 ])
             assert exit_code == 1
             mock_patch.assert_called_once()
-            _, kwargs = mock_patch.call_args
-            assert kwargs.get("skip_pre_unit_closures") is False
-            assert kwargs.get("closure_strictness") == "strict"
-            assert any(
-                "takes precedence over --skip-pre-unit-closures" in r.message
+            assert not any(
+                "overrides configured closure_strictness" in r.message
                 for r in caplog.records
             )
 
-            # 3. CLI --closure-strictness fail_closed overrides CLI --skip-pre-unit-closures
+            # 3. CLI --closure-strictness pedantic overrides strict config and forwards allowlist
             caplog.clear()
             mock_patch.reset_mock()
             with caplog.at_level(logging.WARNING):
@@ -2851,25 +2848,25 @@ def test_cli_closure_strictness_and_skip_closures_precedence_warning(
                     "--patch",
                     str(patch_out),
                     "--closure-strictness",
-                    "fail_closed",
-                    "--skip-pre-unit-closures",
+                    "pedantic",
+                    "--non-suppressing-ctx-managers",
+                    "SafeA,SafeB",
                 ])
             assert exit_code == 1
             mock_patch.assert_called_once()
             _, kwargs = mock_patch.call_args
-            assert kwargs.get("skip_pre_unit_closures") is False
-            assert kwargs.get("closure_strictness") == "strict"
+            assert kwargs.get("closure_strictness") == "pedantic"
+            assert kwargs.get("non_suppressing_ctx_managers") == ("SafeA", "SafeB")
             assert any(
-                "takes precedence over --skip-pre-unit-closures" in r.message
+                "overrides configured closure_strictness='strict'" in r.message
                 for r in caplog.records
             )
 
 
-def test_cli_unrecognized_config_closure_strictness_falls_back(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+def test_cli_unrecognized_config_closure_strictness_fails_usage(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Verifies unrecognized closure_strictness in pyproject.toml warns and falls back."""
-    import logging  # pylint: disable=import-outside-toplevel
+    """Verifies unrecognized closure_strictness in pyproject.toml exits 2 with a configuration error."""
     from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
 
     repo = tmp_path / "fallback_repo"
@@ -2881,66 +2878,902 @@ def test_cli_unrecognized_config_closure_strictness_falls_back(
         encoding="utf-8",
     )
 
+    with pytest.raises(SystemExit) as exc_info:
+        main([
+            str(repo),
+            "--patch",
+            str(patch_out),
+        ])
+    assert exc_info.value.code == 2
+    assert "Invalid closure_strictness" in capsys.readouterr().err
+
+
+def test_resolve_closure_strictness_mode_thread_safety() -> None:
+    """Verifies that concurrent invocations of resolve_closure_strictness_mode deduplicate warnings across threads."""
+    import concurrent.futures  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        clear_closure_warning_cache,
+        resolve_closure_strictness_mode,
+    )
+
+    clear_closure_warning_cache()
+
+    def _worker(val: str) -> str:
+        return resolve_closure_strictness_mode(val)
+
+    with mock.patch("pydoppelgangerhunt.config.logger.warning") as mock_warn:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(_worker, f"unknown_mode_{i % 3}") for i in range(50)]
+            results = [f.result() for f in futures]
+
+    assert all(r == "strict" for r in results)
+    assert mock_warn.call_count == 3
+
+
+def test_resolve_closure_strictness_rejects_unshipped_and_unknown_modes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies that unshipped aliases and unknown strictness strings warn once per distinct value and fall back to strict."""
+    import logging  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        clear_closure_warning_cache,
+        resolve_closure_strictness_mode,
+    )
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert resolve_closure_strictness_mode("fail_closed") == "strict"
+        assert resolve_closure_strictness_mode("fail_closed") == "strict"
+        assert resolve_closure_strictness_mode("fast") == "strict"
+        assert resolve_closure_strictness_mode("skip") == "strict"
+        assert resolve_closure_strictness_mode("strict_with") == "strict"
+
+    assert not [
+        r.message
+        for r in caplog.records
+        if "Deprecated closure_strictness" in r.message
+    ]
+
+    warn_msgs = [
+        r.message
+        for r in caplog.records
+        if "Unrecognized closure_strictness" in r.message
+    ]
+    assert len(warn_msgs) == 4
+    for bad_val in ("fail_closed", "fast", "skip", "strict_with"):
+        assert any(f"Unrecognized closure_strictness '{bad_val}'" in m for m in warn_msgs)
+
+
+def test_cli_pedantic_config_and_ctx_manager_merging(
+    tmp_path: Path,
+) -> None:
+    """Verifies closure_strictness in pyproject.toml and variadic normalize_non_suppressing_ctx_managers merging."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        normalize_non_suppressing_ctx_managers,
+    )
+
+    merged = normalize_non_suppressing_ctx_managers(
+        "LockA, LockB",
+        ["LockB", "pkg.LockC"],
+        None,
+        ("LockA", "LockD"),
+    )
+    assert merged == ("LockA", "LockB", "LockD", "pkg.LockC")
+
+    repo = tmp_path / "strict_with_repo"
+    repo.mkdir()
+    patch_out = repo / "refactor.patch"
+    (repo / "f.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "pyproject.toml").write_text(
+        '[tool.pydoppelgangerhunt]\nclosure_strictness = "pedantic"\n',
+        encoding="utf-8",
+    )
     dummy_clone = (
         0.95,
         {"name": "u1", "file": "f.py", "start": 1, "end": 1},
         {"name": "u2", "file": "f.py", "start": 1, "end": 1},
     )
-
     with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[dummy_clone]):
         with mock.patch(
             "pydoppelgangerhunt.cli.generate_refactoring_patch", return_value="# patch\n"
         ) as mock_patch:
-            with caplog.at_level(logging.WARNING):
-                exit_code = main([
-                    str(repo),
-                    "--patch",
-                    str(patch_out),
-                ])
+            exit_code = main([str(repo), "--patch", str(patch_out)])
             assert exit_code == 1
-            mock_patch.assert_called_once()
             _, kwargs = mock_patch.call_args
-            assert kwargs.get("closure_strictness") == "strict"
-            assert any(
-                "Unrecognized closure_strictness 'unrecognized_custom_mode'" in r.message
-                for r in caplog.records
+            assert kwargs.get("closure_strictness") == "pedantic"
+
+            # Repeated --non-suppressing-ctx-managers flags merge with config list
+            (repo / "pyproject.toml").write_text(
+                '[tool.pydoppelgangerhunt]\nnon_suppressing_ctx_managers = ["CfgMgr"]\n',
+                encoding="utf-8",
+            )
+            mock_patch.reset_mock()
+            exit_code3 = main([
+                str(repo),
+                "--patch",
+                str(patch_out),
+                "--non-suppressing-ctx-managers",
+                "CliA,CliB",
+                "--non-suppressing-ctx-managers",
+                "CliC",
+            ])
+            assert exit_code3 == 1
+            _, kwargs3 = mock_patch.call_args
+            assert kwargs3.get("non_suppressing_ctx_managers") == (
+                "CfgMgr",
+                "CliA",
+                "CliB",
+                "CliC",
             )
 
 
-def test_resolve_closure_strictness_mode_thread_safety() -> None:
-    """Verifies that concurrent invocations of resolve_closure_strictness_mode are thread-safe."""
-    import concurrent.futures  # pylint: disable=import-outside-toplevel
-    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
-        resolve_closure_strictness_mode,
+def test_cli_suggest_plumbing_closure_strictness_and_ctx_managers(
+    tmp_path: Path,
+) -> None:
+    """Verifies --suggest forwards closure_strictness and non_suppressing_ctx_managers."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.reporters import (  # pylint: disable=import-outside-toplevel
+        synthesize_refactoring_suggestion,
     )
 
-    def _worker(val: str) -> tuple[str, bool]:
-        return resolve_closure_strictness_mode(val)
+    repo = tmp_path / "suggest_plumbing_repo"
+    repo.mkdir()
+    mod_src = (
+        "def run_a(items, compute):\n"
+        "    with CustomSafeMgr():\n"
+        "        val = compute(items)\n"
+        "    res = val + 1\n"
+        "    return res\n\n"
+        "def run_b(items, compute):\n"
+        "    with CustomSafeMgr():\n"
+        "        val = compute(items)\n"
+        "    res = val + 1\n"
+        "    return res\n"
+    )
+    f_path = repo / "svc.py"
+    f_path.write_text(mod_src, encoding="utf-8")
+    u1 = {
+        "name": "run_a:block",
+        "file": str(f_path),
+        "start": 2,
+        "end": 4,
+        "kind": "compound_block",
+        "source_text": mod_src,
+    }
+    u2 = {
+        "name": "run_b:block",
+        "file": str(f_path),
+        "start": 8,
+        "end": 10,
+        "kind": "compound_block",
+        "source_text": mod_src,
+    }
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(_worker, f"unknown_mode_{i % 3}") for i in range(50)]
-        results = [f.result() for f in futures]
+    sug_pedantic_allowed = synthesize_refactoring_suggestion(
+        u1,
+        u2,
+        repo_root=str(repo),
+        closure_strictness="pedantic",
+        non_suppressing_ctx_managers=("CustomSafeMgr",),
+    )
+    assert "def _shared_" in sug_pedantic_allowed
 
-    assert all(r == ("strict", False) for r in results)
+    dummy_clone = (0.98, u1, u2)
+    with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[dummy_clone]):
+        with mock.patch(
+            "pydoppelgangerhunt.cli.synthesize_refactoring_suggestion",
+            return_value="# suggestion",
+        ) as mock_suggest:
+            exit_code = main([
+                str(repo),
+                "--suggest",
+                "--closure-strictness",
+                "pedantic",
+                "--non-suppressing-ctx-managers",
+                "MgrOne,MgrTwo",
+                "--non-suppressing-ctx-managers",
+                "MgrThree",
+            ])
+            assert exit_code == 1
+            mock_suggest.assert_called_once()
+            _, sug_kwargs = mock_suggest.call_args
+            assert sug_kwargs.get("closure_strictness") == "pedantic"
+            assert sug_kwargs.get("non_suppressing_ctx_managers") == (
+                "MgrOne",
+                "MgrThree",
+                "MgrTwo",
+            )
 
 
-def test_resolve_closure_strictness_mode_config_conflict_warning(
+def test_cli_replace_clones_keeps_reports_strict_and_preserves_unit_policy(
+    tmp_path: Path,
+) -> None:
+    """Verifies --replace-clones keeps --suggest/--html strict and lets --patch apply pedantic only to unset units."""
+    from pydoppelgangerhunt.cli import main
+
+    repo = tmp_path / "replace_clones_cli"
+    repo.mkdir()
+    (repo / "m.py").write_text("x = 1\n", encoding="utf-8")
+    html_out = repo / "report.html"
+    patch_out = repo / "refactor.patch"
+    dummy_clone = (
+        0.95,
+        {"name": "u1", "file": "m.py", "start": 1, "end": 1},
+        {"name": "u2", "file": "m.py", "start": 1, "end": 1},
+    )
+
+    with (
+        mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[dummy_clone]),
+        mock.patch("pydoppelgangerhunt.cli.generate_html_report", return_value="<html/>") as mock_html,
+        mock.patch("pydoppelgangerhunt.cli.generate_refactoring_patch", return_value="# patch\n") as mock_patch,
+        mock.patch("pydoppelgangerhunt.cli.synthesize_refactoring_suggestion", return_value="sug") as mock_sug,
+    ):
+        code = main([
+            str(repo),
+            "--suggest",
+            "--html",
+            str(html_out),
+            "--patch",
+            str(patch_out),
+            "--replace-clones",
+        ])
+        assert code == 1
+        assert mock_html.call_args.kwargs.get("closure_strictness") is None
+        assert mock_sug.call_args.kwargs.get("closure_strictness") is None
+        assert mock_patch.call_args.kwargs.get("replace_clones") is True
+        assert mock_patch.call_args.kwargs.get("closure_strictness") is None
+
+        # An unrecognized config closure_strictness in pyproject.toml exits 2 cleanly
+        (repo / "pyproject.toml").write_text(
+            '[tool.pydoppelgangerhunt]\nclosure_strictness = "bogus_cfg"\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                str(repo),
+                "--html",
+                str(html_out),
+                "--patch",
+                str(patch_out),
+                "--replace-clones",
+            ])
+        assert exc_info.value.code == 2
+
+        # Explicit closure_strictness = "strict" opts --patch out to strict
+        (repo / "pyproject.toml").write_text(
+            '[tool.pydoppelgangerhunt]\nclosure_strictness = "strict"\n',
+            encoding="utf-8",
+        )
+        code2 = main([
+            str(repo),
+            "--html",
+            str(html_out),
+            "--patch",
+            str(patch_out),
+            "--replace-clones",
+        ])
+        assert code2 == 1
+        assert mock_html.call_args.kwargs.get("closure_strictness") == "strict"
+        assert mock_patch.call_args.kwargs.get("closure_strictness") == "strict"
+
+
+def test_resolve_unit_closure_policy_unrecognized_mode_and_precedence(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Verifies that resolve_closure_strictness_mode warns when closure_strictness='strict'
-    conflicts with skip_pre_unit_closures=True."""
+    """Verifies resolve_unit_closure_policy precedence and warning behavior for unrecognized modes."""
     import logging  # pylint: disable=import-outside-toplevel
-    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
-        resolve_closure_strictness_mode,
+
+    from pydoppelgangerhunt.config import (
+        ResolvedClosurePolicy,
+        clear_closure_warning_cache,
+        resolve_unit_closure_policy,
+    )
+
+    clear_closure_warning_cache()
+    with caplog.at_level(logging.WARNING):
+        res_bogus = resolve_unit_closure_policy(
+            {"closure_strictness": "unrecognized_unit_val"},
+            closure_strictness="lenient",
+        )
+        assert res_bogus == ResolvedClosurePolicy("lenient", ())
+        assert any(
+            "Unrecognized closure_strictness 'unrecognized_unit_val'" in r.message
+            for r in caplog.records
+        )
+
+        caplog.clear()
+        res_override = resolve_unit_closure_policy(
+            {"closure_strictness": "pedantic"},
+            closure_strictness="strict",
+        )
+        assert res_override == ResolvedClosurePolicy("strict", ())
+
+        caplog.clear()
+        res_fallback = resolve_unit_closure_policy(
+            {"closure_strictness": "pedantic"},
+            closure_strictness="unrecognized_caller_val",
+        )
+        assert res_fallback == ResolvedClosurePolicy("pedantic", ())
+        assert any(
+            "Unrecognized closure_strictness 'unrecognized_caller_val'" in r.message
+            for r in caplog.records
+        )
+
+
+def test_nested_heuristic_ctx_manager_session_does_not_escalate_empty_warn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies an empty nested warn=True session does not escalate an outer warn=False session."""
+    import logging  # pylint: disable=import-outside-toplevel
+
+    from pydoppelgangerhunt.config import (
+        heuristic_ctx_manager_session,
+        record_heuristic_non_suppressing_ctx_manager,
     )
 
     caplog.clear()
-    with caplog.at_level(logging.WARNING):
-        mode, skip = resolve_closure_strictness_mode("strict", skip_pre_unit_closures=True)
-    assert mode == "strict"
-    assert skip is False
+    with caplog.at_level(logging.INFO, logger="pydoppelgangerhunt.config"):
+        with heuristic_ctx_manager_session(warn=False):
+            record_heuristic_non_suppressing_ctx_manager("OuterSafeMgr")
+            with heuristic_ctx_manager_session(warn=True):
+                pass
+    summary_records = [
+        r for r in caplog.records if "unproven context manager(s)" in r.message
+    ]
+    assert len(summary_records) == 1
+    assert summary_records[0].levelno == logging.INFO
+    assert "OuterSafeMgr" in summary_records[0].message
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="pydoppelgangerhunt.config"):
+        with heuristic_ctx_manager_session(warn=False):
+            record_heuristic_non_suppressing_ctx_manager("OuterSafeMgr")
+            with heuristic_ctx_manager_session(warn=True):
+                record_heuristic_non_suppressing_ctx_manager("InnerSafeMgr")
+    warn_records = [
+        r for r in caplog.records if "unproven context manager(s)" in r.message
+    ]
+    assert len(warn_records) == 1
+    assert warn_records[0].levelno == logging.WARNING
+    assert "OuterSafeMgr" in warn_records[0].message
+    assert "InnerSafeMgr" in warn_records[0].message
+
+
+@pytest.mark.parametrize(
+    ("outer_warn", "target_kind", "expected_level_name"),
+    [
+        pytest.param(False, "nested_default_session", "INFO", id="outer_false_nested_default_session"),
+        pytest.param(False, "generate_refactoring_patch", "INFO", id="outer_false_patch_inherits_info"),
+        pytest.param(False, "generate_html_report", "INFO", id="outer_false_html_report_inherits_info"),
+        pytest.param(None, "nested_default_session", "WARNING", id="neg_outer_default_session_warns"),
+        pytest.param(True, "generate_refactoring_patch", "WARNING", id="neg_outer_true_patch_warns"),
+    ],
+)
+def test_outer_heuristic_session_warn_false_preserved_across_wrappers(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    outer_warn: Optional[bool],
+    target_kind: str,
+    expected_level_name: str,
+) -> None:
+    """Verifies nested default heuristic_ctx_manager_session, generate_refactoring_patch, and generate_html_report honor an outer warn=False setting."""
+    import logging  # pylint: disable=import-outside-toplevel
+
+    from pydoppelgangerhunt.config import (
+        clear_closure_warning_cache,
+        heuristic_ctx_manager_session,
+        record_heuristic_non_suppressing_ctx_manager,
+    )
+    from pydoppelgangerhunt.fixer import generate_refactoring_patch
+    from pydoppelgangerhunt.reporters import generate_html_report
+
+    mod_src = (
+        "def proc_a(NeutralSessionGuard, items):\n"
+        "    with NeutralSessionGuard():\n"
+        "        total = sum(items)\n"
+        "    return total\n"
+        "\n"
+        "def proc_b(NeutralSessionGuard, items):\n"
+        "    with NeutralSessionGuard():\n"
+        "        total = sum(items)\n"
+        "    return total\n"
+    )
+    mod_file = tmp_path / "mod.py"
+    mod_file.write_text(mod_src, encoding="utf-8")
+    u1 = {"file": str(mod_file), "name": "proc_a:w", "kind": "compound_block", "start": 2, "end": 3}
+    u2 = {"file": str(mod_file), "name": "proc_b:w", "kind": "compound_block", "start": 7, "end": 8}
+
+    clear_closure_warning_cache()
+    expected_level = getattr(logging, expected_level_name)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="pydoppelgangerhunt.config"):
+        cm = (
+            heuristic_ctx_manager_session()
+            if outer_warn is None
+            else heuristic_ctx_manager_session(warn=outer_warn)
+        )
+        with cm:
+            if target_kind == "nested_default_session":
+                with heuristic_ctx_manager_session():
+                    record_heuristic_non_suppressing_ctx_manager("NeutralSessionGuard")
+            elif target_kind == "generate_refactoring_patch":
+                patch_out = generate_refactoring_patch(
+                    [(1.0, u1, u2)],
+                    repo_root=str(tmp_path),
+                    replace_clones=True,
+                    closure_strictness="strict",
+                )
+                assert "def _shared_" in patch_out
+            else:
+                html_out = generate_html_report(
+                    [(1.0, u1, u2)],
+                    str(mod_file),
+                    0.8,
+                    repo_root=str(tmp_path),
+                    closure_strictness="strict",
+                )
+                assert "def _shared_" in html_out
+
+    summary_records = [
+        r for r in caplog.records if "unproven context manager(s)" in r.message
+    ]
+    assert len(summary_records) == 1
+    assert summary_records[0].levelno == expected_level
+    assert "NeutralSessionGuard" in summary_records[0].message
+
+
+def test_render_pair_diff_and_suggestions_preload_failure_counts_once(
+    tmp_path: Any,
+) -> None:
+    """Verifies preload errors increment on_diagnostic_error once while rendering diagnostics for active flags."""
+    # pylint: disable=import-outside-toplevel
+    import argparse
+    from collections import OrderedDict
+    from unittest import mock
+
+    from pydoppelgangerhunt.cli import _render_pair_diff_and_suggestions
+
+    dummy_u1 = {"file": "mod1.py", "start": 1, "end": 3, "name": "fn1", "source": "def fn1(): pass\n"}
+    dummy_u2 = {"file": "mod2.py", "start": 1, "end": 3, "name": "fn2", "source": "def fn2(): pass\n"}
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--suggest", action="store_true")
+    parser.add_argument("--diff", action="store_true")
+    both_args = parser.parse_args(["--suggest", "--diff"])
+    suggest_only_args = parser.parse_args(["--suggest"])
+
+    errors = 0
+
+    def _inc_error() -> None:
+        nonlocal errors
+        errors += 1
+
+    cache: OrderedDict[str, Any] = OrderedDict()
+    with mock.patch(
+        "pydoppelgangerhunt.cli.resolve_cached_unit_source_and_tree",
+        side_effect=SyntaxError("invalid syntax"),
+    ), mock.patch(
+        "pydoppelgangerhunt.cli.synthesize_refactoring_suggestion"
+    ) as mock_sug, mock.patch(
+        "pydoppelgangerhunt.cli.generate_clone_diff"
+    ) as mock_diff:
+        lines = _render_pair_diff_and_suggestions(
+            dummy_u1,
+            dummy_u2,
+            args=both_args,
+            target_repo_root=str(tmp_path),
+            use_color=False,
+            file_cache=cache,
+            on_diagnostic_error=_inc_error,
+        )
+        assert errors == 1
+        assert len(lines) == 2
+        assert "[REFACTOR SUGGESTION] Diagnostic: suggestion skipped due to SyntaxError" in lines[0]
+        assert "# Diagnostic: diff skipped due to SyntaxError" in lines[1]
+        mock_sug.assert_not_called()
+        mock_diff.assert_not_called()
+
+        errors = 0
+        lines_sug = _render_pair_diff_and_suggestions(
+            dummy_u1,
+            dummy_u2,
+            args=suggest_only_args,
+            target_repo_root=str(tmp_path),
+            use_color=False,
+            file_cache=cache,
+            on_diagnostic_error=_inc_error,
+        )
+        assert errors == 1
+        assert len(lines_sug) == 1
+        assert "[REFACTOR SUGGESTION] Diagnostic: suggestion skipped due to SyntaxError" in lines_sug[0]
+
+
+def test_cli_exit_code_3_for_clean_scan_with_diagnostic_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verifies CLI exits 3 (distinct from usage error 2 and clone+error 4) when 0 clones are found and an internal diagnostic error occurs."""
+    from pydoppelgangerhunt.cli import main
+
+    clean_file = tmp_path / "clean_mod.py"
+    clean_file.write_text("def solo(x):\n    return x + 1\n", encoding="utf-8")
+    html_out = tmp_path / "clean_diag.html"
+
+    def _diag_html(*_args: Any, **kwargs: Any) -> str:
+        cb = kwargs.get("on_diagnostic_error")
+        if callable(cb):
+            cb()
+        return "<html/>"
+
+    with mock.patch("pydoppelgangerhunt.cli.generate_html_report", side_effect=_diag_html):
+        code = main([str(clean_file), "--html", str(html_out)])
+    assert code == 3
+    assert "1 internal diagnostic error(s) occurred" in capsys.readouterr().err
+
+
+def test_cli_exit_code_4_for_clones_with_diagnostic_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verifies CLI exits 4 when clones are found and an internal diagnostic error occurs during rendering."""
+    from pydoppelgangerhunt.cli import main
+
+    dup_file = tmp_path / "dup_mod.py"
+    dup_file.write_text(
+        "def a(x):\n    y = x + 1\n    z = y * 2\n    return z\n\n"
+        "def b(x):\n    y = x + 1\n    z = y * 2\n    return z\n",
+        encoding="utf-8",
+    )
+    html_out = tmp_path / "dup_diag.html"
+
+    def _diag_html(*_args: Any, **kwargs: Any) -> str:
+        cb = kwargs.get("on_diagnostic_error")
+        if callable(cb):
+            cb()
+        return "<html/>"
+
+    with mock.patch("pydoppelgangerhunt.cli.generate_html_report", side_effect=_diag_html):
+        code = main([str(dup_file), "--min-lines", "3", "--html", str(html_out)])
+    assert code == 4
+    assert "1 internal diagnostic error(s) occurred" in capsys.readouterr().err
+
+
+def test_cli_main_preserves_global_warning_filters_while_console_main_silences_escapes(
+    tmp_path: Path,
+) -> None:
+    """Verifies cli.main() never mutates warnings.filters while console_main() silences target-repo escape warnings."""
+    import sys
+    import warnings
+    from pydoppelgangerhunt.cli import console_main, main
+
+    escape_warning_cls: type[Warning] = (
+        SyntaxWarning if sys.version_info >= (3, 12) else DeprecationWarning
+    )
+    esc_file = tmp_path / "escape_mod.py"
+    esc_file.write_text(
+        'def parse_a(s):\n    pat = "\\d+\\s+"\n    out = pat + s\n    return out\n\n'
+        'def parse_b(s):\n    pat = "\\d+\\s+"\n    out = pat + s\n    return out\n',
+        encoding="utf-8",
+    )
+    # 1. Programmatic cli.main() must leave process-global warnings.filters untouched
+    with warnings.catch_warnings(record=True) as main_caught:
+        warnings.simplefilter("always", SyntaxWarning)
+        warnings.simplefilter("always", escape_warning_cls)
+        before_filters = list(warnings.filters)
+        code_main = main([str(esc_file), "--min-lines", "3", "--suggest"])
+        after_filters = list(warnings.filters)
+    assert code_main == 1
+    assert after_filters == before_filters
     assert any(
-        "Conflicting configuration: closure_strictness 'strict' takes precedence over" in r.message
-        for r in caplog.records
+        issubclass(w.category, escape_warning_cls)
+        and "invalid escape" in str(w.message)
+        for w in main_caught
     )
 
+    # 2. Standalone console_main() configures process-level filters to suppress target escape noise
+    with warnings.catch_warnings(record=True) as console_caught:
+        warnings.simplefilter("always", SyntaxWarning)
+        warnings.simplefilter("always", escape_warning_cls)
+        code_console = console_main([str(esc_file), "--min-lines", "3", "--suggest"])
+    assert code_console == 1
+    assert not [
+        w
+        for w in console_caught
+        if issubclass(w.category, escape_warning_cls)
+        and "invalid escape" in str(w.message)
+    ]
+
+
+@pytest.mark.parametrize("stage", ["preload", "suggest", "diff"])
+def test_cli_render_pair_diff_and_suggestions_propagates_memory_error(
+    stage: str,
+) -> None:
+    """Verifies _render_pair_diff_and_suggestions never swallows MemoryError across preload, suggest, or diff."""
+    import argparse
+    from collections import OrderedDict
+    from pydoppelgangerhunt.cli import _render_pair_diff_and_suggestions
+
+    u1 = {"file": "a.py", "name": "a", "start": 1, "end": 2}
+    u2 = {"file": "b.py", "name": "b", "start": 1, "end": 2}
+    args = argparse.Namespace(suggest=(stage != "diff"), diff=(stage == "diff"))
+    file_cache: Optional[OrderedDict[str, Any]] = (
+        OrderedDict() if stage == "preload" else None
+    )
+    target = (
+        "pydoppelgangerhunt.cli.resolve_cached_unit_source_and_tree"
+        if stage == "preload"
+        else (
+            "pydoppelgangerhunt.cli.synthesize_refactoring_suggestion"
+            if stage == "suggest"
+            else "pydoppelgangerhunt.cli.generate_clone_diff"
+        )
+    )
+    diag_calls = 0
+
+    def _on_diag() -> None:
+        nonlocal diag_calls
+        diag_calls += 1
+
+    with mock.patch(target, side_effect=MemoryError("oom")):
+        with pytest.raises(MemoryError, match="oom"):
+            _render_pair_diff_and_suggestions(
+                u1,
+                u2,
+                args=args,
+                use_color=False,
+                file_cache=file_cache,
+                on_diagnostic_error=_on_diag,
+            )
+    assert diag_calls == 0
+
+
+def test_heuristic_ctx_manager_session_atomic_pop_and_drain_prevents_lost_worker_entries(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies closing session buckets are skipped and atomically popped on drain so late worker records are not dropped."""
+    import contextvars
+    import logging
+    import threading
+    from pydoppelgangerhunt.config import (
+        _active_heuristic_sessions,
+        _get_or_create_thread_bucket_locked,
+        _warned_closure_lock,
+        clear_closure_warning_cache,
+        heuristic_ctx_manager_session,
+        log_heuristic_ctx_manager_summary,
+        record_heuristic_non_suppressing_ctx_manager,
+    )
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    captured_ctx: list[contextvars.Context] = []
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt.config"):
+        with heuristic_ctx_manager_session(warn=True):
+            record_heuristic_non_suppressing_ctx_manager("InSessionMgr")
+            captured_ctx.append(contextvars.copy_context())
+            # Simulate a bucket marked closing: _get_or_create_thread_bucket_locked must bypass it
+            with _warned_closure_lock:
+                for b in _active_heuristic_sessions.values():
+                    b.closing = True
+                bypass_bucket = _get_or_create_thread_bucket_locked()
+                assert bypass_bucket not in _active_heuristic_sessions.values()
+                for b in _active_heuristic_sessions.values():
+                    b.closing = False
+
+    assert any("InSessionMgr" in rec.message for rec in caplog.records)
+    assert not _active_heuristic_sessions
+
+    # A late worker thread running with the exited session's copied context must record into its fallback bucket, not be dropped.
+    worker_flushed: list[tuple[str, ...]] = []
+    worker_exc: list[BaseException] = []
+
+    def _late_worker() -> None:
+        try:
+            record_heuristic_non_suppressing_ctx_manager("LateWorkerMgr")
+            worker_flushed.append(log_heuristic_ctx_manager_summary(warn=False))
+        except BaseException as exc:  # pylint: disable=broad-exception-caught
+            worker_exc.append(exc)
+
+    t = threading.Thread(target=lambda: captured_ctx[0].run(_late_worker))
+    t.start()
+    t.join(timeout=5.0)
+    assert not worker_exc
+    assert worker_flushed == [("LateWorkerMgr",)]
+
+
+def test_cli_patch_help_text_and_diagnostic_error_callback_integration(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verifies --closure-strictness help text, --patch diagnostic error callback/exit code, and UnitSchema.file typing."""
+    import os
+    from typing import get_type_hints
+    from pydoppelgangerhunt.cli import build_arg_parser, main
+    from pydoppelgangerhunt.fixer.source import UnitSchema
+
+    # 1. CLI help accurately states '--patch' defaults to pedantic when unset
+    help_text = build_arg_parser().format_help()
+    assert "'--patch'" in help_text
+    assert "'--replace-clones' defaults to 'pedantic'" not in help_text
+
+    # 2. UnitSchema.file accepts both str and os.PathLike[str]
+    hints = get_type_hints(UnitSchema)
+    assert os.PathLike[str] in getattr(hints["file"], "__args__", ())
+
+    # 3. Unexpected pair rollback in --patch invokes on_diagnostic_error, logs stderr summary, and exits 4
+    dup_file = tmp_path / "patch_diag.py"
+    dup_file.write_text(
+        "def alpha(x):\n    a = x + 1\n    b = a * 2\n    return b + 3\n\n"
+        "def beta(x):\n    a = x + 1\n    b = a * 2\n    return b + 3\n",
+        encoding="utf-8",
+    )
+    patch_out = tmp_path / "out.patch"
+    with mock.patch(
+        "pydoppelgangerhunt.fixer.patch.synthesize_shared_helper_code",
+        side_effect=RuntimeError("synthetic patch pair boom"),
+    ):
+        code = main([str(dup_file), "--min-lines", "3", "--patch", str(patch_out)])
+    assert code == 4
+    assert "1 internal diagnostic error(s) occurred" in capsys.readouterr().err
+
+
+def test_load_toml_section_authoritative_parser_never_falls_through(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies tomllib/tomli never falls through on absent sections or malformed TOML and fallback honors literal strings."""
+    import builtins  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        _strip_toml_inline_comment,
+        load_toml_section,
+    )
+
+    # 1. Valid TOML lacking [tool.pydoppelgangerhunt] whose multiline string mentions the header must return {}
+    decoy_toml = tmp_path / "decoy.toml"
+    decoy_toml.write_text(
+        '[project]\n'
+        'name = "demo"\n'
+        'description = """\n'
+        '[tool.pydoppelgangerhunt]\n'
+        'threshold = 0.12\n'
+        '"""\n',
+        encoding="utf-8",
+    )
+    assert load_toml_section(decoy_toml, "pydoppelgangerhunt") == {}
+
+    # 2. Malformed TOML fails closed to {} under tomllib instead of scraping partial keys
+    broken_toml = tmp_path / "broken.toml"
+    broken_toml.write_text(
+        "threshold = 0.77\nunquoted = invalid_toml_value\n",
+        encoding="utf-8",
+    )
+    assert load_toml_section(broken_toml, "pydoppelgangerhunt") == {}
+
+    # 3. Zero-dependency fallback treats single-quoted strings as TOML literal strings (no backslash escaping)
+    assert (
+        _strip_toml_inline_comment("path = 'C:\\proj\\' # trailing comment")
+        == "path = 'C:\\proj\\'"
+    )
+    lit_toml = tmp_path / "literal.toml"
+    lit_toml.write_text(
+        "[tool.pydoppelgangerhunt]\n"
+        "exclude = [\n"
+        "    'C:\\proj\\', # windows literal path\n"
+        "    'build',\n"
+        "]\n"
+        "threshold = 0.85\n",
+        encoding="utf-8",
+    )
+    orig_import = builtins.__import__
+
+    def _block_toml(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name in ("tomllib", "tomli"):
+            raise ImportError("no toml")
+        return orig_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _block_toml)
+    fallback_cfg = load_toml_section(lit_toml, "pydoppelgangerhunt")
+    assert fallback_cfg["exclude"] == ["C:\\proj\\", "build"]
+    assert fallback_cfg["threshold"] == 0.85
+
+
+def test_custom_pathlike_unit_files_consistent_across_modules(tmp_path: Path) -> None:
+    """Verifies custom os.PathLike[str] unit['file'] values resolve via os.fspath() across non-fixer modules."""
+    import os  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        clone_pair_fingerprint,
+        clone_pair_structural_fingerprint,
+        namespaced_structural_fingerprint,
+    )
+    from pydoppelgangerhunt.canonical_path import (  # pylint: disable=import-outside-toplevel
+        CanonicalPathResolver,
+    )
+    from pydoppelgangerhunt.clustering import (  # pylint: disable=import-outside-toplevel
+        _normalize_unit_file,
+        unit_key,
+    )
+    from pydoppelgangerhunt.coverage import (  # pylint: disable=import-outside-toplevel
+        compute_unit_coverage,
+    )
+    from pydoppelgangerhunt.git_diff import (  # pylint: disable=import-outside-toplevel
+        DiffRangeMap,
+        compute_unit_diff_overlap,
+    )
+    from pydoppelgangerhunt.matcher import (  # pylint: disable=import-outside-toplevel
+        _normalize_matcher_file,
+        _resolve_diff_unit_indices,
+    )
+    from pydoppelgangerhunt.metrics import (  # pylint: disable=import-outside-toplevel
+        compute_repository_dry_stats,
+    )
+
+    class _OpaquePath(os.PathLike[str]):
+        def __init__(self, target: str) -> None:
+            self._target = target
+
+        def __fspath__(self) -> str:
+            return self._target
+
+        def __str__(self) -> str:
+            return "<opaque-handle>"
+
+    pkg_dir = tmp_path / "pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / "mod_a.py").write_text("x = 1\ny = 2\nz = 3\n", encoding="utf-8")
+    (pkg_dir / "mod_b.py").write_text("x = 1\ny = 2\nz = 3\n", encoding="utf-8")
+
+    u_str_a = {"file": "pkg/mod_a.py", "name": "fn_a", "start": 1, "end": 3, "tokens": ["A", "B"]}
+    u_str_b = {"file": "pkg/mod_b.py", "name": "fn_b", "start": 1, "end": 3, "tokens": ["A", "B"]}
+    u_pl_a = {**u_str_a, "file": _OpaquePath("pkg/mod_a.py")}
+    u_pl_b = {**u_str_b, "file": _OpaquePath("pkg/mod_b.py")}
+
+    assert clone_pair_fingerprint(u_pl_a, u_pl_b) == clone_pair_fingerprint(u_str_a, u_str_b)
+    assert clone_pair_structural_fingerprint(u_pl_a, u_pl_b) == clone_pair_structural_fingerprint(
+        u_str_a, u_str_b
+    )
+    assert namespaced_structural_fingerprint(u_pl_a, u_pl_b) == namespaced_structural_fingerprint(
+        u_str_a, u_str_b
+    )
+    assert unit_key(u_pl_a) == unit_key(u_str_a)
+    assert _normalize_unit_file(u_pl_a) == _normalize_unit_file(u_str_a)
+    assert _normalize_matcher_file(u_pl_a["file"]) == _normalize_matcher_file(u_str_a["file"])
+
+    diff_map = DiffRangeMap(repo_ranges={"pkg/mod_a.py": [(1, 2)]})
+    assert diff_map.get_ranges_for_unit(u_pl_a, unit_basis="repo") == [(1, 2)]
+    assert compute_unit_diff_overlap(u_pl_a, diff_map, unit_basis="repo") == compute_unit_diff_overlap(
+        u_str_a, diff_map, unit_basis="repo"
+    )
+    assert compute_unit_diff_overlap(u_pl_a, {"pkg/mod_a.py": [(1, 2)]}) == (2, round(2 / 3, 4))
+
+    resolver = CanonicalPathResolver(target_root=str(tmp_path), repo_root=str(tmp_path))
+    assert _resolve_diff_unit_indices(
+        [u_pl_a, u_str_a, u_pl_b],
+        ["pkg/mod_a.py"],
+        resolver,
+        is_target_relative_harvest=False,
+    ) == {0, 1}
+
+    assert compute_unit_coverage(u_pl_a, {"pkg/mod_a.py": {1, 2, 3}}) == 1.0
+    stats_pl = compute_repository_dry_stats(str(tmp_path), [(1.0, u_pl_a, u_pl_b)])
+    stats_str = compute_repository_dry_stats(str(tmp_path), [(1.0, u_str_a, u_str_b)])
+    assert stats_pl["dloc"] == stats_str["dloc"] == 6
+
+
+def test_format_synthesized_helper_suggestion_preserves_embedded_control_chars() -> None:
+    """Verifies reporter helper indentation uses physical newlines rather than splitting on form-feed or vertical-tab."""
+    from pydoppelgangerhunt.reporters import (  # pylint: disable=import-outside-toplevel,protected-access
+        _format_synthesized_helper_suggestion,
+    )
+
+    helper_code = 'def _shared():\n    return "a\x0cb\x0bc"\n'
+    rendered = _format_synthesized_helper_suggestion(
+        "_shared",
+        "0 varying line(s) detected between clone blocks.",
+        helper_code,
+        pair_heuristics=set(),
+        pair_wildcards=set(),
+        sc1={},
+        sc2={},
+    )
+    assert '        return "a\x0cb\x0bc"' in rendered

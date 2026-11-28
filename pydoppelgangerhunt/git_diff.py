@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.config import find_matching_path_value, normalize_path_string
-from pydoppelgangerhunt.source_lines import resolve_unit_line_bounds
+from pydoppelgangerhunt.source_lines import resolve_unit_line_bounds, unit_file_str
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ class DiffRangeMap(Dict[str, List[Tuple[int, int]]]):
         unit_basis: str = "repo",
     ) -> Optional[List[Tuple[int, int]]]:
         """Looks up modified ranges for a unit based on its coordinate basis."""
-        raw_file = str(unit.get("file") or "")
+        raw_file = unit_file_str(unit)
         f_norm = normalize_path_string(raw_file, strip_anchor=True)
         if not f_norm:
             return None
@@ -374,17 +374,17 @@ def compute_unit_diff_overlap(
     elif hasattr(modified_ranges, "repo_ranges") and unit_basis == "repo":
         repo_map = getattr(modified_ranges, "repo_ranges")
         if isinstance(repo_map, dict):
-            raw_f = str(unit.get("file") or "")
+            raw_f = unit_file_str(unit)
             f_norm = normalize_path_string(raw_f, strip_anchor=True)
             target_ranges = repo_map.get(f_norm)
     elif hasattr(modified_ranges, "target_ranges") and unit_basis == "target":
         target_map = getattr(modified_ranges, "target_ranges")
         if isinstance(target_map, dict):
-            raw_f = str(unit.get("file") or "")
+            raw_f = unit_file_str(unit)
             f_norm = normalize_path_string(raw_f, strip_anchor=True)
             target_ranges = target_map.get(f_norm)
     else:
-        raw_f = str(unit.get("file") or "")
+        raw_f = unit_file_str(unit)
         f_norm = normalize_path_string(raw_f, strip_anchor=True)
         if f_norm in modified_ranges:
             target_ranges = modified_ranges[f_norm]
@@ -485,7 +485,7 @@ def filter_clones_by_git_diff(
                 alt_matches = 0
                 for _, u1, u2 in clones:
                     for u in (u1, u2):
-                        rf = str(u.get("file") or "")
+                        rf = unit_file_str(u)
                         fn = normalize_path_string(rf, strip_anchor=True)
                         if fn and fn in alt_coord_set:
                             alt_matches += 1
@@ -568,8 +568,8 @@ def check_temporal_divergence(
     max_divergence_days: int = 90,
 ) -> Optional[Dict[str, Any]]:
     """Detects whether two clone instances exhibit temporal divergence (asymmetric commit ages)."""
-    f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
-    f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
+    f1 = normalize_path_string(unit_file_str(u1), strip_anchor=False)
+    f2 = normalize_path_string(unit_file_str(u2), strip_anchor=False)
     if not f1 or not f2:
         return None
     s1, e1 = resolve_unit_line_bounds(u1)

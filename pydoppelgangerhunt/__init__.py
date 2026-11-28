@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from typing import Any
+import warnings
+
 from pydoppelgangerhunt.baseline import (
     BaselineFingerprints,
     ClonePairFingerprint,
@@ -33,7 +36,7 @@ from pydoppelgangerhunt.canonical_path import (
     normalize_lexical_posix,
     parse_notebook_cell_anchor,
 )
-from pydoppelgangerhunt.cli import build_arg_parser, main
+from pydoppelgangerhunt.cli import build_arg_parser, console_main, main
 from pydoppelgangerhunt.clustering import (
     UnionFind,
     cluster_clone_families,
@@ -41,13 +44,27 @@ from pydoppelgangerhunt.clustering import (
     unit_key,
 )
 from pydoppelgangerhunt.config import (
+    APP_VERSION,
     DEFAULT_EXCLUDES,
     DEFAULT_TOOL_TOML_CONTENT,
+    PairClosurePolicy,
+    ResolvedClosurePolicy,
     canonical_path_key,
+    heuristic_ctx_manager_session,
     init_tool_configuration,
     load_toml_section,
     load_tool_config,
     normalize_path_string,
+    resolve_closure_strictness_mode,
+    resolve_pair_closure_policy,
+    resolve_unit_closure_policy,
+)
+from pydoppelgangerhunt.unit_boundary import (
+    NormalizedCoordinates,
+    NormalizedSourceBuffer,
+    NormalizedUnit,
+    normalize_unit_boundary,
+    resolve_unit_source_buffer,
 )
 from pydoppelgangerhunt.coverage import (
     check_asymmetric_coverage,
@@ -55,12 +72,17 @@ from pydoppelgangerhunt.coverage import (
     read_coverage_data,
 )
 from pydoppelgangerhunt.fixer import (
+    AnalysisSession,
     ReplacementItem,
+    SCOPE_SCHEMA_VERSION,
     UnitCollisionError,
     UnitDict,
+    UnitSchema,
     UnitSpan,
+    analysis_session,
     analyze_unit_variable_scope,
     check_units_overlap,
+    clear_dataflow_cache,
     col_offset_to_char_offset,
     compute_line_offsets,
     compute_unit_byte_offsets,
@@ -69,11 +91,13 @@ from pydoppelgangerhunt.fixer import (
     compute_unit_spans,
     count_physical_newlines,
     detect_line_ending,
+    ensure_unit_scope_closure_mode,
     extract_unit_comments_and_pragmas,
     filter_overlapping_clone_units,
     find_enclosing_class,
     find_enclosing_function,
     generate_refactoring_patch,
+    inspect_single_unit_scope,
     intervals_overlap,
     is_subroutine_unit,
     is_valid_unit_coordinates,
@@ -81,10 +105,12 @@ from pydoppelgangerhunt.fixer import (
     refactor_module_units,
     replace_unit_in_source,
     resolve_unit_replacement,
+    scope_matches_closure_mode,
     slice_source_by_token_range,
     split_source_lines,
     synthesize_shared_helper_code,
     validate_module_unit_replacements,
+    validate_unit_schema,
 )
 from pydoppelgangerhunt.git_diff import (
     DiffRangeMap,
@@ -134,6 +160,7 @@ from pydoppelgangerhunt.reporters import (
     colorize,
     emit_structured_report,
     extract_unit_source_code,
+    extract_unit_source_lines_with_state,
     format_github_annotations,
     format_json_report,
     format_markdown_summary,
@@ -143,13 +170,24 @@ from pydoppelgangerhunt.reporters import (
     supports_color,
     synthesize_refactoring_suggestion,
 )
-from pydoppelgangerhunt.source_lines import _PHYSICAL_LINE_RE
+from pydoppelgangerhunt.source_lines import SourceLinesOrigin
 
-__version__ = "1.0.0"
+__version__ = APP_VERSION
 __all__ = [
     "__version__",
+    "console_main",
     "main",
     "build_arg_parser",
+    "NormalizedCoordinates",
+    "NormalizedSourceBuffer",
+    "NormalizedUnit",
+    "PairClosurePolicy",
+    "ResolvedClosurePolicy",
+    "normalize_unit_boundary",
+    "resolve_closure_strictness_mode",
+    "resolve_pair_closure_policy",
+    "resolve_unit_closure_policy",
+    "resolve_unit_source_buffer",
     "scan_target",
     "harvest_file_units",
     "harvest_notebook_units",
@@ -183,6 +221,8 @@ __all__ = [
     "generate_clone_diff",
     "synthesize_refactoring_suggestion",
     "extract_unit_source_code",
+    "extract_unit_source_lines_with_state",
+    "SourceLinesOrigin",
     "supports_color",
     "colorize",
     "parse_git_diff_hunks",
@@ -203,7 +243,15 @@ __all__ = [
     "read_coverage_data",
     "compute_unit_coverage",
     "check_asymmetric_coverage",
+    "AnalysisSession",
+    "analysis_session",
     "analyze_unit_variable_scope",
+    "clear_dataflow_cache",
+    "ensure_unit_scope_closure_mode",
+    "heuristic_ctx_manager_session",
+    "inspect_single_unit_scope",
+    "scope_matches_closure_mode",
+    "SCOPE_SCHEMA_VERSION",
     "synthesize_shared_helper_code",
     "replace_unit_in_source",
     "slice_source_by_token_range",
@@ -219,6 +267,7 @@ __all__ = [
     "detect_line_ending",
     "UnitCollisionError",
     "UnitDict",
+    "UnitSchema",
     "UnitSpan",
     "ReplacementItem",
     "resolve_unit_replacement",
@@ -231,8 +280,8 @@ __all__ = [
     "parse_unit_coord",
     "refactor_module_units",
     "split_source_lines",
-    "_PHYSICAL_LINE_RE",
     "validate_module_unit_replacements",
+    "validate_unit_schema",
     "generate_refactoring_patch",
     "compute_unit_structural_hash",
     "extract_unit_namespace",
@@ -272,3 +321,18 @@ __all__ = [
     "COMPOUND_BLOCK_TYPES",
     "BRANCH_NODE_TYPES",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Provides a deprecated shim for internal attributes removed from the public API."""
+    if name == "_PHYSICAL_LINE_RE":
+        warnings.warn(
+            "pydoppelgangerhunt._PHYSICAL_LINE_RE is internal and deprecated; "
+            "it will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        from pydoppelgangerhunt.source_lines import _PHYSICAL_LINE_RE
+
+        return _PHYSICAL_LINE_RE
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

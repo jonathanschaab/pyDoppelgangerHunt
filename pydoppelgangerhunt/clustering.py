@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.config import canonical_path_key
-from pydoppelgangerhunt.source_lines import resolve_unit_line_bounds
+from pydoppelgangerhunt.source_lines import resolve_unit_line_bounds, unit_file_str
 
 
 class UnionFind:
@@ -43,12 +43,12 @@ class UnionFind:
 
 
 def _normalize_unit_file(unit: Dict[str, Any]) -> str:
-    return canonical_path_key(str(unit.get("file") or ""), strip_anchor=True)
+    return canonical_path_key(unit_file_str(unit), strip_anchor=True)
 
 
 def unit_key(unit: Dict[str, Any]) -> str:
     """Generates unique deterministic string key for an AST unit."""
-    norm_file = canonical_path_key(str(unit.get("file") or ""), strip_anchor=False)
+    norm_file = canonical_path_key(unit_file_str(unit), strip_anchor=False)
     s, e = resolve_unit_line_bounds(unit)
     name = str(unit.get("name") or "unit")
     return f"{norm_file}:{s}-{e}:{name}"
@@ -290,7 +290,7 @@ def cluster_clone_families(
         members = [unit_map[k] for k in member_keys]
         members.sort(
             key=lambda u: (
-                canonical_path_key(str(u.get("file") or ""), strip_anchor=False),
+                canonical_path_key(unit_file_str(u), strip_anchor=False),
                 resolve_unit_line_bounds(u)[0],
             )
         )
