@@ -738,7 +738,9 @@ def test_inverted_index_frequency_threshold_pruning(tmp_path: Path) -> None:
 
 def test_stop_shingle_filtering_and_candidate_pruning(tmp_path: Path) -> None:
     """Test DEFAULT_STOP_SHINGLES and candidate inverted index pruning with stop-shingles."""
-    from pydoppelgangerhunt.matcher import DEFAULT_STOP_SHINGLES, get_boilerplate_stop_shingles  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.matcher import (  # pylint: disable=import-outside-toplevel
+        get_boilerplate_stop_shingles,
+    )
 
     stop_shingles = get_boilerplate_stop_shingles()
     assert isinstance(stop_shingles, set)
@@ -800,8 +802,8 @@ def test_stop_shingle_filtering_and_candidate_pruning(tmp_path: Path) -> None:
     assert isinstance(clones_custom, list)
 
 
-def test_batch_49_matcher_similarity_and_subclones(tmp_path: Path) -> None:
-    """Batch 49: Test matcher similarity bounds, tfidf fallbacks, subclones, and multiprocessing."""
+def test_matcher_similarity_and_subclones(tmp_path: Path) -> None:
+    """Verifies matcher similarity bounds, tfidf fallbacks, subclones, and multiprocessing."""
     # pylint: disable=protected-access,import-outside-toplevel
     from pydoppelgangerhunt.matcher import (
         _worker_harvest_file,
@@ -924,8 +926,8 @@ def test_batch_49_matcher_similarity_and_subclones(tmp_path: Path) -> None:
     assert len(_worker_harvest_file(task)) >= 1
 
 
-def test_batch_51_matcher_defensive_bounds_and_raw_set_baseline(tmp_path: Path) -> None:
-    """Batch 51: Test defensive bounds in matcher merging/subclones, and raw set baseline filtering."""
+def test_matcher_defensive_bounds_and_raw_set_baseline(tmp_path: Path) -> None:
+    """Verifies defensive bounds in matcher merging/subclones and raw set baseline filtering."""
     # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.baseline import (
         clone_pair_structural_fingerprint,
@@ -1092,8 +1094,8 @@ def test_batch_59_scan_target_repo_root_and_diff_hunk_prefixes(tmp_path: Path) -
     assert "/dev/null" not in hunks
 
 
-def test_batch_70_review_fixes(tmp_path: Path) -> None:
-    """Batch 70: Test TRY_NODE_TYPES compatibility, path-specific exemption isolation, and absolute path normalization."""
+def test_try_node_types_exemption_isolation_and_abs_path_norm(tmp_path: Path) -> None:
+    """Verifies TRY_NODE_TYPES compatibility, path-specific exemption isolation, and absolute path normalization."""
     # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.matcher import (
         _normalize_exemption_endpoint,
@@ -1958,7 +1960,7 @@ def test_scan_target_explicit_repo_root_equals_target_dir_precedence(
 
 def test_scan_target_differential_calibration_replacement_model(tmp_path: Path) -> None:
     """Verifies that differential scan uses replacement approximation max(df_local, df_global) preventing double-counting."""
-    from pydoppelgangerhunt.baseline import _serialize_shingle_key
+    from pydoppelgangerhunt._baseline_calibration import _serialize_shingle_key
     from pydoppelgangerhunt.matcher import harvest_file_units
 
     repo = tmp_path / "diff_repo"
@@ -2014,7 +2016,7 @@ def test_scan_target_differential_calibration_replacement_model(tmp_path: Path) 
 
 def test_scan_target_differential_calibration_conservative_pruning_removal(tmp_path: Path) -> None:
     """Verifies that conservative candidate pruning retains shingles when baseline df > cutoff but actual df <= cutoff due to removals."""
-    from pydoppelgangerhunt.baseline import _serialize_shingle_key
+    from pydoppelgangerhunt._baseline_calibration import _serialize_shingle_key
     from pydoppelgangerhunt.matcher import harvest_file_units
 
     repo = tmp_path / "diff_removal_repo"
@@ -2254,7 +2256,9 @@ def test_scan_target_conservative_candidate_pruning_accounts_for_deleted_baselin
       max_removals = max_touched - df_local = 2 - 1 = 1.
       pruning_df = max(3, 4 - 1) = 3 <= 3 -> not pruned, detecting clone with modified a.py!
     """
-    from pydoppelgangerhunt.baseline import _serialize_shingle_key  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt._baseline_calibration import (  # pylint: disable=import-outside-toplevel
+        _serialize_shingle_key,
+    )
     from pydoppelgangerhunt.matcher import harvest_file_units  # pylint: disable=import-outside-toplevel
 
     repo = tmp_path / "deleted_unit_repo"

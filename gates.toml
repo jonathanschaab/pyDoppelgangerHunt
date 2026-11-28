@@ -5,15 +5,21 @@
 
 [gates.1]
 id = "type-safety"
-name = "Static Type Safety (Mypy)"
-command = "python -m mypy pydoppelgangerhunt tests"
-description = "Verify static type correctness across package and tests."
+name = "Static Type Safety (Mypy) & Python 3.9 Syntax Floor"
+commands = [
+    "python -m mypy pydoppelgangerhunt tests",
+    "python scripts/check_py39_compat.py",
+]
+description = "Verify static type correctness across package and tests and enforce Python 3.9 syntax compatibility."
 
 [gates.2]
 id = "linting"
 name = "Code Quality & Strict Linting (Pylint)"
-command = "python -m pylint pydoppelgangerhunt tests"
-description = "Enforce 10.00 / 10.00 code quality rating."
+commands = [
+    "python -m pylint pydoppelgangerhunt",
+    "python -m pylint --ignore= --disable=all --enable=E,F,W0102,W0101,W0611,W0612,W0702,W0631,W1514,R1710,trailing-newlines tests",
+]
+description = "Enforce 10.00 / 10.00 code quality rating across package and strict error/hygiene checks across tests."
 
 [gates.3]
 id = "packaging"

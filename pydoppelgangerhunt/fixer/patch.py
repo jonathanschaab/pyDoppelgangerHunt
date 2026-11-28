@@ -3,20 +3,86 @@
 from __future__ import annotations
 
 import ast
-import builtins
 from collections import defaultdict
-import difflib
-import hashlib
+import contextlib
+from dataclasses import dataclass, field
 import logging
 import os
-import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, TypedDict, Union
+import re
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
-from pydoppelgangerhunt.config import normalize_path_string, resolve_closure_strictness_mode
+from pydoppelgangerhunt.config import (
+    collect_heuristic_ctx_managers,
+    collect_wildcard_ctx_managers,
+    format_ctx_manager_assumption_comments,
+    heuristic_ctx_manager_session,
+    is_recognized_closure_strictness,
+    normalize_heuristic_ctx_managers,
+    normalize_non_suppressing_ctx_managers,
+    normalize_path_string,
+    normalize_wildcard_ctx_manager_matches,
+    record_heuristic_non_suppressing_ctx_manager,
+    record_wildcard_ctx_manager_match,
+)
+from pydoppelgangerhunt._ast_compat import is_cpython_parser_stack_overflow
+from pydoppelgangerhunt.fixer._df_cache import (
+    _get_or_parse_tree,
+    analysis_session,
+)
+from pydoppelgangerhunt.fixer._pair_eval import (
+    check_pair_core_hazards,
+    evaluate_clone_pair_scopes,
+)
+from pydoppelgangerhunt.fixer._patch_delegation import (  # pylint: disable=unused-import
+    UnitCollisionError,
+    _DelegationCallError,
+    _FilePatchPlan,
+    _PlanSnapshot,
+    _apply_line_deltas,
+    _attach_helper_to_plan,
+    _build_unit_delegation_call,
+    _build_whole_method_delegation,
+    _compute_replacement_line_deltas,
+    _delegate_unit_in_plan,
+    _derive_unit_indent_step,
+    _finalize_host_unit_and_helper,
+    _has_unconditional_terminal_return,
+    _intervals_overlap,
+    _module_imports_target,
+    _outputs_compatible,
+    _render_file_patch_plan,
+    _wire_cross_module_host_delegation,
+    check_units_overlap,
+    filter_overlapping_clone_units,
+    intervals_overlap,
+    refactor_module_units,
+    validate_module_unit_replacements,
+)
+from pydoppelgangerhunt.fixer._patch_imports import (  # pylint: disable=unused-import
+    _canonicalize_helper_relative_imports,
+    _collect_host_missing_imports,
+    _extract_helper_symbols,
+    _extract_module_defined_names,
+    _extract_module_import_statements,
+    _has_future_annotations,
+    _helper_requires_future_annotations,
+    _unpack_source_item,
+)
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
-    _extract_child_indentation,
     _get_enclosing_receiver_kind,
     _has_receiver_reference,
     _is_method_of_class,
@@ -27,2814 +93,50 @@ from pydoppelgangerhunt.fixer.binding import (
     find_enclosing_class,
     find_enclosing_function,
 )
-from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
-from pydoppelgangerhunt.fixer._df_closures import (
-    _extract_comprehension_walrus_names,
-    iter_nested_scope_header_nodes,
-)
-from pydoppelgangerhunt.fixer._df_visitors import _extract_assigned_names
 from pydoppelgangerhunt.fixer.dataflow import (
+    allows_u2_source_placeholder,
     has_async_generator_delegation_hazard,
     resolve_clone_pair_outputs,
 )
 from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
-    _collect_top_level_import_nodes,
     _find_enclosing_package_root,
     _find_project_filesystem_root,
     _is_safe_repo_python_path,
     _parse_source_imports,
-    _resolve_relative_import_path,
     build_module_graph,
     derive_module_import_path as _derive_module_import_path,
     find_nearest_common_package,
     resolve_shared_module_file,
 )
 from pydoppelgangerhunt.fixer.scope import (
-    _extract_arg_names,
     _normalize_receiver_attrs,
     analyze_unit_variable_scope,
-    inspect_single_unit_scope,
+    resolve_unit_inferred_col_bounds,
 )
-
-from pydoppelgangerhunt.fixer.source import (
-    ReplacementItem,
-    UnitDict,
-    _detect_indent_step,
-    _extract_unit_body_lines,
-    _find_module_helper_insertion_index,
-    _find_sig_colon,
-    _get_module_imported_names,
-    _insert_imports_into_module,
-    _is_docstring_node,
-    _scan_sig_line,
-    _slice_unit_token_lines,
-    _validate_and_parse_unit_bound,
+from pydoppelgangerhunt.fixer.source import (  # pylint: disable=unused-import
+    _extract_unit_token_lines,
     compute_line_offsets,
-    count_physical_newlines,
-    detect_line_ending,
     extract_unit_comments_and_pragmas,
     is_subroutine_unit,
     is_valid_unit_coordinates,
     parse_unit_coord,
-    resolve_unit_replacement,
     split_source_lines,
-)
-from pydoppelgangerhunt.reporters import extract_unit_source_code
-from pydoppelgangerhunt.source_lines import (
-    normalize_unit_coordinates,
-    resolve_unit_line_bounds,
+    validate_unit_schema,
 )
 from pydoppelgangerhunt.fixer.synthesis import (
     _align_pair_expr_kinds,
-    _extract_required_typing_imports,
-    _extract_unreferenced_lhs_loads,
-    _format_call_arguments,
-    _is_subline_unit,
-    _node_references_name,
-    _order_inputs_by_rhs_loads,
-    _parse_dedented_stmts,
+    _compile_source_safely,
     _prune_pair_lhs_and_augassign_scopes,
     synthesize_shared_helper_code,
 )
+from pydoppelgangerhunt.source_lines import (
+    resolve_unit_line_bounds,
+    unit_file_str,
+)
+from pydoppelgangerhunt.unit_boundary import normalize_unit_boundary
 
 logger = logging.getLogger(__name__)
-_BUILTIN_NAMES: Set[str] = set(dir(builtins))
-
-
-class UnitCollisionError(ValueError):
-    """Raised when two or more refactoring replacement units collide or overlap.
-
-    Subclasses :class:`ValueError` so callers expecting standard Python coordinate
-    or mapping exceptions can catch it transparently, while allowing specialized
-    handlers to differentiate physical and semantic AST coordinate collisions.
-    """
-
-
-def _check_same_line_overlap(
-    sc1: Optional[int],
-    ec1: Optional[int],
-    sc2: Optional[int],
-    ec2: Optional[int],
-) -> bool:
-    """Case 1: Half-open column interval intersection on the same single line."""
-    if sc1 is not None and ec1 is not None and sc2 is not None and ec2 is not None:
-        if sc1 <= ec1 and sc2 <= ec2:
-            return max(sc1, sc2) < min(ec1, ec2)
-        return False
-    return True
-
-
-def _check_sequential_touch(
-    prior_ec: Optional[int],
-    next_sc: Optional[int],
-    next_is_single: bool,
-    next_ec: Optional[int],
-) -> bool:
-    """Cases 2 & 3: Sequential touch where one unit ends on the line the other begins."""
-    if prior_ec is not None and next_sc is not None:
-        if next_is_single and next_ec is not None and next_sc >= next_ec:
-            return False
-        return next_sc < prior_ec
-    return True
-
-
-def _check_boundary_sharing(
-    multi_sc: Optional[int],
-    single_sc: Optional[int],
-    single_ec: Optional[int],
-) -> bool:
-    """Case 4: Multi-line and single-line units sharing a start boundary line."""
-    if multi_sc is None or single_sc is None or single_ec is None:
-        return True
-    if single_sc >= single_ec:
-        return False
-    return multi_sc < single_ec
-
-
-def check_units_overlap(
-    u1: Dict[str, Any],
-    u2: Dict[str, Any],
-    repo_root: Optional[str] = None,
-) -> bool:
-    """Determines whether two AST code units in the same file share overlapping line ranges.
-
-    Acts as Tier 1 of the dual-tier overlap defense. When column offsets ('start_col',
-    'end_col') are omitted from either unit, this check conservatively assumes the unit
-    spans whole lines and treats any shared line as an overlap conflict. When units share
-    a single boundary line (same-line, touching boundary, or a boundary line of a multi-line
-    unit), it checks sub-line column intervals for half-open intersection. Single-line units
-    or boundary intervals with inverted or zero-width column bounds (start_col >= end_col) represent
-    empty ranges and evaluate to False. Any shared interior lines between multi-line units unconditionally conflict.
-
-    Args:
-        u1: First AST unit dictionary with 'file', 'start', and 'end'.
-        u2: Second AST unit dictionary with 'file', 'start', and 'end'.
-        repo_root: Optional repository root path for resolving relative file paths.
-
-    Returns:
-        True if both units reside in the same normalized file path and their [start, end]
-        intervals overlap; False otherwise.
-    """
-    if not isinstance(u1, dict) or not isinstance(u2, dict):
-        raise TypeError(
-            f"Units must be dictionaries, got {type(u1).__name__} and {type(u2).__name__}"
-        )
-    f1 = normalize_path_string(str(u1.get("file") or ""))
-    f2 = normalize_path_string(str(u2.get("file") or ""))
-    if not f1 or not f2 or not _is_same_file_path(f1, f2, repo_root=repo_root):
-        return False
-
-    def _parse_lines(u: Dict[str, Any], label: str, file_path: str) -> Tuple[int, int]:
-        try:
-            s = max(1, parse_unit_coord(u, "start", default=1))
-            e = max(1, parse_unit_coord(u, "end", default=s))
-            return s, e
-        except (ValueError, TypeError) as err:
-            raise ValueError(
-                f"Malformed unit: invalid line boundary in {label} ({file_path}): {err}"
-            ) from err
-
-    start1, end1 = _parse_lines(u1, "u1", f1)
-    start2, end2 = _parse_lines(u2, "u2", f2)
-
-    # Inverted line ranges (start > end) represent empty 0-width ranges, which cannot overlap.
-    if start1 > end1 or start2 > end2 or end1 < start2 or end2 < start1:
-        return False
-
-    def _parse_col(val: Any, col_name: str, file_path: str) -> Optional[int]:
-        if val is None:
-            return None
-        try:
-            parsed = parse_unit_coord({col_name: val}, col_name, default=None)
-            if parsed is None:
-                return None
-            return max(0, parsed)
-        except (ValueError, TypeError) as err:
-            raise ValueError(
-                f"Malformed unit: invalid column offset '{col_name}'={val!r} in {file_path}"
-            ) from err
-
-    sc1 = _parse_col(
-        u1.get("start_col") if u1.get("start_col") is not None else u1.get("start_col_offset"),
-        "start_col",
-        f1,
-    )
-    ec1 = _parse_col(
-        u1.get("end_col") if u1.get("end_col") is not None else u1.get("end_col_offset"),
-        "end_col",
-        f1,
-    )
-    sc2 = _parse_col(
-        u2.get("start_col") if u2.get("start_col") is not None else u2.get("start_col_offset"),
-        "start_col",
-        f2,
-    )
-    ec2 = _parse_col(
-        u2.get("end_col") if u2.get("end_col") is not None else u2.get("end_col_offset"),
-        "end_col",
-        f2,
-    )
-
-    # -------------------------------------------------------------------------
-    # Case -> Expected Behaviour Mapping:
-    # -------------------------------------------------------------------------
-    # Case 1: Same line (start1 == end1 == start2 == end2)
-    #   -> Overlap if half-open column intervals intersect: max(sc1, sc2) < min(ec1, ec2).
-    # Case 2: Sequential touch (start1 < start2 and end1 == start2)
-    #   -> u1 ends on the line u2 begins: overlap if sc2 < ec1.
-    # Case 3: Sequential touch (start2 < start1 and end2 == start1)
-    #   -> u2 ends on the line u1 begins: overlap if sc1 < ec2.
-    # Case 4: Start boundary line sharing between a multi-line unit and a single-line unit:
-    #   -> Shared start line: overlap if single unit ends after multi begins (multi_sc < single_ec).
-    #   -> Multi-line vs. multi-line sharing a boundary line: conservatively overlap (True).
-    # Case 5: Multi-line interior overlap (units span multiple shared lines)
-    #   -> Units overlap across interior lines: unconditionally conflict (True).
-    # -------------------------------------------------------------------------
-
-    # Case 1: Both units reside on the exact same single line
-    if start1 == end1 == start2 == end2:
-        return _check_same_line_overlap(sc1, ec1, sc2, ec2)
-
-    # Case 2: Sequential boundary touch (u1 ends where u2 begins)
-    if start1 < start2 and start2 == end1:
-        return _check_sequential_touch(ec1, sc2, start2 == end2, ec2)
-
-    # Case 3: Sequential boundary touch (u2 ends where u1 begins)
-    if start2 < start1 and start1 == end2:
-        return _check_sequential_touch(ec2, sc1, start1 == end1, ec1)
-
-    # Case 4: Units sharing start line (start1 == start2), or multi-line units sharing end line (end1 == end2).
-    # Note: Sequential touches and single-line units sharing the end-line of a multi-line unit
-    # (e.g. u1 lines 1..3, u2 line 3..3) have end1 == start2 and are fully handled by Case 2/3 above.
-    if start1 == start2:
-        if start1 < end1 and start2 == end2:
-            return _check_boundary_sharing(sc1, sc2, ec2)
-        if start2 < end2 and start1 == end1:
-            return _check_boundary_sharing(sc2, sc1, ec1)
-        return True
-
-    if end1 == end2:
-        # Multi-line vs. multi-line sharing an end line (single-line sharing end line is handled in Case 2/3)
-        return True
-
-    # Case 5: Multi-line interior overlap
-    return max(start1, start2) <= min(end1, end2)
-
-
-def filter_overlapping_clone_units(
-    units: Sequence[Dict[str, Any]],
-    repo_root: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """Filters a sequence of candidate code units to retain a maximal non-overlapping subset.
-
-    When candidates share overlapping lines/tokens within the same module, candidates
-    spanning a larger line range are prioritized, with ties broken by earlier start line.
-
-    Args:
-        units: Sequence of AST unit dictionaries proposed for refactoring.
-        repo_root: Optional repository root path for resolving relative file paths.
-
-    Returns:
-        List of non-overlapping units safe for concurrent refactoring within the same pass.
-    """
-    if not units:
-        return []
-
-    file_groups: List[Tuple[str, List[Dict[str, Any]]]] = []
-    for u in units:
-        f_raw = str(u.get("file") or "")
-        matched = False
-        for rep_f, group in file_groups:
-            if (not f_raw and not rep_f) or (
-                f_raw and rep_f and _is_same_file_path(f_raw, rep_f, repo_root=repo_root)
-            ):
-                group.append(u)
-                matched = True
-                break
-        if not matched:
-            file_groups.append((f_raw, [u]))
-
-    retained: List[Dict[str, Any]] = []
-    for _, file_units in file_groups:
-        def _sort_key(u: Dict[str, Any]) -> Tuple[int, int, int, str]:
-            s = parse_unit_coord(u, "start", default=0)
-            e = parse_unit_coord(u, "end", default=s)
-            sc = parse_unit_coord(u, "start_col", default=0)
-            return (-(e - s), s, sc, str(u.get("name") or ""))
-
-        sorted_candidates = sorted(file_units, key=_sort_key)
-        file_retained: List[Dict[str, Any]] = []
-        for cand in sorted_candidates:
-            if not any(check_units_overlap(cand, prev, repo_root=repo_root) for prev in file_retained):
-                file_retained.append(cand)
-        retained.extend(file_retained)
-
-    return retained
-
-
-def intervals_overlap(s1: int, e1: int, s2: int, e2: int) -> bool:
-    """Checks whether two half-open byte intervals [s1, e1) and [s2, e2) overlap, including zero-width boundaries."""
-    if s1 == e1 and s2 == e2:
-        return s1 == s2
-    if s1 == e1:
-        return s2 < s1 < e2
-    if s2 == e2:
-        return s1 < s2 < e1
-    return max(s1, s2) < min(e1, e2)
-
-
-_intervals_overlap = intervals_overlap
-
-
-def _format_unit_desc(u: UnitDict) -> Tuple[str, int, int, str]:
-    """Extracts (name, start_line, end_line, file_path) from an AST unit dictionary."""
-    if not isinstance(u, dict):
-        raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
-    n = str(u.get("name") or "unit")
-    s, e = resolve_unit_line_bounds(u)
-    f = normalize_path_string(str(u.get("file") or ""), strip_anchor=False) or "<module>"
-    return n, s, e, f
-
-
-def _raise_unit_collision_error(
-    u1: UnitDict,
-    u2: UnitDict,
-    context: str = "",
-) -> None:
-    """Formats and raises a UnitCollisionError between two conflicting units."""
-    n1, s1, e1, f1 = _format_unit_desc(u1)
-    n2, s2, e2, _ = _format_unit_desc(u2)
-    ctx_prefix = f" in {context} " if context else " "
-    raise UnitCollisionError(
-        f"Overlapping unit collision detected{ctx_prefix}"
-        f"between '{n1}' ({s1}-{e1}) and '{n2}' ({s2}-{e2}) in {f1}."
-    )
-
-
-def _assert_no_interval_collisions(
-    items: Sequence[ReplacementItem],
-    context: str = "",
-) -> None:
-    """Verifies that a sorted sequence of ReplacementItems does not contain overlapping byte intervals."""
-    max_end_item: Optional[ReplacementItem] = None
-    for item in items:
-        if (
-            max_end_item is not None
-            and _intervals_overlap(
-                max_end_item.start_byte, max_end_item.end_byte, item.start_byte, item.end_byte
-            )
-        ):
-            _raise_unit_collision_error(max_end_item.unit, item.unit, context=context)
-        if max_end_item is None or item.end_byte >= max_end_item.end_byte:
-            max_end_item = item
-
-
-def refactor_module_units(
-    source_text: str,
-    replacements: Sequence[Tuple[UnitDict, str]],
-    lines: Optional[Sequence[str]] = None,
-    line_char_offsets: Optional[Sequence[int]] = None,
-    line_byte_offsets: Optional[Sequence[int]] = None,
-    dry_run: bool = False,
-    tier1: bool = True,
-    tier2: bool = True,
-    strict: bool = True,
-) -> str:
-    """Applies multiple non-overlapping unit replacements in reverse source order.
-
-    Architectural Overview:
-        Refactoring uses a dual-tier collision defense and reverse-order buffer application:
-        1. Tier 1 (Semantic AST Coordinate Check): Fast-path check using :func:`check_units_overlap`
-           to verify that units do not share conflicting lines or column ranges before resolving text.
-        2. Pragma & Boundary Span Resolution: :func:`resolve_unit_replacement` maps each unit to
-           physical character and UTF-8 byte spans while preserving attached boundary pragmas
-           (e.g., `# type: ignore`, `# noqa`, `# pragma: no cover`) and leading decorators.
-        3. Tier 2 (Physical Byte-Span Sweep): Verifies via :func:`intervals_overlap` that the physical
-           byte intervals `[start_byte, end_byte)` of expanded replacement slices do not collide. This
-           catches collisions introduced by pragma expansions or indentation adjustments.
-        4. Reverse-Order Execution: Replacements are sorted descending by `(start_byte, end_byte)`.
-           Applying edits bottom-to-top ensures downstream text length changes never shift upstream
-           character or byte coordinates.
-
-    Performance & Algorithmic Bounds:
-        Tier-1 and Tier-2 validation combined with single-pass descending buffer slicing executes
-        in sub-millisecond to low-millisecond time (<5ms for hundreds of replacements on 10,000+ line
-        modules), avoiding quadratic string re-tokenizations and redundant buffer dry-runs.
-
-    Args:
-        source_text: The complete original Python source code.
-        replacements: Sequence of (unit, replacement_text) tuples.
-        lines: Optional precomputed line strings of source_text.
-        line_char_offsets: Optional precomputed character offsets of line starts.
-        line_byte_offsets: Optional precomputed UTF-8 byte offsets of line starts.
-        dry_run: If True, executes collision validation without slicing or modifying the source buffer.
-        tier1: If True, executes Tier 1 semantic line/column overlap validation.
-        tier2: If True, executes Tier 2 physical UTF-8 byte interval sweep validation.
-        strict: If True, validates unit coordinates with strict positive integer rules.
-
-    Returns:
-        The refactored module source text (or unmodified source_text if dry_run=True).
-
-    Raises:
-        UnitCollisionError: If any pair of units collides under active validation tiers.
-    """
-    if not replacements:
-        return source_text
-
-    # Tier 1 Semantic Overlap Check:
-    # Conservatively reject candidate pairs that share lines when column bounds are
-    # omitted or incomplete (whole-line / statement replacements inherently conflict
-    # with any other edit on the same line), or when column intervals overlap.
-    rep_list: List[Tuple[Dict[str, Any], str]] = []
-    for u_raw, rep in replacements:
-        if not isinstance(u_raw, dict):
-            raise TypeError(f"Unit must be a dictionary, got {type(u_raw).__name__}")
-        u = normalize_unit_coordinates(u_raw)
-        _validate_and_parse_unit_bound(u, "start", strict=strict)
-        _validate_and_parse_unit_bound(u, "end", strict=strict)
-        if not is_valid_unit_coordinates(u, strict=strict):
-            raise ValueError(
-                f"Malformed unit: invalid coordinates for refactoring: {u!r}"
-            )
-        if not u.get("file"):
-            u_norm = dict(u)
-            u_norm["file"] = "<module>"
-            rep_list.append((u_norm, rep))
-        else:
-            rep_list.append((u, rep))
-
-    if tier1:
-        for i, (u1, _) in enumerate(rep_list):
-            for u2, _ in rep_list[i + 1:]:
-                if check_units_overlap(u1, u2):
-                    _raise_unit_collision_error(u1, u2)
-
-    computed_entries: List[ReplacementItem] = []
-    if lines is None:
-        lines = split_source_lines(source_text)
-    if line_char_offsets is None or line_byte_offsets is None:
-        line_char_offsets, line_byte_offsets = compute_line_offsets(lines)
-
-    for i, (unit, rep) in enumerate(rep_list):
-        item = resolve_unit_replacement(
-            source_text,
-            unit,
-            rep,
-            lines=lines,
-            line_char_offsets=line_char_offsets,
-            line_byte_offsets=line_byte_offsets,
-            order_index=i,
-        )
-        computed_entries.append(item)
-
-    # Tier 2 Physical Byte-Span Overlap Check:
-    # After computing exact UTF-8 byte slices in the underlying source buffer,
-    # verify via an O(N log N) sweep that no two physical byte intervals [s_b, e_b) collide.
-    sorted_by_start = sorted(
-        computed_entries,
-        key=lambda item: (item.start_byte, item.end_byte, item.order_index),
-    )
-    if tier2:
-        _assert_no_interval_collisions(sorted_by_start)
-
-    if dry_run:
-        return source_text
-
-    # Note: reverse order ensures downstream replacements do not alter upstream character offsets
-    sorted_replacements = list(reversed(sorted_by_start))
-
-    current_text = source_text
-    for item in sorted_replacements:
-        s_c = item.start_char
-        e_c = item.end_char
-        current_text = current_text[:s_c] + item.final_rep + current_text[e_c:]
-
-    return current_text
-
-
-def validate_module_unit_replacements(
-    source_text: str,
-    replacements: Sequence[Tuple[UnitDict, str]],
-    lines: Optional[Sequence[str]] = None,
-    line_char_offsets: Optional[Sequence[int]] = None,
-    line_byte_offsets: Optional[Sequence[int]] = None,
-    tier1: bool = True,
-    tier2: bool = True,
-    strict: bool = True,
-) -> None:
-    """Validates that candidate unit replacements do not contain interval collisions.
-
-    Runs Tier 1 (AST line/column range overlap) and/or Tier 2 (physical UTF-8 byte span
-    sweep) validation without modifying or allocating new source string buffers.
-
-    Args:
-        source_text: The complete original Python source code.
-        replacements: Sequence of (unit, replacement_text) tuples.
-        lines: Optional precomputed line strings of source_text.
-        line_char_offsets: Optional precomputed character offsets of line starts.
-        line_byte_offsets: Optional precomputed UTF-8 byte offsets of line starts.
-        tier1: If True, executes Tier 1 semantic line/column overlap validation.
-        tier2: If True, executes Tier 2 physical UTF-8 byte interval sweep validation.
-        strict: If True, enforces strict coordinate typing and positive bounds.
-
-    Raises:
-        UnitCollisionError: If any pair of units collides under active validation tiers.
-    """
-    refactor_module_units(
-        source_text,
-        replacements,
-        lines=lines,
-        line_char_offsets=line_char_offsets,
-        line_byte_offsets=line_byte_offsets,
-        dry_run=True,
-        tier1=tier1,
-        tier2=tier2,
-        strict=strict,
-    )
-
-
-def _build_whole_method_delegation(
-    source_text: str,
-    unit: Dict[str, Any],
-    call_prefix: str,
-    helper_name: str,
-    args_str: str,
-    await_prefix: str = "",
-    has_return: bool = True,
-    is_async: bool = False,
-    has_yield: bool = False,
-) -> str:
-    """Builds a delegated method replacement body preserving method signature and docstring."""
-    lines = split_source_lines(source_text)
-    u_start, u_end = resolve_unit_line_bounds(unit)
-
-    lead = lines[u_start - 1] if 1 <= u_start <= len(lines) else ""
-    indent = lead[: len(lead) - len(lead.lstrip())]
-    default_step = _detect_indent_step(indent)
-    body_indent = indent + default_step
-
-    sig_end_line: Optional[int] = None
-    docstring_end_line: Optional[int] = None
-    header = ""
-    raw_u_name = str(unit.get("name") or "")
-    base_u_name = raw_u_name.rsplit(":", maxsplit=1)[-1] if raw_u_name else ""
-
-    try:
-        tree = ast.parse(source_text)
-        cand_nodes: List[Tuple[int, Union[ast.FunctionDef, ast.AsyncFunctionDef]]] = []
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                n_start = getattr(node, "lineno", 0) or 0
-                n_end = getattr(node, "end_lineno", None) or n_start
-                decs = getattr(node, "decorator_list", [])
-                dec_start = (
-                    min((getattr(d, "lineno", None) or n_start) for d in decs)
-                    if decs
-                    else n_start
-                )
-                earliest_start = min(dec_start, n_start)
-                if u_start in (n_start, earliest_start):
-                    cand_nodes.append((0, node))
-                elif node.name in (raw_u_name, base_u_name) and earliest_start <= u_start <= n_end:
-                    cand_nodes.append((n_end - earliest_start + 1, node))
-        if cand_nodes:
-            cand_nodes.sort(key=lambda item: (item[0], -getattr(item[1], "lineno", 0)))
-            matched_node = cand_nodes[0][1]
-            if matched_node.body:
-                b_cand_lines = [
-                    int(getattr(b_stmt, "lineno", 0))
-                    for b_stmt in matched_node.body
-                    if getattr(b_stmt, "lineno", 0) > 0
-                ]
-                found_indent = _extract_child_indentation(lines, b_cand_lines, indent)
-                if found_indent is not None:
-                    body_indent = found_indent
-                first_body = matched_node.body[0]
-                fn_def_line = getattr(matched_node, "lineno", u_start)
-                if first_body.lineno == fn_def_line:
-                    b_col = getattr(first_body, "col_offset", len(lines[fn_def_line - 1]))
-                    same_line = lines[fn_def_line - 1][:b_col].rstrip()
-                    if not same_line.endswith(":"):
-                        colon_pos = _find_sig_colon(lines[fn_def_line - 1][:b_col])
-                        if colon_pos != -1:
-                            same_line = lines[fn_def_line - 1][: colon_pos + 1]
-                    header = "".join(lines[u_start - 1 : fn_def_line - 1]) + same_line + "\n"
-                else:
-                    sig_end_line = first_body.lineno - 1
-                    if _is_docstring_node(first_body):
-                        docstring_end_line = (
-                            getattr(first_body, "end_lineno", None)
-                            or getattr(first_body, "lineno", 0)
-                        )
-    except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
-        pass
-
-    if not header:
-        if docstring_end_line is not None and docstring_end_line >= u_start:
-            header = "".join(lines[u_start - 1 : docstring_end_line])
-        elif sig_end_line is not None and sig_end_line >= u_start:
-            header = "".join(lines[u_start - 1 : sig_end_line])
-        else:
-            hdr_lines = []
-            curr_depth = 0
-            for l_num in range(u_start, min(u_end + 1, len(lines) + 1)):
-                ln = lines[l_num - 1]
-                colon_pos, curr_depth = _scan_sig_line(ln, initial_paren_depth=curr_depth)
-                if colon_pos != -1:
-                    hdr_lines.append(ln[: colon_pos + 1] + "\n")
-                    break
-                hdr_lines.append(ln)
-                if ln.rstrip().endswith(":") and curr_depth == 0:
-                    break
-            header = "".join(hdr_lines)
-
-    if not header.endswith("\n"):
-        header += "\n"
-
-    body_step = (
-        body_indent[len(indent):]
-        if body_indent.startswith(indent) and len(body_indent) > len(indent)
-        else ("\t" if "\t" in body_indent else "    ")
-    )
-
-    effective_async = is_async or bool(await_prefix.strip())
-    if effective_async and has_yield:
-        delegation_stmt = (
-            f"{body_indent}async for _item in {call_prefix}{helper_name}({args_str}):\n"
-            f"{body_indent}{body_step}yield _item\n"
-        )
-    elif has_yield:
-        if has_return:
-            delegation_stmt = (
-                f"{body_indent}return (yield from {call_prefix}{helper_name}({args_str}))\n"
-            )
-        else:
-            delegation_stmt = f"{body_indent}yield from {call_prefix}{helper_name}({args_str})\n"
-    elif effective_async:
-        ret_prefix = "return " if has_return else ""
-        delegation_stmt = f"{body_indent}{ret_prefix}await {call_prefix}{helper_name}({args_str})\n"
-    else:
-        ret_prefix = "return " if has_return else ""
-        delegation_stmt = f"{body_indent}{ret_prefix}{call_prefix}{helper_name}({args_str})\n"
-    return header + delegation_stmt
-
-
-def _has_unconditional_terminal_return(
-    unit: Dict[str, Any], orig_lines: Sequence[str]
-) -> bool:
-    """Checks whether an AST code unit terminates with an unconditional return at its base indentation."""
-    u_start = max(1, parse_unit_coord(unit, "start", default=1))
-    u_end = min(len(orig_lines), parse_unit_coord(unit, "end", default=u_start))
-    if u_start > len(orig_lines) or u_start > u_end:
-        return False
-    cand_lines = orig_lines[u_start - 1 : u_end]
-    non_empty = [ln for ln in cand_lines if ln.strip() and not ln.strip().startswith("#")]
-    if not non_empty:
-        return False
-    base_ind = len(non_empty[0]) - len(non_empty[0].lstrip())
-    last_ln = non_empty[-1]
-    last_ind = len(last_ln) - len(last_ln.lstrip())
-    if last_ind != base_ind:
-        return False
-    s = last_ln.strip()
-    return s == "return" or s.startswith("return ") or s.startswith("return(") or s.startswith("return\t")
-
-
-_AUGASSIGN_OPS: Dict[type, str] = {
-    ast.Add: "+=",
-    ast.Sub: "-=",
-    ast.Mult: "*=",
-    ast.MatMult: "@=",
-    ast.Div: "/=",
-    ast.Mod: "%=",
-    ast.Pow: "**=",
-    ast.LShift: "<<=",
-    ast.RShift: ">>=",
-    ast.BitOr: "|=",
-    ast.BitXor: "^=",
-    ast.BitAnd: "&=",
-    ast.FloorDiv: "//=",
-}
-
-
-def _build_unit_delegation_call(
-    target_unit: Dict[str, Any],
-    orig_text: str,
-    orig_lines: List[str],
-    *,
-    effective_binding: str,
-    helper_name: str,
-    inputs: List[str],
-    outputs: List[str],
-    scope: Dict[str, Any],
-    target_inputs: Optional[List[str]] = None,
-    target_outputs: Optional[List[str]] = None,
-    await_prefix: str = "",
-    step: Optional[str] = None,
-    preserve_boundary_pragmas: bool = True,
-) -> str:
-    """Constructs replacement delegation call statement for a clone unit in refactoring patches."""
-    u_start = max(1, parse_unit_coord(target_unit, "start", default=1))
-    u_end_coord = max(u_start, parse_unit_coord(target_unit, "end", default=u_start))
-    lead = orig_lines[u_start - 1] if 1 <= u_start <= len(orig_lines) else ""
-    if not lead.strip() or lead.lstrip().startswith("#"):
-        for cand_ln in orig_lines[u_start - 1 : min(len(orig_lines), u_end_coord)]:
-            cand_s = cand_ln.lstrip()
-            if cand_s and not cand_s.startswith("#"):
-                lead = cand_ln
-                break
-    indent = lead[: len(lead) - len(lead.lstrip())]
-
-    t_fn = find_enclosing_function(orig_text, target_unit)
-    t_enc = find_enclosing_class(orig_text, target_unit)
-    if not _is_method_of_class(t_fn, t_enc):
-        t_fn = None
-    t_kind = _get_enclosing_receiver_kind(t_fn) if t_fn else "none"
-
-    rec_param = t_fn.get("receiver_param") if t_fn else None
-    rec_name = rec_param or ("cls" if t_kind == "class" else "self")
-
-    if effective_binding == "method":
-        if t_kind == "static":
-            unit_call_prefix = "__class__."
-            unit_receiver_omit: Optional[str] = None
-        elif t_kind == "class":
-            unit_call_prefix = f"{rec_name}."
-            unit_receiver_omit = rec_name
-        else:
-            unit_call_prefix = f"{rec_name}."
-            unit_receiver_omit = rec_name
-    else:
-        unit_call_prefix = ""
-        unit_receiver_omit = (
-            "receivers"
-            if t_kind in ("static", "none")
-            else ("self" if t_kind == "class" else "cls")
-        )
-
-    effective_targets = target_inputs if target_inputs is not None else inputs
-    effective_outputs = target_outputs if target_outputs is not None else outputs
-
-    is_expr_unit = target_unit.get("kind") in ("comprehension", "complex_expr")
-    unit_args_str = _format_call_arguments(
-        inputs,
-        scope.get("param_details", []),
-        receiver_to_omit=unit_receiver_omit,
-        target_inputs=effective_targets,
-        positional_target_map=is_expr_unit,
-    )
-
-    is_whole_method = target_unit.get("kind") in (
-        "function",
-        "closure",
-        "method",
-        "async_function",
-        "async_method",
-    )
-    if is_whole_method:
-        is_init = bool(
-            target_unit.get("name") == "__init__"
-            or str(target_unit.get("name", "")).endswith((".__init__", ":__init__"))
-        )
-        has_return = False if is_init else bool(effective_outputs or scope.get("has_return", True))
-        return _build_whole_method_delegation(
-            orig_text,
-            target_unit,
-            call_prefix=unit_call_prefix,
-            helper_name=helper_name,
-            args_str=unit_args_str,
-            await_prefix=await_prefix,
-            has_return=has_return,
-            is_async=bool(scope.get("is_async")),
-            has_yield=bool(scope.get("has_yield")),
-        )
-
-    if is_expr_unit:
-        call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
-        if not _is_subline_unit(target_unit):
-            u_end = max(u_start, parse_unit_coord(target_unit, "end", default=u_start))
-            raw_block = "".join(orig_lines[u_start - 1 : u_end])
-            assign_prefix: Optional[str] = None
-            try:
-                parsed_body = _parse_dedented_stmts(raw_block)
-                if len(parsed_body) != 1:
-                    return ""
-                parsed_node = parsed_body[0]
-                unref_lhs: Set[str] = set()
-                if isinstance(parsed_node, ast.Assign) and parsed_node.targets:
-                    targets_str = " = ".join(ast.unparse(t) for t in parsed_node.targets)
-                    assign_prefix = f"{targets_str} = "
-                    unref_lhs = _extract_unreferenced_lhs_loads(parsed_node)
-                elif isinstance(parsed_node, ast.AnnAssign) and parsed_node.value is not None:
-                    target_str = ast.unparse(parsed_node.target)
-                    anno_str = ast.unparse(parsed_node.annotation)
-                    assign_prefix = f"{target_str}: {anno_str} = "
-                    unref_lhs = _extract_unreferenced_lhs_loads(parsed_node)
-                elif isinstance(parsed_node, ast.AugAssign):
-                    target_str = ast.unparse(parsed_node.target)
-                    op_symbol = _AUGASSIGN_OPS.get(type(parsed_node.op), "+=")
-                    assign_prefix = f"{target_str} {op_symbol} "
-                    unref_lhs = _extract_unreferenced_lhs_loads(parsed_node)
-                    if isinstance(parsed_node.target, ast.Name):
-                        t_name = parsed_node.target.id
-                        if not _node_references_name(parsed_node.value, t_name):
-                            unref_lhs.add(t_name)
-                elif isinstance(parsed_node, ast.Return) and parsed_node.value is not None:
-                    assign_prefix = "return "
-                elif isinstance(parsed_node, ast.Expr):
-                    assign_prefix = ""
-                rhs_val = getattr(parsed_node, "value", None)
-                if isinstance(
-                    parsed_node,
-                    (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Return, ast.Expr),
-                ) and isinstance(rhs_val, ast.AST):
-                    unit_receiver = rec_param or target_unit.get("receiver_param")
-                    rec_names: Tuple[str, ...] = (
-                        (str(unit_receiver), "self", "cls", "this", "klass")
-                        if unit_receiver
-                        else ("self", "cls", "this", "klass")
-                    )
-                    pruned_eff = (
-                        [
-                            x
-                            for x in effective_targets
-                            if x not in unref_lhs
-                            or (
-                                x == unit_receiver_omit
-                                and (x in inputs or any(r in inputs for r in rec_names))
-                            )
-                        ]
-                        if unref_lhs and len(effective_targets) > len(inputs)
-                        else list(effective_targets)
-                    )
-                    if not any(
-                        x in unref_lhs and x != unit_receiver_omit for x in pruned_eff
-                    ):
-                        pruned_eff = _order_inputs_by_rhs_loads(
-                            pruned_eff, rhs_val, receiver_names=rec_names
-                        )
-                    if len(pruned_eff) == len(inputs):
-                        pruned_args = _format_call_arguments(
-                            inputs,
-                            scope.get("param_details", []),
-                            receiver_to_omit=unit_receiver_omit,
-                            target_inputs=pruned_eff,
-                            positional_target_map=True,
-                        )
-                        call_expr = f"{unit_call_prefix}{helper_name}({pruned_args})"
-            except (SyntaxError, IndexError, ValueError):
-                pass
-
-            if assign_prefix is None:
-                return ""
-            rep_call = f"{indent}{assign_prefix}{await_prefix}{call_expr}\n"
-            if not preserve_boundary_pragmas:
-                return rep_call
-            attached_pragmas = [
-                c["text"].strip()
-                for c in extract_unit_comments_and_pragmas(
-                    orig_text,
-                    start_line=u_start,
-                    end_line=u_end,
-                    include_leading=False,
-                )
-                if c["is_pragma"]
-            ]
-            dedup_pragmas = list(
-                dict.fromkeys(p for p in attached_pragmas if p not in rep_call)
-            )
-            if dedup_pragmas:
-                return rep_call.rstrip("\r\n") + "  " + "  ".join(dedup_pragmas) + "\n"
-            return rep_call
-        return f"{await_prefix}{call_expr}"
-
-    call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
-    rep_step = step or ("\t" if "\t" in indent else "    ")
-    if bool(scope.get("has_yield")) and bool(scope.get("is_async")):
-        return (
-            f"{indent}async for _item in {call_expr}:\n"
-            f"{indent}{rep_step}yield _item\n"
-        )
-
-    is_sync_gen = bool(scope.get("has_yield"))
-    if _has_unconditional_terminal_return(target_unit, orig_lines):
-        if is_sync_gen:
-            return f"{indent}return (yield from {call_expr})\n"
-        return f"{indent}return {await_prefix}{call_expr}\n"
-
-    if effective_outputs:
-        assign_target = ", ".join(effective_outputs) if len(effective_outputs) >= 2 else effective_outputs[0]
-        rhs = (
-            f"(yield from {call_expr})"
-            if is_sync_gen
-            else f"{await_prefix}{call_expr}"
-        )
-        return f"{indent}{assign_target} = {rhs}\n"
-
-    prefix = "yield from " if is_sync_gen else await_prefix
-    return f"{indent}{prefix}{call_expr}\n"
-
-
-def _module_imports_target(
-    source_text: str,
-    target_module: str,
-    current_mod: str = "",
-    is_package: bool = False,
-) -> bool:
-    """Checks whether a module's source unconditionally imports a specific target module."""
-    if not target_module:
-        return False
-    raw_imports = _parse_source_imports(
-        source_text, current_mod, is_package=is_package
-    )
-    for imported_mod in raw_imports:
-        if imported_mod == target_module or imported_mod.startswith(
-            f"{target_module}."
-        ):
-            return True
-    return False
-
-
-def _outputs_compatible(
-    helper_outs: Sequence[str],
-    target_outs: Sequence[str],
-    *,
-    is_subroutine: bool,
-    has_yield: bool,
-) -> bool:
-    """Checks whether candidate clone outputs match synthesized helper outputs.
-
-    Note: When is_subroutine and has_yield are True, resolve_clone_generator_subroutine_outputs
-    strictly guarantees equal-length paired outputs, so output lengths are always compatible.
-    """
-    if is_subroutine and has_yield:
-        return True
-    return len(helper_outs) == len(target_outs)
-
-
-class _PlanSnapshot(TypedDict):
-    """Encapsulates a snapshot of mutable _FilePatchPlan state for transactional rollback."""
-
-    replacements: List[Tuple[UnitDict, str]]
-    replacement_items: List[ReplacementItem]
-    method_helpers: List[Tuple[int, str]]
-    module_helpers: List[str]
-    missing_imports: List[str]
-    comments: List[str]
-    used_helper_names: Set[str]
-    claimed_units: List[UnitDict]
-
-
-class _FilePatchPlan:
-    """Internal accumulator of proposed transformations for a single file."""
-
-    def __init__(
-        self,
-        file_path: Path,
-        rel_path: str,
-        orig_text: str,
-        is_new_file: bool = False,
-    ) -> None:
-        self.path = file_path
-        self.rel_path = rel_path
-        self.orig_text = orig_text
-        self.orig_lines = [] if is_new_file else split_source_lines(orig_text)
-        self.is_new_file = is_new_file
-        if is_new_file:
-            self.line_char_offsets: Sequence[int] = [0]
-            self.line_byte_offsets: Sequence[int] = [0]
-        else:
-            self.line_char_offsets, self.line_byte_offsets = compute_line_offsets(self.orig_lines)
-        self.replacements: List[Tuple[UnitDict, str]] = []
-        self.replacement_items: List[ReplacementItem] = []
-        self.method_helpers: List[Tuple[int, str]] = []
-        self.module_helpers: List[str] = []
-        self.missing_imports: List[str] = []
-        self.comments: List[str] = []
-        self.used_helper_names: Set[str] = set()
-        self.claimed_units: List[UnitDict] = []
-        self._cached_ast: Optional[ast.AST] = None
-        self._ast_attempted: bool = False
-        self._content_digest: Optional[str] = None
-
-    @property
-    def content_digest(self) -> str:
-        """SHA-256 digest of orig_text, cached for reuse in downstream analysis."""
-        if self._content_digest is None:
-            self._content_digest = hashlib.sha256(
-                self.orig_text.encode("utf-8", errors="replace")
-            ).hexdigest()
-        return self._content_digest
-
-    @property
-    def parsed_tree(self) -> Optional[ast.AST]:
-        """Lazily parsed AST of orig_text, cached for reuse across operations."""
-        if not self._ast_attempted:
-            self._ast_attempted = True
-            self._cached_ast = _get_or_parse_tree(
-                self.orig_text, source_digest=self.content_digest
-            )
-        return self._cached_ast
-
-    def snapshot(self) -> _PlanSnapshot:
-        """Creates a snapshot of mutable plan state for transactional rollback."""
-        return {
-            "replacements": list(self.replacements),
-            "replacement_items": list(self.replacement_items),
-            "method_helpers": list(self.method_helpers),
-            "module_helpers": list(self.module_helpers),
-            "missing_imports": list(self.missing_imports),
-            "comments": list(self.comments),
-            "used_helper_names": set(self.used_helper_names),
-            "claimed_units": list(self.claimed_units),
-        }
-
-    def restore(self, snap: _PlanSnapshot) -> None:
-        """Restores mutable plan state from a snapshot."""
-        self.replacements = list(snap["replacements"])
-        self.replacement_items = list(snap.get("replacement_items", []))
-        self.method_helpers = list(snap["method_helpers"])
-        self.module_helpers = list(snap["module_helpers"])
-        self.missing_imports = list(snap["missing_imports"])
-        self.comments = list(snap["comments"])
-        self.used_helper_names = set(snap["used_helper_names"])
-        self.claimed_units = list(snap["claimed_units"])
-
-
-def _compute_replacement_line_deltas(
-    reps: Sequence[Tuple[Dict[str, Any], str]],
-    orig_text: str,
-    lines: Optional[Sequence[str]] = None,
-    line_char_offsets: Optional[Sequence[int]] = None,
-    line_byte_offsets: Optional[Sequence[int]] = None,
-) -> List[Tuple[int, int]]:
-    """Computes (end_line, line_delta) tuples for replacements in source text.
-
-    For each replacement, calculates net change in line count (newlines added - newlines removed).
-    Because candidate replacements are non-overlapping, their line deltas are strictly additive.
-    Each entry is an (end_line, delta) tuple where end_line serves as the boundary cutoff
-    for downstream target line adjustments in _adjust_line_for_replacements (end_line < target_line).
-
-    Raises:
-        TypeError: If any replacement unit is not a dictionary.
-        ValueError: If any unit contains invalid line coordinates or if candidate replacements overlap.
-    """
-    if lines is None:
-        lines = split_source_lines(orig_text)
-    if line_char_offsets is None or line_byte_offsets is None:
-        line_char_offsets, line_byte_offsets = compute_line_offsets(lines)
-    computed: List[Tuple[ReplacementItem, int, int]] = []
-    for i, (u, rep) in enumerate(reps):
-        if not isinstance(u, dict):
-            raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
-        if not is_valid_unit_coordinates(u, strict=False):
-            raise ValueError(
-                f"Malformed unit: invalid line boundary in {u.get('file', '')}: {u}"
-            )
-        try:
-            fallback = max(1, parse_unit_coord(u, "start", default=1))
-            end_l = max(fallback, parse_unit_coord(u, "end", default=fallback))
-        except (ValueError, TypeError) as err:
-            raise ValueError(
-                f"Malformed unit: invalid line boundary in {u.get('file', '')}: {err}"
-            ) from err
-        item = resolve_unit_replacement(
-            orig_text,
-            u,
-            rep,
-            lines=lines,
-            line_char_offsets=line_char_offsets,
-            line_byte_offsets=line_byte_offsets,
-            order_index=i,
-        )
-        orig_nl = count_physical_newlines(orig_text[item.start_char : item.end_char])
-        rep_nl = count_physical_newlines(item.final_rep)
-        computed.append((item, end_l, rep_nl - orig_nl))
-
-    sorted_items = sorted(
-        computed,
-        key=lambda x: (x[0].start_byte, x[0].end_byte, x[0].order_index),
-    )
-    _assert_no_interval_collisions(
-        [item for item, _, _ in sorted_items],
-        context="line delta computation",
-    )
-
-    deltas = [(end_l, d) for _, end_l, d in computed]
-    deltas.sort(key=lambda item: item[0])
-    return deltas
-
-
-def _apply_line_deltas(target_line: int, deltas: Sequence[Tuple[int, int]]) -> int:
-    """Adjusts a target line number given precomputed (end_line, delta) tuples."""
-    try:
-        t_line = int(target_line)
-    except (ValueError, TypeError):
-        t_line = 1
-    if not deltas or t_line <= 1:
-        return max(1, t_line)
-    line_delta = sum(d for end_line, d in deltas if end_line < t_line)
-    return max(1, t_line + line_delta)
-
-
-def _adjust_line_for_replacements(
-    target_line: int,
-    reps: Sequence[Tuple[Dict[str, Any], str]],
-    orig_text: str,
-    lines: Optional[Sequence[str]] = None,
-    line_char_offsets: Optional[Sequence[int]] = None,
-    line_byte_offsets: Optional[Sequence[int]] = None,
-) -> int:
-    """Adjusts a target source line number to account for upstream line expansions or contractions.
-
-    Evaluates cumulative line shift from replacements that conclude strictly prior to
-    target_line (end_line < target_line). If a unit's end_line coincides exactly with
-    target_line (end_line == target_line), its line delta is NOT included, which preserves
-    insertion coordinates immediately preceding target_line (such as prepending helper
-    definitions before the first candidate function or class).
-
-    Args:
-        target_line: 1-indexed target line number to adjust.
-        reps: Sequence of (unit, replacement_text) tuples.
-        orig_text: Original unmodified source code.
-        lines: Optional pre-split lines of orig_text.
-        line_char_offsets: Optional precomputed line start character offsets.
-        line_byte_offsets: Optional precomputed line start UTF-8 byte offsets.
-
-    Returns:
-        Adjusted 1-indexed line number in the refactored source text.
-    """
-    try:
-        t_line = int(target_line)
-    except (ValueError, TypeError):
-        t_line = 1
-    if t_line <= 1 or not reps:
-        return max(1, t_line)
-    if lines is None:
-        lines = split_source_lines(orig_text)
-    deltas = _compute_replacement_line_deltas(
-        reps,
-        orig_text,
-        lines=lines,
-        line_char_offsets=line_char_offsets,
-        line_byte_offsets=line_byte_offsets,
-    )
-    return _apply_line_deltas(t_line, deltas)
-
-
-def _derive_unit_indent_step(
-    unit: Dict[str, Any],
-    lines: Sequence[str],
-    step: Optional[str] = None,
-) -> str:
-    """Derives indentation step for a unit from its starting line indentation if not provided."""
-    if step is not None:
-        return step
-    u_s = max(1, parse_unit_coord(unit, "start", default=1))
-    u_lead = lines[u_s - 1] if 1 <= u_s <= len(lines) else ""
-    u_ind = u_lead[: len(u_lead) - len(u_lead.lstrip())]
-    return _detect_indent_step(u_ind)
-
-
-def _delegate_unit_in_plan(
-    unit: UnitDict,
-    plan: _FilePatchPlan,
-    helper_name: str,
-    inputs: List[str],
-    outputs: List[str],
-    scope: Dict[str, Any],
-    target_inputs: Optional[List[str]],
-    target_outputs: Optional[List[str]],
-    await_prefix: str,
-    binding: str = "module",
-    step: Optional[str] = None,
-) -> None:
-    """Builds and records a delegation call replacement for a unit inside a file plan.
-
-    Incremental Dual-Tier Validation Architecture & Transactional Safety:
-        1. Tier 1 (Semantic Check, O(K)): Fails fast if candidate `unit` overlaps
-           with any existing planned replacement's line/column coordinates.
-        2. Pragma & Span Resolution: `new_item` is resolved against the unmodified
-           source buffer with boundary pragma and indentation preservation.
-        3. Tier 2 (Physical Check, O(K)): `intervals_overlap` verifies that `new_item`'s
-           UTF-8 byte interval does not intersect any existing replacement item.
-
-    Performance & Rollback:
-        Incremental O(K) validation avoids full O(K log K) buffer dry-runs,
-        scaling gracefully to hundreds of replacements per module. Plans are snapshotted
-        before each candidate pair; any UnitCollisionError rolls back without corruption.
-    """
-    step = _derive_unit_indent_step(unit, plan.orig_lines, step)
-
-    rep_stmt = _build_unit_delegation_call(
-        unit,
-        plan.orig_text,
-        plan.orig_lines,
-        effective_binding=binding,
-        helper_name=helper_name,
-        inputs=inputs,
-        outputs=outputs,
-        scope=scope,
-        target_inputs=target_inputs,
-        target_outputs=target_outputs,
-        await_prefix=await_prefix,
-        step=step,
-        preserve_boundary_pragmas=False,
-    )
-    if not rep_stmt:
-        raise ValueError(
-            f"Failed to generate delegation call for unit {unit.get('name', 'unnamed')}"
-        )
-    # Tier 1 Semantic Overlap Check against existing plan replacements: O(K)
-    for existing_u, _ in plan.replacements:
-        if check_units_overlap(existing_u, unit):
-            _raise_unit_collision_error(existing_u, unit)
-
-    # Synchronize replacement_items if plan.replacements was populated externally (e.g. fixtures)
-    while len(plan.replacement_items) < len(plan.replacements):
-        idx = len(plan.replacement_items)
-        u_prev, rep_prev = plan.replacements[idx]
-        item_prev = resolve_unit_replacement(
-            plan.orig_text,
-            u_prev,
-            rep_prev,
-            lines=plan.orig_lines,
-            line_char_offsets=plan.line_char_offsets,
-            line_byte_offsets=plan.line_byte_offsets,
-            order_index=idx,
-        )
-        plan.replacement_items.append(item_prev)
-
-    # Tier 2 Physical Byte-Span Overlap Check against existing replacement items: O(K)
-    new_item = resolve_unit_replacement(
-        plan.orig_text,
-        unit,
-        rep_stmt,
-        lines=plan.orig_lines,
-        line_char_offsets=plan.line_char_offsets,
-        line_byte_offsets=plan.line_byte_offsets,
-        order_index=len(plan.replacement_items),
-    )
-    for existing_item in plan.replacement_items:
-        if intervals_overlap(
-            existing_item.start_byte,
-            existing_item.end_byte,
-            new_item.start_byte,
-            new_item.end_byte,
-        ):
-            _raise_unit_collision_error(existing_item.unit, unit)
-
-    plan.replacements.append((unit, rep_stmt))
-    plan.replacement_items.append(new_item)
-    plan.claimed_units.append(unit)
-
-
-def _wire_cross_module_host_delegation(
-    f1_plan: _FilePatchPlan,
-    f2_plan: _FilePatchPlan,
-    u2: Dict[str, Any],
-    mod1: str,
-    helper_name: str,
-    pair_comment: str,
-    f1_disp: str,
-    f2_disp: str,
-    replace_clones: bool,
-    inputs: List[str],
-    outputs: List[str],
-    scope: Dict[str, Any],
-    t_inputs2: Optional[List[str]],
-    target_outs2: Optional[List[str]],
-    await_prefix: str,
-) -> None:
-    """Wires cross-module import and delegation from target module to host module."""
-    if replace_clones:
-        f2_plan.comments.append(pair_comment)
-        f2_plan.missing_imports.append(f"from {mod1} import {helper_name}")
-        _delegate_unit_in_plan(
-            u2,
-            f2_plan,
-            helper_name=helper_name,
-            inputs=inputs,
-            outputs=target_outs2 if target_outs2 is not None else outputs,
-            scope=scope,
-            target_inputs=t_inputs2,
-            target_outputs=target_outs2,
-            await_prefix=await_prefix,
-            binding="module",
-        )
-    else:
-        f1_plan.comments.append(
-            f"# Note: Cross-module clone pair; helper generated in {f1_disp}. "
-            f"Complete refactoring by importing the helper into {f2_disp}.\n"
-        )
-
-
-def _attach_helper_to_plan(
-    plan: _FilePatchPlan,
-    binding: str,
-    insert_line: int,
-    helper_code: str,
-    missing_imports: Sequence[str],
-) -> None:
-    """Attaches a synthesized helper and its missing imports to the designated file plan."""
-    if binding == "method":
-        plan.method_helpers.append((insert_line, helper_code))
-    else:
-        plan.module_helpers.append(helper_code)
-    plan.missing_imports.extend(missing_imports)
-
-
-def _finalize_host_unit_and_helper(
-    plan: _FilePatchPlan,
-    unit: Dict[str, Any],
-    helper_name: str,
-    inputs: List[str],
-    outputs: List[str],
-    scope: Dict[str, Any],
-    target_inputs: Optional[List[str]],
-    binding: str,
-    step: str,
-    insert_line: int,
-    helper_code: str,
-    missing_imports: Sequence[str],
-    await_prefix: str,
-    replace_clones: bool,
-) -> None:
-    """Delegates host clone unit if replace_clones is enabled and attaches synthesized helper."""
-    if replace_clones:
-        _delegate_unit_in_plan(
-            unit,
-            plan,
-            helper_name=helper_name,
-            inputs=inputs,
-            outputs=outputs,
-            scope=scope,
-            target_inputs=target_inputs,
-            target_outputs=outputs,
-            await_prefix=await_prefix,
-            binding=binding,
-            step=step,
-        )
-    _attach_helper_to_plan(
-        plan,
-        binding=binding,
-        insert_line=insert_line,
-        helper_code=helper_code,
-        missing_imports=missing_imports,
-    )
-
-
-def _render_file_patch_plan(
-    plan: _FilePatchPlan,
-    replace_clones: bool,
-    repo_root: Optional[str] = None,
-) -> str:
-    """Renders a single cumulative unified diff for all modifications in a file plan."""
-    if plan.is_new_file:
-        deduped_imports = list(dict.fromkeys(plan.missing_imports))
-        future_imports = [
-            imp for imp in deduped_imports if imp.strip().startswith("from __future__")
-        ]
-        other_imports = [
-            imp for imp in deduped_imports if not imp.strip().startswith("from __future__")
-        ]
-        ordered_imports = future_imports + other_imports
-        formatted_imports = [imp.rstrip("\r\n") + "\n" for imp in ordered_imports]
-        new_h_lines: List[str] = []
-        for h_code in plan.module_helpers:
-            new_h_lines.extend(
-                ["\n"]
-                + [ln.rstrip("\r\n") + "\n" for ln in split_source_lines(h_code)]
-                + ["\n"]
-            )
-        new_lines: List[str] = []
-        if formatted_imports:
-            new_lines.extend(formatted_imports + ["\n"])
-        new_lines.extend(new_h_lines)
-        while new_lines and not new_lines[0].strip():
-            new_lines.pop(0)
-        diff = difflib.unified_diff(
-            [],
-            new_lines,
-            fromfile="/dev/null",
-            tofile=f"b/{plan.rel_path}",
-            n=3,
-        )
-        diff_str = "".join(diff)
-        if not diff_str:
-            return ""
-        git_header = f"diff --git a/{plan.rel_path} b/{plan.rel_path}\nnew file mode 100644\n"
-        deduped_comments = list(dict.fromkeys(plan.comments))
-        return "".join(deduped_comments) + git_header + diff_str
-    coord_valid_reps: List[Tuple[Dict[str, Any], str]] = []
-    for u, rep in plan.replacements:
-        if not is_valid_unit_coordinates(u, strict=True):
-            logger.warning(
-                "Skipping replacement with invalid coordinates in %s: %r",
-                plan.rel_path,
-                u,
-            )
-            continue
-        coord_valid_reps.append((u, rep))
-
-    retained_cands = filter_overlapping_clone_units(
-        [u for u, _ in coord_valid_reps], repo_root=repo_root
-    )
-
-    def _unit_span(unit: Dict[str, Any]) -> Tuple[int, int]:
-        try:
-            s = parse_unit_coord(unit, "start", default=1, strict=True)
-            return s, parse_unit_coord(unit, "end", default=s, strict=True)
-        except (ValueError, TypeError, AttributeError):
-            try:
-                s = parse_unit_coord(unit, "start", default=1, strict=False)
-                return s, parse_unit_coord(unit, "end", default=s, strict=False)
-            except (ValueError, TypeError, AttributeError):
-                return 1, 1
-
-    def _file_key(unit: Dict[str, Any]) -> str:
-        raw = unit.get("file")
-        if raw is None:
-            return ""
-        return normalize_path_string(str(raw), strip_anchor=False)
-
-    def _parse_col_coord(unit: Dict[str, Any], *keys: str) -> Optional[int]:
-        for k in keys:
-            if k in unit and unit[k] is not None:
-                try:
-                    val = parse_unit_coord(unit, k, default=None, strict=False)
-                    if val is not None:
-                        return val
-                except (ValueError, TypeError, AttributeError):
-                    pass
-        return None
-
-    def _unit_exact_key(
-        unit: Dict[str, Any],
-    ) -> Tuple[str, int, int, Optional[int], Optional[int], str, str]:
-        s, e = _unit_span(unit)
-        sc = _parse_col_coord(unit, "start_col", "start_col_offset")
-        ec = _parse_col_coord(unit, "end_col", "end_col_offset")
-        return (
-            _file_key(unit),
-            s,
-            e,
-            sc,
-            ec,
-            str(unit.get("name") or ""),
-            str(unit.get("kind") or ""),
-        )
-
-    retained_ids: Set[int] = {id(r) for r in retained_cands}
-    retained_exact_keys = {_unit_exact_key(r) for r in retained_cands}
-
-    filtered_reps: List[Tuple[Dict[str, Any], str]] = []
-    for u, rep in coord_valid_reps:
-        if id(u) in retained_ids or _unit_exact_key(u) in retained_exact_keys:
-            if not any(
-                check_units_overlap(u, prev_u, repo_root=repo_root)
-                for prev_u, _ in filtered_reps
-            ):
-                filtered_reps.append((u, rep))
-
-    if replace_clones and filtered_reps:
-        try:
-            current_text = refactor_module_units(
-                plan.orig_text,
-                filtered_reps,
-                lines=plan.orig_lines,
-                line_char_offsets=plan.line_char_offsets,
-                line_byte_offsets=plan.line_byte_offsets,
-            )
-        except UnitCollisionError as exc:
-            logger.warning(
-                "Collision detected during patch rendering for %s (%s); filtering conflicting replacements",
-                plan.rel_path,
-                exc,
-            )
-            valid_reps: List[Tuple[Dict[str, Any], str]] = []
-            candidate_text = plan.orig_text
-            for item in filtered_reps:
-                try:
-                    candidate_text = refactor_module_units(
-                        plan.orig_text,
-                        valid_reps + [item],
-                        lines=plan.orig_lines,
-                        line_char_offsets=plan.line_char_offsets,
-                        line_byte_offsets=plan.line_byte_offsets,
-                    )
-                    valid_reps.append(item)
-                except UnitCollisionError:
-                    logger.debug("Omitted conflicting replacement in %s", plan.rel_path)
-            filtered_reps = valid_reps
-            current_text = candidate_text
-    else:
-        current_text = plan.orig_text
-
-    nl = detect_line_ending(plan.orig_text)
-    if plan.method_helpers:
-        deltas = (
-            _compute_replacement_line_deltas(
-                filtered_reps,
-                plan.orig_text,
-                lines=plan.orig_lines,
-                line_char_offsets=plan.line_char_offsets,
-                line_byte_offsets=plan.line_byte_offsets,
-            )
-            if replace_clones and filtered_reps
-            else []
-        )
-        adjusted_methods = [
-            (
-                _apply_line_deltas(ins_line, deltas),
-                h_code,
-            )
-            for ins_line, h_code in plan.method_helpers
-        ]
-        sorted_methods = sorted(adjusted_methods, key=lambda m: m[0], reverse=True)
-        for ins_line, h_code in sorted_methods:
-            c_lines = split_source_lines(current_text)
-            idx = max(0, ins_line - 1)
-            h_lines = [ln.rstrip("\r\n") + nl for ln in split_source_lines(h_code)] + [nl]
-            current_text = "".join(c_lines[:idx] + h_lines + c_lines[idx:])
-
-    c_lines = split_source_lines(current_text)
-    deduped_imports = list(dict.fromkeys(plan.missing_imports))
-    lines_with_imports = _insert_imports_into_module(c_lines, deduped_imports)
-
-    if plan.module_helpers:
-        ins_idx = _find_module_helper_insertion_index(lines_with_imports)
-        all_h_lines: List[str] = []
-        for h_code in plan.module_helpers:
-            all_h_lines.extend(
-                [nl]
-                + [ln.rstrip("\r\n") + nl for ln in split_source_lines(h_code)]
-                + [nl]
-            )
-        modified_lines = lines_with_imports[:ins_idx] + all_h_lines + lines_with_imports[ins_idx:]
-    else:
-        modified_lines = lines_with_imports
-
-    diff = difflib.unified_diff(
-        plan.orig_lines,
-        modified_lines,
-        fromfile=f"a/{plan.rel_path}",
-        tofile=f"b/{plan.rel_path}",
-        n=3,
-    )
-    diff_str = "".join(diff)
-    if not diff_str:
-        advisory_comments = [
-            c for c in plan.comments if not c.startswith("# Clone Pair (")
-        ]
-        if advisory_comments:
-            deduped_comments = list(dict.fromkeys(advisory_comments))
-            return "".join(deduped_comments)
-        return ""
-
-    deduped_comments = list(dict.fromkeys(plan.comments))
-    return "".join(deduped_comments) + diff_str
-
-
-def _is_or_contains_bitor(node: ast.AST) -> bool:
-    """Checks if an AST expression node contains a bitwise OR (|) operator."""
-    for sub in ast.walk(node):
-        if isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.BitOr):
-            return True
-    return False
-
-
-def _has_future_annotations(source_text: str) -> bool:
-    """Checks whether source_text enables postponed evaluation of annotations via __future__."""
-    if not source_text or "__future__" not in source_text:
-        return False
-    try:
-        tree = ast.parse(source_text)
-    except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
-        return False
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
-            for alias in node.names:
-                if alias.name == "annotations":
-                    return True
-    return False
-
-
-def _helper_requires_future_annotations(helper_code: str) -> bool:
-    """Detects whether helper annotations use PEP 604 union syntax (|)."""
-    if not helper_code or "|" not in helper_code:
-        return False
-    try:
-        tree = ast.parse(helper_code)
-    except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
-        return False
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            all_args = [
-                *getattr(node.args, "posonlyargs", []),
-                *node.args.args,
-                *getattr(node.args, "kwonlyargs", []),
-                *(arg for arg in (node.args.vararg, node.args.kwarg) if arg is not None),
-            ]
-            for arg in all_args:
-                if arg.annotation and _is_or_contains_bitor(arg.annotation):
-                    return True
-            if node.returns and _is_or_contains_bitor(node.returns):
-                return True
-    return False
-
-
-class _ModuleImportsResult(Tuple[Dict[str, str], List[str]]):
-    """Encapsulates extracted module imports with binding classification.
-
-    Inherits from Tuple[Dict[str, str], List[str]] so callers unpacking
-    (stmts, wildcards) maintain 100% backwards compatibility.
-    """
-
-    stmts: Dict[str, str]
-    wildcards: List[str]
-    unconditional_names: Set[str]
-    guarded_names: Set[str]
-    rebound_conflicts: Set[str]
-
-    def __new__(
-        cls,
-        stmts: Dict[str, str],
-        wildcards: List[str],
-        unconditional_names: Optional[Set[str]] = None,
-        guarded_names: Optional[Set[str]] = None,
-        rebound_conflicts: Optional[Set[str]] = None,
-    ) -> "_ModuleImportsResult":
-        instance = super().__new__(cls, (stmts, wildcards))
-        instance.stmts = stmts
-        instance.wildcards = wildcards
-        instance.unconditional_names = (
-            set() if unconditional_names is None else unconditional_names
-        )
-        instance.guarded_names = (
-            set() if guarded_names is None else guarded_names
-        )
-        instance.rebound_conflicts = (
-            set() if rebound_conflicts is None else rebound_conflicts
-        )
-        return instance
-
-
-def _parse_import_node_statements(
-    node: Union[ast.Import, ast.ImportFrom],
-    source_mod: Optional[str] = None,
-    is_package: bool = False,
-) -> Tuple[List[Tuple[str, str]], List[str]]:
-    """Extracts (bound_name, import_stmt) pairs and wildcard strings from an AST import node."""
-    name_stmts: List[Tuple[str, str]] = []
-    wildcards: List[str] = []
-    if isinstance(node, ast.Import):
-        for alias in node.names:
-            name = alias.asname or alias.name.split(".", maxsplit=1)[0]
-            if name != "*":
-                if alias.asname:
-                    stmt = f"import {alias.name} as {alias.asname}"
-                else:
-                    stmt = f"import {alias.name}"
-                name_stmts.append((name, stmt))
-    elif isinstance(node, ast.ImportFrom):
-        level = getattr(node, "level", 0) or 0
-        target_module = ""
-        if level == 0 and node.module:
-            target_module = node.module
-        elif level > 0:
-            if source_mod:
-                target_module = _resolve_relative_import_path(
-                    source_mod, level, node.module, is_package=is_package
-                )
-            else:
-                dots = "." * level
-                target_module = f"{dots}{node.module}" if node.module else dots
-
-        if target_module:
-            for alias in node.names:
-                if alias.name == "*":
-                    wildcards.append(f"from {target_module} import *")
-                else:
-                    name = alias.asname or alias.name
-                    if alias.asname:
-                        stmt = (
-                            f"from {target_module} import {alias.name} as {alias.asname}"
-                        )
-                    else:
-                        stmt = f"from {target_module} import {alias.name}"
-                    name_stmts.append((name, stmt))
-    return name_stmts, wildcards
-
-
-def _extract_module_import_statements(
-    source_text: str,
-    source_mod: Optional[str] = None,
-    is_package: bool = False,
-) -> _ModuleImportsResult:
-    """Maps imported symbol/module names to clean import statements from source text.
-
-    Tracks final top-level bindings for rebound symbols, distinguishes unconditional
-    top-level imports from runtime-guarded imports, and detects conflicting rebindings.
-    """
-    stmts: Dict[str, str] = {}
-    wildcards: List[str] = []
-    unconditional_names: Set[str] = set()
-    guarded_names: Set[str] = set()
-    rebound_conflicts: Set[str] = set()
-
-    if not source_text.strip():
-        return _ModuleImportsResult(stmts, wildcards)
-    try:
-        tree = ast.parse(source_text)
-        for stmt in tree.body:
-            if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-                name_stmts, wilds = _parse_import_node_statements(
-                    stmt, source_mod=source_mod, is_package=is_package
-                )
-                wildcards.extend(wilds)
-                for name, stmt_str in name_stmts:
-                    if name in unconditional_names and stmts.get(name) != stmt_str:
-                        rebound_conflicts.add(name)
-                    stmts[name] = stmt_str
-                    unconditional_names.add(name)
-            else:
-                guarded_nodes = _collect_top_level_import_nodes(
-                    [stmt], include_classes=False
-                )
-                for g_node in guarded_nodes:
-                    name_stmts, wilds = _parse_import_node_statements(
-                        g_node, source_mod=source_mod, is_package=is_package
-                    )
-                    wildcards.extend(wilds)
-                    for name, stmt_str in name_stmts:
-                        guarded_names.add(name)
-                        if name in unconditional_names and stmts.get(name) != stmt_str:
-                            rebound_conflicts.add(name)
-                        elif name not in stmts:
-                            stmts[name] = stmt_str
-    except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
-        return _ModuleImportsResult({}, [])
-
-    return _ModuleImportsResult(
-        stmts=stmts,
-        wildcards=wildcards,
-        unconditional_names=unconditional_names,
-        guarded_names=guarded_names,
-        rebound_conflicts=rebound_conflicts,
-    )
-
-
-def _canonicalize_helper_relative_imports(
-    helper_code: str,
-    source_mods: Sequence[Union[str, Tuple[Optional[str], bool], None]] = (),
-) -> str:
-    """Translates relative imports inside a helper body to canonical absolute imports."""
-    if not helper_code:
-        return helper_code
-    valid_mods: List[Tuple[str, bool]] = []
-    for item in source_mods:
-        if not item:
-            continue
-        if isinstance(item, tuple):
-            if item[0]:
-                valid_mods.append((item[0], bool(item[1])))
-        else:
-            valid_mods.append((item, False))
-    if not valid_mods:
-        return helper_code
-    try:
-        tree = ast.parse(helper_code)
-    except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
-        return helper_code
-
-    import_nodes: List[ast.ImportFrom] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and (getattr(node, "level", 0) or 0) > 0:
-            if hasattr(node, "lineno") and hasattr(node, "end_lineno"):
-                import_nodes.append(node)
-
-    if not import_nodes:
-        return helper_code
-
-    import_nodes.sort(
-        key=lambda n: (
-            n.lineno if n.lineno is not None else 0,
-            getattr(n, "col_offset", 0) or 0,
-        ),
-        reverse=True,
-    )
-    nl = detect_line_ending(helper_code)
-    lines = [ln.rstrip("\r\n") for ln in split_source_lines(helper_code)]
-
-    for node in import_nodes:
-        resolved_targets: Set[str] = set()
-        for s_mod, s_ispkg in valid_mods:
-            resolved = _resolve_relative_import_path(
-                s_mod, node.level, node.module, is_package=s_ispkg
-            )
-            if resolved:
-                resolved_targets.add(resolved)
-        if len(resolved_targets) > 1:
-            raise ValueError(
-                "conflicting relative import in helper across clone sources"
-            )
-        if not resolved_targets:
-            continue
-        resolved = next(iter(resolved_targets))
-
-        if node.lineno is None:
-            continue
-        start_idx = node.lineno - 1
-        end_idx = node.end_lineno if node.end_lineno is not None else node.lineno
-        if start_idx < 0 or start_idx >= len(lines) or end_idx < start_idx:
-            continue
-
-        names_str = ", ".join(
-            f"{a.name} as {a.asname}" if a.asname else a.name
-            for a in node.names
-        )
-
-        col_start = getattr(node, "col_offset", None)
-        col_end = getattr(node, "end_col_offset", None)
-        if (
-            start_idx == end_idx - 1
-            and col_start is not None
-            and col_end is not None
-            and 0 <= col_start <= col_end <= len(lines[start_idx])
-        ):
-            line = lines[start_idx]
-            new_slice = f"from {resolved} import {names_str}"
-            lines[start_idx] = line[:col_start] + new_slice + line[col_end:]
-        else:
-            first_line = lines[start_idx]
-            indent = first_line[: len(first_line) - len(first_line.lstrip())]
-            trailing_comment = ""
-            last_line = lines[end_idx - 1] if 0 <= end_idx - 1 < len(lines) else first_line
-            hash_pos = last_line.find("#")
-            if hash_pos != -1:
-                trailing_comment = f"  {last_line[hash_pos:].strip()}"
-            new_stmt = f"{indent}from {resolved} import {names_str}{trailing_comment}"
-            lines[start_idx:end_idx] = [new_stmt]
-
-    result = nl.join(lines)
-    if helper_code.endswith(("\r", "\n")) and not result.endswith(("\r", "\n")):
-        result += nl
-    return result
-
-
-def _unpack_source_item(
-    item: Union[str, Tuple[Any, ...], List[Any]]
-) -> Tuple[str, Optional[str], bool]:
-    if isinstance(item, (tuple, list)):
-        text = str(item[0]) if len(item) > 0 else ""
-        mod = str(item[1]) if len(item) > 1 and item[1] is not None else None
-        ispkg = bool(item[2]) if len(item) > 2 else False
-        return text, mod, ispkg
-    return str(item), None, False
-
-
-def _extract_module_defined_names(source_text: str) -> Set[str]:
-    """Extracts top-level defined names (classes, functions, variables) from source text."""
-    if not source_text.strip():
-        return set()
-    try:
-        tree = ast.parse(source_text)
-    except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
-        return set()
-    names: Set[str] = set()
-
-    def _collect_top_defs(stmts: Sequence[ast.stmt]) -> None:
-        for node in stmts:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                names.add(node.name)
-            elif isinstance(node, ast.Assign):
-                for target in node.targets:
-                    for sub in ast.walk(target):
-                        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
-                            names.add(sub.id)
-            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
-                for sub in ast.walk(node.target):
-                    if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
-                        names.add(sub.id)
-            elif isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
-                if hasattr(node, "target"):
-                    for sub in ast.walk(node.target):
-                        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
-                            names.add(sub.id)
-                _collect_top_defs(node.body)
-                _collect_top_defs(node.orelse)
-            elif isinstance(node, (ast.With, ast.AsyncWith)):
-                for item in node.items:
-                    if item.optional_vars:
-                        for sub in ast.walk(item.optional_vars):
-                            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
-                                names.add(sub.id)
-                _collect_top_defs(node.body)
-            elif isinstance(node, ast.If):
-                _collect_top_defs(node.body)
-                _collect_top_defs(node.orelse)
-            elif isinstance(node, ast.Try) or type(node).__name__ == "TryStar":
-                _collect_top_defs(getattr(node, "body", []))
-                for handler in getattr(node, "handlers", []):
-                    _collect_top_defs(getattr(handler, "body", []))
-                _collect_top_defs(getattr(node, "orelse", []))
-                _collect_top_defs(getattr(node, "finalbody", []))
-            elif type(node).__name__ == "Match":
-                for case in getattr(node, "cases", []):
-                    for sub in ast.walk(case.pattern):
-                        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
-                            names.add(sub.id)
-                        elif type(sub).__name__ in ("MatchAs", "MatchStar"):
-                            sub_name = getattr(sub, "name", None)
-                            if isinstance(sub_name, str):
-                                names.add(sub_name)
-                        elif type(sub).__name__ == "MatchMapping":
-                            sub_rest = getattr(sub, "rest", None)
-                            if isinstance(sub_rest, str):
-                                names.add(sub_rest)
-                    _collect_top_defs(case.body)
-            elif type(node).__name__ == "TypeAlias":
-                tgt_name = getattr(node, "name", None)
-                if isinstance(tgt_name, ast.Name):
-                    names.add(tgt_name.id)
-                elif isinstance(tgt_name, str):
-                    names.add(tgt_name)
-
-    def _collect_top_named_exprs(node: ast.AST) -> None:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-                continue
-            if type(child).__name__ == "NamedExpr":
-                tgt = getattr(child, "target", None)
-                if isinstance(tgt, ast.Name) and isinstance(tgt.ctx, ast.Store):
-                    names.add(tgt.id)
-            _collect_top_named_exprs(child)
-
-    try:
-        _collect_top_defs(tree.body)
-        _collect_top_named_exprs(tree)
-    except (RecursionError, MemoryError):
-        return set()
-    return names
-
-
-def _extract_helper_symbols(
-    helper_tree: ast.AST,
-) -> Tuple[Set[str], Set[str], Set[str]]:
-    """Extracts (free_names, defined_names, helper_local_imported_names) with lexical scope awareness.
-
-    Parameters and local stores from nested functions/classes/comprehensions do not bleed
-    into the outer helper scope, preventing false shadowing of module-level dependencies.
-    """
-    has_top_level_fn = isinstance(
-        helper_tree, (ast.FunctionDef, ast.AsyncFunctionDef)
-    ) or (
-        isinstance(helper_tree, ast.Module)
-        and any(
-            isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
-            for stmt in getattr(helper_tree, "body", [])
-        )
-    )
-    max_helper_scope_depth = 2 if has_top_level_fn else 1
-    free_names: Set[str] = set()
-    defined_names: Set[str] = set()
-    local_imported_names: Set[str] = set()
-    scope_stack: List[Set[str]] = [set()]
-    type_param_scopes: List[Set[str]] = []
-
-    def _collect_direct_bindings(stmts: Sequence[ast.stmt]) -> Set[str]:
-        bound: Set[str] = set()
-
-        def _collect_helper_named_exprs(curr: ast.AST) -> None:
-            for child in ast.iter_child_nodes(curr):
-                if isinstance(
-                    child,
-                    (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
-                ):
-                    for hdr in iter_nested_scope_header_nodes(child):
-                        _collect_helper_named_exprs(hdr)
-                    continue
-                if isinstance(
-                    child,
-                    (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
-                ):
-                    bound.update(_extract_comprehension_walrus_names(child))
-                    continue
-                if type(child).__name__ == "NamedExpr":
-                    target_node = getattr(child, "target", None)
-                    if isinstance(target_node, ast.Name):
-                        bound.add(target_node.id)
-                _collect_helper_named_exprs(child)
-
-        for stmt in stmts:
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                bound.add(stmt.name)
-                for hdr in iter_nested_scope_header_nodes(stmt):
-                    _collect_helper_named_exprs(hdr)
-            elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
-                for alias in stmt.names:
-                    b_name = alias.asname or alias.name.split(".", 1)[0]
-                    if b_name != "*":
-                        bound.add(b_name)
-            elif isinstance(stmt, ast.Assign):
-                for t in stmt.targets:
-                    bound.update(_extract_assigned_names(t))
-            elif isinstance(stmt, (ast.AugAssign, ast.AnnAssign)):
-                bound.update(_extract_assigned_names(stmt.target))
-            elif isinstance(stmt, (ast.For, ast.AsyncFor)):
-                bound.update(_extract_assigned_names(stmt.target))
-                bound.update(_collect_direct_bindings(stmt.body))
-                bound.update(_collect_direct_bindings(stmt.orelse))
-            elif isinstance(stmt, (ast.While, ast.If)):
-                bound.update(_collect_direct_bindings(stmt.body))
-                bound.update(_collect_direct_bindings(stmt.orelse))
-            elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-                for item in stmt.items:
-                    if item.optional_vars:
-                        bound.update(_extract_assigned_names(item.optional_vars))
-                bound.update(_collect_direct_bindings(stmt.body))
-            elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
-                bound.update(_collect_direct_bindings(getattr(stmt, "body", [])))
-                for handler in getattr(stmt, "handlers", []):
-                    if isinstance(getattr(handler, "name", None), str):
-                        bound.add(handler.name)
-                    bound.update(_collect_direct_bindings(getattr(handler, "body", [])))
-                bound.update(_collect_direct_bindings(getattr(stmt, "orelse", [])))
-                bound.update(_collect_direct_bindings(getattr(stmt, "finalbody", [])))
-            elif type(stmt).__name__ == "Match":
-                for case in getattr(stmt, "cases", []):
-                    pattern = getattr(case, "pattern", None)
-                    if pattern is not None:
-                        for n in ast.walk(pattern):
-                            m_name = getattr(n, "name", None) or getattr(n, "rest", None)
-                            if isinstance(m_name, str) and m_name != "_":
-                                bound.add(m_name)
-                    bound.update(_collect_direct_bindings(case.body))
-            elif type(stmt).__name__ == "TypeAlias":
-                name_node = getattr(stmt, "name", None)
-                if isinstance(name_node, ast.Name):
-                    bound.add(name_node.id)
-            elif isinstance(stmt, ast.Global):
-                for g_name in stmt.names:
-                    bound.add(f":global:{g_name}")
-            elif isinstance(stmt, ast.Nonlocal):
-                for nl_name in stmt.names:
-                    bound.add(f":nonlocal:{nl_name}")
-
-            if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                _collect_helper_named_exprs(stmt)
-        rebound_elsewhere = {
-            s.split(":", 2)[2]
-            for s in bound
-            if s.startswith((":global:", ":nonlocal:"))
-        }
-        return bound - rebound_elsewhere
-
-    class _ScopeVisitor(ast.NodeVisitor):
-
-        def _bind_to_frame(
-            self, frame: Set[str], names: Union[Set[str], Sequence[str]]
-        ) -> None:
-            for n in names:
-                if f":global:{n}" in frame:
-                    free_names.add(n)
-                elif f":nonlocal:{n}" in frame:
-                    self._check_load_name(n)
-                else:
-                    frame.add(n)
-                    if frame is scope_stack[0]:
-                        defined_names.add(n)
-
-        def _bind_names(
-            self, names: Union[Set[str], Sequence[str]], *, is_walrus: bool = False
-        ) -> None:
-            if is_walrus:
-                for frame in reversed(scope_stack):
-                    if ":comp_scope:" not in frame:
-                        if not (
-                            ":class_scope:" in frame
-                            and ":comp_scope:" in scope_stack[-1]
-                        ):
-                            self._bind_to_frame(frame, names)
-                        break
-                return
-            self._bind_to_frame(scope_stack[-1], names)
-
-        def _check_load_name(self, name: str) -> None:
-            if not any(name in tp for tp in type_param_scopes) and not any(
-                name in s
-                for s in reversed(scope_stack)
-                if ":class_scope:" not in s or s is scope_stack[-1]
-            ):
-                free_names.add(name)
-
-        def _visit_with_type_params(
-            self,
-            node: ast.AST,
-            inner_nodes: Sequence[Optional[ast.AST]],
-            *,
-            record_def: bool = False,
-        ) -> Set[str]:
-            if record_def:
-                for d in getattr(node, "decorator_list", []):
-                    self.visit(d)
-                fn_args = getattr(node, "args", None)
-                if fn_args is not None:
-                    for default in list(getattr(fn_args, "defaults", [])) + list(
-                        getattr(fn_args, "kw_defaults", [])
-                    ):
-                        if default is not None:
-                            self.visit(default)
-            tp_list = getattr(node, "type_params", [])
-            tp_names = {
-                tp.name for tp in tp_list if isinstance(getattr(tp, "name", None), str)
-            }
-            if tp_names:
-                type_param_scopes.append(tp_names)
-            try:
-                for sub in list(tp_list) + [n for n in inner_nodes if n is not None]:
-                    self.visit(sub)
-            finally:
-                if tp_names:
-                    type_param_scopes.pop()
-            if record_def:
-                name_str = getattr(node, "name", "")
-                self._bind_names({name_str})
-            return tp_names
-
-        def _handle_function_def(
-            self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
-        ) -> None:
-            all_args = (
-                node.args.posonlyargs
-                + node.args.args
-                + node.args.kwonlyargs
-                + ([node.args.vararg] if node.args.vararg else [])
-                + ([node.args.kwarg] if node.args.kwarg else [])
-            )
-            sig_nodes: List[Optional[ast.AST]] = [a.annotation for a in all_args]
-            sig_nodes.append(node.returns)
-            tp_names = self._visit_with_type_params(node, sig_nodes, record_def=True)
-            fn_scope: Set[str] = _extract_arg_names(node.args) | tp_names
-            fn_scope.update(_collect_direct_bindings(node.body))
-            self._enter_block_scope(fn_scope, node.body)
-
-        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-            self._handle_function_def(node)
-
-        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-            self._handle_function_def(node)
-
-        def visit_ClassDef(self, node: ast.ClassDef) -> None:
-            tp_names = self._visit_with_type_params(
-                node, list(node.bases) + list(node.keywords), record_def=True
-            )
-            if tp_names:
-                type_param_scopes.append(tp_names)
-            try:
-                self._enter_block_scope({":class_scope:"}, node.body)
-            finally:
-                if tp_names:
-                    type_param_scopes.pop()
-
-        def visit_TypeAlias(self, node: ast.AST) -> None:
-            name_node = getattr(node, "name", None)
-            if isinstance(name_node, ast.Name):
-                self._bind_names({name_node.id})
-            self._visit_with_type_params(node, [getattr(node, "value", None)])
-
-        def visit_Assign(self, node: ast.Assign) -> None:
-            self.visit(node.value)
-            for t in node.targets:
-                self.visit(t)
-                self._bind_names(_extract_assigned_names(t))
-
-        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-            self.visit(node.annotation)
-            if node.value is not None:
-                self.visit(node.value)
-            self.visit(node.target)
-            if node.value is not None or (
-                len(scope_stack) > 1 and ":class_scope:" not in scope_stack[-1]
-            ):
-                self._bind_names(_extract_assigned_names(node.target))
-
-        def visit_AugAssign(self, node: ast.AugAssign) -> None:
-            if isinstance(node.target, ast.Name):
-                self._check_load_name(node.target.id)
-            self.visit(node.target)
-            self.visit(node.value)
-            self._bind_names(_extract_assigned_names(node.target))
-
-        def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
-            self.visit(node.value)
-            self.visit(node.target)
-            if isinstance(node.target, ast.Name):
-                self._bind_names({node.target.id}, is_walrus=True)
-
-        def visit_For(self, node: Union[ast.For, ast.AsyncFor]) -> None:
-            self.visit(node.iter)
-            self.visit(node.target)
-            self._bind_names(_extract_assigned_names(node.target))
-            for s in list(node.body) + list(node.orelse):
-                self.visit(s)
-
-        def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
-            self.visit_For(node)
-
-        def visit_With(self, node: Union[ast.With, ast.AsyncWith]) -> None:
-            for item in node.items:
-                self.visit(item.context_expr)
-                if item.optional_vars is not None:
-                    self.visit(item.optional_vars)
-                    self._bind_names(_extract_assigned_names(item.optional_vars))
-            for s in node.body:
-                self.visit(s)
-
-        def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
-            self.visit_With(node)
-
-        def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
-            if node.type is not None:
-                self.visit(node.type)
-            if isinstance(node.name, str):
-                self._bind_names({node.name})
-            for s in node.body:
-                self.visit(s)
-
-        def visit_MatchAs(self, node: ast.AST) -> None:
-            self.generic_visit(node)
-            m_name = getattr(node, "name", None)
-            if isinstance(m_name, str) and m_name != "_":
-                self._bind_names({m_name})
-
-        def visit_MatchStar(self, node: ast.AST) -> None:
-            self.visit_MatchAs(node)
-
-        def visit_MatchMapping(self, node: ast.AST) -> None:
-            self.generic_visit(node)
-            m_rest = getattr(node, "rest", None)
-            if isinstance(m_rest, str) and m_rest != "_":
-                self._bind_names({m_rest})
-
-        def _enter_block_scope(
-            self, child_scope: Set[str], body: Sequence[ast.stmt]
-        ) -> None:
-            is_top_block = len(scope_stack) == 1
-            scope_stack.append(child_scope)
-            try:
-                for body_stmt in body:
-                    self.visit(body_stmt)
-            finally:
-                scope_stack.pop()
-            if is_top_block:
-                defined_names.update(
-                    s for s in child_scope if not s.startswith(":")
-                )
-
-        def _handle_comprehension(
-            self, elts: Sequence[ast.expr], generators: Sequence[ast.comprehension]
-        ) -> None:
-            if generators:
-                self.visit(generators[0].iter)
-            comp_scope: Set[str] = {":comp_scope:"}
-            scope_stack.append(comp_scope)
-            try:
-                for gen in generators:
-                    if gen is not generators[0]:
-                        self.visit(gen.iter)
-                    target_stack: List[ast.AST] = [gen.target]
-                    while target_stack:
-                        curr_t = target_stack.pop()
-                        if isinstance(curr_t, (ast.Tuple, ast.List)):
-                            target_stack.extend(reversed(curr_t.elts))
-                        elif isinstance(curr_t, ast.Starred):
-                            target_stack.append(curr_t.value)
-                        elif isinstance(curr_t, ast.Name) and isinstance(
-                            curr_t.ctx, ast.Store
-                        ):
-                            comp_scope.add(curr_t.id)
-                        else:
-                            self.visit(curr_t)
-                    for if_clause in gen.ifs:
-                        self.visit(if_clause)
-                for e in elts:
-                    self.visit(e)
-            finally:
-                scope_stack.pop()
-
-        def visit_ListComp(self, node: ast.ListComp) -> None:
-            self._handle_comprehension([node.elt], node.generators)
-
-        def visit_SetComp(self, node: ast.SetComp) -> None:
-            self._handle_comprehension([node.elt], node.generators)
-
-        def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
-            self._handle_comprehension([node.elt], node.generators)
-
-        def visit_DictComp(self, node: ast.DictComp) -> None:
-            self._handle_comprehension([node.key, node.value], node.generators)
-
-        def visit_Lambda(self, node: ast.Lambda) -> None:
-            for d in list(node.args.defaults) + list(node.args.kw_defaults):
-                if d is not None:
-                    self.visit(d)
-            scope_stack.append(_extract_arg_names(node.args))
-            try:
-                self.visit(node.body)
-            finally:
-                scope_stack.pop()
-
-        def visit_Import(self, node: ast.Import) -> None:
-            for alias in node.names:
-                name = alias.asname or alias.name.split(".", 1)[0]
-                if name != "*":
-                    self._bind_names({name})
-                    if len(scope_stack) <= max_helper_scope_depth:
-                        local_imported_names.add(name)
-
-        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-            for alias in node.names:
-                name = alias.asname or alias.name
-                if name != "*":
-                    self._bind_names({name})
-                    if len(scope_stack) <= max_helper_scope_depth:
-                        local_imported_names.add(name)
-
-        def visit_Global(self, node: ast.Global) -> None:
-            for name in node.names:
-                scope_stack[-1].add(f":global:{name}")
-                free_names.add(name)
-
-        def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
-            for name in node.names:
-                scope_stack[-1].add(f":nonlocal:{name}")
-                self._check_load_name(name)
-
-        def visit_Name(self, node: ast.Name) -> None:
-            if isinstance(node.ctx, (ast.Load, ast.Del)):
-                self._check_load_name(node.id)
-
-    try:
-        _ScopeVisitor().visit(helper_tree)
-    except (RecursionError, MemoryError):
-        return set(), set(), set()
-    return free_names, defined_names, local_imported_names
-
-
-def _parse_local_import_statements(
-    loc_imports: Sequence[str],
-    source_texts: Sequence[Union[str, Tuple[Any, ...]]],
-    source_idx: Optional[int] = None,
-) -> Dict[str, str]:
-    stmts: Dict[str, str] = {}
-
-    def _add_target(
-        s_item: Any,
-        lvl: int,
-        mod: Optional[str],
-        targets: Set[str],
-    ) -> None:
-        _, sm, s_pkg = _unpack_source_item(s_item)
-        if sm:
-            tm = _resolve_relative_import_path(sm, lvl, mod, is_package=s_pkg)
-            if tm:
-                targets.add(tm)
-
-    for loc_imp in loc_imports:
-        s_loc = loc_imp.strip()
-        if not s_loc:
-            continue
-        try:
-            loc_tree = ast.parse(s_loc)
-        except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
-            continue
-
-        for node in loc_tree.body:
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    name = alias.asname or alias.name.split(".", 1)[0]
-                    stmt = (
-                        f"import {alias.name} as {alias.asname}"
-                        if alias.asname
-                        else f"import {alias.name}"
-                    )
-                    if name in stmts and stmts[name] != stmt:
-                        raise ValueError(
-                            f"conflicting local import symbol '{name}' across clone sources"
-                        )
-                    stmts[name] = stmt
-            elif isinstance(node, ast.ImportFrom):
-                level = getattr(node, "level", 0) or 0
-                for alias in node.names:
-                    if alias.name == "*":
-                        continue
-                    name = alias.asname or alias.name
-                    if level == 0 and node.module:
-                        stmt = (
-                            f"from {node.module} import {alias.name} as {alias.asname}"
-                            if alias.asname
-                            else f"from {node.module} import {alias.name}"
-                        )
-                    elif level > 0:
-                        resolved_targets: Set[str] = set()
-                        if source_idx is not None and 0 <= source_idx < len(source_texts):
-                            _add_target(
-                                source_texts[source_idx],
-                                level,
-                                node.module,
-                                resolved_targets,
-                            )
-                        if not resolved_targets and source_texts:
-                            matching_items = [
-                                item for item in source_texts
-                                if bool(_unpack_source_item(item)[0] and s_loc in (_unpack_source_item(item)[0] or ""))
-                            ]
-                            for item in matching_items or source_texts:
-                                _add_target(
-                                    item,
-                                    level,
-                                    node.module,
-                                    resolved_targets,
-                                )
-
-                        if len(resolved_targets) > 1:
-                            raise ValueError(
-                                f"conflicting local import symbol '{name}' across clone sources"
-                            )
-                        if not resolved_targets:
-                            continue
-                        target_mod = next(iter(resolved_targets))
-                        stmt = (
-                            f"from {target_mod} import {alias.name} as {alias.asname}"
-                            if alias.asname
-                            else f"from {target_mod} import {alias.name}"
-                        )
-                    else:
-                        continue
-
-                    if name in stmts and stmts[name] != stmt:
-                        raise ValueError(
-                            f"conflicting local import symbol '{name}' across clone sources"
-                        )
-                    stmts[name] = stmt
-    return stmts
-
-
-def _collect_host_missing_imports(
-    host_plan: _FilePatchPlan,
-    helper_code: str,
-    scope: Dict[str, Any],
-    source_texts: Sequence[Union[str, Tuple[Any, ...]]] = (),
-    host_mod: Optional[str] = None,
-    is_host_pkg: bool = False,
-) -> List[str]:
-    """Computes all required imports for a host plan receiving extracted helper_code.
-
-    Considers typing symbols, scope local imports, and module-level source dependencies
-    against the destination host plan's actual content and existing missing_imports.
-    """
-    host_content = (host_plan.orig_text or "") + "\n" + "\n".join(host_plan.missing_imports)
-    host_imported = _get_module_imported_names(host_content, include_conditional=False)
-
-    missing: List[str] = []
-
-    # 0. Future annotations for newly synthesized modules or PEP 604 annotations
-    raw_sources = [
-        _unpack_source_item(s)[0]
-        for s in source_texts
-        if _unpack_source_item(s)[0]
-    ]
-    needs_future = any(_has_future_annotations(s) for s in raw_sources) or (
-        _helper_requires_future_annotations(helper_code)
-    )
-
-    if (
-        needs_future
-        and not _has_future_annotations(host_plan.orig_text or "")
-        and "from __future__ import annotations" not in host_plan.missing_imports
-    ):
-        missing.append("from __future__ import annotations")
-
-    # 1. Typing annotations
-    needed_typing = _extract_required_typing_imports(helper_code)
-    missing_typing = [s for s in needed_typing if s not in host_imported]
-    if missing_typing:
-        missing.append(f"from typing import {', '.join(sorted(missing_typing))}")
-
-    # 2. Local imports discovered during scope analysis
-    raw_units_local = scope.get("local_imports_by_unit")
-    unit_local_maps: List[Dict[str, str]] = []
-    if raw_units_local is not None:
-        for u_idx, raw_list in enumerate(raw_units_local):
-            s_idx = u_idx if u_idx < len(source_texts) else 0
-            u_map = _parse_local_import_statements(raw_list, source_texts, source_idx=s_idx)
-            unit_local_maps.append(u_map)
-    else:
-        flat_loc = scope.get("local_imports", [])
-        if len(source_texts) <= 1:
-            u_map = _parse_local_import_statements(flat_loc, source_texts, source_idx=0)
-            unit_local_maps = [u_map]
-        else:
-            for s_idx, item in enumerate(source_texts):
-                s_text = _unpack_source_item(item)[0] or ""
-                attributed = [
-                    stmt_str for stmt_str in flat_loc
-                    if stmt_str.strip() in s_text
-                ]
-                if not attributed and flat_loc:
-                    attributed = list(flat_loc)
-                u_map = _parse_local_import_statements(attributed, source_texts, source_idx=s_idx)
-                unit_local_maps.append(u_map)
-
-    local_import_stmts: Dict[str, str] = {}
-    for u_map in unit_local_maps:
-        for name, stmt in u_map.items():
-            if name in local_import_stmts and local_import_stmts[name] != stmt:
-                raise ValueError(
-                    f"conflicting local import symbol '{name}' across clone sources"
-                )
-            local_import_stmts[name] = stmt
-
-    # 3. Source dependencies referenced in helper_code
-    try:
-        helper_tree = ast.parse(helper_code)
-    except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
-        helper_tree = None
-
-    if helper_tree is not None and source_texts:
-        free_names, defined_in_helper, helper_local_imported_names = _extract_helper_symbols(
-            helper_tree
-        )
-
-        is_same_file_host = (
-            not host_plan.is_new_file
-            and len(source_texts) == 1
-            and _unpack_source_item(source_texts[0])[0] == host_plan.orig_text
-        )
-
-        source_info: List[Tuple[_ModuleImportsResult, List[str], Set[str]]] = []
-        for item in source_texts:
-            src_text, src_mod, src_ispkg = _unpack_source_item(item)
-            if not src_text:
-                continue
-            s_res = _extract_module_import_statements(
-                src_text, source_mod=src_mod, is_package=src_ispkg
-            )
-            s_defs = _extract_module_defined_names(src_text)
-            source_info.append((s_res, s_res.wildcards, s_defs))
-
-        source_bound_names: Set[str] = (
-            set(local_import_stmts.keys()) | helper_local_imported_names
-        )
-        for s_res, _, s_defs in source_info:
-            source_bound_names.update(s_res.stmts.keys())
-            source_bound_names.update(s_defs)
-
-        effective_builtins = _BUILTIN_NAMES - source_bound_names
-        effective_typing = set(needed_typing) - source_bound_names
-        ignored_names = effective_builtins | defined_in_helper | effective_typing
-        symbol_to_stmt: Dict[str, str] = dict(local_import_stmts)
-        source_hoisted_symbols: Set[str] = set()
-        host_defs: Optional[Set[str]] = None
-
-        symbols_to_check = set(free_names) | (helper_local_imported_names & source_bound_names)
-        for loaded_name in sorted(symbols_to_check):
-            if loaded_name in ignored_names:
-                continue
-
-            num_units = max(len(unit_local_maps), len(source_texts))
-            unit_bindings: List[Tuple[str, Optional[str], Optional[str], int, int]] = []
-            for u_idx in range(num_units):
-                u_loc = unit_local_maps[u_idx] if u_idx < len(unit_local_maps) else {}
-                s_idx = u_idx if u_idx < len(source_texts) else 0
-                s_res, s_wild, s_defs = source_info[s_idx]
-                _, s_mod, _ = _unpack_source_item(source_texts[s_idx])
-
-                if loaded_name in u_loc:
-                    b_type = "import"
-                    b_val = u_loc[loaded_name]
-                elif loaded_name in s_res.stmts:
-                    if loaded_name in s_defs:
-                        raise ValueError(
-                            f"conflicting imported symbol '{loaded_name}' rebound by local definition within source module"
-                        )
-                    if loaded_name in s_res.rebound_conflicts:
-                        raise ValueError(
-                            f"conflicting imported symbol '{loaded_name}' rebound within source module"
-                        )
-                    if not is_same_file_host and (
-                        loaded_name in s_res.guarded_names
-                        and loaded_name not in s_res.unconditional_names
-                    ):
-                        raise ValueError(
-                            f"symbol '{loaded_name}' relies on runtime-guarded import in source module"
-                        )
-                    b_type = "import"
-                    b_val = s_res.stmts[loaded_name]
-                elif loaded_name in s_defs:
-                    b_type = "def"
-                    b_val = s_mod or f"source_{s_idx}"
-                elif bool(s_wild):
-                    b_type = "wildcard"
-                    b_val = "*"
-                elif loaded_name in _BUILTIN_NAMES:
-                    b_type = "builtin"
-                    b_val = loaded_name
-                else:
-                    b_type = "unresolved"
-                    b_val = None
-
-                unit_bindings.append((b_type, b_val, s_mod, s_idx, u_idx))
-
-            # 1. Wildcard check: reject wildcard-dependent cross-file extraction,
-            # or mixed wildcard/explicit bindings within the same file.
-            has_wildcard = any(b[0] == "wildcard" for b in unit_bindings)
-            has_explicit = any(b[0] in ("import", "def") for b in unit_bindings)
-            if has_wildcard and (not is_same_file_host or has_explicit):
-                raise ValueError(
-                    f"symbol '{loaded_name}' potentially relies on wildcard import"
-                )
-
-            # 2. Builtin shadowed by local import or def while another unit uses builtin
-            has_builtin = any(b[0] == "builtin" for b in unit_bindings)
-            has_shadowed = any(b[0] in ("import", "def") for b in unit_bindings)
-            if has_builtin and has_shadowed:
-                raise ValueError(
-                    f"conflicting imported symbol '{loaded_name}' across clone sources"
-                )
-
-            # 3. If targeting a new shared module, any symbol without an agreed import cannot be resolved
-            has_import = any(b[0] == "import" for b in unit_bindings)
-            if host_plan.is_new_file and not has_import:
-                raise ValueError(
-                    f"unresolved symbol '{loaded_name}' in shared module"
-                )
-
-            # 4. Conflicting local definitions across different clone modules
-            def_mods = {b[1] for b in unit_bindings if b[0] == "def"}
-            if len(def_mods) > 1:
-                raise ValueError(
-                    f"conflicting local definition '{loaded_name}' across clone sources"
-                )
-
-            # 5. Check imports across units
-            has_unresolved = any(b[0] == "unresolved" for b in unit_bindings)
-            if has_import and (has_builtin or has_unresolved):
-                raise ValueError(
-                    f"conflicting imported symbol '{loaded_name}' across clone sources"
-                )
-
-            agreed_stmt: Optional[str] = None
-            for b_type, b_val, _, _, _ in unit_bindings:
-                if b_type == "import":
-                    imp_stmt = b_val
-                    if imp_stmt is None:
-                        continue
-                    if def_mods:
-                        def_mod = next(iter(def_mods))
-                        is_from_def = bool(def_mod) and imp_stmt.startswith(f"from {def_mod} import ")
-                        if not is_from_def:
-                            raise ValueError(
-                                f"conflicting imported symbol '{loaded_name}' across clone sources"
-                            )
-                    if agreed_stmt is None:
-                        agreed_stmt = imp_stmt
-                    elif agreed_stmt != imp_stmt:
-                        raise ValueError(
-                            f"conflicting imported symbol '{loaded_name}' across clone sources"
-                        )
-
-            if agreed_stmt is not None:
-                symbol_to_stmt[loaded_name] = agreed_stmt
-                if (
-                    loaded_name not in helper_local_imported_names
-                    and not (
-                        is_same_file_host
-                        and any(
-                            loaded_name in s_info[0].guarded_names
-                            and loaded_name not in s_info[0].unconditional_names
-                            for s_info in source_info
-                        )
-                    )
-                ):
-                    source_hoisted_symbols.add(loaded_name)
-            else:
-                # No agreed import exists: verify symbol resolution in host/caller modules
-                if not is_same_file_host:
-                    if host_plan.is_new_file:
-                        raise ValueError(
-                            f"unresolved symbol '{loaded_name}' in shared module"
-                        )
-                    if host_defs is None:
-                        host_defs = _extract_module_defined_names(host_plan.orig_text or "")
-                    if loaded_name not in host_imported and loaded_name not in host_defs:
-                        raise ValueError(
-                            f"unresolved symbol '{loaded_name}' in host module"
-                        )
-                    for item, (s_res, _, s_defs) in zip(source_texts, source_info):
-                        src_text, s_mod, _ = _unpack_source_item(item)
-                        if (
-                            (s_mod is not None and host_mod is not None and s_mod == host_mod)
-                            or (
-                                (s_mod is None or host_mod is None)
-                                and src_text == host_plan.orig_text
-                            )
-                        ):
-                            continue
-                        if loaded_name in s_defs:
-                            raise ValueError(
-                                f"conflicting local definition '{loaded_name}' across clone sources"
-                            )
-                        if loaded_name not in s_res.stmts and not any(
-                            loaded_name in u for u in unit_local_maps
-                        ):
-                            raise ValueError(
-                                f"unresolved symbol '{loaded_name}' in caller module"
-                            )
-                else:
-                    if host_defs is None:
-                        host_defs = _extract_module_defined_names(host_plan.orig_text or "")
-                    if loaded_name not in host_imported and loaded_name not in host_defs:
-                        raise ValueError(
-                            f"unresolved symbol '{loaded_name}' in host module"
-                        )
-
-        # Treat bindings imported from host_mod as satisfied by host's local definition
-        if not host_plan.is_new_file:
-            if host_defs is None:
-                host_defs = _extract_module_defined_names(host_plan.orig_text or "")
-            effective_host_mod = host_mod
-            if effective_host_mod is None:
-                for item in source_texts:
-                    src_text, s_mod, _ = _unpack_source_item(item)
-                    if src_text == host_plan.orig_text and s_mod:
-                        effective_host_mod = s_mod
-                        break
-            self_imported = [
-                sname
-                for sname, stmt in symbol_to_stmt.items()
-                if sname in host_defs
-                and (
-                    (
-                        bool(effective_host_mod)
-                        and (
-                            stmt.startswith(f"from {effective_host_mod} import ")
-                            or stmt == f"import {effective_host_mod}"
-                            or stmt.startswith(f"import {effective_host_mod} as ")
-                        )
-                    )
-                    or not effective_host_mod
-                )
-            ]
-            for sname in self_imported:
-                symbol_to_stmt.pop(sname, None)
-
-        # Cross-check symbol_to_stmt against host module's existing and queued imports
-        host_existing_res = _extract_module_import_statements(
-            host_plan.orig_text or "", source_mod=host_mod, is_package=is_host_pkg
-        )
-        host_existing_stmts = host_existing_res.stmts
-        host_queued_res = _extract_module_import_statements(
-            "\n".join(host_plan.missing_imports), source_mod=host_mod, is_package=is_host_pkg
-        )
-        host_queued_stmts = host_queued_res.stmts
-        all_host_stmts: Dict[str, str] = {**host_existing_stmts, **host_queued_stmts}
-
-        for hname, hstmt in all_host_stmts.items():
-            if hname in symbol_to_stmt:
-                if host_defs is not None and hname in host_defs:
-                    raise ValueError(
-                        f"conflicting imported symbol '{hname}' rebound by local definition within host module"
-                    )
-                if hname in host_existing_res.rebound_conflicts:
-                    raise ValueError(
-                        f"conflicting imported symbol '{hname}' rebound within host module"
-                    )
-                if symbol_to_stmt.pop(hname) != hstmt:
-                    raise ValueError(
-                        f"conflicting imported symbol '{hname}' across clone sources"
-                    )
-
-        existing_and_queued = (
-            set(all_host_stmts.values()) | set(host_plan.missing_imports)
-        )
-        unmatched_host = set(symbol_to_stmt.keys()) & host_imported
-        for sname in unmatched_host:
-            cand_stmt = symbol_to_stmt.pop(sname)
-            if cand_stmt not in existing_and_queued:
-                raise ValueError(
-                    f"conflicting imported symbol '{sname}' with host module"
-                )
-
-        for sname, stmt in symbol_to_stmt.items():
-            if sname in source_hoisted_symbols:
-                if stmt not in missing and stmt not in existing_and_queued:
-                    missing.append(stmt)
-
-    return missing
 
 
 def _safely_prepare_helper_and_imports(
@@ -3039,30 +341,39 @@ def _validate_helper_compilation(helper_code: str) -> bool:
         compile(helper_code, "<patch_helper>", "exec")
         return True
     except IndentationError:
+        wrapped_code = "if 1:\n" + helper_code
         try:
-            compile("if 1:\n" + helper_code, "<patch_helper>", "exec")
+            compile(wrapped_code, "<patch_helper>", "exec")
             return True
         except IndentationError:
             pass
-        except (SyntaxError, ValueError, RecursionError, MemoryError):
+        except (SyntaxError, ValueError, RecursionError):
             return False
-    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        except MemoryError as exc:
+            if not is_cpython_parser_stack_overflow(exc, source=wrapped_code):
+                raise
+            return False
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+    except MemoryError as exc:
+        if not is_cpython_parser_stack_overflow(exc, source=helper_code):
+            raise
         return False
 
     sep = "\r\n\r\n\r\n" if "\r\n\r\n\r\n" in helper_code else "\n\n\n"
     if sep in helper_code:
         header, body = helper_code.split(sep, 1)
-        try:
-            if header.strip():
-                compile(header, "<patch_imports>", "exec")
-            if body.strip():
-                if body.lstrip("\r\n").startswith((" ", "\t")):
-                    compile("if 1:\n" + body, "<patch_helper>", "exec")
-                else:
-                    compile(body, "<patch_helper>", "exec")
-            return True
-        except (SyntaxError, ValueError, RecursionError, MemoryError):
+        if header.strip() and not _compile_source_safely(header, "<patch_imports>"):
             return False
+        if body.strip():
+            body_src = (
+                "if 1:\n" + body
+                if body.lstrip("\r\n").startswith((" ", "\t"))
+                else body
+            )
+            if not _compile_source_safely(body_src, "<patch_helper>"):
+                return False
+        return True
     return False
 
 
@@ -3163,1224 +474,37 @@ def _unit_start(u: Dict[str, Any]) -> int:
     return max(1, parse_unit_coord(u, "start", default=1))
 
 
-def _generate_refactoring_patch_impl(
-    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
-    repo_root: Optional[str] = None,
-    type_merge_strategy: str = "fallback_any",
-    replace_clones: bool = False,
-    method_binding: str = "auto",
-    cross_file_strategy: str = "auto",
-    shared_module_name: str = "_common.py",
-    depgraph: Optional[ModuleDependencyGraph] = None,
-    skip_pre_unit_closures: bool = False,
-    closure_strictness: Optional[str] = None,
-) -> str:
-    """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
-    if not clones:
-        return ""
-    skip_reasons: Dict[str, int] = defaultdict(int)
-    fs_root = Path(repo_root or os.getcwd()).resolve()
-    if fs_root.is_file():
-        fs_root = fs_root.parent
-    patch_root = _find_project_filesystem_root(fs_root)
-    root = fs_root
-    import_root = _find_enclosing_package_root(fs_root)
-    cross_file_strategy = (cross_file_strategy or "auto").strip().lower()
-    if cross_file_strategy not in (
-        "auto",
-        "host_module",
-        "host",
-        "shared_module",
-        "shared",
-        "skip",
-    ):
-        cross_file_strategy = "auto"
-    type_merge_strategy = (type_merge_strategy or "fallback_any").strip().lower()
-    if type_merge_strategy not in ("fallback_any", "union", "intersect", "strict"):
-        type_merge_strategy = "fallback_any"
-    method_binding = (method_binding or "auto").strip().lower()
-    if method_binding not in ("auto", "method", "module"):
-        method_binding = "auto"
-    _, effective_skip_closures = resolve_closure_strictness_mode(
-        closure_strictness=closure_strictness,
-        skip_pre_unit_closures=skip_pre_unit_closures,
-    )
-    if effective_skip_closures:
-        logger.debug("Generating patches in lenient closure strictness mode")
-    graph_holder: List[Optional[ModuleDependencyGraph]] = [
-        depgraph.copy() if depgraph is not None else None
-    ]
-
-    def _get_depgraph() -> ModuleDependencyGraph:
-        g = graph_holder[0]
-        if g is None:
-            g = build_module_graph(patch_root, import_root=import_root)
-            graph_holder[0] = g
-        return g
-
-    file_plans: Dict[Path, _FilePatchPlan] = {}
-
-    def _get_plan(
-        file_p: Path, rel_f: str, text: str, is_new_file: bool = False
-    ) -> _FilePatchPlan:
-        if file_p not in file_plans:
-            file_plans[file_p] = _FilePatchPlan(
-                file_p, rel_f, text, is_new_file=is_new_file
-            )
-        return file_plans[file_p]
-
-    candidate_roots = (
-        (fs_root,) if repo_root is not None else (fs_root, patch_root, import_root)
-    )
-
-    for sim, u1, u2 in clones:
-        if (
-            not is_valid_unit_coordinates(u1, strict=True)
-            or not is_valid_unit_coordinates(u2, strict=True)
-        ):
-            skip_reasons["malformed coordinates"] += 1
-            logger.debug(
-                "Skipping clone pair with malformed unit coordinates: (%s, %s)", u1, u2
-            )
-            continue
-
-        # Performance: Snapshot only plans touched in this pair (f1, f2, and potential shared
-        # module) to ensure O(touched_plans) = O(1) complexity per pair rather than
-        # O(pairs * total_plans).
-        initial_plan_keys = set(file_plans.keys())
-        plans_snapshot: Dict[Path, _PlanSnapshot] = {}
-        graph_snapshot = graph_holder[0].copy() if graph_holder[0] is not None else None
-
-        try:
-            f1_raw = normalize_path_string(str(u1.get("file") or ""), strip_anchor=True)
-            if not f1_raw:
-                skip_reasons["empty file path"] += 1
-                continue
-            f1_path, is_f1_rejected = _validate_clone_file_path(
-                f1_raw, candidate_roots
-            )
-            if is_f1_rejected or f1_path is None:
-                skip_reasons["invalid or rejected file path"] += 1
-                continue
-
-            if f1_path in initial_plan_keys and f1_path not in plans_snapshot:
-                plans_snapshot[f1_path] = file_plans[f1_path].snapshot()
-
-            rel_f1 = _format_patch_relative_path(f1_path, patch_root, fs_root)
-
-            f1_plan = file_plans.get(f1_path)
-            if f1_plan is None:
-                try:
-                    orig_text = f1_path.read_text(encoding="utf-8")
-                except (OSError, UnicodeDecodeError):
-                    skip_reasons["unreadable file"] += 1
-                    continue
-                f1_plan = _get_plan(f1_path, rel_f1, orig_text)
-            else:
-                orig_text = f1_plan.orig_text
-
-            orig_lines = f1_plan.orig_lines
-
-            f2_raw = normalize_path_string(str(u2.get("file") or ""), strip_anchor=True)
-            f2_path: Optional[Path] = None
-            if f2_raw:
-                f2_path, is_f2_rejected = _validate_clone_file_path(
-                    f2_raw, candidate_roots
-                )
-                if is_f2_rejected:
-                    skip_reasons["invalid or rejected file path"] += 1
-                    continue
-                if (
-                    f2_path is not None
-                    and f2_path in initial_plan_keys
-                    and f2_path not in plans_snapshot
-                ):
-                    plans_snapshot[f2_path] = file_plans[f2_path].snapshot()
-
-            is_same_file = False
-            if f2_path is not None and f1_path is not None:
-                is_same_file = (f1_path == f2_path or f1_path.resolve() == f2_path.resolve())
-            elif not f2_raw:
-                is_same_file = True
-            elif _is_same_file_path(f1_raw, f2_raw, repo_root=str(root)):
-                is_same_file = True
-
-            f2_plan: Optional[_FilePatchPlan] = None
-            if is_same_file:
-                pass
-            elif f2_raw:
-                if f2_path is not None:
-                    rel_f2 = _format_patch_relative_path(f2_path, patch_root, fs_root)
-                    f2_plan = file_plans.get(f2_path)
-                    if f2_plan is None:
-                        try:
-                            loaded_text = f2_path.read_text(encoding="utf-8")
-                            f2_plan = _get_plan(f2_path, rel_f2, loaded_text)
-                        except (OSError, UnicodeDecodeError):
-                            f2_plan = None
-                    if f2_plan is None and replace_clones:
-                        skip_reasons["unreadable file"] += 1
-                        continue
-                elif replace_clones:
-                    skip_reasons["unreadable file"] += 1
-                    continue
-            else:
-                skip_reasons["missing second file"] += 1
-                continue
-
-            u1_lines = orig_lines
-            u2_lines = (
-                orig_lines
-                if is_same_file
-                else (f2_plan.orig_lines if f2_plan is not None else None)
-            )
-            u1_eff = dict(u1, source_lines=u1_lines, source_lines_is_sliced=False)
-            if u2_lines is not None:
-                u2_eff = dict(u2, source_lines=u2_lines, source_lines_is_sliced=False)
-            else:
-                u2_eff = dict(u2)
-
-            f2_text: Optional[str] = (
-                f2_plan.orig_text
-                if f2_plan is not None
-                else (f1_plan.orig_text if is_same_file else None)
-            )
-            tree1 = f1_plan.parsed_tree
-            tree2 = (
-                f2_plan.parsed_tree
-                if f2_plan is not None
-                else (tree1 if is_same_file else None)
-            )
-            if _unit_has_no_refactor_pragma(
-                u1, u1_lines, orig_text=orig_text, tree=tree1
-            ) or _unit_has_no_refactor_pragma(
-                u2, u2_lines, orig_text=f2_text, tree=tree2
-            ):
-                f1_disp = normalize_path_string(
-                    str(u1.get("file") or "file1"), strip_anchor=False
-                )
-                f2_disp = normalize_path_string(
-                    str(u2.get("file") or "file2"), strip_anchor=False
-                )
-                _record_skip_comment(
-                    f1_plan,
-                    f2_plan,
-                    skip_reasons,
-                    "pragma inline suppression",
-                    f"# Note: Clone pair ({f1_disp} vs {f2_disp}) skipped: "
-                    f"inline '# pragma: no-refactor' present\n",
-                )
-                continue
-
-            if replace_clones:
-                u1_claimed = any(
-                    check_units_overlap(u1, prev_u, repo_root=str(root))
-                    for prev_u in f1_plan.claimed_units
-                )
-                if is_same_file:
-                    u2_claimed = any(
-                        check_units_overlap(u2, prev_u, repo_root=str(root))
-                        for prev_u in f1_plan.claimed_units
-                    )
-                else:
-                    u2_claimed = (
-                        any(
-                            check_units_overlap(u2, prev_u, repo_root=str(root))
-                            for prev_u in f2_plan.claimed_units
-                        )
-                        if f2_plan is not None
-                        else False
-                    )
-                if u1_claimed or u2_claimed:
-                    skip_reasons["overlapping claimed unit"] += 1
-                    continue
-
-            if not _align_pair_expr_kinds(u1_eff, u2_eff):
-                skip_reasons["mismatched subroutine kinds"] += 1
-                continue
-
-            digest1 = f1_plan.content_digest
-            digest2 = (
-                f2_plan.content_digest
-                if f2_plan is not None
-                else (digest1 if is_same_file else None)
-            )
-            is_sub1 = is_subroutine_unit(u1_eff, source_text=orig_text, tree=tree1)
-            is_sub2 = is_subroutine_unit(u2_eff, source_text=f2_text, tree=tree2)
-            u1_eff["is_subroutine"] = is_sub1
-            u2_eff["is_subroutine"] = is_sub2
-            if is_sub1 != is_sub2:
-                skip_reasons["mismatched subroutine kinds"] += 1
-                logger.debug(
-                    "Skipping clone pair (%s, %s): mismatched subroutine kinds "
-                    "(is_sub1=%s, is_sub2=%s)",
-                    u1.get("name"),
-                    u2.get("name"),
-                    is_sub1,
-                    is_sub2,
-                )
-                continue
-
-            enc1 = find_enclosing_class(orig_text, u1_eff, tree=tree1)
-            fn1 = find_enclosing_function(orig_text, u1_eff, tree=tree1)
-            enc2 = (
-                find_enclosing_class(f2_text, u2_eff, tree=tree2)
-                if f2_text is not None
-                else None
-            )
-            fn2 = (
-                find_enclosing_function(f2_text, u2_eff, tree=tree2)
-                if f2_text is not None
-                else None
-            )
-            is_same_class = bool(
-                is_same_file
-                and enc1
-                and enc2
-                and enc1["name"] == enc2["name"]
-                and enc1["start"] == enc2["start"]
-            )
-
-            orig_fn1 = fn1
-            orig_fn2 = fn2
-            if not _is_method_of_class(fn1, enc1):
-                fn1 = None
-            if not _is_method_of_class(fn2, enc2):
-                fn2 = None
-
-            fn1_kind = _determine_unit_receiver_kind(fn1, u1_eff, enc1)
-            fn2_kind = _determine_unit_receiver_kind(fn2, u2_eff, enc2)
-
-            receiver_kinds_differ = bool(fn1_kind != fn2_kind)
-            has_method_ctx = bool(
-                fn1
-                and fn2
-                and (fn1.get("receiver_param") or fn1.get("is_static"))
-                and (fn2.get("receiver_param") or fn2.get("is_static"))
-            )
-            if fn1 and u1_eff.get("receiver_param") is None:
-                u1_eff["receiver_param"] = fn1.get("receiver_param")
-            if fn2 and u2_eff.get("receiver_param") is None:
-                u2_eff["receiver_param"] = fn2.get("receiver_param")
-            if fn1_kind != "none" and u1_eff.get("receiver_kind") is None:
-                u1_eff["receiver_kind"] = fn1_kind
-                if fn1_kind == "static":
-                    u1_eff["is_static"] = True
-            if fn2_kind != "none" and u2_eff.get("receiver_kind") is None:
-                u2_eff["receiver_kind"] = fn2_kind
-                if fn2_kind == "static":
-                    u2_eff["is_static"] = True
-            if fn1 and fn2:
-                is_static = bool(fn1.get("is_static") and fn2.get("is_static"))
-            else:
-                is_static = bool(
-                    (fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static"))
-                )
-
-            s1 = inspect_single_unit_scope(u1_eff, repo_root=str(root), tree=tree1)
-            s2 = inspect_single_unit_scope(u2_eff, repo_root=str(root), tree=tree2)
-            if u1_eff.get("kind") in ("comprehension", "complex_expr") or u2_eff.get(
-                "kind"
-            ) in ("comprehension", "complex_expr"):
-                stmt_lines1 = _slice_unit_token_lines(
-                    u1_eff,
-                    _extract_unit_body_lines(
-                        u1_eff,
-                        [
-                            ln.rstrip("\r\n")
-                            for ln in extract_unit_source_code(u1_eff, repo_root=str(root))
-                        ],
-                    ),
-                )
-                stmt_lines2 = _slice_unit_token_lines(
-                    u2_eff,
-                    _extract_unit_body_lines(
-                        u2_eff,
-                        [
-                            ln.rstrip("\r\n")
-                            for ln in extract_unit_source_code(u2_eff, repo_root=str(root))
-                        ],
-                    ),
-                )
-                if not _prune_pair_lhs_and_augassign_scopes(
-                    u1_eff, u2_eff, s1, s2, stmt_lines1, stmt_lines2
-                ):
-                    skip_reasons["incompatible inputs or outputs"] += 1
-                    continue
-            if orig_fn1 and orig_fn1.get("is_async") and s1.get("has_yield"):
-                s1["is_async"] = True
-            if orig_fn2 and orig_fn2.get("is_async") and s2.get("has_yield"):
-                s2["is_async"] = True
-            if s1.get("is_async") is None or s2.get("is_async") is None:
-                skip_reasons["indeterminate async state"] += 1
-                logger.debug(
-                    "Skipping clone pair (%s, %s): indeterminate async state",
-                    u1.get("name"),
-                    u2.get("name"),
-                )
-                continue
-            if bool(s1.get("is_async")) != bool(s2.get("is_async")):
-                skip_reasons["mismatched async state"] += 1
-                continue
-            if bool(s1.get("has_yield")) != bool(s2.get("has_yield")):
-                skip_reasons["mismatched generator state"] += 1
-                continue
-            if has_async_generator_delegation_hazard(s1, s2):
-                skip_reasons["async generator delegation hazard"] += 1
-                continue
-            if s1.get("nonlocals") or s2.get("nonlocals"):
-                skip_reasons["nonlocal variables present"] += 1
-                continue
-            if not is_same_file and (s1.get("globals") or s2.get("globals")):
-                skip_reasons["cross-file global variables"] += 1
-                continue
-            rec1 = u1_eff.get("receiver_param") or ("cls" if fn1_kind == "class" else "self")
-            rec2 = u2_eff.get("receiver_param") or ("cls" if fn2_kind == "class" else "self")
-            if (
-                _normalize_receiver_attrs(s1.get("attrs_read", []), rec1)
-                != _normalize_receiver_attrs(s2.get("attrs_read", []), rec2)
-                or _normalize_receiver_attrs(s1.get("attrs_written", []), rec1)
-                != _normalize_receiver_attrs(s2.get("attrs_written", []), rec2)
-            ):
-                skip_reasons["incompatible receiver attribute accesses"] += 1
-                continue
-
-            hazards1 = set(s1.get("control_flow_hazards", []))
-            hazards2 = set(s2.get("control_flow_hazards", []))
-            if "pathological_ast" in hazards1 | hazards2:
-                skip_reasons["pathological ast"] += 1
-                continue
-            if "type_param_closure_capture" in hazards1 | hazards2:
-                skip_reasons["type_param closure capture"] += 1
-                continue
-            if any(h in ("naked_break", "naked_continue") for h in hazards1 | hazards2):
-                skip_reasons["naked break or continue"] += 1
-                continue
-            if "deleted_output" in hazards1 | hazards2:
-                skip_reasons["deleted output hazard"] += 1
-                continue
-            if "embedded_return" in hazards1 | hazards2:
-                lines1 = u1_lines
-                lines2 = u2_lines
-                if lines1 is None or lines2 is None:
-                    skip_reasons["missing source lines"] += 1
-                    continue
-                if not (
-                    _has_unconditional_terminal_return(u1, lines1)
-                    and _has_unconditional_terminal_return(u2, lines2)
-                ):
-                    skip_reasons["embedded return hazard"] += 1
-                    continue
-
-            if receiver_kinds_differ:
-                if (
-                    _has_receiver_reference(u1_eff, s1, repo_root=str(root))
-                    or _has_receiver_reference(u2_eff, s2, repo_root=str(root))
-                ):
-                    skip_reasons["unbound receiver reference"] += 1
-                    continue
-
-            has_super = bool(s1.get("has_super") or s2.get("has_super"))
-            has_mangled = bool(s1.get("has_mangled_names") or s2.get("has_mangled_names"))
-            is_in_method = _is_pair_in_method(
-                u1_eff,
-                u2_eff,
-                method_binding=method_binding,
-                has_super=has_super,
-                has_mangled=has_mangled,
-                has_method_context=has_method_ctx,
-            )
-            effective_binding = _resolve_effective_binding(
-                method_binding,
-                is_same_class,
-                is_static=is_static,
-                receiver_kinds_differ=receiver_kinds_differ,
-                is_in_method=is_in_method,
-                receiver_kind=fn1_kind,
-            )
-
-            if has_super and (effective_binding == "module" or is_static):
-                skip_reasons["super() in non-method helper"] += 1
-                continue
-
-            if has_mangled and (effective_binding != "method" or not is_same_class or is_static):
-                skip_reasons["mangled names in non-method helper"] += 1
-                continue
-
-            if (
-                s1.get("has_class_scoped_type_params")
-                or s2.get("has_class_scoped_type_params")
-            ) and (effective_binding != "method" or not is_same_class):
-                skip_reasons["type_param closure capture"] += 1
-                continue
-
-            helper_indent = (
-                enc1["method_indent"]
-                if (effective_binding == "method" and enc1)
-                else ("    " if effective_binding == "method" else "")
-            )
-            step = (
-                enc1["method_indent"][len(enc1["indent"]):]
-                if (
-                    enc1
-                    and enc1.get("indent") is not None
-                    and enc1["method_indent"].startswith(enc1["indent"])
-                    and len(enc1["method_indent"]) > len(enc1["indent"])
-                )
-                else None
-            )
-            step = _derive_unit_indent_step(u1, orig_lines, step)
-
-            scope = analyze_unit_variable_scope(
-                u1_eff,
-                u2_eff,
-                repo_root=str(root),
-                tree1=tree1,
-                tree2=tree2,
-                scope1=s1,
-                scope2=s2,
-            )
-            inputs = list(scope.get("inputs", []))
-            if effective_binding == "module":
-                inputs = _prune_unshared_receivers(
-                    inputs, u1_eff, u2_eff, s1, s2, repo_root=str(root)
-                )
-
-            resolved_outs = resolve_clone_pair_outputs(
-                u1=u1_eff,
-                u2=u2_eff,
-                scope1=s1,
-                scope2=s2,
-                source_text1=f1_plan.orig_text,
-                source_text2=f2_text,
-                tree1=tree1,
-                tree2=tree2,
-                repo_root=str(root),
-                skip_pre_unit_closures=effective_skip_closures,
-                source_digest1=digest1,
-                source_digest2=digest2,
-                require_pairing=replace_clones,
-                return_details=True,
-            )
-            if resolved_outs.outputs is None:
-                reason = resolved_outs.skip_reason or "unpaired outputs"
-                skip_reasons[reason] += 1
-                logger.debug(
-                    "Skipping clone pair (%s, %s): failed to resolve clone pair outputs (%s)",
-                    u1.get("name"),
-                    u2.get("name"),
-                    reason,
-                )
-                continue
-            outputs, target_outs2 = resolved_outs.outputs
-            if has_async_generator_delegation_hazard(
-                s1, s2, has_outputs=bool(outputs or target_outs2)
-            ):
-                skip_reasons["async generator delegation hazard"] += 1
-                logger.debug(
-                    "Skipping clone pair (%s, %s): async generator cannot return "
-                    "values or outputs",
-                    u1.get("name"),
-                    u2.get("name"),
-                )
-                continue
-            u1_eff["outputs"] = outputs
-            u2_eff["outputs"] = target_outs2
-            t_inputs1 = list(s1.get("inputs", []))
-            t_inputs2 = list(s2.get("inputs", []))
-            if effective_binding == "module":
-                t_inputs1 = _prune_unshared_receivers(
-                    t_inputs1, u1_eff, u2_eff, s1, s2, repo_root=str(root)
-                )
-                t_inputs2 = _prune_unshared_receivers(
-                    t_inputs2, u2_eff, u1_eff, s2, s1, repo_root=str(root)
-                )
-
-            if replace_clones and (
-                len(t_inputs1) != len(inputs)
-                or len(t_inputs2) != len(inputs)
-                or not _outputs_compatible(
-                    outputs,
-                    target_outs2,
-                    is_subroutine=is_sub1,
-                    has_yield=bool(s1.get("has_yield") or s2.get("has_yield")),
-                )
-            ):
-                skip_reasons["incompatible inputs or outputs"] += 1
-                logger.debug(
-                    "Skipping clone pair (%s, %s): incompatible inputs or outputs",
-                    u1.get("name"),
-                    u2.get("name"),
-                )
-                continue
-
-            base_name1 = _base_unit_name(u1)
-            base_name2 = _base_unit_name(u2)
-            base_helper = (
-                f"_shared_{base_name1}" if base_name1 == base_name2 else f"_shared_{base_name1}_{base_name2}"
-            )
-            shared_p: Optional[Path] = None
-            target_host_plan: Optional[_FilePatchPlan] = None
-            target_host_text: Optional[str] = None
-            cross_file_action = cross_file_strategy
-            if not is_same_file and cross_file_action in ("skip", "none"):
-                skip_reasons["cross-file refactoring skipped"] += 1
-                continue
-            if cross_file_action == "auto" and not is_same_file and f2_plan is not None:
-                common_dir = find_nearest_common_package(f1_path, f2_plan.path, patch_root)
-                try:
-                    res_common = common_dir.resolve()
-                    res_patch_root = patch_root.resolve()
-                    res_src = (patch_root / "src").resolve()
-                    res_import_root = import_root.resolve()
-                    is_top_level = res_common in (res_patch_root, res_src, res_import_root)
-                except (OSError, RuntimeError, ValueError):
-                    is_top_level = False
-                if is_top_level:
-                    cross_file_action = "host_module"
-                else:
-                    cross_file_action = "shared_module"
-
-            if (
-                not is_same_file
-                and f2_plan is not None
-                and cross_file_action in ("shared_module", "shared")
-            ):
-                maybe_shared_p = _safely_resolve_shared_module_file(
-                    f1_path, f2_plan.path, patch_root, shared_module_name, f1_plan, f2_plan
-                )
-                if maybe_shared_p is None:
-                    skip_reasons["shared module path unresolvable"] += 1
-                    continue
-                shared_p = maybe_shared_p
-                if shared_p in initial_plan_keys and shared_p not in plans_snapshot:
-                    plans_snapshot[shared_p] = file_plans[shared_p].snapshot()
-
-                if _is_same_file_or_resolved(shared_p, f1_path):
-                    target_host_plan = f1_plan
-                elif _is_same_file_or_resolved(shared_p, f2_plan.path):
-                    target_host_plan = f2_plan
-                else:
-                    target_host_plan = file_plans.get(shared_p)
-                    try:
-                        if target_host_plan is None and shared_p.is_file() and not shared_p.is_symlink():
-                            try:
-                                shared_p.resolve().relative_to(patch_root.resolve())
-                                target_host_text = shared_p.read_text(
-                                    encoding="utf-8"
-                                )
-                            except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
-                                pass
-                    except (OSError, RuntimeError, ValueError):
-                        pass
-
-            helper_name = base_helper
-            h_idx = 2
-            while (
-                helper_name in f1_plan.used_helper_names
-                or bool(re.search(rf"\b{re.escape(helper_name)}\b", orig_text))
-                or (
-                    f2_plan is not None
-                    and (
-                        helper_name in f2_plan.used_helper_names
-                        or bool(re.search(rf"\b{re.escape(helper_name)}\b", f2_plan.orig_text))
-                    )
-                )
-                or (
-                    target_host_plan is not None
-                    and (
-                        helper_name in target_host_plan.used_helper_names
-                        or bool(re.search(rf"\b{re.escape(helper_name)}\b", target_host_plan.orig_text))
-                    )
-                )
-                or (
-                    target_host_text is not None
-                    and bool(re.search(rf"\b{re.escape(helper_name)}\b", target_host_text))
-                )
-            ):
-                helper_name = f"{base_helper}_{h_idx}"
-                h_idx += 1
-            helper_code = synthesize_shared_helper_code(
-                u1_eff,
-                u2_eff,
-                type_merge_strategy=type_merge_strategy,
-                method_binding=effective_binding,
-                indent=helper_indent,
-                is_static=is_static,
-                receiver_kind=fn1_kind if effective_binding == "method" else None,
-                step=step,
-                repo_root=str(root),
-                helper_name=helper_name,
-                source_text1=f1_plan.orig_text,
-                source_text2=f2_text,
-                tree1=tree1,
-                tree2=tree2,
-                skip_pre_unit_closures=effective_skip_closures,
-                closure_strictness=closure_strictness,
-                outputs=outputs,
-                outputs2=target_outs2,
-                scope1=s1,
-                scope2=s2,
-                scope=scope,
-            )
-            if not helper_code:
-                skip_reasons["shared helper synthesis failed"] += 1
-                continue
-
-            await_prefix = "await " if scope.get("is_async") else ""
-
-            f1_disp = normalize_path_string(str(u1.get("file") or "file1"), strip_anchor=False)
-            f2_disp = normalize_path_string(str(u2.get("file") or "file2"), strip_anchor=False)
-            pair_comment = f"# Clone Pair ({sim:.1%}): {f1_disp} <===> {f2_disp}\n"
-
-            candidate_units = [u1_eff]
-            if is_same_file and not check_units_overlap(u1_eff, u2_eff, repo_root=str(root)):
-                candidate_units.append(u2_eff)
-
-            earliest_unit = min(candidate_units, key=_unit_start)
-            enc_fn_earliest = (
-                find_enclosing_function(
-                    orig_text, earliest_unit, tree=f1_plan.parsed_tree
-                )
-                if effective_binding == "method"
-                else None
-            )
-            insert_line = (
-                enc_fn_earliest["start"]
-                if enc_fn_earliest
-                else _unit_start(earliest_unit)
-            )
-
-            if is_same_file:
-                mod1 = _derive_module_import_path(f1_path, import_root)
-                is_pkg1 = f1_path.name == "__init__.py"
-                helper_code, maybe_imports = _safely_prepare_helper_and_imports(
-                    host_plan=f1_plan,
-                    helper_code=helper_code,
-                    scope=scope,
-                    source_texts=[(orig_text, mod1, is_pkg1)],
-                    f1_plan=f1_plan,
-                    f2_plan=f2_plan,
-                    host_mod=mod1,
-                    is_host_pkg=is_pkg1,
-                )
-                if maybe_imports is None:
-                    skip_reasons["circular import or unresolvable import"] += 1
-                    continue
-                host_imports = maybe_imports
-
-                f1_plan.used_helper_names.add(helper_name)
-                f1_plan.comments.append(pair_comment)
-
-                if replace_clones:
-                    _delegate_unit_in_plan(
-                        u1_eff,
-                        f1_plan,
-                        helper_name=helper_name,
-                        inputs=inputs,
-                        outputs=outputs,
-                        scope=scope,
-                        target_inputs=t_inputs1,
-                        target_outputs=outputs,
-                        await_prefix=await_prefix,
-                        binding=effective_binding,
-                        step=step,
-                    )
-                    if len(candidate_units) > 1:
-                        _delegate_unit_in_plan(
-                            u2_eff,
-                            f1_plan,
-                            helper_name=helper_name,
-                            inputs=inputs,
-                            outputs=target_outs2,
-                            scope=scope,
-                            target_inputs=t_inputs2,
-                            target_outputs=target_outs2,
-                            await_prefix=await_prefix,
-                            binding=effective_binding,
-                            step=step,
-                        )
-                _attach_helper_to_plan(
-                    f1_plan,
-                    binding=effective_binding,
-                    insert_line=insert_line,
-                    helper_code=helper_code,
-                    missing_imports=host_imports,
-                )
-            elif f2_plan is not None:
-                if cross_file_action in ("skip", "none"):
-                    skip_reasons["cross-file refactoring skipped"] += 1
-                    continue
-                if cross_file_action in ("shared_module", "shared"):
-                    if shared_p is None:
-                        skip_reasons["shared module path unresolvable"] += 1
-                        continue
-                    rel_shared = _format_patch_relative_path(shared_p, patch_root, fs_root)
-
-                    if _is_same_file_or_resolved(shared_p, f1_path):
-                        host_plan = f1_plan
-                        callers = [(f2_plan, u2_eff, t_inputs2, target_outs2)]
-                    elif _is_same_file_or_resolved(shared_p, f2_plan.path):
-                        host_plan = f2_plan
-                        callers = [(f1_plan, u1_eff, t_inputs1, outputs)]
-                    else:
-                        shared_plan = file_plans.get(shared_p)
-                        if shared_plan is None:
-                            is_bad_target = False
-                            kind_desc = ""
-                            try:
-                                if shared_p.is_symlink() or shared_p.is_dir():
-                                    is_bad_target = True
-                                    kind_desc = (
-                                        "an existing symlink"
-                                        if shared_p.is_symlink()
-                                        else "an existing directory"
-                                    )
-                            except (OSError, RuntimeError, ValueError) as exc:
-                                is_bad_target = True
-                                kind_desc = f"unresolvable ({exc})"
-
-                            if is_bad_target:
-                                _record_skip_comment(
-                                    f1_plan,
-                                    f2_plan,
-                                    skip_reasons,
-                                    "shared module target is symlink or directory",
-                                    f"# Note: Cross-module clone pair; shared module path "
-                                    f"{rel_shared} is {kind_desc}; skipping extraction.\n",
-                                )
-                                continue
-
-                            try:
-                                is_existing_file = shared_p.is_file()
-                            except (OSError, RuntimeError, ValueError):
-                                is_existing_file = False
-
-                            if is_existing_file:
-                                try:
-                                    shared_p.resolve().relative_to(patch_root.resolve())
-                                    shared_text = shared_p.read_text(
-                                        encoding="utf-8"
-                                    )
-                                    shared_plan = _get_plan(
-                                        shared_p, rel_shared, shared_text, is_new_file=False
-                                    )
-                                except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
-                                    _record_skip_comment(
-                                        f1_plan,
-                                        f2_plan,
-                                        skip_reasons,
-                                        "shared module read error",
-                                        f"# Note: Cross-module clone pair; shared module file "
-                                        f"{rel_shared} exists but could not be read; "
-                                        f"skipping extraction.\n",
-                                    )
-                                    continue
-                            else:
-                                shared_plan = _get_plan(
-                                    shared_p, rel_shared, "", is_new_file=True
-                                )
-                        host_plan = shared_plan
-                        callers = [
-                            (f1_plan, u1_eff, t_inputs1, outputs),
-                            (f2_plan, u2_eff, t_inputs2, target_outs2),
-                        ]
-
-                    mod1 = _derive_module_import_path(f1_path, import_root)
-                    mod2 = _derive_module_import_path(f2_plan.path, import_root)
-                    is_pkg1 = f1_path.name == "__init__.py"
-                    is_pkg2 = f2_plan.path.name == "__init__.py"
-                    mod_host = _derive_module_import_path(host_plan.path, import_root)
-                    is_host_pkg = host_plan.path.name == "__init__.py"
-                    helper_code, maybe_imports = _safely_prepare_helper_and_imports(
-                        host_plan=host_plan,
-                        helper_code=helper_code,
-                        scope=scope,
-                        source_texts=[(orig_text, mod1, is_pkg1), (f2_plan.orig_text, mod2, is_pkg2)],
-                        f1_plan=f1_plan,
-                        f2_plan=f2_plan,
-                        host_mod=mod_host,
-                        is_host_pkg=is_host_pkg,
-                    )
-                    if maybe_imports is None:
-                        skip_reasons["circular import or unresolvable import"] += 1
-                        continue
-                    host_imports = maybe_imports
-
-                    host_disp = normalize_path_string(str(host_plan.rel_path), strip_anchor=False)
-                    dg = _get_depgraph()
-                    if mod_host and host_imports:
-                        host_cycle = dg.check_cycle_if_imports_added(
-                            mod_host,
-                            host_imports,
-                            file_path=host_plan.path,
-                            is_package=is_host_pkg,
-                        )
-                        if host_cycle:
-                            cycle_desc = (
-                                f"Circular import detected (cycle: {' -> '.join(host_cycle)})"
-                            )
-                            _record_skip_comment(
-                                f1_plan,
-                                f2_plan,
-                                skip_reasons,
-                                "circular import detected",
-                                f"# Note: Cross-module clone pair; "
-                                f"helper extraction to {host_disp} "
-                                f"rejected due to circular dependency ({cycle_desc}).\n",
-                            )
-                            continue
-
-                    tentative_dg = dg.copy()
-                    if mod_host:
-                        _register_plan_dependencies_in_graph(
-                            tentative_dg, mod_host, host_plan.path, host_imports
-                        )
-
-                    caller_evaluations: List[
-                        Tuple[
-                            _FilePatchPlan,
-                            Dict[str, Any],
-                            List[str],
-                            List[str],
-                            str,
-                            Optional[List[str]],
-                        ]
-                    ] = []
-                    for c_plan, c_unit, c_tin, c_tout in callers:
-                        c_mod = _derive_module_import_path(c_plan.path, import_root)
-                        c_cycle = (
-                            tentative_dg.check_cycle_if_added(c_mod, mod_host)
-                            if (c_mod and mod_host)
-                            else None
-                        )
-                        caller_evaluations.append(
-                            (c_plan, c_unit, c_tin, c_tout, c_mod, c_cycle)
-                        )
-
-                    if host_plan in (f1_plan, f2_plan) and caller_evaluations:
-                        c_plan, _, _, _, c_mod, c_cycle = caller_evaluations[0]
-                        if c_cycle or not mod_host or not c_mod:
-                            c_disp = normalize_path_string(
-                                str(c_plan.rel_path), strip_anchor=False
-                            )
-                            c_desc = f" (cycle: {' -> '.join(c_cycle)})" if c_cycle else ""
-                            _record_skip_comment(
-                                f1_plan,
-                                f2_plan,
-                                skip_reasons,
-                                "circular import detected",
-                                f"# Note: Cross-module clone pair; "
-                                f"helper extraction to {host_disp} "
-                                f"rejected. Circular import or unresolvable module path{c_desc}.\n",
-                            )
-                            continue
-
-                    if host_plan not in (f1_plan, f2_plan) and all(
-                        bool(cycle or not mod_host or not m_call)
-                        for _, _, _, _, m_call, cycle in caller_evaluations
-                    ):
-                        c_descs = [
-                            f"{m_call}: {' -> '.join(cycle)}"
-                            for _, _, _, _, m_call, cycle in caller_evaluations
-                            if cycle
-                        ]
-                        c_txt = f" ({'; '.join(c_descs)})" if c_descs else ""
-                        _record_skip_comment(
-                            f1_plan,
-                            f2_plan,
-                            skip_reasons,
-                            "circular import detected",
-                            f"# Note: Cross-module clone pair; helper extraction to {host_disp} "
-                            f"rejected due to circular dependency{c_txt}.\n",
-                        )
-                        continue
-
-                    host_plan.module_helpers.append(helper_code)
-                    host_plan.missing_imports.extend(host_imports)
-                    host_plan.used_helper_names.add(helper_name)
-                    f1_plan.used_helper_names.add(helper_name)
-                    if f2_plan is not None:
-                        f2_plan.used_helper_names.add(helper_name)
-                    host_plan.comments.append(pair_comment)
-
-                    if mod_host:
-                        _register_plan_dependencies_in_graph(
-                            dg, mod_host, host_plan.path, host_imports
-                        )
-
-                    if replace_clones:
-                        if host_plan is f1_plan:
-                            _delegate_unit_in_plan(
-                                u1_eff,
-                                f1_plan,
-                                helper_name=helper_name,
-                                inputs=inputs,
-                                outputs=outputs,
-                                scope=scope,
-                                target_inputs=t_inputs1,
-                                target_outputs=outputs,
-                                await_prefix=await_prefix,
-                                binding=effective_binding,
-                                step=step,
-                            )
-                        elif host_plan is f2_plan:
-                            _delegate_unit_in_plan(
-                                u2_eff,
-                                f2_plan,
-                                helper_name=helper_name,
-                                inputs=inputs,
-                                outputs=target_outs2,
-                                scope=scope,
-                                target_inputs=t_inputs2,
-                                target_outputs=target_outs2,
-                                await_prefix=await_prefix,
-                                binding="module",
-                            )
-
-                    for c_plan, c_unit, c_tin, c_tout, mod_caller, cycle in caller_evaluations:
-                        c_plan.comments.append(pair_comment)
-                        c_disp = normalize_path_string(str(c_plan.rel_path), strip_anchor=False)
-                        if cycle or not mod_host or not mod_caller:
-                            cycle_desc = ""
-                            if cycle:
-                                cycle_desc = f"Circular import detected (cycle: {' -> '.join(cycle)})"
-                            else:
-                                cycle_desc = "Unresolvable module import path"
-                            cycle_msg = (
-                                f"# Note: Cross-module clone pair; helper extracted to {host_disp}. "
-                                f"{cycle_desc}; import manually into {c_disp}.\n"
-                            )
-                            c_plan.comments.append(cycle_msg)
-                            host_plan.comments.append(cycle_msg)
-                        else:
-                            c_plan.missing_imports.append(f"from {mod_host} import {helper_name}")
-                            if mod_caller and mod_host:
-                                dg.add_dependency(mod_caller, mod_host)
-                            if replace_clones:
-                                _delegate_unit_in_plan(
-                                    c_unit,
-                                    c_plan,
-                                    helper_name=helper_name,
-                                    inputs=inputs,
-                                    outputs=c_tout if c_tout is not None else outputs,
-                                    scope=scope,
-                                    target_inputs=c_tin,
-                                    target_outputs=c_tout,
-                                    await_prefix=await_prefix,
-                                    binding="module",
-                                )
-                            else:
-                                c_plan.comments.append(
-                                    f"# Note: Cross-module clone pair; helper extracted to {host_disp}. "
-                                    f"Complete refactoring by replacing the clone with a call in {c_disp}.\n"
-                                )
-                else:
-                    mod1 = _derive_module_import_path(f1_path, import_root)
-                    mod2 = _derive_module_import_path(f2_plan.path, import_root)
-                    is_pkg1 = f1_path.name == "__init__.py"
-                    is_pkg2 = f2_plan.path.name == "__init__.py"
-                    dg = _get_depgraph()
-
-                    helper_code, maybe_imports = _safely_prepare_helper_and_imports(
-                        host_plan=f1_plan,
-                        helper_code=helper_code,
-                        scope=scope,
-                        source_texts=[(orig_text, mod1, is_pkg1), (f2_plan.orig_text, mod2, is_pkg2)],
-                        f1_plan=f1_plan,
-                        f2_plan=f2_plan,
-                        host_mod=mod1,
-                        is_host_pkg=is_pkg1,
-                    )
-                    if maybe_imports is None:
-                        skip_reasons["circular import or unresolvable import"] += 1
-                        continue
-                    host_imports = maybe_imports
-
-                    if mod1 and host_imports:
-                        host_cycle = dg.check_cycle_if_imports_added(
-                            mod1,
-                            host_imports,
-                            file_path=f1_plan.path,
-                            is_package=is_pkg1,
-                        )
-                        if host_cycle:
-                            skip_reasons["circular import detected"] += 1
-                            cycle_desc = f" (cycle: {' -> '.join(host_cycle)})"
-                            cycle_msg = (
-                                f"# Note: Cross-module clone pair; helper extraction to {f1_disp} "
-                                f"rejected due to circular dependency{cycle_desc}.\n"
-                            )
-                            for plan in (f1_plan, f2_plan):
-                                plan.comments.append(cycle_msg)
-                            continue
-
-                    tentative_dg = dg.copy()
-                    if mod1:
-                        _register_plan_dependencies_in_graph(
-                            tentative_dg, mod1, f1_plan.path, host_imports
-                        )
-
-                    cycle = (
-                        tentative_dg.check_cycle_if_added(mod2, mod1)
-                        if (mod1 and mod2)
-                        else None
-                    )
-                    direct_import = bool(
-                        mod2
-                        and _module_imports_target(
-                            orig_text, mod2, current_mod=mod1, is_package=is_pkg1
-                        )
-                    )
-                    is_circular = bool(cycle or direct_import)
-
-                    if is_circular or not mod1 or not mod2:
-                        skip_reasons["circular import detected"] += 1
-                        cycle_desc = ""
-                        if cycle:
-                            cycle_desc = f" (cycle: {' -> '.join(cycle)})"
-                        elif direct_import:
-                            cycle_desc = f" (cycle: {mod2} -> {mod1} -> {mod2})"
-                        cycle_msg = (
-                            f"# Note: Cross-module clone pair; helper extraction to {f1_disp} rejected. "
-                            f"Circular import or unresolvable module path{cycle_desc}.\n"
-                        )
-                        for plan in (f1_plan, f2_plan):
-                            plan.comments.append(cycle_msg)
-                        continue
-
-                    if mod1:
-                        _register_plan_dependencies_in_graph(
-                            dg, mod1, f1_plan.path, host_imports
-                        )
-
-                    f1_plan.used_helper_names.add(helper_name)
-                    f2_plan.used_helper_names.add(helper_name)
-                    f1_plan.comments.append(pair_comment)
-
-                    _wire_cross_module_host_delegation(
-                        f1_plan=f1_plan,
-                        f2_plan=f2_plan,
-                        u2=u2_eff,
-                        mod1=mod1,
-                        helper_name=helper_name,
-                        pair_comment=pair_comment,
-                        f1_disp=f1_disp,
-                        f2_disp=f2_disp,
-                        replace_clones=replace_clones,
-                        inputs=inputs,
-                        outputs=outputs,
-                        scope=scope,
-                        t_inputs2=t_inputs2,
-                        target_outs2=target_outs2,
-                        await_prefix=await_prefix,
-                    )
-                    if replace_clones and mod1 and mod2:
-                        dg.add_dependency(mod2, mod1)
-
-                    _finalize_host_unit_and_helper(
-                        plan=f1_plan,
-                        unit=u1_eff,
-                        helper_name=helper_name,
-                        inputs=inputs,
-                        outputs=outputs,
-                        scope=scope,
-                        target_inputs=t_inputs1,
-                        binding=effective_binding,
-                        step=step,
-                        insert_line=insert_line,
-                        helper_code=helper_code,
-                        missing_imports=host_imports,
-                        await_prefix=await_prefix,
-                        replace_clones=replace_clones,
-                    )
-            else:
-                if replace_clones:
-                    skip_reasons["unreadable file"] += 1
-                    continue
-                mod1 = _derive_module_import_path(f1_path, import_root)
-                is_pkg1 = f1_path.name == "__init__.py"
-                helper_code, maybe_imports = _safely_prepare_helper_and_imports(
-                    host_plan=f1_plan,
-                    helper_code=helper_code,
-                    scope=scope,
-                    source_texts=[(orig_text, mod1, is_pkg1)],
-                    f1_plan=f1_plan,
-                    f2_plan=f2_plan,
-                    host_mod=mod1,
-                    is_host_pkg=is_pkg1,
-                )
-                if maybe_imports is None:
-                    skip_reasons["circular import or unresolvable import"] += 1
-                    continue
-                host_imports = maybe_imports
-
-                f1_plan.used_helper_names.add(helper_name)
-                f1_plan.comments.append(pair_comment)
-                f1_plan.comments.append(
-                    f"# Note: Cross-module clone pair; helper generated in {f1_disp}. "
-                    f"Complete refactoring by importing the helper into {f2_disp}.\n"
-                )
-                _finalize_host_unit_and_helper(
-                    plan=f1_plan,
-                    unit=u1_eff,
-                    helper_name=helper_name,
-                    inputs=inputs,
-                    outputs=outputs,
-                    scope=scope,
-                    target_inputs=t_inputs1,
-                    binding=effective_binding,
-                    step=step,
-                    insert_line=insert_line,
-                    helper_code=helper_code,
-                    missing_imports=host_imports,
-                    await_prefix=await_prefix,
-                    replace_clones=replace_clones,
-                )
-        except (AttributeError, NameError, RecursionError, ImportError):
-            raise
-        except Exception as exc:
-            skip_reasons["processing exception"] += 1
-            if isinstance(exc, (ValueError, TypeError, SyntaxError, MemoryError)):
-                logger.debug(
-                    "Skipping clone pair due to coordinate, syntax, or processing error: %s",
-                    exc,
-                )
-            else:
-                logger.warning(
-                    "Unexpected failure processing clone pair; rolling back changes for this pair: %s",
-                    exc,
-                    exc_info=True,
-                )
-            for p, snap in plans_snapshot.items():
-                if p in file_plans:
-                    file_plans[p].restore(snap)
-            for p in list(file_plans.keys()):
-                if p not in initial_plan_keys:
-                    del file_plans[p]
-            graph_holder[0] = graph_snapshot
-            continue
-
-    total_skipped = sum(skip_reasons.values())
-    if total_skipped > 0:
-        sorted_reasons = sorted(skip_reasons.items(), key=lambda kv: (-kv[1], kv[0]))
-        reason_summary = ", ".join(f"{cnt} {reason}" for reason, cnt in sorted_reasons)
-        logger.info("%d clone pair(s) skipped: %s", total_skipped, reason_summary)
-
-    patch_chunks: List[str] = []
-    seen_comments: Set[str] = set()
-    for plan in file_plans.values():
-        chunk = _render_file_patch_plan(
-            plan, replace_clones=replace_clones, repo_root=str(patch_root)
-        )
-        if chunk:
-            if not plan.replacements and not plan.module_helpers and not plan.method_helpers:
-                if chunk in seen_comments:
-                    continue
-                seen_comments.add(chunk)
-            patch_chunks.append(chunk)
-
-    return "\n".join(patch_chunks)
+@contextlib.contextmanager
+def _isolated_pair_ctx_manager_collectors() -> Iterator[
+    Tuple[Set[str], Set[Tuple[str, str]]]
+]:
+    """Collects heuristic and wildcard context-manager hits for one pair without polluting the session."""
+    with collect_heuristic_ctx_managers(isolate=True) as h_bucket:
+        with collect_wildcard_ctx_managers(isolate=True) as wc_bucket:
+            yield h_bucket, wc_bucket
+
+
+def _record_committed_pair_ctx_managers(
+    heuristics: Sequence[str],
+    wildcards: Sequence[Tuple[str, str]],
+) -> None:
+    """Records heuristic and wildcard context-manager assumptions for a committed patch pair."""
+    for mgr_name in heuristics:
+        record_heuristic_non_suppressing_ctx_manager(mgr_name)
+    for wc_pat, mgr_name in wildcards:
+        record_wildcard_ctx_manager_match(wc_pat, mgr_name)
+
+
+def _slice_loaded_unit_lines(
+    unit: Dict[str, Any], full_lines: Sequence[str]
+) -> Tuple[List[str], bool]:
+    """Slices already-loaded full-file lines to unit line bounds, returning (lines, is_placeholder)."""
+    u_start, u_end = resolve_unit_line_bounds(unit)
+    start = max(1, u_start)
+    end = min(len(full_lines), u_end)
+    if start - 1 < end:
+        return list(full_lines[start - 1 : end]), False
+    return [], True
 
 
 def generate_refactoring_patch(
@@ -4392,19 +516,1636 @@ def generate_refactoring_patch(
     cross_file_strategy: str = "auto",
     shared_module_name: str = "_common.py",
     depgraph: Optional[ModuleDependencyGraph] = None,
-    skip_pre_unit_closures: bool = False,
     closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    *,
+    on_diagnostic_error: Optional[Callable[[], None]] = None,
 ) -> str:
-    """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
-    return _generate_refactoring_patch_impl(
-        clones=clones,
-        repo_root=repo_root,
-        type_merge_strategy=type_merge_strategy,
-        replace_clones=replace_clones,
-        method_binding=method_binding,
-        cross_file_strategy=cross_file_strategy,
-        shared_module_name=shared_module_name,
-        depgraph=depgraph,
-        skip_pre_unit_closures=skip_pre_unit_closures,
-        closure_strictness=closure_strictness,
+    """Generates a git-apply compatible unified diff patch proposing shared helper extractions.
+
+    Per-unit ``UnitSchema`` fields (including ``unit["closure_strictness"]``) are validated
+    upfront via :func:`validate_unit_schema` and raise ``ValueError`` if invalid. Passing an
+    unrecognized string for the ``closure_strictness`` keyword argument logs a deduplicated
+    warning and falls back to the ``"pedantic"`` patch default.
+    """
+    with heuristic_ctx_manager_session(), analysis_session():
+        return _generate_refactoring_patch_impl(
+            clones=clones,
+            repo_root=repo_root,
+            type_merge_strategy=type_merge_strategy,
+            replace_clones=replace_clones,
+            method_binding=method_binding,
+            cross_file_strategy=cross_file_strategy,
+            shared_module_name=shared_module_name,
+            depgraph=depgraph,
+            closure_strictness=closure_strictness,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+            on_diagnostic_error=on_diagnostic_error,
+        )
+
+
+@dataclass
+class _PatchBatchState:
+    """Shared batch-level configuration, file plan registry, and dependency graph holder."""
+
+    fs_root: Path
+    patch_root: Path
+    import_root: Path
+    candidate_roots: Tuple[Path, ...]
+    cross_file_strategy: str
+    type_merge_strategy: str
+    method_binding: str
+    replace_clones: bool
+    shared_module_name: str
+    eff_caller_strictness: Optional[str]
+    eff_non_sup: Tuple[str, ...]
+    graph_holder: List[Optional[ModuleDependencyGraph]]
+    file_plans: Dict[Path, _FilePatchPlan] = field(default_factory=dict)
+    skip_reasons: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+
+    def get_depgraph(self) -> ModuleDependencyGraph:
+        """Lazily builds and returns the mutable module dependency graph for this batch."""
+        g = self.graph_holder[0]
+        if g is None:
+            g = build_module_graph(self.patch_root, import_root=self.import_root)
+            self.graph_holder[0] = g
+        return g
+
+    def get_plan(
+        self, file_p: Path, rel_f: str, text: str, is_new_file: bool = False
+    ) -> _FilePatchPlan:
+        """Returns the existing _FilePatchPlan for file_p or creates and registers a new one."""
+        if file_p not in self.file_plans:
+            self.file_plans[file_p] = _FilePatchPlan(
+                file_p, rel_f, text, is_new_file=is_new_file
+            )
+        return self.file_plans[file_p]
+
+
+@dataclass
+class _LoadedPairFiles:
+    """Validated file paths, plans, parsed ASTs, and effective unit dicts for one clone pair."""
+
+    u1: Dict[str, Any]
+    u2: Dict[str, Any]
+    u1_eff: Dict[str, Any]
+    u2_eff: Dict[str, Any]
+    f1_path: Path
+    f1_plan: _FilePatchPlan
+    f2_plan: Optional[_FilePatchPlan]
+    is_same_file: bool
+    orig_text: str
+    orig_lines: List[str]
+    f2_text: Optional[str]
+    u1_lines: List[str]
+    u2_lines: Optional[List[str]]
+    tree1: Optional[ast.AST]
+    tree2: Optional[ast.AST]
+    is_sub1: bool
+
+
+@dataclass
+class _ValidatedPairScopes:
+    """Validated scope analysis, receiver binding, and paired inputs/outputs for one clone pair."""
+
+    s1: Dict[str, Any]
+    s2: Dict[str, Any]
+    scope: Dict[str, Any]
+    enc1: Optional[Dict[str, Any]]
+    fn1_kind: str
+    is_static: bool
+    effective_binding: str
+    helper_indent: str
+    step: str
+    effective_pair_strictness: str
+    inputs: List[str]
+    outputs: List[str]
+    target_outs2: List[str]
+    t_inputs1: List[str]
+    t_inputs2: List[str]
+    scope_heuristics: Set[str]
+    scope_wildcards: Set[Tuple[str, str]]
+    out_heuristics: Set[str]
+    out_wildcards: Set[Tuple[str, str]]
+    lhs_pruned: bool = False
+
+
+@dataclass
+class _PreparedPairHelper:
+    """Synthesized helper code, naming, comments, and routing decision for one clone pair."""
+
+    loaded: _LoadedPairFiles
+    validated: _ValidatedPairScopes
+    helper_name: str
+    helper_code: str
+    await_prefix: str
+    f1_disp: str
+    f2_disp: str
+    pair_comment: str
+    pair_heuristics: List[str]
+    pair_wildcards: List[Tuple[str, str]]
+    candidate_units: List[Dict[str, Any]]
+    insert_line: int
+    cross_file_action: str
+    shared_p: Optional[Path]
+
+
+def _load_and_validate_pair_files(
+    batch: _PatchBatchState,
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    initial_plan_keys: Set[Path],
+    plans_snapshot: Dict[Path, _PlanSnapshot],
+) -> Optional[_LoadedPairFiles]:
+    """Resolves file paths, loads plans, checks pragmas/overlaps, and aligns subroutine kinds."""
+    norm1 = normalize_unit_boundary(u1)
+    norm2 = normalize_unit_boundary(u2)
+    f1_raw = normalize_path_string(norm1.file_path, strip_anchor=True)
+    if not f1_raw:
+        batch.skip_reasons["empty file path"] += 1
+        return None
+    f1_path, is_f1_rejected = _validate_clone_file_path(f1_raw, batch.candidate_roots)
+    if is_f1_rejected or f1_path is None:
+        batch.skip_reasons["invalid or rejected file path"] += 1
+        return None
+
+    if f1_path in initial_plan_keys and f1_path not in plans_snapshot:
+        plans_snapshot[f1_path] = batch.file_plans[f1_path].snapshot()
+
+    rel_f1 = _format_patch_relative_path(f1_path, batch.patch_root, batch.fs_root)
+    f1_plan = batch.file_plans.get(f1_path)
+    if f1_plan is None:
+        try:
+            orig_text = f1_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            batch.skip_reasons["unreadable file"] += 1
+            return None
+        f1_plan = batch.get_plan(f1_path, rel_f1, orig_text)
+    else:
+        orig_text = f1_plan.orig_text
+    orig_lines = f1_plan.orig_lines
+
+    f2_raw = normalize_path_string(norm2.file_path, strip_anchor=True)
+    f2_path: Optional[Path] = None
+    if f2_raw:
+        f2_path, is_f2_rejected = _validate_clone_file_path(f2_raw, batch.candidate_roots)
+        if is_f2_rejected:
+            batch.skip_reasons["invalid or rejected file path"] += 1
+            return None
+        if (
+            f2_path is not None
+            and f2_path in initial_plan_keys
+            and f2_path not in plans_snapshot
+        ):
+            plans_snapshot[f2_path] = batch.file_plans[f2_path].snapshot()
+
+    is_same_file = False
+    if f2_path is not None:
+        is_same_file = f1_path == f2_path or f1_path.resolve() == f2_path.resolve()
+    elif not f2_raw:
+        is_same_file = True
+    elif _is_same_file_path(f1_raw, f2_raw, repo_root=str(batch.fs_root)):
+        is_same_file = True
+
+    f2_plan: Optional[_FilePatchPlan] = None
+    if not is_same_file:
+        if not f2_raw:
+            batch.skip_reasons["missing second file"] += 1
+            return None
+        if f2_path is not None:
+            rel_f2 = _format_patch_relative_path(f2_path, batch.patch_root, batch.fs_root)
+            f2_plan = batch.file_plans.get(f2_path)
+            if f2_plan is None:
+                try:
+                    loaded_text = f2_path.read_text(encoding="utf-8")
+                    f2_plan = batch.get_plan(f2_path, rel_f2, loaded_text)
+                except (OSError, UnicodeDecodeError):
+                    f2_plan = None
+            if f2_plan is None and batch.replace_clones:
+                batch.skip_reasons["unreadable file"] += 1
+                return None
+        elif batch.replace_clones:
+            batch.skip_reasons["unreadable file"] += 1
+            return None
+
+    u1_lines = orig_lines
+    u2_lines = (
+        orig_lines
+        if is_same_file
+        else (f2_plan.orig_lines if f2_plan is not None else None)
     )
+    u1_eff = dict(u1, source_lines=u1_lines, source_lines_is_sliced=False)
+    u2_eff = (
+        dict(u2, source_lines=u2_lines, source_lines_is_sliced=False)
+        if u2_lines is not None
+        else dict(u2)
+    )
+    f2_text: Optional[str] = (
+        f2_plan.orig_text
+        if f2_plan is not None
+        else (f1_plan.orig_text if is_same_file else None)
+    )
+    tree1 = f1_plan.parsed_tree
+    tree2 = (
+        f2_plan.parsed_tree
+        if f2_plan is not None
+        else (tree1 if is_same_file else None)
+    )
+    if _unit_has_no_refactor_pragma(
+        u1, u1_lines, orig_text=orig_text, tree=tree1
+    ) or _unit_has_no_refactor_pragma(
+        u2, u2_lines, orig_text=f2_text, tree=tree2
+    ):
+        f1_disp = normalize_path_string(
+            unit_file_str(u1, default="file1"), strip_anchor=False
+        )
+        f2_disp = normalize_path_string(
+            unit_file_str(u2, default="file2"), strip_anchor=False
+        )
+        _record_skip_comment(
+            f1_plan,
+            f2_plan,
+            batch.skip_reasons,
+            "pragma inline suppression",
+            f"# Note: Clone pair ({f1_disp} vs {f2_disp}) skipped: "
+            f"inline '# pragma: no-refactor' present\n",
+        )
+        return None
+
+    if not _align_pair_expr_kinds(u1_eff, u2_eff):
+        batch.skip_reasons["mismatched subroutine kinds"] += 1
+        return None
+    root_str = str(batch.fs_root)
+    u1_col_lines, u1_col_ph = _slice_loaded_unit_lines(u1_eff, u1_lines)
+    u1_eff = resolve_unit_inferred_col_bounds(
+        u1_eff,
+        repo_root=root_str,
+        unit_code_lines=u1_col_lines,
+        is_placeholder_origin=u1_col_ph,
+        explicit_col_sliced=False,
+    ).unit
+    if u2_lines is not None:
+        u2_col_lines, u2_col_ph = _slice_loaded_unit_lines(u2_eff, u2_lines)
+        u2_eff = resolve_unit_inferred_col_bounds(
+            u2_eff,
+            repo_root=root_str,
+            unit_code_lines=u2_col_lines,
+            is_placeholder_origin=u2_col_ph,
+            explicit_col_sliced=False,
+        ).unit
+    elif not (
+        u2_eff.get("source_lines")
+        or u2_eff.get("source_text")
+        or u2_eff.get("file_source")
+    ):
+        u2_eff = resolve_unit_inferred_col_bounds(
+            u2_eff,
+            repo_root=root_str,
+            unit_code_lines=(),
+            is_placeholder_origin=True,
+        ).unit
+    else:
+        u2_eff = resolve_unit_inferred_col_bounds(u2_eff, repo_root=root_str).unit
+
+    if batch.replace_clones:
+        u1_claimed = any(
+            check_units_overlap(u1_eff, prev_u, repo_root=root_str)
+            for prev_u in f1_plan.claimed_units
+        )
+        target_plan_for_u2 = f1_plan if is_same_file else f2_plan
+        u2_claimed = (
+            any(
+                check_units_overlap(u2_eff, prev_u, repo_root=root_str)
+                for prev_u in target_plan_for_u2.claimed_units
+            )
+            if target_plan_for_u2 is not None
+            else False
+        )
+        if u1_claimed or u2_claimed:
+            batch.skip_reasons["overlapping claimed unit"] += 1
+            return None
+
+    is_sub1 = is_subroutine_unit(u1_eff, source_text=orig_text, tree=tree1)
+    is_sub2 = is_subroutine_unit(u2_eff, source_text=f2_text, tree=tree2)
+    u1_eff["is_subroutine"] = is_sub1
+    u2_eff["is_subroutine"] = is_sub2
+    if is_sub1 != is_sub2:
+        batch.skip_reasons["mismatched subroutine kinds"] += 1
+        logger.debug(
+            "Skipping clone pair (%s, %s): mismatched subroutine kinds "
+            "(is_sub1=%s, is_sub2=%s)",
+            u1.get("name"),
+            u2.get("name"),
+            is_sub1,
+            is_sub2,
+        )
+        return None
+    return _LoadedPairFiles(
+        u1=u1,
+        u2=u2,
+        u1_eff=u1_eff,
+        u2_eff=u2_eff,
+        f1_path=f1_path,
+        f1_plan=f1_plan,
+        f2_plan=f2_plan,
+        is_same_file=is_same_file,
+        orig_text=orig_text,
+        orig_lines=orig_lines,
+        f2_text=f2_text,
+        u1_lines=u1_lines,
+        u2_lines=u2_lines,
+        tree1=tree1,
+        tree2=tree2,
+        is_sub1=is_sub1,
+    )
+
+
+def _check_pair_scope_hazards(
+    batch: _PatchBatchState,
+    loaded: _LoadedPairFiles,
+    s1: Dict[str, Any],
+    s2: Dict[str, Any],
+    *,
+    fn1_kind: str,
+    fn2_kind: str,
+    receiver_kinds_differ: bool,
+) -> bool:
+    """Checks scope hazards, async/generator/receiver parity, and returns True if pair is safe."""
+    root_str = str(batch.fs_root)
+    allow_u2_ph = allows_u2_source_placeholder(
+        is_subroutine=loaded.is_sub1,
+        requires_u2_edit=batch.replace_clones,
+        source_text2=loaded.f2_text,
+        u2=loaded.u2_eff,
+        repo_root=root_str,
+    )
+    term_check = check_pair_core_hazards(
+        s1,
+        s2,
+        is_same_file=loaded.is_same_file,
+        allow_u2_placeholder=allow_u2_ph,
+        check_stage="terminal",
+    )
+    if term_check.skip_reason is not None:
+        batch.skip_reasons[term_check.skip_reason] += 1
+        return False
+
+    if loaded.u1_eff.get("kind") in (
+        "comprehension",
+        "complex_expr",
+    ) or loaded.u2_eff.get("kind") in ("comprehension", "complex_expr"):
+        stmt_lines1 = _extract_unit_token_lines(loaded.u1_eff, repo_root=root_str)
+        stmt_lines2 = _extract_unit_token_lines(loaded.u2_eff, repo_root=root_str)
+        if (
+            stmt_lines1 is None
+            or stmt_lines2 is None
+            or not _prune_pair_lhs_and_augassign_scopes(
+                loaded.u1_eff, loaded.u2_eff, s1, s2, stmt_lines1, stmt_lines2
+            )
+        ):
+            batch.skip_reasons["incompatible inputs or outputs"] += 1
+            return False
+
+    compat_check = check_pair_core_hazards(
+        s1,
+        s2,
+        is_same_file=loaded.is_same_file,
+        allow_u2_placeholder=allow_u2_ph,
+        check_stage="compatibility",
+    )
+    if compat_check.skip_reason is not None:
+        batch.skip_reasons[compat_check.skip_reason] += 1
+        if compat_check.skip_reason == "indeterminate async state":
+            logger.debug(
+                "Skipping clone pair (%s, %s): indeterminate async state",
+                loaded.u1.get("name"),
+                loaded.u2.get("name"),
+            )
+        return False
+
+    rec1 = loaded.u1_eff.get("receiver_param") or (
+        "cls" if fn1_kind == "class" else "self"
+    )
+    rec2 = loaded.u2_eff.get("receiver_param") or (
+        "cls" if fn2_kind == "class" else "self"
+    )
+    if (
+        _normalize_receiver_attrs(s1.get("attrs_read", []), rec1)
+        != _normalize_receiver_attrs(s2.get("attrs_read", []), rec2)
+        or _normalize_receiver_attrs(s1.get("attrs_written", []), rec1)
+        != _normalize_receiver_attrs(s2.get("attrs_written", []), rec2)
+    ):
+        batch.skip_reasons["incompatible receiver attribute accesses"] += 1
+        return False
+
+    post_check = check_pair_core_hazards(
+        s1,
+        s2,
+        is_same_file=loaded.is_same_file,
+        allow_u2_placeholder=allow_u2_ph,
+        check_stage="post_compat",
+    )
+    if post_check.skip_reason is not None:
+        batch.skip_reasons[post_check.skip_reason] += 1
+        if post_check.detail:
+            logger.debug(
+                "Skipping clone pair (%s, %s): %s (%s)",
+                loaded.u1.get("name"),
+                loaded.u2.get("name"),
+                post_check.skip_reason,
+                post_check.detail,
+            )
+        return False
+    if "embedded_return" in post_check.combined_hazards:
+        if loaded.u1_lines is None or loaded.u2_lines is None:
+            batch.skip_reasons["missing source lines"] += 1
+            return False
+        if not (
+            _has_unconditional_terminal_return(loaded.u1, loaded.u1_lines)
+            and _has_unconditional_terminal_return(loaded.u2, loaded.u2_lines)
+        ):
+            batch.skip_reasons["embedded return hazard"] += 1
+            return False
+    if receiver_kinds_differ and (
+        _has_receiver_reference(loaded.u1_eff, s1, repo_root=root_str)
+        or _has_receiver_reference(loaded.u2_eff, s2, repo_root=root_str)
+    ):
+        batch.skip_reasons["unbound receiver reference"] += 1
+        return False
+    return True
+
+
+class _PairEnclosingContext(NamedTuple):
+    """Resolved enclosing class/function metadata and receiver kinds for a clone pair."""
+
+    enc1: Optional[Dict[str, Any]]
+    orig_fn1: Optional[Dict[str, Any]]
+    orig_fn2: Optional[Dict[str, Any]]
+    is_same_class: bool
+    fn1_kind: str
+    fn2_kind: str
+    receiver_kinds_differ: bool
+    has_method_ctx: bool
+    is_static: bool
+
+
+def _resolve_pair_enclosing_context(
+    loaded: _LoadedPairFiles,
+) -> _PairEnclosingContext:
+    """Resolves enclosing class/method context and stamps inferred receiver metadata on u1_eff/u2_eff."""
+    enc1 = find_enclosing_class(loaded.orig_text, loaded.u1_eff, tree=loaded.tree1)
+    fn1 = find_enclosing_function(loaded.orig_text, loaded.u1_eff, tree=loaded.tree1)
+    enc2 = (
+        find_enclosing_class(loaded.f2_text, loaded.u2_eff, tree=loaded.tree2)
+        if loaded.f2_text is not None
+        else None
+    )
+    fn2 = (
+        find_enclosing_function(loaded.f2_text, loaded.u2_eff, tree=loaded.tree2)
+        if loaded.f2_text is not None
+        else None
+    )
+    is_same_class = bool(
+        loaded.is_same_file
+        and enc1
+        and enc2
+        and enc1["name"] == enc2["name"]
+        and enc1["start"] == enc2["start"]
+    )
+    orig_fn1, orig_fn2 = fn1, fn2
+    if not _is_method_of_class(fn1, enc1):
+        fn1 = None
+    if not _is_method_of_class(fn2, enc2):
+        fn2 = None
+
+    fn1_kind = _determine_unit_receiver_kind(fn1, loaded.u1_eff, enc1)
+    fn2_kind = _determine_unit_receiver_kind(fn2, loaded.u2_eff, enc2)
+    receiver_kinds_differ = bool(fn1_kind != fn2_kind)
+    has_method_ctx = bool(
+        fn1
+        and fn2
+        and (fn1.get("receiver_param") or fn1.get("is_static"))
+        and (fn2.get("receiver_param") or fn2.get("is_static"))
+    )
+    for fn_meta, fn_k, u_eff in (
+        (fn1, fn1_kind, loaded.u1_eff),
+        (fn2, fn2_kind, loaded.u2_eff),
+    ):
+        if fn_meta and u_eff.get("receiver_param") is None:
+            u_eff["receiver_param"] = fn_meta.get("receiver_param")
+        if fn_k != "none" and u_eff.get("receiver_kind") is None:
+            u_eff["receiver_kind"] = fn_k
+            if fn_k == "static":
+                u_eff["is_static"] = True
+    if fn1 and fn2:
+        is_static = bool(fn1.get("is_static") and fn2.get("is_static"))
+    else:
+        is_static = bool(
+            (fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static"))
+        )
+    return _PairEnclosingContext(
+        enc1=enc1,
+        orig_fn1=orig_fn1,
+        orig_fn2=orig_fn2,
+        is_same_class=is_same_class,
+        fn1_kind=fn1_kind,
+        fn2_kind=fn2_kind,
+        receiver_kinds_differ=receiver_kinds_differ,
+        has_method_ctx=has_method_ctx,
+        is_static=is_static,
+    )
+
+
+def _inspect_and_validate_pair_scopes(
+    batch: _PatchBatchState,
+    loaded: _LoadedPairFiles,
+) -> Optional[_ValidatedPairScopes]:
+    """Resolves enclosing scopes, closure policies, hazards, bindings, and paired I/O."""
+    root_str = str(batch.fs_root)
+    enc_ctx = _resolve_pair_enclosing_context(loaded)
+    enc1 = enc_ctx.enc1
+    is_same_class = enc_ctx.is_same_class
+    fn1_kind = enc_ctx.fn1_kind
+    fn2_kind = enc_ctx.fn2_kind
+    receiver_kinds_differ = enc_ctx.receiver_kinds_differ
+    has_method_ctx = enc_ctx.has_method_ctx
+    is_static = enc_ctx.is_static
+    orig_fn1 = enc_ctx.orig_fn1
+    orig_fn2 = enc_ctx.orig_fn2
+
+    # Apply monotone strict-wins pair resolution (pedantic > strict > lenient)
+    # across both units through the shared pair-evaluation pipeline.
+    scope_eval = evaluate_clone_pair_scopes(
+        loaded.u1_eff,
+        loaded.u2_eff,
+        policy_u1=loaded.u1,
+        policy_u2=loaded.u2,
+        closure_strictness=batch.eff_caller_strictness,
+        non_suppressing_ctx_managers=batch.eff_non_sup or None,
+        default_strictness="pedantic",
+        source_text1=loaded.orig_text,
+        source_text2=loaded.f2_text,
+        tree1=loaded.tree1,
+        tree2=loaded.tree2,
+        repo_root=root_str,
+        copy_scopes=True,
+        stamp_units=True,
+    )
+    effective_pair_strictness = scope_eval.policy.effective_mode
+    s1 = scope_eval.scope1
+    s2 = scope_eval.scope2
+    scope_heuristics = set(scope_eval.heuristics)
+    scope_wildcards = set(scope_eval.wildcards)
+
+    if orig_fn1 and orig_fn1.get("is_async") and s1.get("has_yield"):
+        s1["is_async"] = True
+    if orig_fn2 and orig_fn2.get("is_async") and s2.get("has_yield"):
+        s2["is_async"] = True
+    if not _check_pair_scope_hazards(
+        batch,
+        loaded,
+        s1,
+        s2,
+        fn1_kind=fn1_kind,
+        fn2_kind=fn2_kind,
+        receiver_kinds_differ=receiver_kinds_differ,
+    ):
+        return None
+
+    has_super = bool(s1.get("has_super") or s2.get("has_super"))
+    has_mangled = bool(s1.get("has_mangled_names") or s2.get("has_mangled_names"))
+    is_in_method = _is_pair_in_method(
+        loaded.u1_eff,
+        loaded.u2_eff,
+        method_binding=batch.method_binding,
+        has_super=has_super,
+        has_mangled=has_mangled,
+        has_method_context=has_method_ctx,
+    )
+    effective_binding = _resolve_effective_binding(
+        batch.method_binding,
+        is_same_class,
+        is_static=is_static,
+        receiver_kinds_differ=receiver_kinds_differ,
+        is_in_method=is_in_method,
+        receiver_kind=fn1_kind,
+    )
+    if has_super and (effective_binding == "module" or is_static):
+        batch.skip_reasons["super() in non-method helper"] += 1
+        return None
+    if has_mangled and (
+        effective_binding != "method" or not is_same_class or is_static
+    ):
+        batch.skip_reasons["mangled names in non-method helper"] += 1
+        return None
+    if (
+        s1.get("has_class_scoped_type_params")
+        or s2.get("has_class_scoped_type_params")
+    ) and (effective_binding != "method" or not is_same_class):
+        batch.skip_reasons["type_param closure capture"] += 1
+        return None
+
+    helper_indent = (
+        enc1["method_indent"]
+        if (effective_binding == "method" and enc1)
+        else ("    " if effective_binding == "method" else "")
+    )
+    step_hint = (
+        enc1["method_indent"][len(enc1["indent"]) :]
+        if (
+            enc1
+            and enc1.get("indent") is not None
+            and enc1["method_indent"].startswith(enc1["indent"])
+            and len(enc1["method_indent"]) > len(enc1["indent"])
+        )
+        else None
+    )
+    step = _derive_unit_indent_step(loaded.u1, loaded.orig_lines, step_hint)
+
+    digest1 = loaded.f1_plan.content_digest
+    digest2 = (
+        loaded.f2_plan.content_digest
+        if loaded.f2_plan is not None
+        else (digest1 if loaded.is_same_file else None)
+    )
+    with _isolated_pair_ctx_manager_collectors() as (out_heuristics, out_wildcards):
+        scope = analyze_unit_variable_scope(
+            loaded.u1_eff,
+            loaded.u2_eff,
+            repo_root=root_str,
+            tree1=loaded.tree1,
+            tree2=loaded.tree2,
+            scope1=s1,
+            scope2=s2,
+        )
+        inputs = list(scope.get("inputs", []))
+        if effective_binding == "module":
+            inputs = _prune_unshared_receivers(
+                inputs, loaded.u1_eff, loaded.u2_eff, s1, s2, repo_root=root_str
+            )
+        resolved_outs = resolve_clone_pair_outputs(
+            u1=loaded.u1_eff,
+            u2=loaded.u2_eff,
+            scope1=s1,
+            scope2=s2,
+            source_text1=loaded.f1_plan.orig_text,
+            source_text2=loaded.f2_text,
+            tree1=loaded.tree1,
+            tree2=loaded.tree2,
+            repo_root=root_str,
+            source_digest1=digest1,
+            source_digest2=digest2,
+            closure_strictness=effective_pair_strictness,
+            non_suppressing_ctx_managers=batch.eff_non_sup or None,
+            require_pairing=batch.replace_clones,
+            return_details=True,
+        )
+    if resolved_outs.outputs is None:
+        reason = resolved_outs.skip_reason or "unpaired outputs"
+        batch.skip_reasons[reason] += 1
+        logger.debug(
+            "Skipping clone pair (%s, %s): failed to resolve clone pair outputs (%s)",
+            loaded.u1.get("name"),
+            loaded.u2.get("name"),
+            reason,
+        )
+        return None
+    outputs, target_outs2 = resolved_outs.outputs
+    if has_async_generator_delegation_hazard(
+        s1, s2, has_outputs=bool(outputs or target_outs2)
+    ):
+        batch.skip_reasons["async generator delegation hazard"] += 1
+        logger.debug(
+            "Skipping clone pair (%s, %s): async generator cannot return "
+            "values or outputs",
+            loaded.u1.get("name"),
+            loaded.u2.get("name"),
+        )
+        return None
+    loaded.u1_eff["outputs"] = outputs
+    loaded.u2_eff["outputs"] = target_outs2
+    t_inputs1 = list(s1.get("inputs", []))
+    t_inputs2 = list(s2.get("inputs", []))
+    if effective_binding == "module":
+        t_inputs1 = _prune_unshared_receivers(
+            t_inputs1, loaded.u1_eff, loaded.u2_eff, s1, s2, repo_root=root_str
+        )
+        t_inputs2 = _prune_unshared_receivers(
+            t_inputs2, loaded.u2_eff, loaded.u1_eff, s2, s1, repo_root=root_str
+        )
+    if batch.replace_clones and (
+        len(t_inputs1) != len(inputs)
+        or len(t_inputs2) != len(inputs)
+        or not _outputs_compatible(
+            outputs,
+            target_outs2,
+            is_subroutine=loaded.is_sub1,
+            has_yield=bool(s1.get("has_yield") or s2.get("has_yield")),
+        )
+    ):
+        batch.skip_reasons["incompatible inputs or outputs"] += 1
+        logger.debug(
+            "Skipping clone pair (%s, %s): incompatible inputs or outputs",
+            loaded.u1.get("name"),
+            loaded.u2.get("name"),
+        )
+        return None
+    return _ValidatedPairScopes(
+        s1=s1,
+        s2=s2,
+        scope=scope,
+        enc1=enc1,
+        fn1_kind=fn1_kind,
+        is_static=is_static,
+        effective_binding=effective_binding,
+        helper_indent=helper_indent,
+        step=step,
+        effective_pair_strictness=effective_pair_strictness,
+        inputs=inputs,
+        outputs=outputs,
+        target_outs2=target_outs2,
+        t_inputs1=t_inputs1,
+        t_inputs2=t_inputs2,
+        scope_heuristics=scope_heuristics,
+        scope_wildcards=scope_wildcards,
+        out_heuristics=out_heuristics,
+        out_wildcards=out_wildcards,
+        lhs_pruned=(
+            loaded.u1_eff.get("kind") in ("comprehension", "complex_expr")
+            or loaded.u2_eff.get("kind") in ("comprehension", "complex_expr")
+        ),
+    )
+
+
+def _prepare_pair_helper_and_target(
+    batch: _PatchBatchState,
+    sim: float,
+    loaded: _LoadedPairFiles,
+    validated: _ValidatedPairScopes,
+    initial_plan_keys: Set[Path],
+    plans_snapshot: Dict[Path, _PlanSnapshot],
+) -> Optional[_PreparedPairHelper]:
+    """Selects cross-file routing, generates collision-free helper name & code, and builds pair comments."""
+    base_name1 = _base_unit_name(loaded.u1)
+    base_name2 = _base_unit_name(loaded.u2)
+    base_helper = (
+        f"_shared_{base_name1}"
+        if base_name1 == base_name2
+        else f"_shared_{base_name1}_{base_name2}"
+    )
+    shared_p: Optional[Path] = None
+    target_host_plan: Optional[_FilePatchPlan] = None
+    target_host_text: Optional[str] = None
+    cross_file_action = batch.cross_file_strategy
+    if not loaded.is_same_file and cross_file_action in ("skip", "none"):
+        batch.skip_reasons["cross-file refactoring skipped"] += 1
+        return None
+    if (
+        cross_file_action == "auto"
+        and not loaded.is_same_file
+        and loaded.f2_plan is not None
+    ):
+        common_dir = find_nearest_common_package(
+            loaded.f1_path, loaded.f2_plan.path, batch.patch_root
+        )
+        try:
+            res_common = common_dir.resolve()
+            is_top_level = res_common in (
+                batch.patch_root.resolve(),
+                (batch.patch_root / "src").resolve(),
+                batch.import_root.resolve(),
+            )
+        except (OSError, RuntimeError, ValueError):
+            is_top_level = False
+        cross_file_action = "host_module" if is_top_level else "shared_module"
+
+    if (
+        not loaded.is_same_file
+        and loaded.f2_plan is not None
+        and cross_file_action in ("shared_module", "shared")
+    ):
+        maybe_shared_p = _safely_resolve_shared_module_file(
+            loaded.f1_path,
+            loaded.f2_plan.path,
+            batch.patch_root,
+            batch.shared_module_name,
+            loaded.f1_plan,
+            loaded.f2_plan,
+        )
+        if maybe_shared_p is None:
+            batch.skip_reasons["shared module path unresolvable"] += 1
+            return None
+        shared_p = maybe_shared_p
+        if shared_p in initial_plan_keys and shared_p not in plans_snapshot:
+            plans_snapshot[shared_p] = batch.file_plans[shared_p].snapshot()
+        if _is_same_file_or_resolved(shared_p, loaded.f1_path):
+            target_host_plan = loaded.f1_plan
+        elif _is_same_file_or_resolved(shared_p, loaded.f2_plan.path):
+            target_host_plan = loaded.f2_plan
+        else:
+            target_host_plan = batch.file_plans.get(shared_p)
+            try:
+                if (
+                    target_host_plan is None
+                    and shared_p.is_file()
+                    and not shared_p.is_symlink()
+                ):
+                    try:
+                        shared_p.resolve().relative_to(batch.patch_root.resolve())
+                        target_host_text = shared_p.read_text(encoding="utf-8")
+                    except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
+                        pass
+            except (OSError, RuntimeError, ValueError):
+                pass
+
+    helper_name = base_helper
+    h_idx = 2
+    while (
+        helper_name in loaded.f1_plan.used_helper_names
+        or bool(re.search(rf"\b{re.escape(helper_name)}\b", loaded.orig_text))
+        or (
+            loaded.f2_plan is not None
+            and (
+                helper_name in loaded.f2_plan.used_helper_names
+                or bool(
+                    re.search(rf"\b{re.escape(helper_name)}\b", loaded.f2_plan.orig_text)
+                )
+            )
+        )
+        or (
+            target_host_plan is not None
+            and (
+                helper_name in target_host_plan.used_helper_names
+                or bool(
+                    re.search(
+                        rf"\b{re.escape(helper_name)}\b", target_host_plan.orig_text
+                    )
+                )
+            )
+        )
+        or (
+            target_host_text is not None
+            and bool(re.search(rf"\b{re.escape(helper_name)}\b", target_host_text))
+        )
+    ):
+        helper_name = f"{base_helper}_{h_idx}"
+        h_idx += 1
+
+    with _isolated_pair_ctx_manager_collectors() as (synth_heuristics, synth_wildcards):
+        helper_code = synthesize_shared_helper_code(
+            loaded.u1_eff,
+            loaded.u2_eff,
+            type_merge_strategy=batch.type_merge_strategy,
+            method_binding=validated.effective_binding,
+            indent=validated.helper_indent,
+            is_static=validated.is_static,
+            receiver_kind=(
+                validated.fn1_kind if validated.effective_binding == "method" else None
+            ),
+            step=validated.step,
+            repo_root=str(batch.fs_root),
+            helper_name=helper_name,
+            source_text1=loaded.f1_plan.orig_text,
+            source_text2=loaded.f2_text,
+            tree1=loaded.tree1,
+            tree2=loaded.tree2,
+            closure_strictness=validated.effective_pair_strictness,
+            non_suppressing_ctx_managers=batch.eff_non_sup or None,
+            outputs=validated.outputs,
+            outputs2=validated.target_outs2,
+            scope1=validated.s1,
+            scope2=validated.s2,
+            scope=validated.scope,
+            scopes_lhs_pruned=validated.lhs_pruned,
+        )
+    if not helper_code:
+        batch.skip_reasons["shared helper synthesis failed"] += 1
+        return None
+
+    await_prefix = "await " if validated.scope.get("is_async") else ""
+    f1_disp = normalize_path_string(
+        unit_file_str(loaded.u1, default="file1"), strip_anchor=False
+    )
+    f2_disp = normalize_path_string(
+        unit_file_str(loaded.u2, default="file2"), strip_anchor=False
+    )
+    pair_comment = f"# Clone Pair ({sim:.1%}): {f1_disp} <===> {f2_disp}\n"
+    pair_heuristics = normalize_heuristic_ctx_managers(
+        validated.scope_heuristics,
+        validated.out_heuristics,
+        synth_heuristics,
+        validated.s1.get("heuristic_ctx_managers"),
+        validated.s2.get("heuristic_ctx_managers"),
+        validated.scope.get("heuristic_ctx_managers"),
+    )
+    pair_wildcards = normalize_wildcard_ctx_manager_matches(
+        validated.scope_wildcards,
+        validated.out_wildcards,
+        synth_wildcards,
+        validated.s1.get("wildcard_ctx_managers"),
+        validated.s2.get("wildcard_ctx_managers"),
+        validated.scope.get("wildcard_ctx_managers"),
+    )
+    assumption_notes = format_ctx_manager_assumption_comments(
+        pair_heuristics,
+        pair_wildcards,
+    )
+    if assumption_notes:
+        pair_comment += assumption_notes + "\n"
+
+    candidate_units = [loaded.u1_eff]
+    if loaded.is_same_file and not check_units_overlap(
+        loaded.u1_eff, loaded.u2_eff, repo_root=str(batch.fs_root)
+    ):
+        candidate_units.append(loaded.u2_eff)
+    earliest_unit = min(candidate_units, key=_unit_start)
+    enc_fn_earliest = (
+        find_enclosing_function(
+            loaded.orig_text, earliest_unit, tree=loaded.f1_plan.parsed_tree
+        )
+        if validated.effective_binding == "method"
+        else None
+    )
+    insert_line = (
+        enc_fn_earliest["start"] if enc_fn_earliest else _unit_start(earliest_unit)
+    )
+    return _PreparedPairHelper(
+        loaded=loaded,
+        validated=validated,
+        helper_name=helper_name,
+        helper_code=helper_code,
+        await_prefix=await_prefix,
+        f1_disp=f1_disp,
+        f2_disp=f2_disp,
+        pair_comment=pair_comment,
+        pair_heuristics=pair_heuristics,
+        pair_wildcards=pair_wildcards,
+        candidate_units=candidate_units,
+        insert_line=insert_line,
+        cross_file_action=cross_file_action,
+        shared_p=shared_p,
+    )
+
+
+def _prepare_host_module_imports(
+    batch: _PatchBatchState,
+    prep: _PreparedPairHelper,
+    host_plan: _FilePatchPlan,
+    f2_plan: Optional[_FilePatchPlan],
+) -> Optional[Tuple[str, List[str], str, bool, str]]:
+    """Derives module paths and safely prepares host helper imports, returning None on skip."""
+    loaded = prep.loaded
+    mod1 = _derive_module_import_path(loaded.f1_path, batch.import_root)
+    is_pkg1 = loaded.f1_path.name == "__init__.py"
+    source_texts: List[Tuple[str, str, bool]] = [(loaded.orig_text, mod1, is_pkg1)]
+    mod2 = ""
+    if f2_plan is not None:
+        mod2 = _derive_module_import_path(f2_plan.path, batch.import_root)
+        source_texts.append(
+            (f2_plan.orig_text, mod2, f2_plan.path.name == "__init__.py")
+        )
+    mod_host = (
+        mod1
+        if host_plan is loaded.f1_plan
+        else _derive_module_import_path(host_plan.path, batch.import_root)
+    )
+    is_host_pkg = host_plan.path.name == "__init__.py"
+    helper_code, maybe_imports = _safely_prepare_helper_and_imports(
+        host_plan=host_plan,
+        helper_code=prep.helper_code,
+        scope=prep.validated.scope,
+        source_texts=source_texts,
+        f1_plan=loaded.f1_plan,
+        f2_plan=f2_plan,
+        host_mod=mod_host,
+        is_host_pkg=is_host_pkg,
+    )
+    if maybe_imports is None:
+        batch.skip_reasons["circular import or unresolvable import"] += 1
+        return None
+    return helper_code, maybe_imports, mod_host, is_host_pkg, mod2
+
+
+def _apply_same_file_pair_plan(
+    batch: _PatchBatchState,
+    prep: _PreparedPairHelper,
+) -> bool:
+    """Applies helper insertion and optional call delegation for a same-file clone pair."""
+    loaded = prep.loaded
+    val = prep.validated
+    prepared_imports = _prepare_host_module_imports(batch, prep, loaded.f1_plan, None)
+    if prepared_imports is None:
+        return False
+    helper_code, host_imports, _, _, _ = prepared_imports
+    loaded.f1_plan.used_helper_names.add(prep.helper_name)
+    loaded.f1_plan.comments.append(prep.pair_comment)
+    if batch.replace_clones:
+        _delegate_unit_in_plan(
+            loaded.u1_eff,
+            loaded.f1_plan,
+            helper_name=prep.helper_name,
+            inputs=val.inputs,
+            outputs=val.outputs,
+            scope=val.scope,
+            target_inputs=val.t_inputs1,
+            target_outputs=val.outputs,
+            await_prefix=prep.await_prefix,
+            binding=val.effective_binding,
+            step=val.step,
+        )
+        if len(prep.candidate_units) > 1:
+            _delegate_unit_in_plan(
+                loaded.u2_eff,
+                loaded.f1_plan,
+                helper_name=prep.helper_name,
+                inputs=val.inputs,
+                outputs=val.target_outs2,
+                scope=val.scope,
+                target_inputs=val.t_inputs2,
+                target_outputs=val.target_outs2,
+                await_prefix=prep.await_prefix,
+                binding=val.effective_binding,
+                step=val.step,
+            )
+    _attach_helper_to_plan(
+        loaded.f1_plan,
+        binding=val.effective_binding,
+        insert_line=prep.insert_line,
+        helper_code=helper_code,
+        missing_imports=host_imports,
+    )
+    return True
+
+
+def _resolve_shared_host_plan_and_callers(
+    batch: _PatchBatchState,
+    prep: _PreparedPairHelper,
+    f2_plan: _FilePatchPlan,
+) -> Optional[
+    Tuple[
+        _FilePatchPlan,
+        List[Tuple[_FilePatchPlan, Dict[str, Any], List[str], List[str]]],
+    ]
+]:
+    """Resolves or creates the shared-module host plan and caller list, failing closed on unsafe targets."""
+    loaded = prep.loaded
+    val = prep.validated
+    shared_p = prep.shared_p
+    if shared_p is None:
+        batch.skip_reasons["shared module path unresolvable"] += 1
+        return None
+    rel_shared = _format_patch_relative_path(shared_p, batch.patch_root, batch.fs_root)
+    if _is_same_file_or_resolved(shared_p, loaded.f1_path):
+        return loaded.f1_plan, [(f2_plan, loaded.u2_eff, val.t_inputs2, val.target_outs2)]
+    if _is_same_file_or_resolved(shared_p, f2_plan.path):
+        return f2_plan, [(loaded.f1_plan, loaded.u1_eff, val.t_inputs1, val.outputs)]
+
+    shared_plan = batch.file_plans.get(shared_p)
+    if shared_plan is None:
+        is_bad_target = False
+        kind_desc = ""
+        try:
+            if shared_p.is_symlink() or shared_p.is_dir():
+                is_bad_target = True
+                kind_desc = (
+                    "an existing symlink"
+                    if shared_p.is_symlink()
+                    else "an existing directory"
+                )
+        except (OSError, RuntimeError, ValueError) as exc:
+            is_bad_target = True
+            kind_desc = f"unresolvable ({exc})"
+        if is_bad_target:
+            _record_skip_comment(
+                loaded.f1_plan,
+                f2_plan,
+                batch.skip_reasons,
+                "shared module target is symlink or directory",
+                f"# Note: Cross-module clone pair; shared module path "
+                f"{rel_shared} is {kind_desc}; skipping extraction.\n",
+            )
+            return None
+        try:
+            is_existing_file = shared_p.is_file()
+        except (OSError, RuntimeError, ValueError):
+            is_existing_file = False
+        if is_existing_file:
+            try:
+                shared_p.resolve().relative_to(batch.patch_root.resolve())
+                shared_text = shared_p.read_text(encoding="utf-8")
+                shared_plan = batch.get_plan(
+                    shared_p, rel_shared, shared_text, is_new_file=False
+                )
+            except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
+                _record_skip_comment(
+                    loaded.f1_plan,
+                    f2_plan,
+                    batch.skip_reasons,
+                    "shared module read error",
+                    f"# Note: Cross-module clone pair; shared module file "
+                    f"{rel_shared} exists but could not be read; "
+                    f"skipping extraction.\n",
+                )
+                return None
+        else:
+            shared_plan = batch.get_plan(shared_p, rel_shared, "", is_new_file=True)
+    return shared_plan, [
+        (loaded.f1_plan, loaded.u1_eff, val.t_inputs1, val.outputs),
+        (f2_plan, loaded.u2_eff, val.t_inputs2, val.target_outs2),
+    ]
+
+
+def _apply_shared_module_pair_plan(
+    batch: _PatchBatchState,
+    prep: _PreparedPairHelper,
+    f2_plan: _FilePatchPlan,
+) -> bool:
+    """Applies cross-file shared-module extraction with circular-dependency verification."""
+    loaded = prep.loaded
+    val = prep.validated
+    resolved_host = _resolve_shared_host_plan_and_callers(batch, prep, f2_plan)
+    if resolved_host is None:
+        return False
+    host_plan, callers = resolved_host
+
+    prepared_imports = _prepare_host_module_imports(batch, prep, host_plan, f2_plan)
+    if prepared_imports is None:
+        return False
+    helper_code, host_imports, mod_host, is_host_pkg, _ = prepared_imports
+
+    host_disp = normalize_path_string(str(host_plan.rel_path), strip_anchor=False)
+    dg = batch.get_depgraph()
+    if mod_host and host_imports:
+        host_cycle = dg.check_cycle_if_imports_added(
+            mod_host,
+            host_imports,
+            file_path=host_plan.path,
+            is_package=is_host_pkg,
+        )
+        if host_cycle:
+            cycle_desc = (
+                f"Circular import detected (cycle: {' -> '.join(host_cycle)})"
+            )
+            _record_skip_comment(
+                loaded.f1_plan,
+                f2_plan,
+                batch.skip_reasons,
+                "circular import detected",
+                f"# Note: Cross-module clone pair; "
+                f"helper extraction to {host_disp} "
+                f"rejected due to circular dependency ({cycle_desc}).\n",
+            )
+            return False
+
+    tentative_dg = dg.copy()
+    if mod_host:
+        _register_plan_dependencies_in_graph(
+            tentative_dg, mod_host, host_plan.path, host_imports
+        )
+
+    caller_evaluations: List[
+        Tuple[
+            _FilePatchPlan,
+            Dict[str, Any],
+            List[str],
+            List[str],
+            str,
+            Optional[List[str]],
+        ]
+    ] = []
+    for c_plan, c_unit, c_tin, c_tout in callers:
+        c_mod = _derive_module_import_path(c_plan.path, batch.import_root)
+        c_cycle = (
+            tentative_dg.check_cycle_if_added(c_mod, mod_host)
+            if (c_mod and mod_host)
+            else None
+        )
+        caller_evaluations.append((c_plan, c_unit, c_tin, c_tout, c_mod, c_cycle))
+
+    if host_plan in (loaded.f1_plan, f2_plan) and caller_evaluations:
+        _, _, _, _, c_mod, c_cycle = caller_evaluations[0]
+        if c_cycle or not mod_host or not c_mod:
+            c_desc = f" (cycle: {' -> '.join(c_cycle)})" if c_cycle else ""
+            _record_skip_comment(
+                loaded.f1_plan,
+                f2_plan,
+                batch.skip_reasons,
+                "circular import detected",
+                f"# Note: Cross-module clone pair; "
+                f"helper extraction to {host_disp} "
+                f"rejected. Circular import or unresolvable module path{c_desc}.\n",
+            )
+            return False
+
+    if host_plan not in (loaded.f1_plan, f2_plan) and all(
+        bool(cycle or not mod_host or not m_call)
+        for _, _, _, _, m_call, cycle in caller_evaluations
+    ):
+        c_descs = [
+            f"{m_call}: {' -> '.join(cycle)}"
+            for _, _, _, _, m_call, cycle in caller_evaluations
+            if cycle
+        ]
+        c_txt = f" ({'; '.join(c_descs)})" if c_descs else ""
+        _record_skip_comment(
+            loaded.f1_plan,
+            f2_plan,
+            batch.skip_reasons,
+            "circular import detected",
+            f"# Note: Cross-module clone pair; helper extraction to {host_disp} "
+            f"rejected due to circular dependency{c_txt}.\n",
+        )
+        return False
+
+    host_plan.module_helpers.append(helper_code)
+    host_plan.missing_imports.extend(host_imports)
+    host_plan.used_helper_names.add(prep.helper_name)
+    loaded.f1_plan.used_helper_names.add(prep.helper_name)
+    f2_plan.used_helper_names.add(prep.helper_name)
+    host_plan.comments.append(prep.pair_comment)
+
+    if mod_host:
+        _register_plan_dependencies_in_graph(
+            dg, mod_host, host_plan.path, host_imports
+        )
+
+    if batch.replace_clones:
+        if host_plan is loaded.f1_plan:
+            _delegate_unit_in_plan(
+                loaded.u1_eff,
+                loaded.f1_plan,
+                helper_name=prep.helper_name,
+                inputs=val.inputs,
+                outputs=val.outputs,
+                scope=val.scope,
+                target_inputs=val.t_inputs1,
+                target_outputs=val.outputs,
+                await_prefix=prep.await_prefix,
+                binding=val.effective_binding,
+                step=val.step,
+            )
+        elif host_plan is f2_plan:
+            _delegate_unit_in_plan(
+                loaded.u2_eff,
+                f2_plan,
+                helper_name=prep.helper_name,
+                inputs=val.inputs,
+                outputs=val.target_outs2,
+                scope=val.scope,
+                target_inputs=val.t_inputs2,
+                target_outputs=val.target_outs2,
+                await_prefix=prep.await_prefix,
+                binding="module",
+            )
+
+    for c_plan, c_unit, c_tin, c_tout, mod_caller, cycle in caller_evaluations:
+        c_plan.comments.append(prep.pair_comment)
+        c_disp = normalize_path_string(str(c_plan.rel_path), strip_anchor=False)
+        if cycle or not mod_host or not mod_caller:
+            cycle_desc = (
+                f"Circular import detected (cycle: {' -> '.join(cycle)})"
+                if cycle
+                else "Unresolvable module import path"
+            )
+            cycle_msg = (
+                f"# Note: Cross-module clone pair; helper extracted to {host_disp}. "
+                f"{cycle_desc}; import manually into {c_disp}.\n"
+            )
+            c_plan.comments.append(cycle_msg)
+            host_plan.comments.append(cycle_msg)
+        else:
+            c_plan.missing_imports.append(f"from {mod_host} import {prep.helper_name}")
+            dg.add_dependency(mod_caller, mod_host)
+            if batch.replace_clones:
+                _delegate_unit_in_plan(
+                    c_unit,
+                    c_plan,
+                    helper_name=prep.helper_name,
+                    inputs=val.inputs,
+                    outputs=c_tout if c_tout is not None else val.outputs,
+                    scope=val.scope,
+                    target_inputs=c_tin,
+                    target_outputs=c_tout,
+                    await_prefix=prep.await_prefix,
+                    binding="module",
+                )
+            else:
+                c_plan.comments.append(
+                    f"# Note: Cross-module clone pair; helper extracted to {host_disp}. "
+                    f"Complete refactoring by replacing the clone with a call in {c_disp}.\n"
+                )
+    return True
+
+
+def _apply_host_module_pair_plan(
+    batch: _PatchBatchState,
+    prep: _PreparedPairHelper,
+    f2_plan: Optional[_FilePatchPlan],
+) -> bool:
+    """Applies cross-file host-module extraction (both live f2_plan and preview-only missing f2)."""
+    loaded = prep.loaded
+    val = prep.validated
+    if f2_plan is None and batch.replace_clones:
+        batch.skip_reasons["unreadable file"] += 1
+        return False
+    prepared_imports = _prepare_host_module_imports(batch, prep, loaded.f1_plan, f2_plan)
+    if prepared_imports is None:
+        return False
+    helper_code, host_imports, mod1, is_pkg1, mod2 = prepared_imports
+    if f2_plan is None:
+        loaded.f1_plan.used_helper_names.add(prep.helper_name)
+        loaded.f1_plan.comments.append(prep.pair_comment)
+        loaded.f1_plan.comments.append(
+            f"# Note: Cross-module clone pair; helper generated in {prep.f1_disp}. "
+            f"Complete refactoring by importing the helper into {prep.f2_disp}.\n"
+        )
+        _finalize_host_unit_and_helper(
+            plan=loaded.f1_plan,
+            unit=loaded.u1_eff,
+            helper_name=prep.helper_name,
+            inputs=val.inputs,
+            outputs=val.outputs,
+            scope=val.scope,
+            target_inputs=val.t_inputs1,
+            binding=val.effective_binding,
+            step=val.step,
+            insert_line=prep.insert_line,
+            helper_code=helper_code,
+            missing_imports=host_imports,
+            await_prefix=prep.await_prefix,
+            replace_clones=batch.replace_clones,
+        )
+        return True
+
+    dg = batch.get_depgraph()
+
+    if mod1 and host_imports:
+        host_cycle = dg.check_cycle_if_imports_added(
+            mod1,
+            host_imports,
+            file_path=loaded.f1_plan.path,
+            is_package=is_pkg1,
+        )
+        if host_cycle:
+            batch.skip_reasons["circular import detected"] += 1
+            cycle_desc = f" (cycle: {' -> '.join(host_cycle)})"
+            cycle_msg = (
+                f"# Note: Cross-module clone pair; helper extraction to {prep.f1_disp} "
+                f"rejected due to circular dependency{cycle_desc}.\n"
+            )
+            for plan in (loaded.f1_plan, f2_plan):
+                plan.comments.append(cycle_msg)
+            return False
+
+    tentative_dg = dg.copy()
+    if mod1:
+        _register_plan_dependencies_in_graph(
+            tentative_dg, mod1, loaded.f1_plan.path, host_imports
+        )
+    cycle = (
+        tentative_dg.check_cycle_if_added(mod2, mod1) if (mod1 and mod2) else None
+    )
+    direct_import = bool(
+        mod2
+        and _module_imports_target(
+            loaded.orig_text, mod2, current_mod=mod1, is_package=is_pkg1
+        )
+    )
+    if bool(cycle or direct_import) or not mod1 or not mod2:
+        batch.skip_reasons["circular import detected"] += 1
+        cycle_desc = ""
+        if cycle:
+            cycle_desc = f" (cycle: {' -> '.join(cycle)})"
+        elif direct_import:
+            cycle_desc = f" (cycle: {mod2} -> {mod1} -> {mod2})"
+        cycle_msg = (
+            f"# Note: Cross-module clone pair; helper extraction to {prep.f1_disp} rejected. "
+            f"Circular import or unresolvable module path{cycle_desc}.\n"
+        )
+        for plan in (loaded.f1_plan, f2_plan):
+            plan.comments.append(cycle_msg)
+        return False
+
+    _register_plan_dependencies_in_graph(dg, mod1, loaded.f1_plan.path, host_imports)
+    loaded.f1_plan.used_helper_names.add(prep.helper_name)
+    f2_plan.used_helper_names.add(prep.helper_name)
+    loaded.f1_plan.comments.append(prep.pair_comment)
+
+    _wire_cross_module_host_delegation(
+        f1_plan=loaded.f1_plan,
+        f2_plan=f2_plan,
+        u2=loaded.u2_eff,
+        mod1=mod1,
+        helper_name=prep.helper_name,
+        pair_comment=prep.pair_comment,
+        f1_disp=prep.f1_disp,
+        f2_disp=prep.f2_disp,
+        replace_clones=batch.replace_clones,
+        inputs=val.inputs,
+        outputs=val.outputs,
+        scope=val.scope,
+        t_inputs2=val.t_inputs2,
+        target_outs2=val.target_outs2,
+        await_prefix=prep.await_prefix,
+    )
+    if batch.replace_clones and mod1 and mod2:
+        dg.add_dependency(mod2, mod1)
+    _finalize_host_unit_and_helper(
+        plan=loaded.f1_plan,
+        unit=loaded.u1_eff,
+        helper_name=prep.helper_name,
+        inputs=val.inputs,
+        outputs=val.outputs,
+        scope=val.scope,
+        target_inputs=val.t_inputs1,
+        binding=val.effective_binding,
+        step=val.step,
+        insert_line=prep.insert_line,
+        helper_code=helper_code,
+        missing_imports=host_imports,
+        await_prefix=prep.await_prefix,
+        replace_clones=batch.replace_clones,
+    )
+    return True
+
+
+def _generate_refactoring_patch_impl(
+    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
+    repo_root: Optional[str] = None,
+    type_merge_strategy: str = "fallback_any",
+    replace_clones: bool = False,
+    method_binding: str = "auto",
+    cross_file_strategy: str = "auto",
+    shared_module_name: str = "_common.py",
+    depgraph: Optional[ModuleDependencyGraph] = None,
+    closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    *,
+    on_diagnostic_error: Optional[Callable[[], None]] = None,
+) -> str:
+    """Core implementation of generate_refactoring_patch inside active heuristic & analysis sessions."""
+    if not clones:
+        return ""
+    seen_unit_ids: Set[int] = set()
+    for _, u1_item, u2_item in clones:
+        for unit_item in (u1_item, u2_item):
+            unit_obj_id = id(unit_item)
+            if unit_obj_id not in seen_unit_ids:
+                seen_unit_ids.add(unit_obj_id)
+                validate_unit_schema(unit_item)
+
+    fs_root = Path(repo_root or os.getcwd()).resolve()
+    if fs_root.is_file():
+        fs_root = fs_root.parent
+    patch_root = _find_project_filesystem_root(fs_root)
+    import_root = _find_enclosing_package_root(fs_root)
+    norm_cross_strategy = (cross_file_strategy or "auto").strip().lower()
+    if norm_cross_strategy not in (
+        "auto",
+        "host_module",
+        "host",
+        "shared_module",
+        "shared",
+        "skip",
+    ):
+        norm_cross_strategy = "auto"
+    norm_type_strategy = (type_merge_strategy or "fallback_any").strip().lower()
+    if norm_type_strategy not in ("fallback_any", "union", "intersect", "strict"):
+        norm_type_strategy = "fallback_any"
+    norm_binding = (method_binding or "auto").strip().lower()
+    if norm_binding not in ("auto", "method", "module"):
+        norm_binding = "auto"
+
+    is_unrecognized_caller_strictness = (
+        closure_strictness is not None
+        and not is_recognized_closure_strictness(closure_strictness)
+    )
+    eff_caller_strictness: Optional[str] = (
+        str(closure_strictness).strip().lower()
+        if closure_strictness is not None and not is_unrecognized_caller_strictness
+        else closure_strictness
+    )
+    eff_non_sup = normalize_non_suppressing_ctx_managers(non_suppressing_ctx_managers)
+    if eff_caller_strictness == "lenient":
+        logger.debug("Generating patches with caller lenient closure strictness")
+
+    batch = _PatchBatchState(
+        fs_root=fs_root,
+        patch_root=patch_root,
+        import_root=import_root,
+        candidate_roots=(
+            (fs_root,) if repo_root is not None else (fs_root, patch_root, import_root)
+        ),
+        cross_file_strategy=norm_cross_strategy,
+        type_merge_strategy=norm_type_strategy,
+        method_binding=norm_binding,
+        replace_clones=replace_clones,
+        shared_module_name=shared_module_name,
+        eff_caller_strictness=eff_caller_strictness,
+        eff_non_sup=eff_non_sup,
+        graph_holder=[depgraph.copy() if depgraph is not None else None],
+    )
+
+    for sim, u1, u2 in clones:
+        if (
+            not is_valid_unit_coordinates(u1, strict=True)
+            or not is_valid_unit_coordinates(u2, strict=True)
+        ):
+            batch.skip_reasons["malformed coordinates"] += 1
+            logger.debug(
+                "Skipping clone pair with malformed unit coordinates: (%s, %s)",
+                u1,
+                u2,
+            )
+            continue
+
+        # Snapshot only plans touched in this pair so rollback stays O(1) per pair.
+        initial_plan_keys = set(batch.file_plans.keys())
+        plans_snapshot: Dict[Path, _PlanSnapshot] = {}
+        graph_snapshot = (
+            batch.graph_holder[0].copy() if batch.graph_holder[0] is not None else None
+        )
+        try:
+            loaded = _load_and_validate_pair_files(
+                batch, u1, u2, initial_plan_keys, plans_snapshot
+            )
+            if loaded is None:
+                continue
+            validated = _inspect_and_validate_pair_scopes(batch, loaded)
+            if validated is None:
+                continue
+            prep = _prepare_pair_helper_and_target(
+                batch, sim, loaded, validated, initial_plan_keys, plans_snapshot
+            )
+            if prep is None:
+                continue
+            if loaded.is_same_file:
+                committed = _apply_same_file_pair_plan(batch, prep)
+            elif loaded.f2_plan is not None and prep.cross_file_action in (
+                "skip",
+                "none",
+            ):
+                batch.skip_reasons["cross-file refactoring skipped"] += 1
+                committed = False
+            elif loaded.f2_plan is not None and prep.cross_file_action in (
+                "shared_module",
+                "shared",
+            ):
+                committed = _apply_shared_module_pair_plan(batch, prep, loaded.f2_plan)
+            else:
+                committed = _apply_host_module_pair_plan(batch, prep, loaded.f2_plan)
+            if committed:
+                _record_committed_pair_ctx_managers(
+                    prep.pair_heuristics, prep.pair_wildcards
+                )
+        except (AttributeError, NameError, RecursionError, ImportError, MemoryError):
+            raise
+        except Exception as exc:
+            batch.skip_reasons["processing exception"] += 1
+            if isinstance(exc, (UnitCollisionError, _DelegationCallError, SyntaxError)):
+                logger.debug(
+                    "Skipping clone pair due to collision, delegation, or syntax error: %s",
+                    exc,
+                )
+            else:
+                if on_diagnostic_error is not None:
+                    on_diagnostic_error()
+                logger.warning(
+                    "Unexpected failure processing clone pair; rolling back changes for this pair: %s",
+                    exc,
+                    exc_info=True,
+                )
+            for p, snap in plans_snapshot.items():
+                if p in batch.file_plans:
+                    batch.file_plans[p].restore(snap)
+            for p in list(batch.file_plans.keys()):
+                if p not in initial_plan_keys:
+                    del batch.file_plans[p]
+            batch.graph_holder[0] = graph_snapshot
+
+    total_skipped = sum(batch.skip_reasons.values())
+    if total_skipped > 0:
+        sorted_reasons = sorted(
+            batch.skip_reasons.items(), key=lambda kv: (-kv[1], kv[0])
+        )
+        reason_summary = ", ".join(f"{cnt} {reason}" for reason, cnt in sorted_reasons)
+        logger.info("%d clone pair(s) skipped: %s", total_skipped, reason_summary)
+
+    patch_chunks: List[str] = []
+    seen_comments: Set[str] = set()
+    for plan in batch.file_plans.values():
+        chunk = _render_file_patch_plan(
+            plan, replace_clones=replace_clones, repo_root=str(patch_root)
+        )
+        if chunk:
+            if (
+                not plan.replacements
+                and not plan.module_helpers
+                and not plan.method_helpers
+            ):
+                if chunk in seen_comments:
+                    continue
+                seen_comments.add(chunk)
+            patch_chunks.append(chunk)
+
+    return "\n".join(patch_chunks)

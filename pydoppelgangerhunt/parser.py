@@ -8,49 +8,61 @@ import hashlib
 import json
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
-from pydoppelgangerhunt.source_lines import split_source_lines
+from pydoppelgangerhunt._ast_compat import (
+    AST_MATCH_CASE_TYPES,
+    AST_MATCH_TYPES,
+    AST_TRYSTAR_TYPES,
+    AST_TRY_OR_TRYSTAR_TYPES,
+    is_match_node,
+)
+from pydoppelgangerhunt.source_lines import (
+    extract_notebook_code_cell_text,
+    safe_parse_ast,
+    split_source_lines,
+)
 
 BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
-COMPOUND_BLOCK_TYPES: Tuple[type, ...] = tuple(
-    cls
-    for cls in (
-        ast.If,
-        ast.For,
-        ast.AsyncFor,
-        ast.While,
-        ast.Try,
-        getattr(ast, "TryStar", None),
-        ast.With,
-        ast.AsyncWith,
-        getattr(ast, "Match", None),
-    )
-    if cls is not None
+COMPOUND_BLOCK_TYPES: Tuple[type, ...] = (
+    ast.If,
+    ast.For,
+    ast.AsyncFor,
+    ast.While,
+    ast.Try,
+    *AST_TRYSTAR_TYPES,
+    ast.With,
+    ast.AsyncWith,
+    *AST_MATCH_TYPES,
 )
 
-BRANCH_NODE_TYPES: Tuple[type, ...] = tuple(
-    cls
-    for cls in (
-        ast.If,
-        ast.IfExp,
-        ast.For,
-        ast.AsyncFor,
-        ast.While,
-        ast.Try,
-        getattr(ast, "TryStar", None),
-        ast.ExceptHandler,
-        getattr(ast, "match_case", None),
-        ast.With,
-        ast.AsyncWith,
-    )
-    if cls is not None
+BRANCH_NODE_TYPES: Tuple[type, ...] = (
+    ast.If,
+    ast.IfExp,
+    ast.For,
+    ast.AsyncFor,
+    ast.While,
+    ast.Try,
+    *AST_TRYSTAR_TYPES,
+    ast.ExceptHandler,
+    *AST_MATCH_CASE_TYPES,
+    ast.With,
+    ast.AsyncWith,
 )
 
-TRY_NODE_TYPES: Tuple[type, ...] = tuple(
-    cls for cls in (ast.Try, getattr(ast, "TryStar", None)) if cls is not None
-)
+TRY_NODE_TYPES: Tuple[type, ...] = AST_TRY_OR_TRYSTAR_TYPES
 
 
 def is_boilerplate_node(node: ast.AST) -> bool:
@@ -609,7 +621,7 @@ def _harvest_complex_expressions(
 
     try:
         _walk_outer(root)
-    except (RecursionError, MemoryError):
+    except RecursionError:
         pass
     return results
 
@@ -923,7 +935,7 @@ def _record_unit(
                 )
                 calls = extract_call_sequence(ast_target)
                 complexity = compute_cyclomatic_complexity(ast_target)
-        except (RecursionError, MemoryError):
+        except RecursionError:
             return
         if token_count >= effective_min_tokens:
             # 16 hex chars = 64 bits of entropy (2^64 keyspace). Collision probability for N=100k
@@ -1132,10 +1144,17 @@ def harvest_notebook_units(
     p = Path(file_path)
     try:
         data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
-    except (json.JSONDecodeError, OSError):
+    except (
+        json.JSONDecodeError,
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+        TypeError,
+        RecursionError,
+    ):
         return units
 
-    cells = data.get("cells", [])
+    cells = data.get("cells", []) if isinstance(data, dict) else None
     if not isinstance(cells, list):
         return units
 
@@ -1145,23 +1164,23 @@ def harvest_notebook_units(
         rel_file = str(p).replace("\\", "/")
 
     for idx, cell in enumerate(cells):
-        if not isinstance(cell, dict) or cell.get("cell_type") != "code":
-            continue
-        source_raw = cell.get("source", [])
-        cell_code = "".join(source_raw) if isinstance(source_raw, list) else str(source_raw)
-        if not cell_code.strip():
+        cell_code = extract_notebook_code_cell_text(cell)
+        if cell_code is None or not cell_code.strip():
             continue
 
         cell_label = f"{rel_file}#cell_{idx + 1}"
+        parsed_tree = safe_parse_ast(cell_code, filename=cell_label)
+        if parsed_tree is None:
+            continue
+        tree: ast.AST = parsed_tree
         try:
-            tree = ast.parse(cell_code, filename=cell_label)
             if idioms:
                 tree = _IdiomCanonicalizer().visit(tree)
                 ast.fix_missing_locations(tree)
             if commutative:
                 tree = _CommutativeCanonicalizer().visit(tree)
                 ast.fix_missing_locations(tree)
-        except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
+        except RecursionError:
             continue
 
         file_lines = [
@@ -1225,6 +1244,342 @@ def _iter_local_nodes(root: ast.AST) -> Iterator[ast.AST]:
             todo.extend(ast.iter_child_nodes(current))
 
 
+class _HarvestFileContext(NamedTuple):
+    """Shared file-level harvesting parameters passed to per-kind unit collectors."""
+
+    rel_file: str
+    min_lines: int
+    min_tokens: int
+    file_lines: List[str]
+    blind_indexing: bool
+    strip_annotations: bool
+    blind_literals: bool
+    filter_boilerplate: bool
+    consistent_renaming: bool
+    abstract_expressions: bool
+    strip_docstrings: bool
+
+    def record_kwargs(self) -> Dict[str, Any]:
+        """Returns common keyword options forwarded to _record_unit / _record_node_unit."""
+        return {
+            "file_lines": self.file_lines,
+            "blind_indexing": self.blind_indexing,
+            "strip_annotations": self.strip_annotations,
+            "blind_literals": self.blind_literals,
+            "filter_boilerplate": self.filter_boilerplate,
+            "consistent_renaming": self.consistent_renaming,
+            "abstract_expressions": self.abstract_expressions,
+            "strip_docstrings": self.strip_docstrings,
+        }
+
+
+def _resolve_function_unit_metadata(
+    node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+    *,
+    closure_parents: Dict[int, str],
+    enclosing_classes: Dict[int, str],
+    enclosing_class_starts: Dict[int, int],
+    harvest_closures: bool,
+) -> Tuple[str, str, Optional[str], Optional[int], Optional[str], bool, bool, bool]:
+    """Resolves unit kind, name, enclosing class, receiver kind, and static/async/closure flags."""
+    enc_class = enclosing_classes.get(id(node))
+    enc_class_start = enclosing_class_starts.get(id(node))
+    decs = getattr(node, "decorator_list", [])
+    fn_is_static = any(is_decorator_named(d, "staticmethod") for d in decs)
+    fn_is_class_method = any(is_decorator_named(d, "classmethod") for d in decs)
+    fn_is_async = isinstance(node, ast.AsyncFunctionDef)
+    is_nested = id(node) in closure_parents
+    is_closure = harvest_closures and is_nested
+    if is_nested:
+        fn_receiver_kind: Optional[str] = None
+        fn_is_static = False
+    elif fn_is_static:
+        fn_receiver_kind = "static"
+    elif fn_is_class_method:
+        fn_receiver_kind = "class"
+    elif enc_class:
+        fn_receiver_kind = "instance"
+    else:
+        fn_receiver_kind = None
+    if is_closure:
+        unit_kind = "closure"
+        unit_name = f"{closure_parents[id(node)]}:{node.name}"
+    else:
+        unit_kind = "function"
+        unit_name = node.name
+    return (
+        unit_kind,
+        unit_name,
+        enc_class,
+        enc_class_start,
+        fn_receiver_kind,
+        fn_is_static,
+        fn_is_async,
+        is_closure,
+    )
+
+
+def _harvest_function_clause_branches(
+    node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+    units: List[Dict[str, Any]],
+    ctx: _HarvestFileContext,
+    *,
+    unit_name: str,
+    enc_class: Optional[str],
+    enc_class_start: Optional[int],
+    fn_receiver_kind: Optional[str],
+    fn_is_static: bool,
+    fn_is_async: bool,
+) -> None:
+    """Harvests if/else, try/except/else/finally, and match/case clause branches inside node."""
+    common_kw = ctx.record_kwargs()
+
+    def _record_branch(label: str, body: List[ast.stmt], default_line: int) -> None:
+        _record_clause_branch(
+            units,
+            unit_name,
+            label,
+            ctx.rel_file,
+            body,
+            default_line,
+            ctx.min_lines,
+            ctx.min_tokens,
+            **common_kw,
+            enclosing_class=enc_class,
+            enclosing_class_start=enc_class_start,
+            receiver_kind=fn_receiver_kind,
+            is_static=fn_is_static,
+            is_async=_node_is_effectively_async(body, fn_is_async),
+        )
+
+    for stmt in _iter_local_nodes(node):
+        if isinstance(stmt, ast.If):
+            s_line = getattr(stmt, "lineno", 0)
+            _record_branch("if_branch", stmt.body, s_line)
+            if stmt.orelse:
+                _record_branch("else_branch", stmt.orelse, s_line)
+        elif isinstance(stmt, TRY_NODE_TYPES):
+            t_line = getattr(stmt, "lineno", 0)
+            for h_idx, handler in enumerate(getattr(stmt, "handlers", [])):
+                h_name = (
+                    handler.type.id
+                    if isinstance(handler.type, ast.Name)
+                    else f"handler_{h_idx}"
+                )
+                _record_branch(f"except_{h_name}", handler.body, t_line)
+            try_else = getattr(stmt, "orelse", None)
+            if try_else:
+                _record_branch("try_else", try_else, t_line)
+            try_finally = getattr(stmt, "finalbody", None)
+            if try_finally:
+                _record_branch("try_finally", try_finally, t_line)
+        elif is_match_node(stmt):  # pragma: no cover (py310+)
+            m_line = getattr(stmt, "lineno", 0)
+            for c_idx, case in enumerate(getattr(stmt, "cases", [])):
+                _record_branch(f"case_{c_idx + 1}", getattr(case, "body", []), m_line)
+
+
+def _harvest_function_units(
+    node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+    units: List[Dict[str, Any]],
+    ctx: _HarvestFileContext,
+    *,
+    closure_parents: Dict[int, str],
+    enclosing_classes: Dict[int, str],
+    enclosing_class_starts: Dict[int, int],
+    harvest_closures: bool,
+    functions_only: bool,
+    sliding_window: bool,
+    window_size: int,
+    clause_level: bool,
+) -> None:
+    """Harvests whole-function, compound-block, sliding-window, and clause-level units for node."""
+    fn_start = getattr(node, "lineno", 0)
+    fn_end = getattr(node, "end_lineno", fn_start)
+    fn_len = (fn_end or fn_start) - fn_start + 1
+    if ctx.file_lines and check_inline_suppression(ctx.file_lines, fn_start, fn_end):
+        return
+
+    (
+        unit_kind,
+        unit_name,
+        enc_class,
+        enc_class_start,
+        fn_receiver_kind,
+        fn_is_static,
+        fn_is_async,
+        is_closure,
+    ) = _resolve_function_unit_metadata(
+        node,
+        closure_parents=closure_parents,
+        enclosing_classes=enclosing_classes,
+        enclosing_class_starts=enclosing_class_starts,
+        harvest_closures=harvest_closures,
+    )
+    common_kw = ctx.record_kwargs()
+    meta_kw: Dict[str, Any] = {
+        "enclosing_class": enc_class,
+        "enclosing_class_start": enc_class_start,
+        "receiver_kind": fn_receiver_kind,
+        "is_static": fn_is_static,
+    }
+
+    # 1. Whole function / closure unit: omit thin 1-statement delegate wrappers
+    doc_offset = 1 if _get_docstring_node(node) is not None else 0
+    if len(node.body) - doc_offset > 1 or is_closure:
+        _record_node_unit(
+            units,
+            unit_name,
+            ctx.rel_file,
+            node,
+            ctx.min_lines,
+            ctx.min_tokens,
+            unit_kind,
+            **common_kw,
+            **meta_kw,
+            is_async=fn_is_async,
+        )
+
+    if not functions_only:
+        for item in _iter_local_nodes(node):
+            if item is not node and isinstance(item, COMPOUND_BLOCK_TYPES):
+                item_start = getattr(item, "lineno", 0)
+                item_end = getattr(item, "end_lineno", item_start) or item_start
+                if (item_end - item_start + 1) < fn_len:
+                    _record_unit(
+                        units,
+                        f"{unit_name}:{type(item).__name__}",
+                        ctx.rel_file,
+                        item_start,
+                        item_end,
+                        item,
+                        ctx.min_lines,
+                        ctx.min_tokens,
+                        "compound_block",
+                        **common_kw,
+                        **meta_kw,
+                        is_async=_node_is_effectively_async(item, fn_is_async),
+                    )
+
+    if sliding_window and hasattr(node, "body"):
+        body_stmts = [s for s in node.body if isinstance(s, ast.stmt)]
+        if len(body_stmts) >= window_size:
+            for w_idx in range(len(body_stmts) - window_size + 1):
+                window_slice = body_stmts[w_idx : w_idx + window_size]
+                w_start = getattr(window_slice[0], "lineno", 0)
+                w_end = getattr(window_slice[-1], "end_lineno", w_start) or w_start
+                _record_unit(
+                    units,
+                    f"{unit_name}:stmts_{w_idx+1}-{w_idx+window_size}",
+                    ctx.rel_file,
+                    w_start,
+                    w_end,
+                    window_slice,
+                    min_lines=ctx.min_lines,
+                    min_tokens=ctx.min_tokens,
+                    kind="sliding_window",
+                    **common_kw,
+                    **meta_kw,
+                    is_async=_node_is_effectively_async(window_slice, fn_is_async),
+                )
+
+    if clause_level and hasattr(node, "body"):
+        _harvest_function_clause_branches(
+            node,
+            units,
+            ctx,
+            unit_name=unit_name,
+            enc_class=enc_class,
+            enc_class_start=enc_class_start,
+            fn_receiver_kind=fn_receiver_kind,
+            fn_is_static=fn_is_static,
+            fn_is_async=fn_is_async,
+        )
+
+
+def _harvest_auxiliary_units(
+    tree: ast.AST,
+    units: List[Dict[str, Any]],
+    ctx: _HarvestFileContext,
+    *,
+    complex_expressions: bool,
+    min_expr_complexity: int,
+    data_tables: bool,
+    comprehensions: bool,
+    enclosing_classes: Dict[int, str],
+    enclosing_class_starts: Dict[int, int],
+    func_owners: Dict[int, str],
+    func_is_async: Dict[int, bool],
+) -> None:
+    """Harvests optional complex-expression, data-table, and comprehension units from tree."""
+    common_kw = ctx.record_kwargs()
+    if complex_expressions:  # pydoppelgangerhunt: ignore
+        for expr_node, expr_start, expr_end in _harvest_complex_expressions(
+            tree, min_complexity=min_expr_complexity
+        ):
+            _record_unit(
+                units,
+                f"expr:{expr_start}",
+                ctx.rel_file,
+                expr_start,
+                expr_end,
+                expr_node,
+                min_lines=1,
+                min_tokens=max(8, ctx.min_tokens // 2),
+                kind="complex_expr",
+                **common_kw,
+                is_async=_node_is_effectively_async(
+                    expr_node, func_is_async.get(id(expr_node), False)
+                ),
+            )
+
+    if data_tables:  # pydoppelgangerhunt: ignore
+        dt_visitor = _DataTableVisitor()
+        try:
+            dt_visitor.visit(tree)
+        except RecursionError:
+            dt_visitor.tables.clear()
+        for tbl_name, tbl_node, tbl_start, tbl_end in dt_visitor.tables:
+            _record_unit(
+                units,
+                f"data_table:{tbl_name}",
+                ctx.rel_file,
+                tbl_start,
+                tbl_end,
+                tbl_node,
+                min_lines=1,
+                min_tokens=max(10, ctx.min_tokens // 2),
+                kind="data_table",
+                **common_kw,
+            )
+
+    if comprehensions:
+        for comp in ast.walk(tree):
+            if isinstance(
+                comp,
+                (ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp),
+            ):
+                comp_name = type(comp).__name__.lower()
+                enc_cls = enclosing_classes.get(id(comp))
+                owner = func_owners.get(id(comp)) or enc_cls or "module"
+                start_l = getattr(comp, "lineno", 0)
+                _record_node_unit(
+                    units,
+                    f"{owner}:{comp_name}_L{start_l}",
+                    ctx.rel_file,
+                    comp,
+                    min_lines=1,
+                    min_tokens=max(8, ctx.min_tokens // 2),
+                    kind="comprehension",
+                    **common_kw,
+                    enclosing_class=enc_cls,
+                    enclosing_class_start=enclosing_class_starts.get(id(comp)),
+                    is_async=_node_is_effectively_async(
+                        comp, func_is_async.get(id(comp), False)
+                    ),
+                )
+
+
 def harvest_file_units(
     file_path: str,
     repo_root: str,
@@ -1272,18 +1627,21 @@ def harvest_file_units(
     p = Path(file_path)
     try:
         source = p.read_text(encoding="utf-8")
-        file_lines = [
-            ln.rstrip("\r\n")
-            for ln in split_source_lines(source)
-        ]
-        tree = ast.parse(source, filename=str(p))
+    except (ValueError, UnicodeDecodeError, OSError):
+        return units
+    file_lines = [ln.rstrip("\r\n") for ln in split_source_lines(source)]
+    parsed_tree = safe_parse_ast(source, filename=str(p))
+    if parsed_tree is None:
+        return units
+    tree: ast.AST = parsed_tree
+    try:
         if idioms:
             tree = _IdiomCanonicalizer().visit(tree)
             ast.fix_missing_locations(tree)
         if commutative:
             tree = _CommutativeCanonicalizer().visit(tree)
             ast.fix_missing_locations(tree)
-    except (SyntaxError, ValueError, UnicodeDecodeError, OSError, RecursionError, MemoryError):
+    except RecursionError:
         return units
 
     try:
@@ -1305,196 +1663,38 @@ def harvest_file_units(
             harvest_closures=harvest_closures,
             func_is_async=func_is_async,
         ).visit(tree)
-    except (RecursionError, MemoryError):
+    except RecursionError:
         return units
 
+    ctx = _HarvestFileContext(
+        rel_file=rel_file,
+        min_lines=min_lines,
+        min_tokens=min_tokens,
+        file_lines=file_lines,
+        blind_indexing=blind_indexing,
+        strip_annotations=strip_annotations,
+        blind_literals=blind_literals,
+        filter_boilerplate=filter_boilerplate,
+        consistent_renaming=consistent_renaming,
+        abstract_expressions=abstract_expressions,
+        strip_docstrings=strip_docstrings,
+    )
+    common_kw = ctx.record_kwargs()
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            fn_start = getattr(node, "lineno", 0)
-            fn_end = getattr(node, "end_lineno", fn_start)
-            fn_len = (fn_end or fn_start) - fn_start + 1
-            if file_lines and check_inline_suppression(file_lines, fn_start, fn_end):
-                continue
-
-            enc_class = enclosing_classes.get(id(node))
-            enc_class_start = enclosing_class_starts.get(id(node))
-            decs = getattr(node, "decorator_list", [])
-            fn_is_static = any(is_decorator_named(d, "staticmethod") for d in decs)
-            fn_is_class_method = any(is_decorator_named(d, "classmethod") for d in decs)
-            fn_is_async = isinstance(node, ast.AsyncFunctionDef)
-            is_nested = id(node) in closure_parents
-            is_closure = harvest_closures and is_nested
-            if is_nested:
-                fn_receiver_kind: Optional[str] = None
-                fn_is_static = False
-                fn_is_class_method = False
-            elif fn_is_static:
-                fn_receiver_kind = "static"
-            elif fn_is_class_method:
-                fn_receiver_kind = "class"
-            elif enc_class:
-                fn_receiver_kind = "instance"
-            else:
-                fn_receiver_kind = None
-            if is_closure:
-                unit_kind = "closure"
-                unit_name = f"{closure_parents[id(node)]}:{node.name}"
-            else:
-                unit_kind = "function"
-                unit_name = node.name
-
-            # 1. Whole function / closure unit: omit thin 1-statement delegate wrappers
-            doc_offset = 1 if _get_docstring_node(node) is not None else 0
-            if len(node.body) - doc_offset > 1 or is_closure:
-                _record_node_unit(
-                    units,
-                    unit_name,
-                    rel_file,
-                    node,
-                    min_lines,
-                    min_tokens,
-                    unit_kind,
-                    file_lines=file_lines,
-                    blind_indexing=blind_indexing,
-                    strip_annotations=strip_annotations,
-                    blind_literals=blind_literals,
-                    filter_boilerplate=filter_boilerplate,
-                    consistent_renaming=consistent_renaming,
-                    abstract_expressions=abstract_expressions,
-                    strip_docstrings=strip_docstrings,
-                    enclosing_class=enc_class,
-                    enclosing_class_start=enc_class_start,
-                    receiver_kind=fn_receiver_kind,
-                    is_static=fn_is_static,
-                    is_async=fn_is_async,
-                )
-
-            if not functions_only:
-                for item in _iter_local_nodes(node):
-                    if item is not node and isinstance(item, COMPOUND_BLOCK_TYPES):
-                        item_start = getattr(item, "lineno", 0)
-                        item_end = getattr(item, "end_lineno", item_start) or item_start
-                        block_lines = item_end - item_start + 1
-                        if block_lines < fn_len:
-                            _record_unit(
-                                units,
-                                f"{unit_name}:{type(item).__name__}",
-                                rel_file,
-                                item_start,
-                                item_end,
-                                item,
-                                min_lines,
-                                min_tokens,
-                                "compound_block",
-                                file_lines=file_lines,
-                                blind_indexing=blind_indexing,
-                                strip_annotations=strip_annotations,
-                                blind_literals=blind_literals,
-                                filter_boilerplate=filter_boilerplate,
-                                consistent_renaming=consistent_renaming,
-                                abstract_expressions=abstract_expressions,
-                                strip_docstrings=strip_docstrings,
-                                enclosing_class=enc_class,
-                                enclosing_class_start=enc_class_start,
-                                receiver_kind=fn_receiver_kind,
-                                is_static=fn_is_static,
-                                is_async=_node_is_effectively_async(item, fn_is_async),
-                            )
-
-            if sliding_window and hasattr(node, "body"):
-                body_stmts = [s for s in node.body if isinstance(s, ast.stmt)]
-                if len(body_stmts) >= window_size:
-                    for w_idx in range(len(body_stmts) - window_size + 1):
-                        window_slice = body_stmts[w_idx : w_idx + window_size]
-                        w_start = getattr(window_slice[0], "lineno", 0)
-                        w_end = getattr(window_slice[-1], "end_lineno", w_start) or w_start
-                        _record_unit(
-                            units,
-                            f"{unit_name}:stmts_{w_idx+1}-{w_idx+window_size}",
-                            rel_file,
-                            w_start,
-                            w_end,
-                            window_slice,
-                            min_lines=min_lines,
-                            min_tokens=min_tokens,
-                            kind="sliding_window",
-                            file_lines=file_lines,
-                            blind_indexing=blind_indexing,
-                            strip_annotations=strip_annotations,
-                            blind_literals=blind_literals,
-                            filter_boilerplate=filter_boilerplate,
-                            consistent_renaming=consistent_renaming,
-                            abstract_expressions=abstract_expressions,
-                            strip_docstrings=strip_docstrings,
-                            enclosing_class=enc_class,
-                            enclosing_class_start=enc_class_start,
-                            receiver_kind=fn_receiver_kind,
-                            is_static=fn_is_static,
-                            is_async=_node_is_effectively_async(window_slice, fn_is_async),
-                        )
-
-            if clause_level and hasattr(node, "body"):
-                def _record_branch(
-                    label: str,
-                    body: List[ast.stmt],
-                    default_line: int,
-                    u_name: str = unit_name,
-                    e_class: Optional[str] = enc_class,
-                    e_start: Optional[int] = enc_class_start,
-                    r_kind: Optional[str] = fn_receiver_kind,
-                    static_fn: bool = fn_is_static,
-                    async_fn: bool = fn_is_async,
-                ) -> None:
-                    _record_clause_branch(
-                        units,
-                        u_name,
-                        label,
-                        rel_file,
-                        body,
-                        default_line,
-                        min_lines,
-                        min_tokens,
-                        file_lines=file_lines,
-                        blind_indexing=blind_indexing,
-                        strip_annotations=strip_annotations,
-                        blind_literals=blind_literals,
-                        filter_boilerplate=filter_boilerplate,
-                        consistent_renaming=consistent_renaming,
-                        abstract_expressions=abstract_expressions,
-                        strip_docstrings=strip_docstrings,
-                        enclosing_class=e_class,
-                        enclosing_class_start=e_start,
-                        receiver_kind=r_kind,
-                        is_static=static_fn,
-                        is_async=_node_is_effectively_async(body, async_fn),
-                    )
-
-                for stmt in _iter_local_nodes(node):
-                    if isinstance(stmt, ast.If):
-                        s_line = getattr(stmt, "lineno", 0)
-                        _record_branch("if_branch", stmt.body, s_line)
-                        if stmt.orelse:
-                            _record_branch("else_branch", stmt.orelse, s_line)
-                    elif isinstance(stmt, TRY_NODE_TYPES):
-                        t_line = getattr(stmt, "lineno", 0)
-                        for h_idx, handler in enumerate(getattr(stmt, "handlers", [])):
-                            h_name = (
-                                handler.type.id
-                                if isinstance(handler.type, ast.Name)
-                                else f"handler_{h_idx}"
-                            )
-                            _record_branch(f"except_{h_name}", handler.body, t_line)
-                        try_else = getattr(stmt, "orelse", None)
-                        if try_else:
-                            _record_branch("try_else", try_else, t_line)
-                        try_finally = getattr(stmt, "finalbody", None)
-                        if try_finally:
-                            _record_branch("try_finally", try_finally, t_line)
-                    elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
-                        m_line = getattr(stmt, "lineno", 0)
-                        for c_idx, case in enumerate(getattr(stmt, "cases", [])):
-                            _record_branch(f"case_{c_idx + 1}", getattr(case, "body", []), m_line)
-
+            _harvest_function_units(
+                node,
+                units,
+                ctx,
+                closure_parents=closure_parents,
+                enclosing_classes=enclosing_classes,
+                enclosing_class_starts=enclosing_class_starts,
+                harvest_closures=harvest_closures,
+                functions_only=functions_only,
+                sliding_window=sliding_window,
+                window_size=window_size,
+                clause_level=clause_level,
+            )
         elif class_level and isinstance(node, ast.ClassDef):
             _record_node_unit(
                 units,
@@ -1504,103 +1704,22 @@ def harvest_file_units(
                 min_lines,
                 min_tokens,
                 "class",
-                file_lines=file_lines,
-                blind_indexing=blind_indexing,
-                strip_annotations=strip_annotations,
-                blind_literals=blind_literals,
-                filter_boilerplate=filter_boilerplate,
-                consistent_renaming=consistent_renaming,
-                abstract_expressions=abstract_expressions,
-                strip_docstrings=strip_docstrings,
+                **common_kw,
                 enclosing_class=enclosing_classes.get(id(node)),
                 enclosing_class_start=enclosing_class_starts.get(id(node)),
             )
 
-    if complex_expressions:  # pydoppelgangerhunt: ignore
-        for expr_node, expr_start, expr_end in _harvest_complex_expressions(
-            tree, min_complexity=min_expr_complexity
-        ):
-            _record_unit(
-                units,
-                f"expr:{expr_start}",
-                rel_file,
-                expr_start,
-                expr_end,
-                expr_node,
-                min_lines=1,
-                min_tokens=max(8, min_tokens // 2),
-                kind="complex_expr",
-                file_lines=file_lines,
-                blind_indexing=blind_indexing,
-                strip_annotations=strip_annotations,
-                blind_literals=blind_literals,
-                filter_boilerplate=filter_boilerplate,
-                consistent_renaming=consistent_renaming,
-                abstract_expressions=abstract_expressions,
-                strip_docstrings=strip_docstrings,
-                is_async=_node_is_effectively_async(
-                    expr_node, func_is_async.get(id(expr_node), False)
-                ),
-            )
-
-    if data_tables:  # pydoppelgangerhunt: ignore
-        dt_visitor = _DataTableVisitor()
-        try:
-            dt_visitor.visit(tree)
-        except (RecursionError, MemoryError):
-            dt_visitor.tables.clear()
-        for tbl_name, tbl_node, tbl_start, tbl_end in dt_visitor.tables:
-            _record_unit(
-                units,
-                f"data_table:{tbl_name}",
-                rel_file,
-                tbl_start,
-                tbl_end,
-                tbl_node,
-                min_lines=1,
-                min_tokens=max(10, min_tokens // 2),
-                kind="data_table",
-                file_lines=file_lines,
-                blind_indexing=blind_indexing,
-                strip_annotations=strip_annotations,
-                blind_literals=blind_literals,
-                filter_boilerplate=filter_boilerplate,
-                consistent_renaming=consistent_renaming,
-                abstract_expressions=abstract_expressions,
-                strip_docstrings=strip_docstrings,
-            )
-
-    if comprehensions:
-        for comp in ast.walk(tree):
-            if isinstance(
-                comp,
-                (ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp),
-            ):
-                comp_name = type(comp).__name__.lower()
-                enc_cls = enclosing_classes.get(id(comp))
-                owner = func_owners.get(id(comp)) or enc_cls or "module"
-                start_l = getattr(comp, "lineno", 0)
-                _record_node_unit(
-                    units,
-                    f"{owner}:{comp_name}_L{start_l}",
-                    rel_file,
-                    comp,
-                    min_lines=1,
-                    min_tokens=max(8, min_tokens // 2),
-                    kind="comprehension",
-                    file_lines=file_lines,
-                    blind_indexing=blind_indexing,
-                    strip_annotations=strip_annotations,
-                    blind_literals=blind_literals,
-                    filter_boilerplate=filter_boilerplate,
-                    consistent_renaming=consistent_renaming,
-                    abstract_expressions=abstract_expressions,
-                    strip_docstrings=strip_docstrings,
-                    enclosing_class=enc_cls,
-                    enclosing_class_start=enclosing_class_starts.get(id(comp)),
-                    is_async=_node_is_effectively_async(
-                        comp, func_is_async.get(id(comp), False)
-                    ),
-                )
-
+    _harvest_auxiliary_units(
+        tree,
+        units,
+        ctx,
+        complex_expressions=complex_expressions,
+        min_expr_complexity=min_expr_complexity,
+        data_tables=data_tables,
+        comprehensions=comprehensions,
+        enclosing_classes=enclosing_classes,
+        enclosing_class_starts=enclosing_class_starts,
+        func_owners=func_owners,
+        func_is_async=func_is_async,
+    )
     return units

@@ -8,18 +8,64 @@ import logging
 import textwrap
 import tokenize
 import warnings
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+    cast,
+)
 
-from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
+from pydoppelgangerhunt._ast_compat import (
+    is_cpython_parser_stack_overflow,
+    is_match_node,
+    is_trystar_node,
+    safe_parse_ast,
+)
+from pydoppelgangerhunt.fixer._df_cache import (
+    _NESTED_UNIT_KINDS,
+    _get_cached_tree_source_lines,
+    _get_or_parse_tree,
+    _get_valid_unit_bounds,
+    _register_tree_source_lines,
+)
+from pydoppelgangerhunt.fixer._df_cfg import _extract_import_bound_names
+from pydoppelgangerhunt.fixer._df_closures import (
+    _get_tree_scope_intervals,
+    _node_scope_bounds,
+)
+from pydoppelgangerhunt.fixer._unit_schema import (  # pylint: disable=useless-import-alias
+    UnitDict as UnitDict,
+    UnitSchema as UnitSchema,
+    _parse_unit_coord,
+    is_valid_unit_coordinates as is_valid_unit_coordinates,
+    validate_unit_schema as validate_unit_schema,
+)
 from pydoppelgangerhunt.source_lines import (
     count_physical_newlines,
     detect_line_ending,
+    is_non_string_sequence,
     is_sliced_unit_source_lines,
     normalize_unit_coordinates,
     parse_unit_coord,
+    read_notebook_cell_lines_cached,
     resolve_safe_unit_file_path,
     resolve_unit_line_bounds,
     split_source_lines,
+)
+from pydoppelgangerhunt.unit_boundary import (
+    END_COL_KEYS as _END_COL_KEYS,
+    END_LINE_KEYS as _END_LINE_KEYS,
+    START_COL_KEYS as _START_COL_KEYS,
+    START_LINE_KEYS as _START_LINE_KEYS,
+    resolve_unit_source_buffer,
 )
 
 logger = logging.getLogger(__name__)
@@ -27,6 +73,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ReplacementItem",
     "UnitDict",
+    "UnitSchema",
     "UnitSpan",
     "col_offset_to_char_offset",
     "compute_line_offsets",
@@ -42,6 +89,7 @@ __all__ = [
     "is_sliced_unit_source_lines",
     "is_subroutine_unit",
     "is_valid_unit_coordinates",
+    "lines_end_with_unconditional_return",
     "parse_unit_coord",
     "replace_unit_in_source",
     "resolve_safe_unit_file_path",
@@ -49,71 +97,8 @@ __all__ = [
     "resolve_unit_replacement",
     "slice_source_by_token_range",
     "split_source_lines",
+    "validate_unit_schema",
 ]
-
-UnitDict = Dict[str, Any]
-
-_parse_unit_coord = parse_unit_coord
-_resolve_safe_unit_file_path = resolve_safe_unit_file_path
-
-
-def is_valid_unit_coordinates(u: Any, strict: bool = False) -> bool:
-    """Verifies that an AST unit dictionary has valid integer coordinates.
-
-    Note (Behavior Change): When strict=False, a positive start coordinate
-    (start > 0) is required, and inverted coordinates (end < start) are
-    rejected. In strict mode (for code refactoring and patching), both start
-    and end are required and must parse strictly to positive integers (rejecting
-    floats, colons, and blank strings) with end >= start. End, start_col (or
-    start_col_offset), and end_col (or end_col_offset) must also parse strictly
-    if present, with end_col >= start_col if on the same line.
-    """
-    if not isinstance(u, dict):
-        return False
-    if "start" not in u or u.get("start") is None:
-        return False
-    if strict and ("end" not in u or u.get("end") is None):
-        return False
-    try:
-        start_val = parse_unit_coord(u, "start", default=None, strict=strict)
-        if start_val is None or start_val <= 0:
-            return False
-
-        end_val: Optional[int] = None
-        if "end" in u and u.get("end") is not None:
-            end_val = parse_unit_coord(u, "end", default=None, strict=strict)
-            if end_val is None or end_val <= 0 or end_val < start_val:
-                return False
-        elif strict:
-            return False
-
-        def _parse_and_validate_cols(keys: Tuple[str, ...]) -> Optional[int]:
-            first_val: Optional[int] = None
-            for key in keys:
-                if u.get(key) is not None:
-                    c_val = parse_unit_coord(u, key, default=None, strict=strict)
-                    if c_val is None or c_val < 0:
-                        raise ValueError
-                    if first_val is None:
-                        first_val = c_val
-            return first_val
-
-        start_col = _parse_and_validate_cols(("start_col", "start_col_offset"))
-        end_col = _parse_and_validate_cols(("end_col", "end_col_offset"))
-
-        effective_end = end_val if end_val is not None else start_val
-        if (
-            effective_end is not None
-            and start_col is not None
-            and end_col is not None
-            and start_val == effective_end
-            and end_col < start_col
-        ):
-            return False
-
-        return True
-    except (ValueError, TypeError, KeyError):
-        return False
 
 
 _is_valid_unit_coordinates = is_valid_unit_coordinates
@@ -192,11 +177,11 @@ def is_subroutine_unit(
         return False
 
     src = source_text or unit.get("source_text") or unit.get("file_source")
-    if not src and isinstance(unit.get("source_lines"), (list, tuple)):
+    if not src and is_non_string_sequence(unit.get("source_lines")):
         u_lines = unit["source_lines"]
         if not _is_sliced_excerpt_for_file(unit, u_lines):
             src = "".join(u_lines)
-    if isinstance(src, (list, tuple)):
+    if is_non_string_sequence(src):
         src = "".join(src)
     if (src and isinstance(src, str)) or tree is not None:
         try:
@@ -243,34 +228,41 @@ def _load_unit_file_text(
     """Reads full source text from memory or disk for AST inspection and read analysis.
 
     Buffer Resolution Priority:
-    1. Direct in-memory full source text ('source_text' or 'file_source').
-    2. In-memory line sequence ('source_lines') when not recognized as a pre-sliced excerpt.
-       When virtual/in-memory units span lines 1 through N of an N-line file, callers
-       must explicitly set 'source_lines_is_sliced': False (or provide 'source_text')
-       to prevent length ambiguity heuristics from bypassing the buffer.
-    3. Disk-based file resolution within repo_root.
+    1. In-memory line sequence (``source_lines``) when non-empty and not recognized as a
+       pre-sliced excerpt, matching ``extract_unit_source_lines_with_state``. When
+       virtual/in-memory units span lines 1 through N of an N-line file, callers must
+       explicitly set ``source_lines_is_sliced: False`` (or provide ``source_text``) to
+       prevent length ambiguity heuristics from bypassing the buffer.
+    2. Direct in-memory full source text (``source_text`` or ``file_source``).
+    3. Empty non-sliced ``source_lines`` buffers (ahead of disk lookup).
+    4. Disk-based file resolution within ``repo_root``.
     """
-    source_text = unit.get("source_text")
-    if source_text is None:
-        source_text = unit.get("file_source")
-    if source_text is not None:
-        return str(source_text)
+    buf = resolve_unit_source_buffer(
+        unit,
+        include_lines=False,
+        is_sliced_lines_fn=_is_sliced_excerpt_for_file,
+    )
+    if buf.is_invalid_notebook:
+        return None
+    if buf.full_text is not None:
+        return buf.full_text
+    if buf.blocked_by_lines:
+        return None
 
-    # In-memory full lines take precedence over disk (vital for IDE/LSP unsaved buffers)
-    unit_lines = unit.get("source_lines")
-    if unit_lines is not None and isinstance(unit_lines, (list, tuple)):
-        if not _is_sliced_excerpt_for_file(unit, unit_lines):
-            return "".join(
-                ln if ln.endswith(("\n", "\r")) else ln + "\n"
-                for ln in unit_lines
-            )
-
-    # Disk resolution: strictly only .py files within repo_root or CWD are accepted.
-    # Notebooks (.ipynb) and out-of-root files fail closed and return None.
+    # Disk resolution: accept .py files and anchored .ipynb#cell_N code cells within
+    # repo_root or CWD; unanchored/malformed/out-of-range/non-code notebook targets fail
+    # closed to None instead of exposing raw nbformat JSON.
     resolved_file = resolve_safe_unit_file_path(
-        unit, repo_root=repo_root, allowed_suffixes=(".py",)
+        unit, repo_root=repo_root, allowed_suffixes=(".py", ".ipynb")
     )
     if resolved_file is not None:
+        if resolved_file.suffix.lower() == ".ipynb":
+            if buf.notebook_anchor is None:
+                return None
+            cell_lines = read_notebook_cell_lines_cached(
+                resolved_file, buf.notebook_anchor[1]
+            )
+            return "".join(cell_lines) if cell_lines else None
         try:
             with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
                 return fh.read()
@@ -422,12 +414,14 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
 
     code_block = "\n".join(raw_lines)
     dedented = dedent_source_text(code_block)
+    parse_src = dedented
     try:
         wrapped = False
         try:
             tree = ast.parse(dedented)
         except IndentationError:
-            tree = ast.parse(f"if 1:\n{dedented}")
+            parse_src = f"if 1:\n{dedented}"
+            tree = ast.parse(parse_src)
             wrapped = True
         top_body = (
             tree.body[0].body
@@ -445,7 +439,7 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
             if body_nodes:
                 d_lines = [ln.rstrip("\r\n") for ln in split_source_lines(dedented)]
                 first_body = body_nodes[0]
-                start_l = _node_scope_bounds(first_body)[0] - line_offset
+                start_l = _node_scope_bounds(first_body, d_lines)[0] - line_offset
                 end_l = (
                     getattr(body_nodes[-1], "end_lineno", len(d_lines) + line_offset)
                     - line_offset
@@ -454,12 +448,22 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
                 if extracted:
                     if start_l == fn_node.lineno - line_offset:
                         b_col = getattr(first_body, "col_offset", 0)
-                        extracted[0] = extracted[0][b_col:]
+                        extracted[0] = _slice_utf8_line(extracted[0], b_col)
                     return [
                         ln.rstrip("\r\n")
                         for ln in split_source_lines(dedent_source_text("\n".join(extracted)))
                     ]
-    except Exception:
+    except MemoryError as exc:
+        if not is_cpython_parser_stack_overflow(exc, source=parse_src):
+            raise
+    except (
+        SyntaxError,
+        ValueError,
+        TypeError,
+        UnicodeDecodeError,
+        RecursionError,
+        IndexError,
+    ):
         pass
     return raw_lines
 
@@ -494,13 +498,38 @@ def _find_header_cookie_boundary(lines: List[str]) -> int:
     return boundary
 
 
+def _is_top_level_import_container(node: ast.AST) -> bool:
+    """Returns True for top-level compound blocks that may guard module-level imports."""
+    return (
+        isinstance(node, (ast.If, ast.Try, ast.With, ast.AsyncWith))
+        or is_trystar_node(node)
+        or is_match_node(node)
+    )
+
+
+def _iter_module_scope_imports(
+    root: ast.AST,
+) -> Iterator[Union[ast.Import, ast.ImportFrom]]:
+    """Yields module-scope Import/ImportFrom nodes inside root without descending into nested scopes."""
+    stack: List[ast.AST] = list(reversed(list(ast.iter_child_nodes(root))))
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, (ast.Import, ast.ImportFrom)):
+            yield curr
+        elif isinstance(
+            curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+        ):
+            continue
+        else:
+            stack.extend(reversed(list(ast.iter_child_nodes(curr))))
+
+
 def _find_module_helper_insertion_index(lines: List[str]) -> int:
     """Finds the line index after module docstring, future imports, and all module imports."""
     min_insert_idx = _find_header_cookie_boundary(lines)
 
-    try:
-        tree = ast.parse("".join(lines))
-    except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
+    tree = safe_parse_ast("".join(lines))
+    if tree is None:
         return min_insert_idx
 
     last_import_line = 0
@@ -518,17 +547,13 @@ def _find_module_helper_insertion_index(lines: List[str]) -> int:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             end_l = int(getattr(node, "end_lineno", None) or getattr(node, "lineno", 0) or 0)
             last_import_line = max(last_import_line, end_l)
-        elif (
-            isinstance(node, (ast.Try, ast.If, ast.With, ast.AsyncWith))
-            or type(node).__name__ == "TryStar"
-        ):
-            for sub in ast.walk(node):
-                if isinstance(sub, (ast.Import, ast.ImportFrom)):
-                    end_l = int(
-                        getattr(node, "end_lineno", None) or getattr(node, "lineno", 0) or 0
-                    )
-                    last_import_line = max(last_import_line, end_l)
-                    break
+        elif _is_top_level_import_container(node):
+            for _ in _iter_module_scope_imports(node):
+                end_l = int(
+                    getattr(node, "end_lineno", None) or getattr(node, "lineno", 0) or 0
+                )
+                last_import_line = max(last_import_line, end_l)
+                break
 
     target_line = max(last_import_line, docstring_line, min_insert_idx)
     if first_def_line is not None:
@@ -550,62 +575,155 @@ def _extract_slice_col_offset(
     return default
 
 
-def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]:
-    """Slices source lines to the exact start_col and end_col offsets of the unit."""
+def _slice_utf8_line(
+    line: str, s_col: int, e_col: Optional[int] = None
+) -> str:
+    """Slices a single line by UTF-8 byte column offsets.
+
+    When e_col < s_col (inverted column bounds), intentionally falls back to
+    line[s_char:] rather than collapsing the line to empty.
+    """
+    s_char = col_offset_to_char_offset(line, s_col)
+    if e_col is not None and e_col >= s_col:
+        return line[s_char : col_offset_to_char_offset(line, e_col)]
+    return line[s_char:]
+
+
+def _is_valid_eval_expr(text: str) -> bool:
+    """Returns True if text parses as a standalone Python expression."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return safe_parse_ast(stripped, mode="eval") is not None
+
+
+def _slice_unit_token_lines(
+    unit: Dict[str, Any],
+    lines: List[str],
+    *,
+    explicit_col_sliced: Optional[bool] = None,
+) -> Optional[List[str]]:
+    """Slices source lines to the exact start_col and end_col offsets of the unit.
+
+    Line-sliced excerpts still undergo first/last-line column clipping unless
+    ``source_lines_is_col_sliced=True`` (or ``explicit_col_sliced=True``) explicitly
+    declares that column offsets were already stripped. Out-of-bounds or invalid
+    ``start_col`` / ``end_col`` coordinates fail closed by returning ``None`` so
+    callers can distinguish column-slicing failures from legitimately empty inputs.
+    """
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
         return lines
-    s_col_opt = _extract_slice_col_offset(
-        unit, ("start_col", "start_col_offset"), default=0
+    raw_s_col = _extract_slice_col_offset(unit, _START_COL_KEYS, default=None)
+    e_col = _extract_slice_col_offset(unit, _END_COL_KEYS, default=None)
+    if (raw_s_col is not None and raw_s_col < 0) or (e_col is not None and e_col < 0):
+        return None
+    raw_col_flag = unit.get("source_lines_is_col_sliced")
+    eff_col_sliced = (
+        explicit_col_sliced
+        if explicit_col_sliced is not None
+        else (raw_col_flag if isinstance(raw_col_flag, bool) else None)
     )
-    e_col = _extract_slice_col_offset(
-        unit, ("end_col", "end_col_offset"), default=None
-    )
-    if s_col_opt is None or s_col_opt < 0 or e_col == -1:
-        return lines
-    s_col = s_col_opt
+    if eff_col_sliced is True:
+        return list(lines)
+    s_col = 0 if raw_s_col is None else raw_s_col
     res = list(lines)
+    first_byte_len = len(res[0].rstrip("\r\n").encode("utf-8"))
     if len(res) == 1:
-        res[0] = res[0][s_col:e_col] if (e_col is not None and e_col >= s_col) else res[0][s_col:]
-    else:
-        res[0] = res[0][s_col:]
-        if e_col is not None:
-            res[-1] = res[-1][:e_col]
-    return res
+        if (
+            s_col > first_byte_len
+            or (raw_s_col is not None and s_col >= first_byte_len)
+            or (e_col is not None and (e_col > first_byte_len or e_col <= s_col))
+        ):
+            return None
+        res[0] = _slice_utf8_line(res[0], s_col, e_col)
+        return res
+    last_byte_len = len(res[-1].rstrip("\r\n").encode("utf-8"))
+    if (
+        s_col > first_byte_len
+        or 0 < first_byte_len == s_col
+        or (e_col is not None and e_col > last_byte_len)
+    ):
+        return None
+    clipped = list(res)
+    if 0 < s_col < first_byte_len:
+        clipped[0] = _slice_utf8_line(clipped[0], s_col, None)
+    if e_col is not None:
+        clipped[-1] = _slice_utf8_line(clipped[-1], 0, e_col)
+    return clipped
+
+
+class _UnitTokenLinesResult(NamedTuple):
+    """Column-sliced unit body lines paired with placeholder-origin status."""
+
+    lines: Optional[List[str]]
+    is_placeholder: bool
+
+
+def _extract_unit_token_lines_with_state(
+    unit: Dict[str, Any], *, repo_root: Optional[str] = None
+) -> _UnitTokenLinesResult:
+    """Extracts body and column-sliced lines with placeholder status, falling back to ``source_code``."""
+    buf = resolve_unit_source_buffer(unit, repo_root=repo_root)
+    raw_lines = buf.lines
+    origin = buf.origin
+    if buf.is_invalid_notebook or (origin.is_placeholder and not raw_lines):
+        return _UnitTokenLinesResult(None, True)
+    used_source_code_fallback = False
+    if origin.is_placeholder:
+        src_code = unit.get("source_code")
+        if isinstance(src_code, str) and src_code.strip():
+            raw_lines = split_source_lines(src_code)
+            used_source_code_fallback = True
+    sliced = _slice_unit_token_lines(
+        unit,
+        _extract_unit_body_lines(
+            unit, [ln.rstrip("\r\n") for ln in raw_lines]
+        ),
+        explicit_col_sliced=True if used_source_code_fallback else None,
+    )
+    return _UnitTokenLinesResult(
+        sliced,
+        origin.is_placeholder and not used_source_code_fallback,
+    )
+
+
+def _extract_unit_token_lines(
+    unit: Dict[str, Any], *, repo_root: Optional[str] = None
+) -> Optional[List[str]]:
+    """Extracts body and column-sliced lines for a unit, falling back to ``source_code`` on non-empty placeholder origins."""
+    return _extract_unit_token_lines_with_state(unit, repo_root=repo_root).lines
+
+
+def _record_module_import_names(
+    stmt: Union[ast.Import, ast.ImportFrom],
+    imported: Set[str],
+) -> None:
+    """Records bound names (plus full dotted names for unaliased Import) into imported."""
+    imported.update(_extract_import_bound_names(stmt))
+    if isinstance(stmt, ast.Import):
+        for alias in stmt.names:
+            if not alias.asname and "." in alias.name:
+                imported.add(alias.name)
+    elif isinstance(stmt, ast.ImportFrom):
+        for alias in stmt.names:
+            if alias.name == "*" and not alias.asname:
+                imported.add("*")
 
 
 def _get_module_imported_names(
     source: str, include_conditional: bool = True
 ) -> Set[str]:
     """Extracts top-level imported module and symbol names from source code."""
-    try:
-        tree = ast.parse(source)
-    except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
+    tree = safe_parse_ast(source)
+    if tree is None:
         return set()
     imported: Set[str] = set()
     for stmt in tree.body:
-        if isinstance(stmt, ast.Import):
-            for alias in stmt.names:
-                imported.add(alias.asname or alias.name.split(".", maxsplit=1)[0])
-                if not alias.asname and "." in alias.name:
-                    imported.add(alias.name)
-        elif isinstance(stmt, ast.ImportFrom):
-            for alias in stmt.names:
-                imported.add(alias.asname or alias.name)
-        elif include_conditional and (
-            isinstance(stmt, (ast.If, ast.Try, ast.With, ast.AsyncWith))
-            or type(stmt).__name__ == "TryStar"
-        ):
-            for sub in ast.walk(stmt):
-                if isinstance(sub, ast.Import):
-                    for alias in sub.names:
-                        imported.add(
-                            alias.asname or alias.name.split(".", maxsplit=1)[0]
-                        )
-                        if not alias.asname and "." in alias.name:
-                            imported.add(alias.name)
-                elif isinstance(sub, ast.ImportFrom):
-                    for alias in sub.names:
-                        imported.add(alias.asname or alias.name)
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            _record_module_import_names(stmt, imported)
+        elif include_conditional and _is_top_level_import_container(stmt):
+            for sub in _iter_module_scope_imports(stmt):
+                _record_module_import_names(sub, imported)
     return imported
 
 
@@ -640,8 +758,8 @@ def _insert_imports_into_module(
     insert_idx = _find_header_cookie_boundary(orig_lines)
 
     parsed_with_ast = False
-    try:
-        tree = ast.parse("".join(orig_lines))
+    tree = safe_parse_ast("".join(orig_lines))
+    if tree is not None:
         doc_end = _extract_module_docstring_end_line(tree)
         future_end = max(
             (
@@ -659,8 +777,6 @@ def _insert_imports_into_module(
         while insert_idx < len(orig_lines) and not orig_lines[insert_idx].strip():
             insert_idx += 1
         parsed_with_ast = True
-    except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
-        pass
 
     if not parsed_with_ast:
         in_docstring = False
@@ -1020,16 +1136,8 @@ def compute_unit_spans(
 
     first_line = lines[start - 1]
     last_line = lines[end - 1]
-    raw_sc = (
-        unit.get("start_col")
-        if unit.get("start_col") is not None
-        else unit.get("start_col_offset")
-    )
-    raw_ec = (
-        unit.get("end_col")
-        if unit.get("end_col") is not None
-        else unit.get("end_col_offset")
-    )
+    raw_sc = next((unit.get(k) for k in _START_COL_KEYS if unit.get(k) is not None), None)
+    raw_ec = next((unit.get(k) for k in _END_COL_KEYS if unit.get(k) is not None), None)
 
     try:
         start_col = _parse_unit_coord(unit, "start_col", default=None)
@@ -1435,69 +1543,6 @@ def _find_sig_colon(line: str) -> int:
     return line.rfind(":")
 
 
-def _node_scope_bounds(node: ast.AST) -> Tuple[int, int]:
-    """Computes (earliest_start, n_end) line bounds for a scope AST node."""
-    n_start = getattr(node, "lineno", 0) or 0
-    n_end = getattr(node, "end_lineno", None) or n_start
-    decorators = getattr(node, "decorator_list", [])
-    dec_start = (
-        min((getattr(d, "lineno", None) or n_start) for d in decorators)
-        if decorators
-        else n_start
-    )
-    return min(dec_start, n_start), n_end
-
-
-def _compute_scope_intervals_sig(
-    tree: ast.AST, intervals: Sequence[Tuple[int, int, int, ast.AST]]
-) -> Tuple[Any, ...]:
-    """Computes a lightweight O(K) structural signature for scope interval cache validation."""
-    return (
-        tuple(id(s) for s in getattr(tree, "body", ())),
-        *(
-            (
-                id(node),
-                _node_scope_bounds(node),
-                getattr(node, "col_offset", 0),
-                tuple(id(s) for s in getattr(node, "body", ())),
-            )
-            for _, _, _, node in intervals
-        ),
-    )
-
-
-def _get_tree_scope_intervals(
-    tree: ast.AST,
-) -> List[Tuple[int, int, int, ast.AST]]:
-    """Builds and caches sorted intervals (earliest_start, n_end, span, node) on the tree."""
-    cached = getattr(tree, "_scope_intervals", None)
-    if (
-        isinstance(cached, list)
-        and getattr(tree, "_scope_intervals_sig", None)
-        == _compute_scope_intervals_sig(tree, cached)
-    ):
-        return cached
-    intervals: List[Tuple[int, int, int, ast.AST]] = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            earliest_start, n_end = _node_scope_bounds(node)
-            intervals.append((earliest_start, n_end, n_end - earliest_start, node))
-    intervals.sort(
-        key=lambda item: (item[2], -item[0], -getattr(item[3], "col_offset", 0))
-    )
-    try:
-        setattr(tree, "_scope_intervals", intervals)
-        setattr(
-            tree,
-            "_scope_intervals_sig",
-            _compute_scope_intervals_sig(tree, intervals),
-        )
-    except (AttributeError, TypeError):
-        pass
-    return intervals
-
-
-
 def _find_innermost_enclosing_node(
     source_text: str,
     unit: Dict[str, Any],
@@ -1505,17 +1550,12 @@ def _find_innermost_enclosing_node(
     tree: Optional[ast.AST] = None,
 ) -> Optional[Tuple[ast.AST, int, int]]:
     """Locates the innermost AST node of matching types enclosing the given unit."""
-    if not isinstance(unit, dict):
+    bounds = _get_valid_unit_bounds(unit)
+    if bounds is None:
         return None
-    try:
-        u_start = parse_unit_coord(unit, "start", default=0)
-        u_end = parse_unit_coord(unit, "end", default=u_start)
-    except (ValueError, TypeError):
-        return None
-    if u_start <= 0 or u_end <= 0 or u_start > u_end:
-        return None
+    u_start, u_end = bounds
 
-    if isinstance(source_text, (list, tuple)):
+    if is_non_string_sequence(source_text):
         source_text = "".join(source_text)
     elif not isinstance(source_text, str):
         return None
@@ -1527,8 +1567,16 @@ def _find_innermost_enclosing_node(
         if tree is None:
             return None
 
+    src_lines: Optional[Tuple[str, ...]] = _get_cached_tree_source_lines(tree)
+    if src_lines is None and source_text:
+        src_lines = _register_tree_source_lines(tree, source_text=source_text)
+        if src_lines is None:
+            src_lines = tuple(
+                ln.rstrip("\r\n") for ln in split_source_lines(source_text)
+            )
+
     candidates: List[Tuple[int, ast.AST, int, int]] = []
-    intervals = _get_tree_scope_intervals(tree)
+    intervals = _get_tree_scope_intervals(tree, source_lines=src_lines)
     for earliest_start, n_end, span, node in intervals:
         if isinstance(node, node_types):
             if earliest_start <= u_start <= u_end <= n_end:
@@ -1541,30 +1589,15 @@ def _find_innermost_enclosing_node(
     ):
         for node in ast.walk(tree):
             if isinstance(node, node_types):
-                n_start = getattr(node, "lineno", 0) or 0
-                n_end = getattr(node, "end_lineno", None) or n_start
-                decorators = getattr(node, "decorator_list", [])
-                dec_start = (
-                    min((getattr(d, "lineno", None) or n_start) for d in decorators)
-                    if decorators
-                    else n_start
-                )
-                earliest_start = min(dec_start, n_start)
+                earliest_start, n_end = _node_scope_bounds(node, src_lines)
                 if earliest_start <= u_start <= u_end <= n_end:
                     candidates.append((n_end - earliest_start, node, earliest_start, n_end))
 
-    is_sub_kind = bool(unit.get("is_subroutine")) or unit.get("kind") in (
-        "compound_block",
-        "sliding_window",
-        "clause_branch",
-        "comprehension",
-        "complex_expr",
-        "data_table",
+    is_sub_kind = (
+        bool(unit.get("is_subroutine")) or unit.get("kind") in _NESTED_UNIT_KINDS
     )
     if is_sub_kind and candidates:
-        u_start_col = _extract_slice_col_offset(
-            unit, ("start_col", "start_col_offset"), default=None
-        )
+        u_start_col = _extract_slice_col_offset(unit, _START_COL_KEYS, default=None)
         has_outer_fn = any(
             isinstance(c_node, (ast.FunctionDef, ast.AsyncFunctionDef))
             and not (
@@ -1614,3 +1647,58 @@ def find_enclosing_function_is_async(
     if res is None:
         return False
     return isinstance(res[0], ast.AsyncFunctionDef)
+
+
+def lines_end_with_unconditional_return(cand_lines: Sequence[str]) -> bool:
+    """Returns True when dedented candidate lines end with an unconditional top-level return statement."""
+    if not cand_lines:
+        return False
+    joined = "".join(
+        ln if ln.endswith(("\n", "\r")) else f"{ln}\n" for ln in cand_lines
+    )
+    dedented = dedent_source_text(joined)
+    if not dedented.strip():
+        return False
+    for wrapper in (None, "async def _w():\n"):
+        src = (
+            dedented
+            if wrapper is None
+            else wrapper + textwrap.indent(dedented, "    ")
+        )
+        mod = safe_parse_ast(src)
+        if mod is None:
+            continue
+        body = (
+            mod.body[0].body
+            if wrapper is not None
+            and len(mod.body) == 1
+            and isinstance(mod.body[0], ast.AsyncFunctionDef)
+            else mod.body
+        )
+        return bool(body) and isinstance(body[-1], ast.Return)
+    return False
+
+
+_ScopeValT = TypeVar("_ScopeValT")
+
+
+def _copy_scope_value(val: _ScopeValT) -> _ScopeValT:
+    """Recursively copies plain container values in a unit scope dictionary, preserving NamedTuples."""
+    if isinstance(val, dict):
+        return cast(_ScopeValT, {k: _copy_scope_value(v) for k, v in val.items()})
+    if isinstance(val, list):
+        return cast(_ScopeValT, [_copy_scope_value(item) for item in val])
+    if isinstance(val, tuple):
+        copied_items = [_copy_scope_value(item) for item in val]
+        make_fn = getattr(type(val), "_make", None)
+        if hasattr(val, "_fields") and callable(make_fn):
+            return cast(_ScopeValT, make_fn(copied_items))
+        return cast(_ScopeValT, tuple(copied_items))
+    if isinstance(val, set):
+        return cast(_ScopeValT, {_copy_scope_value(item) for item in val})
+    return val
+
+
+def _copy_scope_dict(scope: Dict[str, Any]) -> Dict[str, Any]:
+    """Returns a recursive copy of a unit scope dictionary."""
+    return {k: _copy_scope_value(v) for k, v in scope.items()}

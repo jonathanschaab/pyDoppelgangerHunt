@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict
 
-import pytest
 
 from pydoppelgangerhunt import (
     analyze_unit_variable_scope,
@@ -16,7 +14,7 @@ from pydoppelgangerhunt import (
     generate_refactoring_patch,
     synthesize_shared_helper_code,
 )
-from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
+from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=protected-access
     _is_method_of_class,
     _populate_unit_receiver_metadata,
     _prune_unshared_receivers,
@@ -802,14 +800,16 @@ def test_class_level_comprehension_receiver_kind_is_none(tmp_path: Path) -> None
     assert "self: Any" not in helper
     assert "def _shared" in helper
 
-def test_batch_54_fixer_path_resolution_and_receiver_metadata(tmp_path: Path) -> None:
-    """Batch 54: Test _normalize_file_path and _populate_unit_receiver_metadata edge cases."""
+def test_fixer_path_resolution_and_receiver_metadata(tmp_path: Path) -> None:
+    """Verifies _normalize_file_path and _populate_unit_receiver_metadata edge cases."""
     # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.fixer import (
-        _normalize_file_path,
-        _populate_unit_receiver_metadata,
         find_enclosing_class,
         find_enclosing_function,
+    )
+    from pydoppelgangerhunt.fixer.binding import (
+        _normalize_file_path,
+        _populate_unit_receiver_metadata,
     )
 
     # 1. Test _normalize_file_path with existing cwd-relative file and repo_root
@@ -1290,7 +1290,9 @@ def test_batch_83_method_without_positional_params_falls_back_to_module(tmp_path
 
 def test_batch_83_classmethod_receiver_ordering_cls_before_self() -> None:
     """Verifies that _format_helper_parameters sorts 'cls' before 'self' when primary_receiver is 'cls'."""
-    from pydoppelgangerhunt.fixer.synthesis import _format_helper_parameters  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer._synthesis_types import (  # pylint: disable=import-outside-toplevel
+        _format_helper_parameters,
+    )
 
     inputs = ["self", "cls", "data"]
     meta = {

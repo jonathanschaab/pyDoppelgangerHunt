@@ -4,77 +4,36 @@ from __future__ import annotations
 
 import ast
 import json
-import sqlite3
-import unittest.mock as mock
 from pathlib import Path
-from typing import Any
 
 import pydoppelgangerhunt
-from pydoppelgangerhunt.baseline import (
-    clone_pair_fingerprint,
-    filter_clones_by_baseline,
-    load_baseline,
-    record_baseline,
-)
-from pydoppelgangerhunt.clustering import UnionFind, cluster_clone_families
-from pydoppelgangerhunt.config import init_tool_configuration, load_toml_section, load_tool_config
+from pydoppelgangerhunt.clustering import cluster_clone_families
 from pydoppelgangerhunt.coverage import (
     check_asymmetric_coverage,
     compute_unit_coverage,
     read_coverage_data,
 )
 from pydoppelgangerhunt.fixer import generate_refactoring_patch, synthesize_shared_helper_code
-from pydoppelgangerhunt.git_diff import (
-    check_temporal_divergence,
-    filter_clones_by_git_diff,
-    get_git_blame_info,
-    get_git_modified_line_ranges,
-    is_unit_in_modified_ranges,
-    parse_git_diff_hunks,
-)
 from pydoppelgangerhunt.matcher import (
-    call_sequence_similarity,
-    compute_pair_similarity,
     compute_priority_score,
     jaccard_similarity,
-    lcs_alignment_similarity,
-    merge_adjacent_clones,
-    multiset_jaccard_similarity,
     scan_target,
-    suppress_subclones,
-    tfidf_jaccard_similarity,
-    tfidf_multiset_jaccard_similarity,
 )
-from pydoppelgangerhunt.metrics import compute_repository_dry_stats
 from pydoppelgangerhunt.parser import (
-    BUILTIN_NAMES,
     compute_cyclomatic_complexity,
-    extract_call_sequence,
-    get_ast_characteristic_vector,
     get_ast_shingles,
-    get_ast_tokens,
-    harvest_file_units,
     harvest_notebook_units,
-    is_boilerplate_node,
 )
 from pydoppelgangerhunt.reporters import (
-    colorize,
-    emit_structured_report,
-    extract_unit_source_code,
     format_github_annotations,
-    format_json_report,
-    format_markdown_summary,
     format_sarif_report,
-    generate_clone_diff,
     generate_html_report,
-    supports_color,
-    synthesize_refactoring_suggestion,
 )
 
 
 def test_package_metadata_and_exports() -> None:
     """Verify package exports and metadata."""
-    assert pydoppelgangerhunt.__version__ == "1.0.0"
+    assert pydoppelgangerhunt.__version__ == "2.0.0"
     assert callable(pydoppelgangerhunt.main)
     assert callable(pydoppelgangerhunt.scan_target)
     assert callable(pydoppelgangerhunt.cluster_clone_families)
@@ -245,8 +204,9 @@ def test_fixer_and_patch_synthesis(tmp_path: Path) -> None:
     u1 = {"file": str(file_a), "name": "op_one", "start": 1, "end": 3}
     u2 = {"file": str(file_b), "name": "op_two", "start": 1, "end": 3}
 
-    helper = synthesize_shared_helper_code(u1, u2)
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert "def _shared_op_one" in helper
+    assert "res = x + y" in helper
 
     patch = generate_refactoring_patch([(0.85, u1, u2)], repo_root=str(tmp_path))
     assert "--- a/" in patch

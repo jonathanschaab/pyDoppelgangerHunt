@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -13,15 +14,17 @@ from pydoppelgangerhunt import (
     replace_unit_in_source,
     synthesize_shared_helper_code,
 )
-from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
+from pydoppelgangerhunt.fixer.source import (  # pylint: disable=protected-access
     _detect_indent_step,
-    _extract_required_typing_imports,
     _extract_unit_body_lines,
     _find_module_helper_insertion_index,
     _get_module_imported_names,
     _insert_imports_into_module,
+    find_enclosing_function_is_async,
 )
-from pydoppelgangerhunt.fixer.source import find_enclosing_function_is_async
+from pydoppelgangerhunt.fixer._synthesis_types import (  # pylint: disable=protected-access
+    _extract_required_typing_imports,
+)
 
 
 def test_fixer_feedback_and_advanced_robustness(tmp_path: Path) -> None:
@@ -290,7 +293,7 @@ def test_extract_unit_source_code_empty_and_directory_path(tmp_path: Path) -> No
 
 def test_resolve_safe_unit_file_path_symlinked_root_prefix(tmp_path: Path) -> None:
     """Verifies that _resolve_safe_unit_file_path handles absolute paths with symlink roots."""
-    from pydoppelgangerhunt.fixer.source import _resolve_safe_unit_file_path
+    from pydoppelgangerhunt.fixer._unit_schema import _resolve_safe_unit_file_path
 
     real_repo = tmp_path / "real_repo"
     real_repo.mkdir()
@@ -371,7 +374,7 @@ def test_extract_unit_body_lines_single_line_function() -> None:
 
 def test_insert_imports_into_module_deduplicates_within_import_lines() -> None:
     """Verifies that _insert_imports_into_module eliminates duplicate imports present in import_lines."""
-    from pydoppelgangerhunt.fixer import _insert_imports_into_module  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.source import _insert_imports_into_module  # pylint: disable=import-outside-toplevel
 
     orig = ["def foo(): pass\n"]
     imports = ["from typing import Any", "from typing import Any", "from typing import Tuple"]
@@ -381,7 +384,7 @@ def test_insert_imports_into_module_deduplicates_within_import_lines() -> None:
 
 def test_extract_unit_body_lines_and_scope_method_kind(tmp_path: Path) -> None:
     """Verifies that units with kind='method' strip headers/docstrings and preserve method parameters."""
-    from pydoppelgangerhunt.fixer import _extract_unit_body_lines  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.source import _extract_unit_body_lines  # pylint: disable=import-outside-toplevel
 
     code = (
         "class Calculator:\n"
@@ -413,7 +416,7 @@ def test_extract_unit_body_lines_and_scope_method_kind(tmp_path: Path) -> None:
 
 def test_find_module_helper_insertion_index_with_try_except_and_conditional_imports() -> None:
     """Verifies that _find_module_helper_insertion_index places helpers after try/except and conditional imports."""
-    from pydoppelgangerhunt.fixer import _find_module_helper_insertion_index  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.source import _find_module_helper_insertion_index  # pylint: disable=import-outside-toplevel
 
     lines = [
         '"""Module docstring."""\n',
@@ -433,7 +436,7 @@ def test_find_module_helper_insertion_index_with_try_except_and_conditional_impo
 
 def test_is_docstring_node_and_extract_docstring_end_line() -> None:
     """Verifies that _is_docstring_node and _extract_docstring_end_line accurately detect docstrings."""
-    from pydoppelgangerhunt.fixer import (  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
         _extract_docstring_end_line,
         _is_docstring_node,
     )
@@ -460,9 +463,9 @@ def test_is_docstring_node_and_extract_docstring_end_line() -> None:
     fn_tree = ast.parse("def f():\n    '''Function docstring.'''\n    return 10\n")
     assert _extract_docstring_end_line(fn_tree.body[0]) == 2
 
-def test_batch_82_get_module_imported_names_guarded_imports() -> None:
+def test_get_module_imported_names_guarded_imports() -> None:
     """Verifies that _get_module_imported_names inspects top-level If and Try import blocks."""
-    from pydoppelgangerhunt.fixer import _get_module_imported_names  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.source import _get_module_imported_names  # pylint: disable=import-outside-toplevel
 
     code = (
         "import sys\n"
@@ -488,9 +491,9 @@ def test_batch_82_get_module_imported_names_guarded_imports() -> None:
     assert "List" not in unconditional
     assert "Sequence" not in unconditional
 
-def test_batch_82_slice_unit_token_lines_single_line_bounds() -> None:
+def test_slice_unit_token_lines_single_line_bounds() -> None:
     """Verifies defensive single-line column bounds check in _slice_unit_token_lines."""
-    from pydoppelgangerhunt.fixer import _slice_unit_token_lines  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines  # pylint: disable=import-outside-toplevel
 
     line = ["    total = sum(x for x in data)"]
     # Normal column slice
@@ -500,12 +503,12 @@ def test_batch_82_slice_unit_token_lines_single_line_bounds() -> None:
     )
     assert res_normal == ["sum(x for x in data)"]
 
-    # Inverted column bounds (e_col <= s_col) must not collapse the line to empty
+    # Inverted column bounds (e_col < s_col) must fail closed by returning None rather than slicing to EOL
     res_inverted = _slice_unit_token_lines(
         {"kind": "comprehension", "start_col": 12, "end_col": 5},
         list(line),
     )
-    assert res_inverted == ["sum(x for x in data)"]
+    assert res_inverted is None
 
 
 def test_insert_imports_orders_future_annotations_first() -> None:
@@ -708,18 +711,29 @@ def test_is_subroutine_unit_comprehension_with_source() -> None:
 
 
 def test_slice_unit_token_lines_invalid_or_negative_start_col() -> None:
-    """Verifies that _slice_unit_token_lines returns lines untouched on negative
-    or non-numeric start_col offsets."""
+    """Verifies that _slice_unit_token_lines fails closed (returns None) on negative or non-numeric column offsets."""
     from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
 
     lines = ["    res = [x for x in data]\n"]
-    # Negative start_col
-    u_neg = {"kind": "comprehension", "start_col": -5, "end_col": 10}
-    assert _slice_unit_token_lines(u_neg, lines) == lines
-
-    # Non-int start_col
-    u_bad = {"kind": "comprehension", "start_col": "invalid", "end_col": 10}
-    assert _slice_unit_token_lines(u_bad, lines) == lines
+    # Negative start_col and negative end_col both fail closed, even on col-sliced buffers.
+    for bad_unit in (
+        {"kind": "comprehension", "start_col": -5, "end_col": 10},
+        {"kind": "comprehension", "start_col": 4, "end_col": -2},
+        {
+            "kind": "comprehension",
+            "start_col": -5,
+            "end_col": 10,
+            "source_lines_is_col_sliced": True,
+        },
+        {
+            "kind": "comprehension",
+            "start_col": 4,
+            "end_col": -2,
+            "source_lines_is_col_sliced": True,
+        },
+        {"kind": "comprehension", "start_col": "invalid", "end_col": 10},
+    ):
+        assert _slice_unit_token_lines(bad_unit, lines) is None
 
 
 def test_is_sliced_excerpt_for_file_starts_at_line_one() -> None:
@@ -787,7 +801,7 @@ def test_load_unit_file_text_prioritizes_unsliced_source_lines_over_disk(tmp_pat
 
 
 def test_slice_unit_token_lines_offset_aliases() -> None:
-    """Verifies that _slice_unit_token_lines respects start_col_offset and end_col_offset."""
+    """Verifies that _slice_unit_token_lines respects start_col_offset, col_offset, and end_col_offset."""
     from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
 
     lines = ["    total = [x * 2 for x in items]\n"]
@@ -798,6 +812,15 @@ def test_slice_unit_token_lines_offset_aliases() -> None:
     }
     sliced = _slice_unit_token_lines(u_aliases, list(lines))
     assert sliced == ["[x * 2 for x in items]"]
+
+    u_col_offset = {
+        "kind": "comprehension",
+        "col_offset": 12,
+        "end_col": 34,
+    }
+    assert _slice_unit_token_lines(u_col_offset, list(lines)) == [
+        "[x * 2 for x in items]"
+    ]
 
     # Multi-line unit with offset aliases
     multi_lines = [
@@ -811,6 +834,7 @@ def test_slice_unit_token_lines_offset_aliases() -> None:
         "end_col_offset": 5,
     }
     sliced_multi = _slice_unit_token_lines(u_multi, list(multi_lines))
+    assert sliced_multi is not None
     assert sliced_multi[0] == "(\n"
     assert sliced_multi[1] == "        [x * 2 for x in items]\n"
     assert sliced_multi[2] == "    )"
@@ -842,7 +866,7 @@ def test_is_sliced_excerpt_for_file_explicit_flag_and_ambiguous_span() -> None:
 
 def test_extract_required_typing_imports_generator_types() -> None:
     """Verifies that Generator and AsyncGenerator are extracted from type annotations."""
-    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer._synthesis_types import (  # pylint: disable=import-outside-toplevel
         _extract_required_typing_imports,
     )
 
@@ -889,3 +913,1010 @@ def test_extract_unit_body_lines_indented_method_col0_multiline_string() -> None
     cr_text = "    x = '''header\rcol0_line'''\r    y = 1\r"
     assert _find_multiline_string_continuation_lines(cr_text) == {2}
     assert dedent_source_text(cr_text) == "x = '''header\rcol0_line'''\ry = 1\r"
+
+
+@pytest.mark.parametrize(
+    ("case_id", "src", "unit_template"),
+    [
+        pytest.param(
+            "utf8_multibyte_same_line_bytes_vs_chars",
+            "# header café\nval = 'αβ🚀' + target_expr\n",
+            {"start": 2, "end": 2, "kind": "complex_expr"},
+            id="utf8_multibyte_same_line",
+        ),
+        pytest.param(
+            "crlf_line_endings_preserved_across_lines",
+            "x = 1\r\nres = 'π' + target_expr\r\nz = 3\r\n",
+            {"start": 2, "end": 2, "kind": "complex_expr"},
+            id="crlf_line_endings",
+        ),
+        pytest.param(
+            "lone_cr_line_endings_preserved_across_lines",
+            "x = 1\rres = 'é' + target_expr\rz = 3\r",
+            {"start": 2, "end": 2, "kind": "complex_expr"},
+            id="lone_cr_line_endings",
+        ),
+    ],
+)
+def test_utf8_byte_and_char_offsets_and_line_ending_preservation(
+    case_id: str,
+    src: str,
+    unit_template: dict[str, object],
+) -> None:
+    """Verifies UTF-8 byte vs character offsets and CRLF/lone-CR replacement span integrity."""
+    from pydoppelgangerhunt import compute_unit_byte_offsets, compute_unit_char_offsets
+
+    expr = "target_expr"
+    start_val = unit_template["start"]
+    assert isinstance(start_val, int)
+    target_line_idx = start_val - 1
+    from pydoppelgangerhunt.source_lines import split_source_lines
+
+    line_str = split_source_lines(src)[target_line_idx]
+    char_start = line_str.index(expr)
+    byte_start = len(line_str[:char_start].encode("utf-8"))
+    byte_end = byte_start + len(expr.encode("utf-8"))
+    unit = {
+        **unit_template,
+        "start_col": byte_start,
+        "end_col": byte_end,
+        "source_text": src,
+    }
+    sb, eb = compute_unit_byte_offsets(src, unit)
+    sc, ec = compute_unit_char_offsets(src, unit)
+    assert src.encode("utf-8")[sb:eb].decode("utf-8") == expr, case_id
+    assert src[sc:ec] == expr, case_id
+    replaced = replace_unit_in_source(src, unit, "replacement_call()")
+    assert replaced.replace("replacement_call()", expr) == src, case_id
+
+
+def test_column_slicing_exact_eof_col_oob_col_and_no_double_slicing() -> None:
+    """Verifies exact end_col==len, end_col==len+1 rejection, and source_lines_is_col_sliced non-double-slicing."""
+    from pydoppelgangerhunt.fixer.scope import _has_out_of_bounds_unit_cols
+    from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
+
+    full_line = "val = x + y\n"
+    code_bytes = len(full_line.rstrip("\n").encode("utf-8"))  # 11
+
+    # Exact end_col == code_bytes succeeds cleanly
+    sliced_exact = _slice_unit_token_lines(
+        {"kind": "complex_expr", "start": 1, "end": 1, "start_col": 6, "end_col": code_bytes},
+        [full_line],
+    )
+    assert sliced_exact == ["x + y"]
+
+    # end_col == code_bytes + 1 fails closed in both _slice_unit_token_lines and _has_out_of_bounds_unit_cols
+    assert (
+        _slice_unit_token_lines(
+            {"kind": "complex_expr", "start": 1, "end": 1, "start_col": 6, "end_col": code_bytes + 1},
+            [full_line],
+        )
+        is None
+    )
+    assert (
+        _has_out_of_bounds_unit_cols(
+            {"kind": "complex_expr", "start": 1, "end": 1, "start_col": 6, "end_col": code_bytes + 1},
+            [full_line],
+            is_placeholder_origin=False,
+            explicit_col_sliced=False,
+        )
+        is True
+    )
+
+    # source_lines_is_col_sliced=True prevents double slicing already trimmed excerpts
+    already_trimmed = ["x + y"]
+    no_reslice = _slice_unit_token_lines(
+        {
+            "kind": "complex_expr",
+            "start": 1,
+            "end": 1,
+            "start_col": 6,
+            "end_col": code_bytes,
+            "source_lines_is_col_sliced": True,
+        },
+        already_trimmed,
+    )
+    assert no_reslice == already_trimmed
+
+
+def test_col_offset_alias_across_slicing_normalization_synthesis_and_patch(
+    tmp_path: Path,
+) -> None:
+    """Verifies 'col_offset' acts consistently as 'start_col' across slicing, validation, synthesis, and patching."""
+    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch
+    from pydoppelgangerhunt.fixer.source import (
+        _slice_unit_token_lines,
+        validate_unit_schema,
+    )
+    from pydoppelgangerhunt.fixer.synthesis import synthesize_shared_helper_code
+    from pydoppelgangerhunt.source_lines import (
+        normalize_unit_coordinates,
+        parse_unit_coord,
+    )
+
+    line_text = "result = (alpha + beta) * 2\n"
+    expr = "(alpha + beta) * 2"
+    col_start = line_text.index(expr)
+    col_end = col_start + len(expr)
+
+    # Direct token slicing respects col_offset and strips leading assignment prefix
+    sliced = _slice_unit_token_lines(
+        {
+            "kind": "complex_expr",
+            "start": 1,
+            "end": 1,
+            "col_offset": col_start,
+            "end_col": col_end,
+        },
+        [line_text],
+    )
+    assert sliced == [expr]
+
+    norm_u = normalize_unit_coordinates(
+        {"start": 1, "end": 1, "col_offset": col_start, "end_col_offset": col_end}
+    )
+    assert norm_u["start_col"] == col_start
+    assert norm_u["end_col"] == col_end
+    assert parse_unit_coord({"col_offset": col_start}, "start_col", default=None) == col_start
+
+    # Conflicting start_col vs col_offset fails validation cleanly
+    with pytest.raises(ValueError, match="Conflicting coordinate aliases"):
+        validate_unit_schema(
+            {"start": 1, "end": 1, "start_col": col_start + 1, "col_offset": col_start}
+        )
+
+    # End-to-end synthesis & patch generation with col_offset-only expression units
+    src = (
+        "def fn_one(a, b):\n"
+        "    out = (a + b) * 2 + 1\n"
+        "    return out\n"
+        "\n"
+        "def fn_two(c, d):\n"
+        "    val = (c + d) * 2 + 1\n"
+        "    return val\n"
+    )
+    mod_file = tmp_path / "expr_mod.py"
+    mod_file.write_text(src, encoding="utf-8")
+    lines = src.splitlines(keepends=True)
+    e1 = "(a + b) * 2 + 1"
+    e2 = "(c + d) * 2 + 1"
+    u1: dict[str, Any] = {
+        "file": str(mod_file),
+        "name": "fn_one",
+        "kind": "complex_expr",
+        "start": 2,
+        "end": 2,
+        "col_offset": lines[1].index(e1),
+        "end_col": lines[1].index(e1) + len(e1),
+    }
+    u2: dict[str, Any] = {
+        "file": str(mod_file),
+        "name": "fn_two",
+        "kind": "complex_expr",
+        "start": 6,
+        "end": 6,
+        "col_offset": lines[5].index(e2),
+        "end_col": lines[5].index(e2) + len(e2),
+    }
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "def _shared_" in helper
+    assert "return " in helper
+    ast.parse(helper)
+
+    patch_text = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert "def _shared_" in patch_text
+    assert "_shared_" in patch_text
+    assert "out = _shared_" in patch_text
+    assert "val = _shared_" in patch_text
+
+
+@pytest.mark.parametrize(
+    ("line", "start_col", "end_col", "expected"),
+    [
+        pytest.param("x = [i for i in items]", 4, 4, None, id="zero_width_interior_rejected"),
+        pytest.param("x = [i for i in items]", 0, 0, None, id="zero_width_origin_rejected"),
+        pytest.param("x = [i for i in items]", 22, 22, None, id="zero_width_eol_rejected"),
+        pytest.param("x = [i for i in items]", None, 0, None, id="implicit_zero_to_zero_rejected"),
+        pytest.param("", 0, 0, None, id="empty_line_explicit_zero_width_rejected"),
+        pytest.param("", None, None, [""], id="control_empty_line_without_cols_allowed"),
+        pytest.param("x = [i for i in items]", 4, 22, ["[i for i in items]"], id="control_valid_span_sliced"),
+    ],
+)
+def test_slice_unit_token_lines_rejects_zero_width_single_line_spans(
+    line: str,
+    start_col: int | None,
+    end_col: int | None,
+    expected: list[str] | None,
+) -> None:
+    """Verifies _slice_unit_token_lines rejects zero-width single-line spans consistently with schema validation."""
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
+        _slice_unit_token_lines,
+    )
+
+    unit: dict[str, Any] = {"kind": "comprehension", "start": 1, "end": 1}
+    if start_col is not None:
+        unit["start_col"] = start_col
+    if end_col is not None:
+        unit["end_col"] = end_col
+    assert _slice_unit_token_lines(unit, [line]) == expected
+
+
+@pytest.mark.parametrize(
+    ("source_lines", "is_sliced_flag", "expect_from_lines"),
+    [
+        pytest.param(
+            ["def from_lines():\n", "    return 1\n", "def extra():\n", "    return 2\n"],
+            None,
+            True,
+            id="non_sliced_source_lines_beats_conflicting_source_text",
+        ),
+        pytest.param(
+            ["def from_lines():\n", "    return 1\n"],
+            False,
+            True,
+            id="explicit_unsliced_source_lines_beats_conflicting_source_text",
+        ),
+        pytest.param(
+            ["def from_lines():\n", "    return 1\n"],
+            True,
+            False,
+            id="control_pre_sliced_source_lines_falls_through_to_full_source_text",
+        ),
+        pytest.param(
+            [],
+            None,
+            False,
+            id="control_empty_source_lines_falls_through_to_source_text",
+        ),
+    ],
+)
+def test_load_unit_file_text_matches_extract_source_lines_precedence_on_py_units(
+    source_lines: list[str],
+    is_sliced_flag: bool | None,
+    expect_from_lines: bool,
+) -> None:
+    """Verifies _load_unit_file_text prioritizes non-sliced source_lines ahead of source_text on .py units."""
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
+        _load_unit_file_text,
+    )
+    from pydoppelgangerhunt.source_lines import (  # pylint: disable=import-outside-toplevel
+        extract_unit_source_lines_with_state,
+    )
+
+    source_text = "def from_text():\n    return 99\n"
+    unit: dict[str, Any] = {
+        "file": "mod.py",
+        "name": "target",
+        "start": 1,
+        "end": 2,
+        "source_lines": source_lines,
+        "source_text": source_text,
+    }
+    if is_sliced_flag is not None:
+        unit["source_lines_is_sliced"] = is_sliced_flag
+
+    loaded = _load_unit_file_text(unit)
+    extracted_lines, _ = extract_unit_source_lines_with_state(unit)
+    if expect_from_lines:
+        assert loaded == "".join(source_lines)
+        assert "".join(extracted_lines) == "".join(source_lines[:2])
+    else:
+        assert loaded == source_text
+
+
+@pytest.mark.parametrize(
+    ("unit_overrides", "expect_safe"),
+    [
+        pytest.param(
+            {"file": "nb.ipynb#bad", "kind": "function"},
+            False,
+            id="malformed_ipynb_fragment_with_source_code",
+        ),
+        pytest.param(
+            {"file": "nb.ipynb#cell_0", "kind": "function"},
+            False,
+            id="zero_indexed_ipynb_cell_anchor_with_source_code",
+        ),
+        pytest.param(
+            {
+                "file": "nb.ipynb#cell_99",
+                "kind": "function",
+                "file_source": (
+                    '{"cells": [{"cell_type": "code", "source": ["x = 1\\n"]}], '
+                    '"metadata": {}, "nbformat": 4, "nbformat_minor": 5}'
+                ),
+            },
+            False,
+            id="out_of_range_nbformat_json_cell_with_source_code",
+        ),
+        pytest.param(
+            {
+                "file": "nb.ipynb#cell_2",
+                "kind": "function",
+                "source_text": (
+                    '{"cells": ['
+                    '{"cell_type": "code", "source": ["x = 1\\n"]}, '
+                    '{"cell_type": "markdown", "source": ["# Heading\\n"]}'
+                    '], "metadata": {}, "nbformat": 4, "nbformat_minor": 5}'
+                ),
+            },
+            False,
+            id="markdown_nbformat_json_cell_with_source_code",
+        ),
+        pytest.param(
+            {
+                "file": "nb.ipynb#cell_1",
+                "kind": "basic_block",
+                "is_subroutine": True,
+                "allow_snippet_only": True,
+                "file_source": "{corrupt json",
+            },
+            False,
+            id="corrupt_nbformat_json_subroutine_even_with_allow_snippet_only",
+        ),
+        pytest.param(
+            {"file": "virtual/mod.py", "kind": "function"},
+            True,
+            id="control_virtual_py_snippet_fallback_stays_allowed",
+        ),
+        pytest.param(
+            {
+                "file": "nb.ipynb#cell_1",
+                "kind": "function",
+                "source_text": "def f(x):\n    return x + 1\n",
+            },
+            True,
+            id="control_valid_plain_python_notebook_cell_buffer",
+        ),
+    ],
+)
+def test_inspect_single_unit_scope_fails_closed_on_invalid_notebook_anchors_with_source_code(
+    tmp_path: Path,
+    unit_overrides: dict[str, Any],
+    expect_safe: bool,
+) -> None:
+    """Verifies invalid .ipynb anchors/buffers fail closed in inspect_single_unit_scope even with source_code."""
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        inspect_single_unit_scope,
+    )
+
+    unit: dict[str, Any] = {
+        "name": "f",
+        "start": 1,
+        "end": 2,
+        "source_code": "def f(x):\n    return x + 1\n",
+        **unit_overrides,
+    }
+    scope = inspect_single_unit_scope(unit, repo_root=str(tmp_path))
+    assert scope["is_control_flow_safe"] is expect_safe, scope
+    if not expect_safe:
+        assert "unavailable_source_placeholder" in scope["control_flow_hazards"]
+    else:
+        assert "unavailable_source_placeholder" not in scope["control_flow_hazards"]
+
+    # Unanchored .ipynb file on disk must also fail closed even when source_code is populated
+    raw_nb = tmp_path / "unanchored.ipynb"
+    raw_nb.write_text(
+        '{"cells": [{"cell_type": "code", "source": ["def f(x):\\n", "    return x + 1\\n"]}], '
+        '"metadata": {}, "nbformat": 4, "nbformat_minor": 5}',
+        encoding="utf-8",
+    )
+    unanchored_scope = inspect_single_unit_scope(
+        {
+            "file": str(raw_nb),
+            "name": "f",
+            "start": 1,
+            "end": 2,
+            "kind": "function",
+            "source_code": "def f(x):\n    return x + 1\n",
+        },
+        repo_root=str(tmp_path),
+    )
+    assert unanchored_scope["is_control_flow_safe"] is False
+    assert "unavailable_source_placeholder" in unanchored_scope["control_flow_hazards"]
+
+
+@pytest.mark.parametrize(
+    (
+        "kind",
+        "source_text",
+        "start_line",
+        "end_line",
+        "full_lines",
+        "sliced_lines",
+        "start_col",
+        "end_col",
+        "expected_inputs",
+        "expected_stores",
+        "expect_safe",
+    ),
+    [
+        pytest.param(
+            "basic_block",
+            (
+                "def work(c, e, g):\n"
+                "    a = 1; b = c + 1; d = e + 2\n"
+                "    f = g + 3; h = 4\n"
+                "    return b, d, f\n"
+            ),
+            2,
+            3,
+            ["    a = 1; b = c + 1; d = e + 2\n", "    f = g + 3; h = 4\n"],
+            ["    b = c + 1; d = e + 2\n", "    f = g + 3\n"],
+            11,
+            13,
+            ["c", "e", "g"],
+            ["b", "d", "f"],
+            True,
+            id="multiline_semicolon_basic_block_pre_col_sliced_not_double_sliced",
+        ),
+        pytest.param(
+            "basic_block",
+            None,
+            2,
+            2,
+            ["    b = c + 1; d = e + 2  # ok\n"],
+            ["b = c + 1; d = e + 2  # ok\n"],
+            4,
+            20,
+            ["c", "e"],
+            ["b", "d"],
+            True,
+            id="single_line_semicolon_basic_block_pre_col_sliced_not_double_sliced",
+        ),
+        pytest.param(
+            "closure",
+            None,
+            2,
+            2,
+            ["    fn =  lambda x: lambda y: x + y + offset\n"],
+            ["lambda x: lambda y: x + y + offset\n"],
+            10,
+            34,
+            ["offset"],
+            [],
+            False,
+            id="single_line_nested_lambda_closure_pre_col_sliced_not_double_sliced",
+        ),
+    ],
+)
+def test_inspect_single_unit_scope_does_not_double_slice_when_col_sliced_flag_true(
+    kind: str,
+    source_text: str | None,
+    start_line: int,
+    end_line: int,
+    full_lines: list[str],
+    sliced_lines: list[str],
+    start_col: int,
+    end_col: int,
+    expected_inputs: list[str],
+    expected_stores: list[str],
+    expect_safe: bool,
+) -> None:
+    """Verifies non-expression units with source_lines_is_col_sliced=True are not sliced a second time."""
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        inspect_single_unit_scope,
+    )
+
+    col_sliced_unit: dict[str, Any] = {
+        "file": "mod.py",
+        "name": "target",
+        "kind": kind,
+        "start": start_line,
+        "end": end_line,
+        "start_col": start_col,
+        "end_col": end_col,
+        "source_lines": sliced_lines,
+        "source_lines_is_sliced": True,
+        "source_lines_is_col_sliced": True,
+        "allow_snippet_only": True,
+    }
+    if source_text is not None:
+        col_sliced_unit["source_text"] = source_text
+    scope_pre_sliced = inspect_single_unit_scope(col_sliced_unit)
+    assert scope_pre_sliced["is_control_flow_safe"] is expect_safe, scope_pre_sliced
+    assert scope_pre_sliced["inputs"] == expected_inputs
+    assert scope_pre_sliced["stores"] == expected_stores
+
+    # Control: when source_lines_is_col_sliced=False on unclipped full lines, column slicing runs once
+    if source_text is not None:
+        full_line_unit: dict[str, Any] = {
+            "file": "mod.py",
+            "name": "target",
+            "kind": kind,
+            "start": start_line,
+            "end": end_line,
+            "start_col": start_col,
+            "end_col": end_col,
+            "source_lines": full_lines,
+            "source_lines_is_sliced": True,
+            "source_lines_is_col_sliced": False,
+            "source_text": source_text,
+            "allow_snippet_only": True,
+        }
+        scope_full_line = inspect_single_unit_scope(full_line_unit)
+        assert scope_full_line["is_control_flow_safe"] is expect_safe, scope_full_line
+        assert scope_full_line["inputs"] == expected_inputs
+        assert scope_full_line["stores"] == expected_stores
+
+
+@pytest.mark.parametrize(
+    ("unit", "expected_snippet"),
+    [
+        pytest.param(
+            {
+                "file": "mod.py",
+                "name": "target",
+                "start": 1,
+                "end": 2,
+                "source_lines": [
+                    "def from_lines():\n",
+                    "    return 1\n",
+                    "def other():\n",
+                    "    return 2\n",
+                ],
+                "file_source": "def stale_file_source():\n    return 99\n",
+            },
+            "def from_lines():",
+            id="non_sliced_py_source_lines_beats_file_source",
+        ),
+        pytest.param(
+            {
+                "file": "mod.py",
+                "name": "target",
+                "start": 1,
+                "end": 2,
+                "source_lines": ["def explicit_unsliced():\n", "    return 3\n"],
+                "source_lines_is_sliced": False,
+                "source_text": "def stale_source_text():\n    return 88\n",
+            },
+            "def explicit_unsliced():",
+            id="explicit_unsliced_py_source_lines_beats_source_text",
+        ),
+        pytest.param(
+            {
+                "file": "mod.py",
+                "name": "target",
+                "start": 1,
+                "end": 2,
+                "source_lines": ["def pre_sliced_excerpt():\n", "    return 4\n"],
+                "source_lines_is_sliced": True,
+                "file_source": "def full_file_source():\n    return 77\n",
+            },
+            "def full_file_source():",
+            id="control_pre_sliced_source_lines_falls_through_to_file_source",
+        ),
+        pytest.param(
+            {
+                "file": "nb.ipynb#bad",
+                "name": "target",
+                "start": 1,
+                "end": 2,
+                "source_lines": ["def bad_nb():\n", "    return 0\n"],
+            },
+            None,
+            id="control_malformed_notebook_anchor_returns_none",
+        ),
+    ],
+)
+def test_resolve_cached_unit_source_and_tree_matches_non_sliced_source_lines_precedence(
+    unit: dict[str, Any],
+    expected_snippet: str | None,
+) -> None:
+    """Verifies reporters.resolve_cached_unit_source_and_tree prioritizes non-sliced source_lines uniformly."""
+    from pydoppelgangerhunt.reporters import (  # pylint: disable=import-outside-toplevel
+        resolve_cached_unit_source_and_tree,
+    )
+
+    src, tree = resolve_cached_unit_source_and_tree(unit)
+    if expected_snippet is None:
+        assert src is None
+        assert tree is None
+    else:
+        assert src is not None and expected_snippet in src
+        assert isinstance(tree, ast.Module)
+
+
+@pytest.mark.parametrize(
+    (
+        "source_lines",
+        "source_lines_is_sliced",
+        "source_text",
+        "expect_origin_name",
+        "expected_unit_snippet",
+        "expected_full_snippet",
+    ),
+    [
+        pytest.param(
+            [
+                '{"cells": [{"cell_type": "code", "source": '
+                '["def from_lines():\\n", "    return 1\\n"]}], '
+                '"metadata": {}, "nbformat": 4, "nbformat_minor": 5}\n'
+            ],
+            None,
+            (
+                '{"cells": [{"cell_type": "code", "source": '
+                '["def from_text():\\n", "    return 2\\n"]}], '
+                '"metadata": {}, "nbformat": 4, "nbformat_minor": 5}'
+            ),
+            "FULL_BUFFER",
+            "def from_lines():",
+            "def from_lines():",
+            id="both_source_lines_and_source_text_nbformat_json_prefers_source_lines",
+        ),
+        pytest.param(
+            ["def plain_cell():\n", "    return 3\n"],
+            False,
+            (
+                '{"cells": [{"cell_type": "code", "source": '
+                '["def from_text():\\n", "    return 2\\n"]}], '
+                '"metadata": {}, "nbformat": 4, "nbformat_minor": 5}'
+            ),
+            "FULL_BUFFER",
+            "def plain_cell():",
+            "def plain_cell():",
+            id="plain_python_source_lines_beats_nbformat_json_source_text",
+        ),
+        pytest.param(
+            ["    return 3\n"],
+            True,
+            (
+                '{"cells": [{"cell_type": "code", "source": '
+                '["def from_text():\\n", "    return 3\\n"]}], '
+                '"metadata": {}, "nbformat": 4, "nbformat_minor": 5}'
+            ),
+            "PRE_SLICED",
+            "return 3",
+            "def from_text():",
+            id="control_pre_sliced_source_lines_falls_through_to_nbformat_source_text_for_full_text",
+        ),
+        pytest.param(
+            [
+                '{"cells": [{"cell_type": "markdown", "source": ["# md\\n"]}], '
+                '"metadata": {}, "nbformat": 4, "nbformat_minor": 5}\n'
+            ],
+            None,
+            (
+                '{"cells": [{"cell_type": "code", "source": '
+                '["def from_text():\\n", "    return 2\\n"]}], '
+                '"metadata": {}, "nbformat": 4, "nbformat_minor": 5}'
+            ),
+            "PLACEHOLDER",
+            None,
+            None,
+            id="adversarial_invalid_source_lines_nbformat_fails_closed_ahead_of_valid_source_text",
+        ),
+    ],
+)
+def test_notebook_in_memory_source_lines_beats_source_text_when_both_carry_nbformat_json(
+    source_lines: list[str],
+    source_lines_is_sliced: bool | None,
+    source_text: str,
+    expect_origin_name: str,
+    expected_unit_snippet: str | None,
+    expected_full_snippet: str | None,
+) -> None:
+    """Verifies resolve_in_memory_notebook_unit and all callers agree on source_lines > source_text precedence."""
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
+        _load_unit_file_text,
+    )
+    from pydoppelgangerhunt.reporters import (  # pylint: disable=import-outside-toplevel
+        resolve_cached_unit_source_and_tree,
+    )
+    from pydoppelgangerhunt.source_lines import (  # pylint: disable=import-outside-toplevel
+        SourceLinesOrigin,
+        extract_unit_source_lines_with_state,
+        resolve_in_memory_notebook_unit,
+    )
+
+    unit: dict[str, Any] = {
+        "file": "nb.ipynb#cell_1",
+        "name": "target",
+        "start": 1,
+        "end": 2,
+        "source_lines": source_lines,
+        "source_text": source_text,
+    }
+    if source_lines_is_sliced is not None:
+        unit["source_lines_is_sliced"] = source_lines_is_sliced
+
+    nb_state = resolve_in_memory_notebook_unit(unit)
+    lines, origin = extract_unit_source_lines_with_state(unit)
+    loaded = _load_unit_file_text(unit)
+    rep_src, rep_tree = resolve_cached_unit_source_and_tree(unit)
+
+    assert origin is SourceLinesOrigin[expect_origin_name]
+    if expected_unit_snippet is None:
+        assert nb_state.is_invalid is True
+        assert lines == []
+        assert loaded is None
+        assert rep_src is None and rep_tree is None
+    else:
+        assert nb_state.is_invalid is False
+        joined_lines = "".join(lines)
+        assert expected_unit_snippet in joined_lines
+        assert '"nbformat"' not in joined_lines
+        assert loaded is not None and expected_full_snippet is not None
+        assert expected_full_snippet in loaded
+        assert '"nbformat"' not in loaded
+        assert rep_src is not None and expected_full_snippet in rep_src
+        assert isinstance(rep_tree, ast.Module)
+
+
+@pytest.mark.parametrize(
+    ("source_code", "unit_kind", "expect_v_definite"),
+    [
+        pytest.param(
+            (
+                "def run(compute):\n"
+                "    class Mgr:\n"
+                "        def __enter__(self):\n"
+                "            return self\n"
+                "        def __exit__(self, *a):\n"
+                "            return False\n"
+                "    Mgr.__exit__ = lambda self, *a: True\n"
+                "    with Mgr():\n"
+                "        v = compute()\n"
+                "    return v\n"
+            ),
+            "function",
+            {"strict": False, "pedantic": False},
+            id="snippet_only_direct_exit_reassign_invalidates_definite_store",
+        ),
+        pytest.param(
+            (
+                "def run(compute):\n"
+                "    class Mgr:\n"
+                "        def __enter__(self):\n"
+                "            return self\n"
+                "        def __exit__(self, *a):\n"
+                "            return False\n"
+                "    setattr(Mgr, '__exit__', lambda self, *a: True)\n"
+                "    with Mgr():\n"
+                "        v = compute()\n"
+                "    return v\n"
+            ),
+            "function",
+            {"strict": False, "pedantic": False},
+            id="snippet_only_setattr_exit_invalidates_definite_store",
+        ),
+        pytest.param(
+            (
+                "class Mgr:\n"
+                "    def __enter__(self):\n"
+                "        return self\n"
+                "    def __exit__(self, *a):\n"
+                "        return False\n"
+                "Mgr.__exit__ = lambda self, *a: True\n"
+                "with Mgr():\n"
+                "    v = compute()\n"
+                "return v\n"
+            ),
+            "basic_block",
+            {"strict": False, "pedantic": False},
+            id="snippet_only_synthetic_wrapper_block_detects_exit_patch",
+        ),
+        pytest.param(
+            (
+                "def run(compute, eval=False):\n"
+                "    class SafeMgr:\n"
+                "        def __enter__(self):\n"
+                "            return self\n"
+                "        def __exit__(self, *a):\n"
+                "            return False\n"
+                "    flag = eval\n"
+                "    with SafeMgr():\n"
+                "        v = compute(flag)\n"
+                "    return v\n"
+            ),
+            "function",
+            {"strict": True, "pedantic": True},
+            id="control_param_shadowing_eval_keeps_snippet_only_class_proof",
+        ),
+    ],
+)
+def test_snippet_only_scope_inspection_detects_exit_protocol_patches(
+    source_code: str,
+    unit_kind: str,
+    expect_v_definite: dict[str, bool],
+) -> None:
+    """Verifies standalone source_code-only scope inspection scans exit-protocol patches when mod_tree is absent."""
+    from pydoppelgangerhunt.fixer import (  # pylint: disable=import-outside-toplevel
+        clear_dataflow_cache,
+        inspect_single_unit_scope,
+    )
+
+    got: dict[str, bool] = {}
+    for mode in ("strict", "pedantic"):
+        clear_dataflow_cache()
+        sc = inspect_single_unit_scope(
+            {
+                "name": "run",
+                "file": "",
+                "start": 1,
+                "end": len(source_code.splitlines()),
+                "kind": unit_kind,
+                "source_code": source_code,
+                "allow_snippet_only": True,
+                "closure_strictness": mode,
+            }
+        )
+        got[mode] = "v" in sc["definite_stores"]
+    assert got == expect_v_definite
+
+
+@pytest.mark.parametrize(
+    ("lines", "unit_kind", "s_col", "e_col", "expect_changed"),
+    [
+        pytest.param(["x = 1\x00\n"], "complex_expr", 0, None, False, id="nul_byte_returns_unchanged"),
+        pytest.param(
+            ["(" * 300 + "1" + ")" * 300 + "\n"],
+            "complex_expr",
+            0,
+            None,
+            False,
+            id="pathological_nesting_returns_unchanged",
+        ),
+        pytest.param(
+            ["res = [x + 1 for x in items]\n"],
+            "comprehension",
+            6,
+            None,
+            True,
+            id="control_valid_comprehension_infers_col_bounds",
+        ),
+    ],
+)
+def test_infer_missing_col_from_line_ast_handles_nul_and_pathological_nesting(
+    lines: list[str],
+    unit_kind: str,
+    s_col: int | None,
+    e_col: int | None,
+    expect_changed: bool,
+) -> None:
+    """Verifies _infer_missing_col_from_line_ast uses safe_parse_ast and never raises on NUL or deep nesting."""
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        _infer_missing_col_from_line_ast,
+    )
+
+    out_s, out_e = _infer_missing_col_from_line_ast(
+        lines, s_col, e_col, unit_kind=unit_kind, allow_expr_fallback=True
+    )
+    if expect_changed:
+        assert out_s == 6 and out_e == 28
+    else:
+        assert (out_s, out_e) == (s_col, e_col)
+
+
+def test_tree_sha256_digest_handles_lone_surrogates() -> None:
+    """Verifies _get_tree_sha256_digest encodes lone surrogates without raising UnicodeEncodeError."""
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
+        _register_tree_source_lines,
+        clear_dataflow_cache,
+    )
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        _get_tree_sha256_digest,
+    )
+
+    clear_dataflow_cache()
+    tree_cached = ast.parse("x = 'ok'\n")
+    _register_tree_source_lines(tree_cached, source_text="x = '\ud800'\n")
+    d_cached = _get_tree_sha256_digest(tree_cached)
+    assert len(d_cached) == 64
+
+    tree_ast = ast.Module(
+        body=[ast.Expr(value=ast.Constant(value="\ud800"))],
+        type_ignores=[],
+    )
+    d_ast = _get_tree_sha256_digest(tree_ast)
+    assert len(d_ast) == 64
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "expect_severed_closure"),
+    [
+        pytest.param(2, 3, True, id="kindless_placeholder_inside_enclosing_fn_records_severed_closure"),
+        pytest.param(1, 4, False, id="control_kindless_placeholder_whole_fn_omits_severed_closure"),
+    ],
+)
+def test_kindless_placeholder_unit_with_file_tree_reports_severed_closure_cell(
+    start: int,
+    end: int,
+    expect_severed_closure: bool,
+) -> None:
+    """Verifies _inspect_unit_scope_impl passes file_tree to _is_subroutine_or_nested_expr_unit on placeholders."""
+    from pydoppelgangerhunt.fixer import (  # pylint: disable=import-outside-toplevel
+        inspect_single_unit_scope,
+    )
+
+    file_tree = ast.parse(
+        "def outer():\n"
+        "    x = 1\n"
+        "    y = x + 2\n"
+        "    return y\n"
+    )
+    sc = inspect_single_unit_scope(
+        {
+            "name": "block",
+            "file": "nonexistent_placeholder.py",
+            "start": start,
+            "end": end,
+        },
+        tree=file_tree,
+    )
+    assert sc["is_control_flow_safe"] is False
+    assert "unavailable_source_placeholder" in sc["control_flow_hazards"]
+    assert ("severed_closure_cell" in sc["control_flow_hazards"]) is expect_severed_closure
+
+
+def test_module_import_scans_skip_nested_scopes_and_support_match() -> None:
+    """Verifies module import scanners exclude imports nested inside def/class and honor match blocks."""
+    import sys  # pylint: disable=import-outside-toplevel
+
+    nested_src = (
+        "import os\n"
+        "if __name__ == '__main__':\n"
+        "    def _runner():\n"
+        "        import json\n"
+        "        return json\n"
+        "    class _Box:\n"
+        "        import math\n"
+        "\n"
+        "def target():\n"
+        "    return os\n"
+    )
+    imported = _get_module_imported_names(nested_src, include_conditional=True)
+    assert "os" in imported
+    assert "json" not in imported
+    assert "math" not in imported
+    ins_idx = _find_module_helper_insertion_index(nested_src.splitlines(keepends=True))
+    assert ins_idx == 1
+
+    if sys.version_info >= (3, 10):
+        match_src = (
+            "import sys\n"
+            "match sys.platform:\n"
+            "    case 'win32':\n"
+            "        import msvcrt\n"
+            "    case _:\n"
+            "        def _lazy():\n"
+            "            import fcntl\n"
+            "            return fcntl\n"
+            "\n"
+            "def worker():\n"
+            "    pass\n"
+        )
+        cond_names = _get_module_imported_names(match_src, include_conditional=True)
+        uncond_names = _get_module_imported_names(match_src, include_conditional=False)
+        assert "msvcrt" in cond_names
+        assert "fcntl" not in cond_names
+        assert "msvcrt" not in uncond_names
+        match_ins = _find_module_helper_insertion_index(match_src.splitlines(keepends=True))
+        assert match_ins == 8
+
+
+def test_analysis_session_tree_source_lines_enforces_lru_eviction() -> None:
+    """Verifies AnalysisSession.tree_source_lines is LRU-bounded and drops entries evicted with parent_maps."""
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
+        AnalysisSession,
+    )
+
+    sess = AnalysisSession(max_bucket_entries=16)
+    trees = [ast.parse(f"x = {idx}\n") for idx in range(20)]
+    for idx, tree in enumerate(trees[:16]):
+        sess.register_tree_source_lines(tree, (f"x = {idx}",))
+        sess.get_or_build_parent_map(tree)
+    # Touch trees[0] so it becomes most recently used and survives subsequent evictions
+    assert sess.get_tree_source_lines(trees[0]) == ("x = 0",)
+    for idx, tree in enumerate(trees[16:], start=16):
+        sess.register_tree_source_lines(tree, (f"x = {idx}",))
+        sess.get_or_build_parent_map(tree)
+
+    assert len(sess.tree_source_lines) <= 16
+    assert len(sess.parent_maps) <= 16
+    assert trees[1] not in sess.tree_source_lines
+    assert trees[0] in sess.tree_source_lines
+    assert trees[-1] in sess.tree_source_lines

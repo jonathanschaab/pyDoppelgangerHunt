@@ -7,7 +7,10 @@ import keyword
 import os
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
+
+from pydoppelgangerhunt._ast_compat import safe_parse_ast
+from pydoppelgangerhunt.fixer._df_cfg import _lower_compound_clauses
 
 EXCLUDED_GRAPH_DIRS: Set[str] = {
     ".git",
@@ -574,38 +577,8 @@ def _is_inverted_type_checking_guard(test_node: ast.expr) -> bool:
     return False
 
 
-def _collect_try_block_imports(
-    node: Any,
-    include_classes: bool = True,
-) -> List[Union[ast.Import, ast.ImportFrom]]:
-    """Helper to collect runtime import nodes from try/try* blocks."""
-    res: List[Union[ast.Import, ast.ImportFrom]] = []
-    res.extend(
-        _collect_top_level_import_nodes(
-            getattr(node, "body", []), include_classes=include_classes
-        )
-    )
-    for handler in getattr(node, "handlers", []):
-        res.extend(
-            _collect_top_level_import_nodes(
-                getattr(handler, "body", []), include_classes=include_classes
-            )
-        )
-    res.extend(
-        _collect_top_level_import_nodes(
-            getattr(node, "orelse", []), include_classes=include_classes
-        )
-    )
-    res.extend(
-        _collect_top_level_import_nodes(
-            getattr(node, "finalbody", []), include_classes=include_classes
-        )
-    )
-    return res
-
-
 def _collect_top_level_import_nodes(
-    stmts: Sequence[ast.stmt],
+    stmts: Sequence[ast.AST],
     include_classes: bool = True,
 ) -> List[Union[ast.Import, ast.ImportFrom]]:
     """Recursively collects module-level runtime import nodes, skipping type-checking and functions."""
@@ -637,41 +610,13 @@ def _collect_top_level_import_nodes(
                         stmt.orelse, include_classes=include_classes
                     )
                 )
-        elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
-            result.extend(
-                _collect_try_block_imports(
-                    stmt, include_classes=include_classes
-                )
-            )
-        elif isinstance(stmt, ast.ClassDef):
-            if include_classes:
+        elif isinstance(stmt, ast.ClassDef) and not include_classes:
+            continue
+        else:
+            for clause in _lower_compound_clauses(stmt):
                 result.extend(
                     _collect_top_level_import_nodes(
-                        stmt.body, include_classes=include_classes
-                    )
-                )
-        elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-            result.extend(
-                _collect_top_level_import_nodes(
-                    stmt.body, include_classes=include_classes
-                )
-            )
-        elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
-            result.extend(
-                _collect_top_level_import_nodes(
-                    stmt.body, include_classes=include_classes
-                )
-            )
-            result.extend(
-                _collect_top_level_import_nodes(
-                    stmt.orelse, include_classes=include_classes
-                )
-            )
-        elif type(stmt).__name__ == "Match":
-            for case in getattr(stmt, "cases", []):
-                result.extend(
-                    _collect_top_level_import_nodes(
-                        case.body, include_classes=include_classes
+                        clause.body, include_classes=include_classes
                     )
                 )
     return result
@@ -682,10 +627,12 @@ def _parse_source_imports(
 ) -> Set[str]:
     """Extracts module-level imported module dot-paths executed at runtime."""
     imports: Set[str] = set()
+    tree = safe_parse_ast(source_text)
+    if tree is None:
+        return imports
     try:
-        tree = ast.parse(source_text)
         import_nodes = _collect_top_level_import_nodes(tree.body)
-    except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
+    except RecursionError:
         return imports
 
     for node in import_nodes:

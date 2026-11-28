@@ -3,1531 +3,189 @@
 from __future__ import annotations
 
 import ast
-import builtins
+import contextlib
 import logging
 import re
-import textwrap
 from typing import (
+    AbstractSet,
     Any,
+    Callable,
     Dict,
-    Iterable,
+    FrozenSet,
+    Iterator,
     List,
+    NamedTuple,
     Optional,
     Sequence,
     Set,
     Tuple,
-    Union,
 )
 
-from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
-from pydoppelgangerhunt.fixer._df_closures import (
+from pydoppelgangerhunt.config import (
+    collect_heuristic_ctx_managers,
+    collect_wildcard_ctx_managers,
+    combine_closure_strictness,
+    normalize_heuristic_ctx_managers,
+    normalize_non_suppressing_ctx_managers,
+    normalize_wildcard_ctx_manager_matches,
+    record_heuristic_non_suppressing_ctx_manager,
+    record_wildcard_ctx_manager_match,
+    resolve_closure_strictness_mode,
+    resolve_pair_closure_policy,
+    resolve_unit_closure_policy,
+    should_warn_closure_event,
+    validate_closure_strictness,
+)
+from pydoppelgangerhunt.fixer._df_block_flow import (  # pylint: disable=unused-import
+    _analyze_block_assignment,
+    _block_terminates,
+)
+from pydoppelgangerhunt.fixer._df_cfg import (
+    _extract_arg_names as _extract_arg_names_tuple,
+    _extract_non_name_bound_names,
+    _extract_type_alias_name,
+    _is_branching_cfg_node,
+)
+from pydoppelgangerhunt.fixer._df_cache import (
+    _ephemeral_unit_ast_context,
+    _get_or_parse_tree,
+    _register_tree_source_lines,
+    _split_source_lines_stripped,
+    analysis_session,
+)
+from pydoppelgangerhunt.fixer._df_scope_ctx import _get_fn_scope_context
+from pydoppelgangerhunt.fixer._df_cell_hazards import (
+    _UnitClosureHazardContext,
+    _evaluate_severed_closure_cell_hazard,
+)
+from pydoppelgangerhunt.fixer._df_cell_traversal import (
+    _find_enclosing_chain_definite_pre_bound,
+)
+from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=unused-import
+    _extract_chain_nonlocals_and_outer_globals,
     _extract_comprehension_walrus_names,
+    _extract_scope_nonlocals_and_outer_globals,
     _extract_single_node_local_names,
+    _extract_strict_fn_local_names,
+    _get_tree_scope_intervals,
+    _is_irrefutable_case,
+    _is_irrefutable_pattern,
+    _is_span_in_scope_header,
+    _node_earliest_start_pos,
+    _node_strictly_encloses_bounds,
+    _resolve_immediate_scope_in_fn,
     iter_nested_scope_header_nodes,
 )
+from pydoppelgangerhunt.fixer._df_exit_protocol import scan_exit_protocol_patches
 from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
-from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor, _UnitLiveInVisitor
-from pydoppelgangerhunt.reporters import extract_unit_source_code
+from pydoppelgangerhunt.fixer._df_module_seed import (
+    _apply_exit_protocol_patch_scan,
+    _seed_scope_suppress_aliases,
+)
+from pydoppelgangerhunt.fixer._df_span_index import (
+    _find_enclosing_function_chain,
+    _has_invalid_lexical_scope_declarations,
+    _resolve_unit_col_bounds,
+)
+from pydoppelgangerhunt.fixer._df_visitors import (
+    _UnitLiveInVisitor,
+    _is_ast_node_within_unit_bounds,
+)
+from pydoppelgangerhunt.fixer._df_suppress_prov import (  # pylint: disable=unused-import
+    _EMPTY_SUPPRESS_PROVENANCE,
+    _SuppressProvenance,
+)
+from pydoppelgangerhunt.fixer._df_with_rules import (  # pylint: disable=unused-import
+    _extract_deleted_names,
+    _walrus_assignment_in_expr,
+)
+from pydoppelgangerhunt.fixer._scope_source import (  # pylint: disable=unused-import
+    SCOPE_SCHEMA_VERSION,
+    _get_tree_sha256_digest,
+    _has_out_of_bounds_unit_cols,
+    _infer_missing_col_from_line_ast,
+    _is_ordered_contiguous_source_match,
+    _is_subroutine_or_nested_expr_unit,
+    _make_empty_scope_result,
+    _matched_ast_cols_compatible,
+    _parse_unit_scope_ast,
+    _placeholder_tree_cols_out_of_bounds,
+    _prepare_unit_scope_source,
+    _strip_comments_from_lines,
+    _strip_inline_comment_line,
+    _unit_cols,
+    resolve_unit_inferred_col_bounds,
+)
+from pydoppelgangerhunt.fixer._scope_visitor import (  # pylint: disable=unused-import
+    BUILTIN_NAMES,
+    _SYNTHETIC_WRAPPER_NAME,
+    _ScopeVisitor,
+    _block_contains_yield,
+    _extract_arg_names,
+    _extract_type_param_names,
+    _is_mangled_name,
+    _normalize_receiver_attr_name,
+    _normalize_receiver_attrs,
+    _unfold_receiver_attribute,
+)
 from pydoppelgangerhunt.fixer.source import (
     _SUBROUTINE_KINDS,
     _WHOLE_UNIT_KINDS,
-    _get_tree_scope_intervals,
+    _is_sliced_excerpt_for_file,
     _load_unit_file_text,
-    _slice_unit_token_lines,
-    dedent_source_text,
     find_enclosing_function_is_async,
     is_subroutine_unit,
     parse_unit_coord,
     resolve_unit_declared_outputs,
     split_source_lines,
 )
+from pydoppelgangerhunt.source_lines import is_non_string_sequence
+from pydoppelgangerhunt.unit_boundary import (
+    normalize_unit_boundary,
+    resolve_unit_source_buffer,
+)
+
+__all__ = [
+    "BUILTIN_NAMES",
+    "SCOPE_SCHEMA_VERSION",
+    "analyze_unit_variable_scope",
+    "ensure_unit_scope_closure_mode",
+    "inspect_single_unit_scope",
+    "is_subroutine_unit",
+    "scope_matches_closure_mode",
+]
 
 logger = logging.getLogger(__name__)
 
-BUILTIN_NAMES: Set[str] = set(dir(builtins))
-
-
-_SYNTHETIC_WRAPPER_NAME: str = "__pdh_wrapper__"
-
-
-def _is_mangled_name(name: str) -> bool:
-    """Checks if an identifier is subject to Python private name mangling (__foo, not __foo__)."""
-    return name.startswith("__") and not name.endswith("__") and len(name) > 2
-
-
-def _unfold_receiver_attribute(
-    node: ast.AST,
-    receiver_names: Optional[Sequence[str]] = None,
-) -> Optional[str]:
-    """Unfolds chained attribute access on receiver parameters (e.g. self.config.timeout -> 'self.config.timeout')."""
-    parts: List[str] = []
-    curr: ast.AST = node
-    while isinstance(curr, ast.Attribute):
-        parts.append(curr.attr)
-        curr = curr.value
-    valid_receivers = tuple(receiver_names) if receiver_names is not None else ("self", "cls")
-    if isinstance(curr, ast.Name) and curr.id in valid_receivers:
-        parts.append(curr.id)
-        return ".".join(reversed(parts))
-    return None
-
-
-def _normalize_receiver_attr_name(
-    attr: str,
-    receiver_param: Optional[str] = None,
-) -> str:
-    """Normalizes receiver attribute prefix (e.g. 'self.x', 'this.x', 'cls.x') to canonical '<rec>.x'."""
-    pfxs = ["self.", "cls."]
-    if receiver_param:
-        pfxs.append(f"{receiver_param}.")
-    for pfx in pfxs:
-        if attr.startswith(pfx):
-            return "<rec>." + attr[len(pfx):]
-    return attr
-
-
-def _normalize_receiver_attrs(
-    attrs: Sequence[str],
-    receiver_param: Optional[str] = None,
-) -> Set[str]:
-    """Normalizes a collection of receiver attribute strings to canonical '<rec>.*' form."""
-    return {_normalize_receiver_attr_name(a, receiver_param) for a in attrs}
-
-def _extract_arg_names(args: ast.arguments) -> Set[str]:
-    """Extracts all parameter names from an ast.arguments node."""
-    arg_set = {a.arg for a in (args.posonlyargs + args.args + args.kwonlyargs)}
-    if args.vararg:
-        arg_set.add(args.vararg.arg)
-    if args.kwarg:
-        arg_set.add(args.kwarg.arg)
-    return arg_set
-
-
-def _extract_type_param_names(node: ast.AST) -> Set[str]:
-    """Extracts PEP 695 type parameter names from an AST node."""
-    return {
-        tp.name
-        for tp in getattr(node, "type_params", [])
-        if isinstance(getattr(tp, "name", None), str)
+BLOCKING_CONTROL_FLOW_HAZARDS: FrozenSet[str] = frozenset(
+    {
+        "naked_break",
+        "naked_continue",
+        "embedded_return",
+        "type_param_closure_capture",
+        "pathological_ast",
+        "deleted_output",
+        "severed_closure_cell",
+        "stale_source_code",
+        "unavailable_source_for_closure_mode",
+        "unavailable_source_placeholder",
+        "invalid_unit_columns",
     }
+)
 
 
-def _block_contains_yield(node: ast.AST) -> bool:
-    """Returns True if the node contains a Yield or YieldFrom at the current scope level."""
-    stack = [node]
-    while stack:
-        curr = stack.pop()
-        for child in ast.iter_child_nodes(curr):
-            if isinstance(child, (ast.Yield, ast.YieldFrom)):
-                return True
-            if not isinstance(
-                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
-            ):
-                stack.append(child)
-    return False
-
-
-class _ScopeVisitor(ast.NodeVisitor):
-
-    """Inspects AST loads, stores, parameters, returns, nonlocals, globals, and attrs."""
-
-    def __init__(
-        self,
-        loop_offset: int = 0,
-        source_lines: Optional[Sequence[str]] = None,
-        is_subroutine: bool = False,
-        receiver_names: Optional[Sequence[str]] = None,
-    ) -> None:
-        self.loads: List[str] = []
-        self.stores: List[str] = []
-        self.read_before_write: List[str] = []
-        self.params: List[str] = []
-        self.param_details: List[Dict[str, Any]] = []
-        self.returns: List[str] = []
-        self.return_type: Optional[str] = None
-        self.nonlocals: List[str] = []
-        self.globals: List[str] = []
-        self.attrs_read: List[str] = []
-        self.attrs_written: List[str] = []
-        self.except_vars: Set[str] = set()
-        self.deleted_names: Set[str] = set()
-        self.type_aliases: Set[str] = set()
-        self.type_params: List[str] = []
-        self.type_param_free_vars: List[str] = []
-        self._scope_stack: List[Set[str]] = []
-        self._type_param_scopes: List[Set[str]] = []
-        self._comprehension_depth: int = 0
-        self.class_depth: int = 0
-        self.loop_offset: int = loop_offset
-        self.loop_depth: int = 0
-        self.has_return: bool = False
-        self.has_return_value: bool = False
-        self.has_yield: bool = False
-        self.has_yield_assignment: bool = False
-        self.has_try_or_with: bool = False
-        self._ancestors: List[ast.AST] = []
-        self.has_super: bool = False
-        self.has_mangled_names: bool = False
-        self.naked_breaks: int = 0
-        self.naked_continues: int = 0
-        self.local_imports: List[str] = []
-        self.imported_names: Dict[str, str] = {}
-        self.yield_expr_names: List[Tuple[str, str]] = []
-        self.is_async: bool = False
-        self.is_subroutine: bool = is_subroutine
-        self._has_processed_top_func: bool = False
-        self.source_lines: Optional[List[str]] = list(source_lines) if source_lines is not None else None
-        self.receiver_names: Tuple[str, ...] = (
-            tuple(dict.fromkeys(list(receiver_names) + ["self", "cls"]))
-            if receiver_names is not None
-            else ("self", "cls")
-        )
-        self._unit_top_locals: Set[str] = set()
-        self._unit_top_stored_locals: Set[str] = set()
-
-    def _init_unit_top_locals(self, target_node: ast.AST) -> None:
-        self._unit_top_locals = _extract_single_node_local_names(
-            target_node,
-            include_globals=False,
-            include_nonlocals=False,
-            include_self_name=False,
-            include_bare_annotations=True,
-        )
-        self._unit_top_stored_locals = _extract_single_node_local_names(
-            target_node,
-            include_globals=False,
-            include_nonlocals=False,
-            include_self_name=False,
-            include_bare_annotations=False,
-        )
-
-    def visit_Module(self, node: ast.Module) -> None:
-        if self.is_subroutine and not self._unit_top_locals:
-            if (
-                len(node.body) == 1
-                and isinstance(node.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))
-                and node.body[0].name == _SYNTHETIC_WRAPPER_NAME
-            ):
-                wrapper_body = node.body[0].body
-                if (
-                    self.loop_offset > 0
-                    and len(wrapper_body) == 1
-                    and isinstance(wrapper_body[0], (ast.For, ast.AsyncFor, ast.While))
-                ):
-                    wrapper_body = wrapper_body[0].body
-                target_mod = ast.Module(body=wrapper_body, type_ignores=[])
-            else:
-                target_mod = node
-            self._init_unit_top_locals(target_mod)
-        self.generic_visit(node)
-
-    def visit(self, node: ast.AST) -> Any:
-        self._ancestors.append(node)
+@contextlib.contextmanager
+def _capture_unit_ctx_managers(
+    heur_out: Set[str],
+    wc_out: Set[Tuple[str, str]],
+) -> Iterator[None]:
+    """Collects heuristic and wildcard context-manager matches into caller accumulator sets."""
+    with collect_heuristic_ctx_managers() as heur, collect_wildcard_ctx_managers() as wc:
         try:
-            return super().visit(node)
+            yield
         finally:
-            self._ancestors.pop()
-
-    def _record_arg(
-        self,
-        arg_node: Optional[ast.arg],
-        default_node: Optional[ast.expr],
-        kind: str,
-    ) -> None:
-        if arg_node is None or arg_node.arg in BUILTIN_NAMES:
-            return
-        arg_name = arg_node.arg
-        if arg_name not in self.params:
-            self.params.append(arg_name)
-
-        type_val = None
-        if arg_node.annotation is not None:
-            try:
-                type_val = ast.unparse(arg_node.annotation)
-            except Exception as exc:
-                logger.debug("Failed to unparse argument annotation %r: %s", arg_node.annotation, exc)
-                type_val = None
-
-        default_val = None
-        if default_node is not None:
-            try:
-                default_val = ast.unparse(default_node)
-            except Exception as exc:
-                logger.debug("Failed to unparse default value %r: %s", default_node, exc)
-                default_val = None
-
-        prefix = "*" if kind == "vararg" else ("**" if kind == "kwarg" else "")
-        self.param_details.append({
-            "name": f"{prefix}{arg_name}",
-            "type": type_val,
-            "default": default_val,
-            "kind": kind,
-        })
-
-    def _process_args(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
-        if node.returns is not None:
-            try:
-                self.return_type = ast.unparse(node.returns)
-            except Exception as exc:
-                logger.debug("Failed to unparse return annotation %r: %s", node.returns, exc)
-                self.return_type = None
-
-        pos_and_plain = node.args.posonlyargs + node.args.args
-        num_pos = len(pos_and_plain)
-        num_defaults = len(node.args.defaults)
-        first_default_idx = num_pos - num_defaults
-
-        for i, a in enumerate(pos_and_plain):
-            def_node = node.args.defaults[i - first_default_idx] if i >= first_default_idx else None
-            self._record_arg(a, def_node, "pos")
-
-        self._record_arg(node.args.vararg, None, "vararg")
-
-        for k, kw_def in zip(node.args.kwonlyargs, node.args.kw_defaults):
-            self._record_arg(k, kw_def, "kwonly")
-
-        self._record_arg(node.args.kwarg, None, "kwarg")
-
-    _extract_arg_names = staticmethod(_extract_arg_names)
-
-
-    def _record_store_name(self, name: str, comp_depth: int = 0) -> None:
-        if self._comprehension_depth > 0 and comp_depth == 0:
-            self._scope_stack[-1].add(name)
-            return
-        eff_len = len(self._scope_stack) - comp_depth
-        bound_in_intermediate_fn = eff_len > 2 and any(
-            name in s
-            for s in self._scope_stack[1 : -1 - comp_depth]
-            if ":class_scope:" not in s
-        )
-        is_active_nonlocal = (
-            name in self.nonlocals
-            if eff_len <= 1
-            else (
-                f"nonlocal:{name}" in self._scope_stack[-1 - comp_depth]
-                and not bound_in_intermediate_fn
-            )
-        )
-        is_active_global = (
-            name in self.globals
-            if eff_len <= 1
-            else f"global:{name}" in self._scope_stack[-1 - comp_depth]
-        )
-        if eff_len <= 1 or is_active_nonlocal:
-            self.deleted_names.discard(name)
-        if is_active_nonlocal:
-            if (
-                name not in BUILTIN_NAMES
-                and name not in self.stores
-                and name not in self._unit_top_stored_locals
-            ):
-                self.stores.append(name)
-        elif is_active_global:
-            pass
-        elif eff_len > 1:
-            target_frame = self._scope_stack[-1 - comp_depth]
-            if (
-                f"nonlocal:{name}" not in target_frame
-                and not (comp_depth > 0 and ":class_scope:" in target_frame)
-            ):
-                target_frame.add(name)
-        elif name not in BUILTIN_NAMES and name not in self.stores:
-            self.stores.append(name)
-
-    def _process_func(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
-        if (
-            self.is_subroutine
-            and len(self._scope_stack) == 0
-            and node.name == _SYNTHETIC_WRAPPER_NAME
-        ):
-            body = node.body
-            if (
-                self.loop_offset > 0
-                and len(body) == 1
-                and isinstance(body[0], (ast.For, ast.AsyncFor, ast.While))
-            ):
-                body = body[0].body
-                self.loop_offset = 0
-            if not self._unit_top_locals:
-                self._init_unit_top_locals(ast.Module(body=body, type_ignores=[]))
-            if isinstance(node, ast.AsyncFunctionDef):
-                self.is_async = True
-            for stmt in body:
-                self.visit(stmt)
-            return
-
-        tp_names = _extract_type_param_names(node)
-        is_top = (
-            len(self._scope_stack) == 0
-            and not self.is_subroutine
-            and not self._has_processed_top_func
-        )
-        created_outer = False
-        if is_top:
-            self._has_processed_top_func = True
-            for tp in getattr(node, "type_params", []):
-                try:
-                    self.type_params.append(ast.unparse(tp))
-                except Exception as exc:
-                    logger.debug("Failed to unparse type_param %r: %s", tp, exc)
-                tp_visitor = _OuterExprVisitor()
-                tp_visitor.visit(tp)
-                for name in tp_visitor.ordered_names:
-                    if (
-                        name not in tp_names
-                        and name not in BUILTIN_NAMES
-                        and name not in self.type_param_free_vars
-                    ):
-                        self.type_param_free_vars.append(name)
-            self._process_args(node)
-        else:
-            for dec in node.decorator_list:
-                self.visit(dec)
-            for default in node.args.defaults:
-                self.visit(default)
-            for kw_default in node.args.kw_defaults:
-                if kw_default is not None:
-                    self.visit(kw_default)
-
-        if tp_names:
-            self._type_param_scopes.append(tp_names)
-        try:
-            if is_top:
-                self._init_unit_top_locals(node)
-                self._scope_stack.append(
-                    set(self.params) | tp_names | self._unit_top_locals
-                )
-            else:
-                for tp in getattr(node, "type_params", []):
-                    self.visit(tp)
-                for arg in (
-                    list(getattr(node.args, "posonlyargs", []))
-                    + list(node.args.args)
-                    + list(node.args.kwonlyargs)
-                    + ([node.args.vararg] if node.args.vararg else [])
-                    + ([node.args.kwarg] if node.args.kwarg else [])
-                ):
-                    if arg.annotation is not None:
-                        self.visit(arg.annotation)
-                if node.returns is not None:
-                    self.visit(node.returns)
-                self._record_store_name(node.name)
-                if not self._scope_stack:
-                    self._scope_stack.append(set(self._unit_top_locals))
-                    created_outer = True
-                nested_locals = _extract_single_node_local_names(
-                    node,
-                    include_globals=False,
-                    include_nonlocals=False,
-                    include_self_name=False,
-                )
-                self._scope_stack.append(
-                    self._extract_arg_names(node.args) | tp_names | nested_locals
-                )
-            try:
-                for stmt in node.body:
-                    self.visit(stmt)
-            finally:
-                self._scope_stack.pop()
-                if created_outer:
-                    self._scope_stack.pop()
-        finally:
-            if tp_names:
-                self._type_param_scopes.pop()
-
-    def visit_Lambda(self, node: ast.Lambda) -> None:
-        for default in node.args.defaults:
-            self.visit(default)
-        for kw_default in node.args.kw_defaults:
-            if kw_default is not None:
-                self.visit(kw_default)
-        created_outer = False
-        if not self._scope_stack:
-            self._scope_stack.append(set(self._unit_top_locals))
-            created_outer = True
-        self._scope_stack.append(self._extract_arg_names(node.args))
-        saved_comp_depth = self._comprehension_depth
-        self._comprehension_depth = 0
-        try:
-            self.visit(node.body)
-        finally:
-            self._comprehension_depth = saved_comp_depth
-            self._scope_stack.pop()
-            if created_outer:
-                self._scope_stack.pop()
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._process_func(node)
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        if len(self._scope_stack) == 0 and not self.is_subroutine:
-            self.is_async = True
-        self._process_func(node)
-
-    def visit_Await(self, node: ast.Await) -> None:
-        if (len(self._scope_stack) - self._comprehension_depth) <= 1:
-            self.is_async = True
-        self.generic_visit(node)
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        for dec in node.decorator_list:
-            self.visit(dec)
-        tp_names = _extract_type_param_names(node)
-        if tp_names:
-            self._type_param_scopes.append(tp_names)
-        try:
-            for tp in getattr(node, "type_params", []):
-                self.visit(tp)
-            for base in node.bases:
-                self.visit(base)
-            for keyword in node.keywords:
-                self.visit(keyword)
-            self._record_store_name(node.name)
-            created_outer = False
-            if not self._scope_stack:
-                self._scope_stack.append(set(self._unit_top_locals))
-                created_outer = True
-            self._scope_stack.append({":class_scope:", *tp_names})
-            self.class_depth += 1
-            try:
-                for stmt in node.body:
-                    self.visit(stmt)
-            finally:
-                self.class_depth -= 1
-                self._scope_stack.pop()
-                if created_outer:
-                    self._scope_stack.pop()
-        finally:
-            if tp_names:
-                self._type_param_scopes.pop()
-
-    def visit_TypeAlias(self, node: ast.AST) -> None:  # pragma: no cover (py312+)
-        name_node = getattr(node, "name", None)
-        alias_name = (
-            name_node.id
-            if isinstance(name_node, ast.Name)
-            else (name_node if isinstance(name_node, str) else None)
-        )
-        if isinstance(alias_name, str):
-            is_nested = (
-                len(self._scope_stack) > 0
-                if self.is_subroutine
-                else len(self._scope_stack) > 1
-            )
-            if not is_nested:
-                self.type_aliases.add(alias_name)
-            self._record_store_name(alias_name)
-        tp_names = _extract_type_param_names(node)
-        if tp_names:
-            self._type_param_scopes.append(tp_names)
-        try:
-            for tp in getattr(node, "type_params", []):
-                self.visit(tp)
-            val_node = getattr(node, "value", None)
-            if isinstance(val_node, ast.AST):
-                self.visit(val_node)
-        finally:
-            if tp_names:
-                self._type_param_scopes.pop()
-
-    def visit_Call(self, node: ast.Call) -> None:
-        if self.class_depth == 0:
-            if (
-                isinstance(node.func, ast.Name)
-                and node.func.id == "super"
-                and "super" not in self.stores
-                and "super" not in self.params
-            ) or (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "super"
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "builtins"
-            ):
-                self.has_super = True
-        self.generic_visit(node)
-
-    def visit_MatchAs(self, node: ast.AST) -> None:  # pragma: no cover (py310+)
-        name = getattr(node, "name", None)
-        if name and isinstance(name, str) and name != "_":
-            self._record_store_name(name)
-        self.generic_visit(node)
-
-    def visit_MatchStar(self, node: ast.AST) -> None:  # pragma: no cover (py310+)
-        name = getattr(node, "name", None)
-        if name and isinstance(name, str) and name != "_":
-            self._record_store_name(name)
-        self.generic_visit(node)
-
-    def visit_MatchMapping(self, node: ast.AST) -> None:  # pragma: no cover (py310+)
-        rest = getattr(node, "rest", None)
-        if rest and isinstance(rest, str) and rest != "_":
-            self._record_store_name(rest)
-        self.generic_visit(node)
-
-    def _deferred_scope_depth(self) -> int:
-        return (
-            sum(1 for s in self._scope_stack if ":class_scope:" not in s)
-            - self._comprehension_depth
-        )
-
-    def _record_load_name(self, name: str) -> None:
-        is_inner = any(
-            name in s
-            for s in self._scope_stack[1:]
-            if ":class_scope:" not in s or s is self._scope_stack[-1]
-        ) or any(name in s for s in self._type_param_scopes)
-        if not is_inner and name not in BUILTIN_NAMES:
-            if name not in self.loads:
-                self.loads.append(name)
-            if (
-                self._deferred_scope_depth() <= 1
-                and name not in self.params
-                and name not in self.stores
-                and name not in self.read_before_write
-            ):
-                self.read_before_write.append(name)
-
-    def visit_Name(self, node: ast.Name) -> None:
-        if self.class_depth == 0 and _is_mangled_name(node.id):
-            self.has_mangled_names = True
-        if isinstance(node.ctx, ast.Load):
-            self._record_load_name(node.id)
-        elif isinstance(node.ctx, ast.Store):
-            self._record_store_name(node.id)
-        elif isinstance(node.ctx, ast.Del):
-            if (
-                self._deferred_scope_depth() <= 1
-                and self.class_depth == 0
-            ):
-                self._record_load_name(node.id)
-            if len(self._scope_stack) <= 1 or (
-                f"nonlocal:{node.id}" in self._scope_stack[-1]
-                and not any(
-                    node.id in s
-                    for s in self._scope_stack[1:-1]
-                    if ":class_scope:" not in s
-                )
-            ):
-                self.deleted_names.add(node.id)
-
-    def visit_Attribute(self, node: ast.Attribute) -> None:
-        if self.class_depth == 0 and _is_mangled_name(node.attr):
-            self.has_mangled_names = True
-        attr_name = _unfold_receiver_attribute(node, receiver_names=self.receiver_names)
-        if attr_name is not None:
-            receiver_id = attr_name.split(".", 1)[0]
-            is_inner = any(
-                receiver_id in s
-                for s in self._scope_stack[1:]
-                if ":class_scope:" not in s or s is self._scope_stack[-1]
-            )
-            if not is_inner and self.class_depth == 0:
-                if isinstance(node.ctx, ast.Load):
-                    if attr_name not in self.attrs_read:
-                        self.attrs_read.append(attr_name)
-                elif isinstance(node.ctx, (ast.Store, ast.Del)):
-                    if attr_name not in self.attrs_written:
-                        self.attrs_written.append(attr_name)
-        self.generic_visit(node)
-
-    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
-        if node.type is not None:
-            self.visit(node.type)
-        if node.name and isinstance(node.name, str):
-            self.except_vars.add(node.name)
-            self._record_store_name(node.name)
-        for stmt in node.body:
-            self.visit(stmt)
-
-    def visit_Assign(self, node: ast.Assign) -> None:
-        self.visit(node.value)
-        for target in node.targets:
-            self.visit(target)
-
-    def visit_AugAssign(self, node: ast.AugAssign) -> None:
-        # AugAssign both loads and stores the target
-        if isinstance(node.target, ast.Name):
-            self._record_load_name(node.target.id)
-            self._record_store_name(node.target.id)
-        elif isinstance(node.target, ast.Attribute):
-            attr_name = _unfold_receiver_attribute(node.target, receiver_names=self.receiver_names)
-            if attr_name is not None:
-                receiver_id = attr_name.split(".", 1)[0]
-                is_inner = any(
-                    receiver_id in s
-                    for s in self._scope_stack[1:]
-                    if ":class_scope:" not in s or s is self._scope_stack[-1]
-                )
-                if not is_inner and self.class_depth == 0:
-                    if attr_name not in self.attrs_read:
-                        self.attrs_read.append(attr_name)
-                    if attr_name not in self.attrs_written:
-                        self.attrs_written.append(attr_name)
-        self.generic_visit(node)
-
-    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        if node.value is not None:
-            self.visit(node.value)
-            if isinstance(node.target, ast.Name):
-                self._record_store_name(node.target.id)
-            else:
-                self.visit(node.target)
-        elif not isinstance(node.target, ast.Name):
-            self.visit(node.target)
-
-    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
-        self.visit(node.value)
-        if isinstance(node.target, ast.Name):
-            self._record_store_name(
-                node.target.id, comp_depth=self._comprehension_depth
-            )
-
-    def _visit_comprehension(
-        self,
-        node: Union[ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp],
-    ) -> None:
-        if node.generators:
-            self.visit(node.generators[0].iter)
-        self._comprehension_depth += 1
-        created_outer = False
-        if not self._scope_stack:
-            self._scope_stack.append(set(self._unit_top_locals))
-            created_outer = True
-        inner_vars: Set[str] = set()
-        self._scope_stack.append(inner_vars)
-        if (
-            any(getattr(g, "is_async", False) for g in node.generators)
-            and (len(self._scope_stack) - self._comprehension_depth) <= 1
-        ):
-            self.is_async = True
-        try:
-            for gen in node.generators:
-                if gen is not node.generators[0]:
-                    self.visit(gen.iter)
-                for sub in (gen.target, *gen.ifs):
-                    self.visit(sub)
-            if isinstance(node, ast.DictComp):
-                self.visit(node.key)
-                self.visit(node.value)
-            else:
-                self.visit(node.elt)
-        finally:
-            self._scope_stack.pop()
-            if created_outer:
-                self._scope_stack.pop()
-            self._comprehension_depth -= 1
-
-    def visit_ListComp(self, node: ast.ListComp) -> None:
-        self._visit_comprehension(node)
-
-    def visit_SetComp(self, node: ast.SetComp) -> None:
-        self._visit_comprehension(node)
-
-    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
-        self._visit_comprehension(node)
-
-    def visit_DictComp(self, node: ast.DictComp) -> None:
-        self._visit_comprehension(node)
-
-    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
-        eff_len = len(self._scope_stack) - self._comprehension_depth
-        enclosing_frames = self._scope_stack[: -1 - self._comprehension_depth]
-        for name in node.names:
-            is_unit_bound = (
-                any(
-                    name in s and ":class_scope:" not in s
-                    for s in enclosing_frames
-                )
-                or name in self.stores
-                or name in self.params
-                or name in self._unit_top_locals
-            )
-            if (eff_len <= 1 or not is_unit_bound) and name not in self.nonlocals:
-                self.nonlocals.append(name)
-            if eff_len > 1:
-                self._scope_stack[-1 - self._comprehension_depth].add(
-                    f"nonlocal:{name}"
-                )
-        self.generic_visit(node)
-
-    def visit_Global(self, node: ast.Global) -> None:
-        eff_len = len(self._scope_stack) - self._comprehension_depth
-        for name in node.names:
-            if eff_len <= 1:
-                if name not in self.globals:
-                    self.globals.append(name)
-            else:
-                self._scope_stack[-1 - self._comprehension_depth].add(
-                    f"global:{name}"
-                )
-        self.generic_visit(node)
-
-    def _visit_loop(self, node: Union[ast.For, ast.AsyncFor, ast.While]) -> None:
-        self.loop_depth += 1
-        try:
-            if isinstance(node, (ast.For, ast.AsyncFor)):
-                self.visit(node.iter)
-                self.visit(node.target)
-            else:
-                self.visit(node.test)
-            for stmt in node.body:
-                self.visit(stmt)
-            for stmt in node.orelse:
-                self.visit(stmt)
-        finally:
-            self.loop_depth -= 1
-
-    def visit_For(self, node: ast.For) -> None:
-        self._visit_loop(node)
-
-    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
-        if len(self._scope_stack) <= 1:
-            self.is_async = True
-        self._visit_loop(node)
-
-    def visit_With(self, node: ast.With) -> None:
-        if len(self._scope_stack) <= 1 and _block_contains_yield(node):
-            self.has_try_or_with = True
-        self.generic_visit(node)
-
-    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
-        if len(self._scope_stack) <= 1:
-            self.is_async = True
-            if _block_contains_yield(node):
-                self.has_try_or_with = True
-        self.generic_visit(node)
-
-    def visit_Try(self, node: ast.Try) -> None:
-        if len(self._scope_stack) <= 1 and _block_contains_yield(node):
-            self.has_try_or_with = True
-        self.generic_visit(node)
-
-    def visit_TryStar(self, node: ast.AST) -> None:
-        if len(self._scope_stack) <= 1 and _block_contains_yield(node):
-            self.has_try_or_with = True
-        self.generic_visit(node)
-
-    def visit_While(self, node: ast.While) -> None:
-        self._visit_loop(node)
-
-    def _record_loop_control(self, is_break: bool) -> None:
-        if self.loop_depth <= self.loop_offset:
-            if is_break:
-                self.naked_breaks += 1
-            else:
-                self.naked_continues += 1
-
-    def visit_Break(self, node: ast.Break) -> None:
-        self._record_loop_control(is_break=True)
-        self.generic_visit(node)
-
-    def visit_Continue(self, node: ast.Continue) -> None:
-        self._record_loop_control(is_break=False)
-        self.generic_visit(node)
-
-    def _record_yield_expr(self, kind: str, node: Union[ast.Yield, ast.YieldFrom]) -> None:
-        if len(self._scope_stack) <= 1:
-            self.has_yield = True
-            if node.value is not None:
-                if isinstance(node.value, ast.Name):
-                    self.yield_expr_names.append((kind, node.value.id))
-                elif isinstance(node.value, ast.Constant) and node.value.value is not None:
-                    self.yield_expr_names.append((kind, f":literal:{type(node.value.value).__name__}"))
-                elif (
-                    kind == "yield_from"
-                    and isinstance(node.value, (ast.List, ast.Tuple, ast.Set))
-                    and node.value.elts
-                ):
-                    first_elt = node.value.elts[0]
-                    if isinstance(first_elt, ast.Constant) and first_elt.value is not None:
-                        t_name = type(first_elt.value).__name__
-                        if all(
-                            isinstance(e, ast.Constant)
-                            and e.value is not None
-                            and type(e.value).__name__ == t_name
-                            for e in node.value.elts
-                        ):
-                            self.yield_expr_names.append((kind, f":literal:{t_name}"))
-
-    def _inspect_yield_assignment(self) -> None:
-        if len(self._scope_stack) <= 1 and len(self._ancestors) >= 2:
-            immediate_parent = self._ancestors[-2]
-            if not isinstance(immediate_parent, ast.Expr):
-                self.has_yield_assignment = True
-
-    def visit_Yield(self, node: ast.Yield) -> None:
-        self._record_yield_expr("yield", node)
-        if len(self._scope_stack) <= 1:
-            self._inspect_yield_assignment()
-        self.generic_visit(node)
-
-    def visit_YieldFrom(self, node: ast.YieldFrom) -> None:
-        self._record_yield_expr("yield_from", node)
-        self.generic_visit(node)
-
-
-    def visit_Return(self, node: ast.Return) -> None:
-        if len(self._scope_stack) <= 1:
-            self.has_return = True
-            if node.value is not None:
-                self.has_return_value = True
-                if isinstance(node.value, ast.Name):
-                    if node.value.id not in self.returns:
-                        self.returns.append(node.value.id)
-                elif isinstance(node.value, ast.Tuple):
-                    for elt in node.value.elts:
-                        if isinstance(elt, ast.Name) and elt.id not in self.returns:
-                            self.returns.append(elt.id)
-        self.generic_visit(node)
-
-    def _record_import_node(self, node: Union[ast.Import, ast.ImportFrom]) -> None:
-        stmt: Optional[str] = None
-        if self.source_lines is not None:
-            lineno = getattr(node, "lineno", None)
-            end_lineno = getattr(node, "end_lineno", lineno)
-            if lineno is not None and end_lineno is not None:
-                if 1 <= lineno <= len(self.source_lines) and 1 <= end_lineno <= len(self.source_lines):
-                    raw_slice = self.source_lines[lineno - 1 : end_lineno]
-                    raw_str = "".join(raw_slice).strip()
-                    if raw_str:
-                        stmt = raw_str
-
-        if stmt is None:
-            try:
-                stmt = ast.unparse(node)
-            except Exception as exc:
-                logger.debug("Failed to unparse import node %r: %s", node, exc)
-                return
-
-        is_nested = (
-            len(self._scope_stack) > 0
-            if self.is_subroutine
-            else len(self._scope_stack) > 1
-        )
-        if not is_nested and stmt not in self.local_imports:
-            self.local_imports.append(stmt)
-        for alias in node.names:
-            if isinstance(node, ast.Import):
-                bound_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
-            else:
-                bound_name = alias.asname or alias.name
-            if bound_name != "*":
-                if not is_nested:
-                    self.imported_names[bound_name] = stmt
-                self._record_store_name(bound_name)
-
-    def visit_Import(self, node: ast.Import) -> None:
-        self._record_import_node(node)
-        self.generic_visit(node)
-
-    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        self._record_import_node(node)
-        self.generic_visit(node)
-
-
-def _walrus_in_sequence(
-    items: Sequence[Optional[ast.AST]],
-    is_conditional: bool = False,
-) -> Tuple[Set[str], Set[str]]:
-    """Evaluates walrus assignments sequentially across expressions with short-circuiting tail conditions."""
-    definite: Set[str] = set()
-    conditional: Set[str] = set()
-    for idx, item in enumerate(items):
-        if item is not None:
-            d, c = _walrus_assignment_in_expr(item, is_conditional if idx == 0 else True)
-            definite.update(d)
-            conditional.update(c)
-    return definite, conditional
-
-
-def _walrus_assignment_in_expr(
-    expr: Optional[ast.AST],
-    is_conditional: bool = False,
-) -> Tuple[Set[str], Set[str]]:
-    """Analyzes walrus assignments in an expression to distinguish definite from conditional stores."""
-    definite: Set[str] = set()
-    conditional: Set[str] = set()
-    if expr is None:
-        return definite, conditional
-
-    if isinstance(expr, ast.NamedExpr) and isinstance(expr.target, ast.Name):
-        if is_conditional:
-            conditional.add(expr.target.id)
-        else:
-            definite.add(expr.target.id)
-
-    if isinstance(expr, ast.BoolOp):
-        d_seq, c_seq = _walrus_in_sequence(expr.values, is_conditional)
-        definite.update(d_seq)
-        conditional.update(c_seq)
-        return definite, conditional - definite
-
-    if isinstance(expr, ast.IfExp):
-        d_t, c_t = _walrus_assignment_in_expr(expr.test, is_conditional)
-        d_b, c_b = _walrus_assignment_in_expr(expr.body, True)
-        d_o, c_o = _walrus_assignment_in_expr(expr.orelse, True)
-        definite.update(d_t)
-        conditional.update(c_t | d_b | c_b | d_o | c_o)
-        return definite, conditional - definite
-
-    if isinstance(expr, ast.Compare):
-        d_l, c_l = _walrus_assignment_in_expr(expr.left, is_conditional)
-        definite.update(d_l)
-        conditional.update(c_l)
-        d_seq, c_seq = _walrus_in_sequence(expr.comparators, is_conditional)
-        definite.update(d_seq)
-        conditional.update(c_seq)
-        return definite, conditional - definite
-
-    if isinstance(expr, ast.Lambda):
-        d_l, c_l = _walrus_assignment_in_expr(expr.body, True)
-        conditional.update(d_l | c_l)
-        return definite, conditional - definite
-
-    if isinstance(expr, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
-        d_seq, c_seq = _walrus_in_sequence([g.iter for g in expr.generators], is_conditional)
-        definite.update(d_seq)
-        conditional.update(c_seq)
-        for child in ast.iter_child_nodes(expr):
-            if isinstance(expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp)) and child is expr.elt:
-                d_c, c_c = _walrus_assignment_in_expr(child, True)
-                conditional.update(d_c | c_c)
-            elif isinstance(expr, ast.DictComp) and child in (expr.key, expr.value):
-                d_c, c_c = _walrus_assignment_in_expr(child, True)
-                conditional.update(d_c | c_c)
-            elif isinstance(child, ast.comprehension):
-                for if_expr in child.ifs:
-                    d_c, c_c = _walrus_assignment_in_expr(if_expr, True)
-                    conditional.update(d_c | c_c)
-        return definite, conditional - definite
-
-    for child in ast.iter_child_nodes(expr):
-        target_child = child.value if isinstance(child, ast.keyword) else child
-        if isinstance(target_child, ast.AST):
-            d_ch, c_ch = _walrus_assignment_in_expr(target_child, is_conditional)
-            definite.update(d_ch)
-            conditional.update(c_ch)
-
-    return definite, conditional - definite
-
-
-def _is_irrefutable_pattern(pattern: Optional[ast.AST]) -> bool:  # pragma: no cover (py310+)
-    """Recursively determines if a pattern matching AST node unconditionally matches any subject."""
-    if pattern is None:
-        return True
-    if type(pattern).__name__ == "MatchAs":
-        sub_pat = getattr(pattern, "pattern", None)
-        return sub_pat is None or _is_irrefutable_pattern(sub_pat)
-    if type(pattern).__name__ == "MatchOr":
-        patterns = getattr(pattern, "patterns", [])
-        return any(_is_irrefutable_pattern(p) for p in patterns)
-    return False
-
-
-def _is_irrefutable_case(case: ast.AST) -> bool:  # pragma: no cover (py310+)
-    """Returns True if the match case has no guard and an irrefutable pattern."""
-    guard = getattr(case, "guard", None)
-    pattern = getattr(case, "pattern", None)
-    if guard is not None or pattern is None:
-        return False
-    return _is_irrefutable_pattern(pattern)
-
-
-def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
-    """Returns True if the statement sequence unconditionally terminates via return or raise."""
-    for stmt in statements:
-        if isinstance(stmt, (ast.Return, ast.Raise)):
-            return True
-        if isinstance(stmt, ast.If):
-            if (
-                stmt.orelse
-                and _block_terminates(stmt.body)
-                and _block_terminates(stmt.orelse)
-            ):
-                return True
-        elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-            if _block_terminates(stmt.body):
-                return True
-        elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
-            cases = getattr(stmt, "cases", [])
-            has_irrefutable = any(_is_irrefutable_case(c) for c in cases)
-            if has_irrefutable and cases and all(_block_terminates(c.body) for c in cases):
-                return True
-        elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
-            f_body = getattr(stmt, "finalbody", [])
-            if f_body and _block_terminates(f_body):
-                return True
-            handlers = getattr(stmt, "handlers", [])
-            o_stmts = getattr(stmt, "orelse", [])
-            body_terminates = _block_terminates(getattr(stmt, "body", [])) or (
-                bool(o_stmts) and _block_terminates(o_stmts)
-            )
-            if (
-                handlers
-                and body_terminates
-                and all(_block_terminates(getattr(h, "body", [])) for h in handlers)
-            ):
-                return True
-    return False
-
-
-def _extract_deleted_names(statements: Sequence[ast.AST]) -> Set[str]:
-    """Finds all variable names deleted within a statement sequence without recursing into nested functions."""
-    deleted: Set[str] = set()
-    for stmt in statements:
-        if isinstance(stmt, ast.Delete):
-            for target in stmt.targets:
-                for node in ast.walk(target):
-                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del):
-                        deleted.add(node.id)
-        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            continue
-        elif isinstance(stmt, ast.ExceptHandler):
-            deleted.update(_extract_deleted_names(stmt.body))
-        elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
-            for case in getattr(stmt, "cases", []):
-                deleted.update(_extract_deleted_names(getattr(case, "body", [])))
-        else:
-            for child in ast.iter_child_nodes(stmt):
-                if isinstance(child, (ast.stmt, ast.ExceptHandler)):
-                    deleted.update(_extract_deleted_names([child]))
-    return deleted
-
-
-def _demote_deletions_to_conditional(
-    deleted_names: Iterable[str],
-    definite: Set[str],
-    conditional: Set[str],
-) -> None:
-    """Discards deleted variables from definite and promotes previously definite variables to conditional."""
-    for v_del in deleted_names:
-        if v_del in definite:
-            definite.discard(v_del)
-            conditional.add(v_del)
-
-
-def _analyze_block_assignment(
-    statements: Sequence[ast.stmt],
-    definite: Optional[Set[str]] = None,
-    conditional: Optional[Set[str]] = None,
-    *,
-    may_deleted: Optional[Set[str]] = None,
-    live_in_deleted: Optional[Set[str]] = None,
-) -> Tuple[Set[str], Set[str]]:
-    """Analyzes a sequence of statements to determine unconditionally and conditionally assigned variables.
-
-    Returns:
-        A tuple of (definitely_assigned, conditionally_assigned) variable name sets.
-    """
-    if definite is None:
-        definite = set()
-    if conditional is None:
-        conditional = set()
-    may_del = may_deleted if may_deleted is not None else set()
-    live_in_del = live_in_deleted if live_in_deleted is not None else set()
-
-    for stmt in statements:
-        before_def = set(definite)
-        if isinstance(stmt, ast.Assign):
-            for target in stmt.targets:
-                for node in ast.walk(target):
-                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-                        definite.add(node.id)
-                        may_del.discard(node.id)
-                d_t, c_t = _walrus_assignment_in_expr(target)
-                definite.update(d_t)
-                may_del.difference_update(d_t)
-                conditional.update(c_t)
-            d_val, c_val = _walrus_assignment_in_expr(stmt.value)
-            definite.update(d_val)
-            may_del.difference_update(d_val)
-            conditional.update(c_val)
-        elif isinstance(stmt, ast.AnnAssign):
-            if stmt.value is not None:
-                if isinstance(stmt.target, ast.Name):
-                    definite.add(stmt.target.id)
-                    may_del.discard(stmt.target.id)
-                d_val, c_val = _walrus_assignment_in_expr(stmt.value)
-                definite.update(d_val)
-                may_del.difference_update(d_val)
-                conditional.update(c_val)
-        elif isinstance(stmt, ast.AugAssign):
-            if isinstance(stmt.target, ast.Name):
-                definite.add(stmt.target.id)
-                may_del.discard(stmt.target.id)
-            d_t, c_t = _walrus_assignment_in_expr(stmt.target)
-            definite.update(d_t)
-            may_del.difference_update(d_t)
-            conditional.update(c_t)
-            d_val, c_val = _walrus_assignment_in_expr(stmt.value)
-            definite.update(d_val)
-            may_del.difference_update(d_val)
-            conditional.update(c_val)
-        elif isinstance(stmt, ast.Expr):
-            d_val, c_val = _walrus_assignment_in_expr(stmt.value)
-            definite.update(d_val)
-            may_del.difference_update(d_val)
-            conditional.update(c_val)
-        elif isinstance(stmt, ast.Delete):
-            for target in stmt.targets:
-                d_del, c_del = _walrus_assignment_in_expr(target)
-                definite.update(d_del)
-                may_del.difference_update(d_del)
-                conditional.update(c_del)
-                for node in ast.walk(target):
-                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del):
-                        if node.id not in definite:
-                            live_in_del.add(node.id)
-                        definite.discard(node.id)
-                        conditional.discard(node.id)
-                        may_del.add(node.id)
-        elif isinstance(stmt, ast.Raise):
-            if stmt.exc is not None:
-                d_exc, c_exc = _walrus_assignment_in_expr(stmt.exc)
-                definite.update(d_exc)
-                may_del.difference_update(d_exc)
-                conditional.update(c_exc)
-            if stmt.cause is not None:
-                d_cause, c_cause = _walrus_assignment_in_expr(stmt.cause)
-                definite.update(d_cause)
-                may_del.difference_update(d_cause)
-                conditional.update(c_cause)
-        elif isinstance(stmt, ast.Return):
-            if stmt.value is not None:
-                d_val, c_val = _walrus_assignment_in_expr(stmt.value)
-                definite.update(d_val)
-                may_del.difference_update(d_val)
-                conditional.update(c_val)
-        elif isinstance(stmt, ast.If):
-            d_test, c_test = _walrus_assignment_in_expr(stmt.test)
-            definite.update(d_test)
-            may_del.difference_update(d_test)
-            conditional.update(c_test)
-            b_may: Set[str] = set()
-            b_live: Set[str] = set()
-            o_may: Set[str] = set()
-            o_live: Set[str] = set()
-            b_def, b_cond = _analyze_block_assignment(
-                stmt.body, may_deleted=b_may, live_in_deleted=b_live
-            )
-            o_def, o_cond = (
-                _analyze_block_assignment(
-                    stmt.orelse, may_deleted=o_may, live_in_deleted=o_live
-                )
-                if stmt.orelse
-                else (set(), set())
-            )
-            live_in_del.update((b_live | o_live) - definite)
-            b_term = _block_terminates(stmt.body)
-            o_term = _block_terminates(stmt.orelse) if stmt.orelse else False
-            if stmt.orelse:
-                if o_term and not b_term:
-                    definite.update(b_def)
-                    conditional.update((b_def | b_cond) - definite)
-                    may_del.difference_update(b_def)
-                    may_del.update(b_may)
-                elif b_term and not o_term:
-                    definite.update(o_def)
-                    conditional.update((o_def | o_cond) - definite)
-                    may_del.difference_update(o_def)
-                    may_del.update(o_may)
-                elif not b_term and not o_term:
-                    both = b_def & o_def
-                    definite.update(both)
-                    conditional.update((b_def | b_cond | o_def | o_cond) - definite)
-                    may_del.difference_update(both)
-                    may_del.update(b_may | o_may)
-                eff_b_del = _extract_deleted_names(stmt.body) - b_def
-                eff_o_del = _extract_deleted_names(stmt.orelse) - o_def
-                for v_del in eff_b_del & eff_o_del:
-                    definite.discard(v_del)
-                    conditional.discard(v_del)
-                _demote_deletions_to_conditional(eff_b_del ^ eff_o_del, definite, conditional)
-            else:
-                if not b_term:
-                    conditional.update((b_def | b_cond) - definite)
-                    may_del.update(b_may)
-                    eff_b_del = _extract_deleted_names(stmt.body) - b_def
-                    _demote_deletions_to_conditional(eff_b_del, definite, conditional)
-        elif isinstance(stmt, ast.While):
-            d_test, c_test = _walrus_assignment_in_expr(stmt.test)
-            definite.update(d_test)
-            may_del.difference_update(d_test)
-            conditional.update(c_test)
-            sub_stmts = list(stmt.body)
-            if hasattr(stmt, "orelse") and stmt.orelse:
-                sub_stmts.extend(stmt.orelse)
-            sub_may: Set[str] = set()
-            sub_live: Set[str] = set()
-            sub_def, sub_cond = _analyze_block_assignment(
-                sub_stmts, may_deleted=sub_may, live_in_deleted=sub_live
-            )
-            live_in_del.update(sub_live - definite)
-            may_del.update(sub_may)
-            conditional.update((sub_def | sub_cond) - definite)
-            _demote_deletions_to_conditional(_extract_deleted_names(sub_stmts), definite, conditional)
-        elif isinstance(stmt, (ast.For, ast.AsyncFor)):
-            d_iter, c_iter = _walrus_assignment_in_expr(stmt.iter)
-            definite.update(d_iter)
-            may_del.difference_update(d_iter)
-            conditional.update(c_iter)
-            t_names: Set[str] = set()
-            for p_node in ast.walk(stmt.target):
-                if isinstance(p_node, ast.Name) and isinstance(p_node.ctx, ast.Store):
-                    conditional.add(p_node.id)
-                    t_names.add(p_node.id)
-            sub_stmts = list(stmt.body)
-            if hasattr(stmt, "orelse") and stmt.orelse:
-                sub_stmts.extend(stmt.orelse)
-            for_may: Set[str] = set()
-            for_live: Set[str] = set()
-            sub_def, sub_cond = _analyze_block_assignment(
-                sub_stmts, may_deleted=for_may, live_in_deleted=for_live
-            )
-            live_in_del.update((for_live - t_names) - definite)
-            may_del.update(for_may)
-            conditional.update((sub_def | sub_cond) - definite)
-            _demote_deletions_to_conditional(_extract_deleted_names(sub_stmts), definite, conditional)
-        elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-            for item in stmt.items:
-                d_ctx, c_ctx = _walrus_assignment_in_expr(item.context_expr)
-                definite.update(d_ctx)
-                may_del.difference_update(d_ctx)
-                conditional.update(c_ctx)
-                if item.optional_vars is not None:
-                    for p_node in ast.walk(item.optional_vars):
-                        if isinstance(p_node, ast.Name) and isinstance(p_node.ctx, ast.Store):
-                            definite.add(p_node.id)
-                            may_del.discard(p_node.id)
-            _analyze_block_assignment(
-                stmt.body,
-                definite,
-                conditional,
-                may_deleted=may_del,
-                live_in_deleted=live_in_del,
-            )
-        elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
-            t_body = list(getattr(stmt, "body", []))
-            t_may: Set[str] = set()
-            t_live: Set[str] = set()
-            t_def, t_cond = _analyze_block_assignment(
-                t_body, may_deleted=t_may, live_in_deleted=t_live
-            )
-            live_in_del.update(t_live - definite)
-            t_term = _block_terminates(t_body)
-            o_stmts = list(getattr(stmt, "orelse", []))
-            o_try_may: Set[str] = set()
-            if o_stmts:
-                o_try_live: Set[str] = set()
-                o_def, o_cond = _analyze_block_assignment(
-                    o_stmts, may_deleted=o_try_may, live_in_deleted=o_try_live
-                )
-                if not t_term:
-                    live_in_del.update(o_try_live - (definite | t_def))
-                o_term = _block_terminates(o_stmts)
-                if not o_term:
-                    try_def = t_def | o_def
-                    try_cond = (t_cond | o_cond) - try_def
-                    succ_may = (t_may - o_def) | o_try_may
-                else:
-                    try_def = set()
-                    try_cond = set()
-                    succ_may = set()
-                    t_term = True
-            else:
-                try_def = t_def
-                try_cond = t_cond
-                succ_may = t_may
-
-            handlers = list(getattr(stmt, "handlers", []))
-            h_defs: List[Set[str]] = []
-            h_dels: List[Tuple[Set[str], bool]] = []
-            h_mays: List[Set[str]] = []
-            all_handlers_terminate = bool(
-                handlers and all(_block_terminates(getattr(h, "body", [])) for h in handlers)
-            )
-
-            for h in handlers:
-                h_body = list(getattr(h, "body", []))
-                if getattr(h, "type", None) is not None:
-                    d_ht, c_ht = _walrus_assignment_in_expr(h.type, is_conditional=True)
-                    conditional.update(d_ht | c_ht)
-                h_may: Set[str] = set()
-                h_live: Set[str] = set()
-                h_d, h_c = _analyze_block_assignment(
-                    h_body, may_deleted=h_may, live_in_deleted=h_live
-                )
-                h_bound = {h.name} if isinstance(getattr(h, "name", None), str) else set()
-                h_may.difference_update(h_bound)
-                live_in_del.update((h_live - h_bound) - definite)
-                h_term = _block_terminates(h_body)
-                eff_h_del = _extract_deleted_names(h_body) - h_d
-                h_dels.append((eff_h_del, h_term))
-                if not h_term:
-                    h_defs.append(h_d)
-                    h_mays.append(h_may)
-                conditional.update((h_d | h_c) - definite)
-
-            if not t_term:
-                if all_handlers_terminate:
-                    definite.update(try_def)
-                    conditional.update(try_cond - definite)
-                    may_del.difference_update(try_def)
-                    may_del.update(succ_may)
-                elif handlers and h_defs:
-                    common = try_def.intersection(*h_defs)
-                    definite.update(common)
-                    conditional.update((try_def | try_cond) - definite)
-                    may_del.difference_update(common)
-                    may_del.update(succ_may)
-                    for hm in h_mays:
-                        may_del.update(hm)
-                elif not handlers:
-                    definite.update(try_def)
-                    conditional.update(try_cond - definite)
-                    may_del.difference_update(try_def)
-                    may_del.update(succ_may)
-            elif h_defs:
-                common = set.intersection(*h_defs)
-                definite.update(common)
-                conditional.update(try_cond - definite)
-                may_del.difference_update(common)
-                for hm in h_mays:
-                    may_del.update(hm)
-
-            eff_try_del = _extract_deleted_names(t_body) - t_def
-            eff_o_del = _extract_deleted_names(o_stmts) - o_def if o_stmts else set()
-            succ_del = eff_try_del | eff_o_del
-
-            surviving_dels: List[Set[str]] = []
-            all_try_dels = succ_del.copy()
-            if not t_term:
-                surviving_dels.append(succ_del)
-
-            for eff_h_del, h_term in h_dels:
-                all_try_dels.update(eff_h_del)
-                if not h_term:
-                    surviving_dels.append(eff_h_del)
-
-            if surviving_dels:
-                uncond_dels = set.intersection(*surviving_dels)
-                for v_del in uncond_dels:
-                    definite.discard(v_del)
-                    conditional.discard(v_del)
-                _demote_deletions_to_conditional(all_try_dels - uncond_dels, definite, conditional)
-            else:
-                _demote_deletions_to_conditional(all_try_dels, definite, conditional)
-
-            f_body = list(getattr(stmt, "finalbody", []))
-            if f_body:
-                _analyze_block_assignment(
-                    f_body,
-                    definite,
-                    conditional,
-                    may_deleted=may_del,
-                    live_in_deleted=live_in_del,
-                )
-        elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
-            d_sub, c_sub = _walrus_assignment_in_expr(getattr(stmt, "subject", None))
-            definite.update(d_sub)
-            may_del.difference_update(d_sub)
-            conditional.update(c_sub)
-            case_defs: List[Set[str]] = []
-            non_term_case_defs: List[Set[str]] = []
-            case_conds: Set[str] = set()
-            case_dels: Set[str] = set()
-            non_term_case_dels: List[Set[str]] = []
-            has_irrefutable_default = False
-            for case in getattr(stmt, "cases", []):
-                pattern_stores: Set[str] = set()
-                pattern = getattr(case, "pattern", None)
-                if pattern is not None:
-                    for p_node in ast.walk(pattern):
-                        if type(p_node).__name__ in ("MatchAs", "MatchStar"):
-                            p_name = getattr(p_node, "name", None)
-                            if p_name and isinstance(p_name, str) and p_name != "_":
-                                pattern_stores.add(p_name)
-                        elif type(p_node).__name__ == "MatchMapping":
-                            p_rest = getattr(p_node, "rest", None)
-                            if p_rest and isinstance(p_rest, str) and p_rest != "_":
-                                pattern_stores.add(p_rest)
-                guard = getattr(case, "guard", None)
-                d_g: Set[str] = set()
-                c_g: Set[str] = set()
-                if guard is not None:
-                    d_g, c_g = _walrus_assignment_in_expr(guard, is_conditional=False)
-                case_init_def = pattern_stores | d_g
-                c_may: Set[str] = set()
-                c_live: Set[str] = set()
-                c_def, c_cond = _analyze_block_assignment(
-                    case.body,
-                    definite=case_init_def.copy(),
-                    conditional=c_g.copy() if c_g else None,
-                    may_deleted=c_may,
-                    live_in_deleted=c_live,
-                )
-                live_in_del.update((c_live - case_init_def) - definite)
-                case_defs.append(c_def)
-                case_conds.update(c_def | c_cond)
-                c_del = _extract_deleted_names(case.body) - c_def
-                case_dels.update(c_del)
-                if not _block_terminates(case.body):
-                    non_term_case_defs.append(c_def)
-                    non_term_case_dels.append(c_del)
-                    may_del.update(c_may - pattern_stores)
-                if _is_irrefutable_case(case):
-                    has_irrefutable_default = True
-            if case_defs and has_irrefutable_default:
-                if non_term_case_defs:
-                    common = set.intersection(*non_term_case_defs)
-                    definite.update(common)
-                    may_del.difference_update(common)
-                conditional.update(case_conds - definite)
-            else:
-                conditional.update(case_conds - definite)
-            all_del = (
-                {v for v in case_dels if all(v in d for d in non_term_case_dels)}
-                if (has_irrefutable_default and non_term_case_dels)
-                else set()
-            )
-            for v_del in all_del:
-                definite.discard(v_del)
-                conditional.discard(v_del)
-            _demote_deletions_to_conditional(case_dels - all_del, definite, conditional)
-        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            definite.add(stmt.name)
-            may_del.discard(stmt.name)
-        elif type(stmt).__name__ == "TypeAlias":  # pragma: no cover (py312+)
-            name_node = getattr(stmt, "name", None)
-            if isinstance(name_node, ast.Name):
-                definite.add(name_node.id)
-                may_del.discard(name_node.id)
-        elif isinstance(stmt, ast.Import):
-            for alias in stmt.names:
-                bound_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
-                definite.add(bound_name)
-                may_del.discard(bound_name)
-        elif isinstance(stmt, ast.ImportFrom):
-            for alias in stmt.names:
-                if alias.name != "*":
-                    bound_name = alias.asname or alias.name
-                    definite.add(bound_name)
-                    may_del.discard(bound_name)
-        elif isinstance(stmt, ast.Assert):
-            d_ast, c_ast = _walrus_assignment_in_expr(stmt.test)
-            definite.update(d_ast)
-            may_del.difference_update(d_ast)
-            conditional.update(c_ast)
-            if stmt.msg is not None:
-                d_m, c_m = _walrus_assignment_in_expr(stmt.msg, is_conditional=True)
-                conditional.update(d_m | c_m)
-
-        may_del.difference_update(definite - before_def)
-        if _block_terminates([stmt]):
-            break
-
-    return definite, conditional - definite
+            heur_out.update(heur)
+            wc_out.update(wc)
 
 
 def _determine_binding_kind(
@@ -1592,16 +250,88 @@ def _rank_param_kind(
     return 1
 
 
+# INVARIANT (SHARED CFG LOWERING CONTRACT — ENCLOSING MAY-BOUND SCAN):
+# This walker computes *may-bound* names before the unit across module, class, and
+# function scopes to contrast against *must-bound* definite assignment from
+# `_df_cell_traversal._find_enclosing_chain_definite_pre_bound`. Branching and
+# non-Name binding classification MUST route through `_df_cfg._is_branching_cfg_node`
+# and `_df_cfg._extract_non_name_bound_names` rather than duplicating syntax checks.
 def _find_enclosing_pre_bound_names(
-    mod_tree: ast.AST, s_line: int, e_line: int
+    mod_tree: ast.AST,
+    s_line: int,
+    e_line: int,
+    u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
 ) -> Tuple[Set[str], bool]:
-    """Finds names bound before s_line in scopes enclosing [s_line, e_line] and loop containment."""
+    """Finds names may-bound before s_line in enclosing module/class/function scopes.
+
+    Unlike ``_find_enclosing_chain_definite_pre_bound`` (which computes must-bound
+    definite assignment across every control-flow path in enclosing functions), this
+    function collects all names that have a lexical binding on at least one path prior
+    to the unit across module, class, and function scopes, and reports whether the unit
+    is enclosed inside a loop. Comparing the may-bound set against the must-bound set
+    identifies variables that are only conditionally initialized before the unit.
+    """
     bound_before: Set[str] = set()
     in_loop = False
+
+    def _is_before_unit(c_line: Optional[int], c_col: Optional[int]) -> bool:
+        if not isinstance(c_line, int):
+            return False
+        if c_line < s_line:
+            return True
+        return (
+            c_line == s_line
+            and u_start_col is not None
+            and isinstance(c_col, int)
+            and c_col < u_start_col
+        )
+
+    def _node_contains_or_encloses_unit(node: ast.AST) -> bool:
+        return _is_ast_node_within_unit_bounds(
+            node,
+            s_line,
+            e_line,
+            u_end_col=u_end_col,
+            u_start_col=u_start_col,
+        ) or _node_strictly_encloses_bounds(
+            node,
+            s_line,
+            e_line,
+            u_start_col=u_start_col,
+            u_end_col=u_end_col,
+        )
+
     intervals = [
         (earliest_start, n_end, span, node)
         for earliest_start, n_end, span, node in _get_tree_scope_intervals(mod_tree)
-        if earliest_start <= s_line and e_line <= n_end
+        if earliest_start <= s_line
+        and e_line <= n_end
+        and (
+            _node_strictly_encloses_bounds(
+                node,
+                s_line,
+                e_line,
+                u_start_col=u_start_col,
+                u_end_col=u_end_col,
+            )
+            or (
+                u_start_col is None
+                and u_end_col is None
+                and (
+                    earliest_start < s_line
+                    or n_end > e_line
+                    or earliest_start == n_end
+                )
+            )
+        )
+        and not _is_span_in_scope_header(
+            node,
+            s_line,
+            e_line,
+            u_start_col=u_start_col,
+            u_end_col=u_end_col,
+        )
     ]
     intervals.sort(key=lambda item: (item[0], -item[1], -item[2]))
     innermost_scope = intervals[-1][3] if intervals else mod_tree
@@ -1617,23 +347,28 @@ def _find_enclosing_pre_bound_names(
     for scope_node in active_scopes:
         is_class_scope = isinstance(scope_node, ast.ClassDef)
         if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for arg in (
-                scope_node.args.posonlyargs
-                + scope_node.args.args
-                + scope_node.args.kwonlyargs
-                + ([scope_node.args.vararg] if scope_node.args.vararg else [])
-                + ([scope_node.args.kwarg] if scope_node.args.kwarg else [])
-            ):
-                bound_before.add(arg.arg)
+            bound_before.difference_update(
+                _extract_strict_fn_local_names(scope_node)
+            )
+            bound_before.update(_extract_arg_names_tuple(scope_node.args))
         stack: List[Tuple[ast.AST, bool]] = [
             (stmt, False) for stmt in reversed(getattr(scope_node, "body", []))
         ]
         while stack:
             curr, is_branched = stack.pop()
             c_start = getattr(curr, "lineno", None)
+            c_col = getattr(curr, "col_offset", None)
             c_end = getattr(curr, "end_lineno", c_start)
+            c_end_col = getattr(curr, "end_col_offset", c_col)
             if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if isinstance(c_start, int) and c_start < s_line:
+                estart, ecol = _node_earliest_start_pos(curr)
+                if _is_before_unit(estart, ecol) and (
+                    (
+                        curr in active_scopes
+                        and not isinstance(curr, ast.ClassDef)
+                    )
+                    or _is_before_unit(c_end, c_end_col)
+                ):
                     bound_before.add(curr.name)
                 if not is_class_scope:
                     stack.extend(
@@ -1651,14 +386,13 @@ def _find_enclosing_pre_bound_names(
             if isinstance(
                 curr, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
             ):
-                if isinstance(c_start, int) and c_start < s_line and not is_class_scope:
+                if _is_before_unit(c_start, c_col) and not is_class_scope:
                     bound_before.update(_extract_comprehension_walrus_names(curr))
                 continue
-            if type(curr).__name__ == "TypeAlias":
-                if isinstance(c_start, int) and c_start < s_line:
-                    alias_name = getattr(curr, "name", None)
-                    if isinstance(alias_name, ast.Name):
-                        bound_before.add(alias_name.id)
+            alias_name = _extract_type_alias_name(curr)
+            if alias_name is not None:
+                if _is_before_unit(c_start, c_col):
+                    bound_before.add(alias_name)
                 continue
             if (
                 isinstance(curr, ast.AnnAssign)
@@ -1667,16 +401,37 @@ def _find_enclosing_pre_bound_names(
             ):
                 stack.append((curr.annotation, is_branched))
                 continue
+            if isinstance(
+                curr,
+                (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr),
+            ):
+                rhs_val = curr.value
+                if rhs_val is not None and _node_contains_or_encloses_unit(
+                    rhs_val
+                ):
+                    stack.append((rhs_val, is_branched))
+                    if isinstance(curr, ast.AnnAssign):
+                        stack.append((curr.annotation, is_branched))
+                    elif isinstance(curr, ast.AugAssign) and not isinstance(
+                        curr.target, ast.Name
+                    ):
+                        stack.append((curr.target, is_branched))
+                    continue
             if isinstance(curr, (ast.For, ast.AsyncFor, ast.While)):
-                if (
-                    isinstance(c_start, int)
-                    and isinstance(c_end, int)
-                    and c_start <= s_line
-                    and e_line <= c_end
-                    and (c_start < s_line or c_end > e_line)
+                if isinstance(
+                    curr, (ast.For, ast.AsyncFor)
+                ) and _node_contains_or_encloses_unit(curr.iter):
+                    stack.append((curr.iter, is_branched))
+                    continue
+                if _node_strictly_encloses_bounds(
+                    curr,
+                    s_line,
+                    e_line,
+                    u_start_col=u_start_col,
+                    u_end_col=u_end_col,
                 ):
                     in_loop = True
-            if isinstance(c_start, int) and c_start < s_line:
+            if _is_before_unit(c_start, c_col):
                 if isinstance(curr, ast.Name) and isinstance(curr.ctx, ast.Store):
                     bound_before.add(curr.id)
                 elif (
@@ -1685,37 +440,21 @@ def _find_enclosing_pre_bound_names(
                     and not is_branched
                 ):
                     bound_before.discard(curr.id)
-                elif isinstance(curr, (ast.Import, ast.ImportFrom)):
-                    for alias in curr.names:
-                        b_name = alias.asname or alias.name.split(".", 1)[0]
-                        if b_name != "*":
-                            bound_before.add(b_name)
                 elif (
                     isinstance(curr, ast.ExceptHandler)
                     and isinstance(curr.name, str)
-                    and isinstance(c_end, int)
-                    and c_start <= s_line
-                    and e_line <= c_end
+                    and _node_strictly_encloses_bounds(
+                        curr,
+                        s_line,
+                        e_line,
+                        u_start_col=u_start_col,
+                        u_end_col=u_end_col,
+                    )
                 ):
                     bound_before.add(curr.name)
-                elif type(curr).__name__ in ("MatchAs", "MatchStar", "MatchMapping"):
-                    m_name = getattr(curr, "name", None) or getattr(curr, "rest", None)
-                    if isinstance(m_name, str) and m_name != "_":
-                        bound_before.add(m_name)
-            child_branched = is_branched or (
-                isinstance(
-                    curr,
-                    (
-                        ast.If,
-                        ast.For,
-                        ast.AsyncFor,
-                        ast.While,
-                        ast.Try,
-                        ast.ExceptHandler,
-                    ),
-                )
-                or type(curr).__name__ in ("TryStar", "Match")
-            )
+                else:
+                    bound_before.update(_extract_non_name_bound_names(curr))
+            child_branched = is_branched or _is_branching_cfg_node(curr)
             stack.extend(
                 (ch, child_branched)
                 for ch in reversed(list(ast.iter_child_nodes(curr)))
@@ -1727,606 +466,1291 @@ def _inspect_unit_scope(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
     file_tree: Optional[ast.AST] = None,
+    *,
+    allow_disk_read: bool = True,
 ) -> Dict[str, Any]:
+    with analysis_session():
+        return _inspect_unit_scope_impl(
+            unit,
+            repo_root=repo_root,
+            file_tree=file_tree,
+            allow_disk_read=allow_disk_read,
+        )
+
+
+def _check_type_param_closure_capture(
+    unit: Dict[str, Any],
+    tree: ast.AST,
+    visitor: _ScopeVisitor,
+    *,
+    inferred_s_col: Optional[int],
+    file_tree: Optional[ast.AST],
+    get_full_source: Callable[[], Optional[str]],
+    hazards: List[str],
+) -> bool:
+    """Checks PEP 695 type-parameter closure capture hazards and returns has_class_scoped_type_params."""
+    s_line = parse_unit_coord(unit, "start", default=1)
+    e_line = parse_unit_coord(unit, "end", default=s_line)
+    u_col = inferred_s_col
+    top_fn = (
+        tree.body[0]
+        if isinstance(tree, ast.Module)
+        and len(tree.body) == 1
+        and isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))
+        else None
+    )
+    top_fn_name = getattr(top_fn, "name", None) if top_fn is not None else None
+    top_fn_count = (
+        sum(
+            1
+            for n in ast.walk(top_fn)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        if top_fn is not None
+        else None
+    )
+    parsed_tree = file_tree
+    if parsed_tree is None:
+        full_src = get_full_source()
+        if full_src:
+            parsed_tree = _get_or_parse_tree(full_src)
+    enclosing_fn_locals: Set[str] = set()
+    enclosing_cls_locals: Set[str] = set()
+    has_enclosing_fn = False
+    has_enclosing_cls = False
+    prev_enclosed_cls_name: Optional[str] = None
+    if parsed_tree is not None:
+        full_src_for_lines = get_full_source()
+        mod_src_lines: Optional[Tuple[str, ...]] = (
+            _register_tree_source_lines(parsed_tree, source_text=full_src_for_lines)
+            if full_src_for_lines
+            else None
+        )
+        matched_self = False
+        for earliest_start, n_end, _span, scope_node in _get_tree_scope_intervals(
+            parsed_tree, source_lines=mod_src_lines
+        ):
+            if earliest_start > s_line or e_line > n_end:
+                continue
+            if isinstance(scope_node, ast.ClassDef):
+                if not has_enclosing_cls:
+                    has_enclosing_cls = True
+                    prev_enclosed_cls_name = getattr(scope_node, "name", None)
+                    enclosing_cls_locals.update(
+                        _extract_single_node_local_names(
+                            scope_node, include_globals=False
+                        )
+                    )
+                else:
+                    if isinstance(prev_enclosed_cls_name, str):
+                        enclosing_cls_locals.add(prev_enclosed_cls_name)
+                    prev_enclosed_cls_name = getattr(scope_node, "name", None)
+                    enclosing_cls_locals.update(_extract_type_param_names(scope_node))
+            elif isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if (
+                    not matched_self
+                    and s_line
+                    in (
+                        earliest_start,
+                        getattr(scope_node, "lineno", earliest_start),
+                    )
+                    and (
+                        e_line == n_end
+                        or top_fn_name is not None
+                        or u_col is not None
+                    )
+                    and (
+                        u_col is None
+                        or getattr(scope_node, "col_offset", 0) == u_col
+                    )
+                    and (
+                        top_fn_name is None
+                        or getattr(scope_node, "name", None) == top_fn_name
+                    )
+                    and (
+                        top_fn_count is None
+                        or sum(
+                            1
+                            for n in ast.walk(scope_node)
+                            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        )
+                        == top_fn_count
+                    )
+                ):
+                    matched_self = True
+                    continue
+                if (
+                    earliest_start < s_line
+                    or n_end > e_line
+                    or (u_col is None and matched_self)
+                    or (
+                        u_col is not None
+                        and getattr(scope_node, "col_offset", 0) < u_col
+                    )
+                ):
+                    has_enclosing_fn = True
+                    enclosing_fn_locals.update(
+                        _extract_single_node_local_names(
+                            scope_node, include_globals=False
+                        )
+                    )
+    has_class_scoped_type_params = False
+    if has_enclosing_fn and any(
+        fv in enclosing_fn_locals for fv in visitor.type_param_free_vars
+    ):
+        hazards.append("type_param_closure_capture")
+    elif (
+        not has_enclosing_fn
+        and not has_enclosing_cls
+        and unit.get("kind") == "closure"
+    ):
+        hazards.append("type_param_closure_capture")
+    if has_enclosing_cls and any(
+        fv in enclosing_cls_locals for fv in visitor.type_param_free_vars
+    ):
+        has_class_scoped_type_params = True
+        if (
+            has_enclosing_fn or unit.get("kind") == "closure"
+        ) and "type_param_closure_capture" not in hazards:
+            hazards.append("type_param_closure_capture")
+    elif not has_enclosing_cls and (
+        unit.get("enclosing_class")
+        or unit.get("kind") in ("method", "async_method")
+    ):
+        has_class_scoped_type_params = True
+    return has_class_scoped_type_params
+
+
+def _seed_unit_with_suppress_provenance(
+    tree: ast.AST,
+    candidate_stmts: Sequence[ast.stmt],
+    visitor: _ScopeVisitor,
+    *,
+    mod_tree: Optional[ast.AST],
+    full_mod_lines: Optional[Tuple[str, ...]],
+    enclosing_chain: Sequence[Tuple[int, int, ast.AST]],
+    is_subroutine: bool,
+    u_start: int,
+    u_end: int,
+    resolved_s_col: Optional[int],
+    extra_non_sup: FrozenSet[str],
+    strict_with_flag: bool,
+) -> _SuppressProvenance:
+    """Seeds context-manager suppression provenance for units containing With/AsyncWith blocks."""
+    initial_sup_prov: _SuppressProvenance = _EMPTY_SUPPRESS_PROVENANCE
+    has_any_with = any(
+        isinstance(n, (ast.With, ast.AsyncWith))
+        for st in candidate_stmts
+        for n in ast.walk(st)
+    )
+    if mod_tree is not None and has_any_with:
+        unit_fn_node: Optional[ast.AST] = None
+        if not is_subroutine:
+            enclosing_set = {f for _, _, f in enclosing_chain}
+            best_span: Optional[int] = None
+            for earliest_start, n_end, span_sz, sc_node in _get_tree_scope_intervals(
+                mod_tree, source_lines=full_mod_lines
+            ):
+                if not (
+                    sc_node not in enclosing_set
+                    and isinstance(sc_node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and earliest_start <= u_start <= getattr(sc_node, "lineno", u_start)
+                    and n_end == u_end
+                ):
+                    continue
+                if (
+                    resolved_s_col is not None
+                    and not getattr(sc_node, "decorator_list", None)
+                    and getattr(sc_node, "lineno", None) == u_start
+                    and getattr(sc_node, "col_offset", resolved_s_col) != resolved_s_col
+                ):
+                    continue
+                if best_span is None or span_sz < best_span:
+                    unit_fn_node = sc_node
+                    best_span = span_sz
+        if unit_fn_node is not None:
+            sup_fn = unit_fn_node
+            sup_enclosing_scopes = [f for _, _, f in enclosing_chain]
+        else:
+            sup_fn = enclosing_chain[-1][2] if enclosing_chain else mod_tree
+            sup_enclosing_scopes = [f for _, _, f in enclosing_chain[:-1]]
+        sup_scope_ctx = (
+            _get_fn_scope_context(
+                sup_fn,
+                mod_tree=mod_tree,
+                enclosing_scopes=sup_enclosing_scopes,
+            )
+            if isinstance(sup_fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+            else None
+        )
+        initial_sup_prov = _seed_scope_suppress_aliases(
+            sup_fn,
+            mod_tree=mod_tree,
+            u_start=u_start,
+            scope_ctx=sup_scope_ctx,
+            extra_non_suppressing_ctx_managers=extra_non_sup,
+            strict_with_suppression=strict_with_flag,
+        )
+    elif has_any_with:
+        is_synthetic_wrapper = (
+            isinstance(tree, ast.Module)
+            and len(tree.body) == 1
+            and isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))
+            and tree.body[0].name == _SYNTHETIC_WRAPPER_NAME
+        )
+        scan_tree: ast.AST = (
+            tree
+            if isinstance(tree, ast.Module) and not is_synthetic_wrapper
+            else ast.Module(body=list(candidate_stmts), type_ignores=[])
+        )
+        with _ephemeral_unit_ast_context(scan_tree):
+            initial_sup_prov = _apply_exit_protocol_patch_scan(
+                initial_sup_prov,
+                scan_exit_protocol_patches(scan_tree),
+            )
+    for p_name in set(visitor.params) | visitor.type_param_names:
+        initial_sup_prov = initial_sup_prov.clear_name(p_name)
+    return initial_sup_prov
+
+
+def _analyze_subroutine_conditional_live_ins(
+    unit: Dict[str, Any],
+    candidate_stmts: Sequence[ast.stmt],
+    visitor: _ScopeVisitor,
+    *,
+    is_subroutine: bool,
+    def_assigned: Set[str],
+    cond_assigned: Set[str],
+    mod_tree: Optional[ast.AST],
+    full_mod_lines: Optional[Tuple[str, ...]],
+    enclosing_chain: Sequence[Tuple[int, int, ast.AST]],
+    u_start: int,
+    u_end: int,
+    resolved_s_col: Optional[int],
+    resolved_e_col: Optional[int],
+    strict_with_flag: bool,
+    extra_non_sup: FrozenSet[str],
+    get_full_source: Callable[[], Optional[str]],
+    hazards: List[str],
+    closure_hazard_reasons: List[str],
+    unit_heuristic_mgrs: Set[str],
+    unit_wildcard_mgrs: Set[Tuple[str, str]],
+) -> None:
+    """Evaluates subroutine conditional live-ins and write-only conditional candidates against enclosing pre-bounds."""
+    if not is_subroutine:
+        return
+    live_in_visitor = _UnitLiveInVisitor(1, 10**9, include_annotations=False)
+    for stmt in candidate_stmts:
+        live_in_visitor.visit(stmt)
+    excluded_cond_vars = set(visitor.params) | set(visitor.globals) | BUILTIN_NAMES
+    cond_live_ins = [
+        v
+        for v in sorted(live_in_visitor.live_ins)
+        if v in visitor.loads
+        and v not in excluded_cond_vars
+        and v not in visitor.read_before_write
+    ]
+    cond_escaping_cands = [
+        v
+        for v in sorted(
+            (cond_assigned - def_assigned)
+            | set(cond_live_ins)
+            | (live_in_visitor.live_ins & set(visitor.stores))
+        )
+        if v not in excluded_cond_vars
+    ]
+    if not (cond_live_ins or cond_escaping_cands):
+        return
+    pre_bound: Set[str] = set()
+    rejected_escaping_vars: Set[str] = set()
+    if mod_tree is not None and full_mod_lines is not None:
+        _register_tree_source_lines(mod_tree, full_mod_lines)
+    if mod_tree is not None and u_start > 0:
+        u_start_col, u_end_col = resolved_s_col, resolved_e_col
+        pre_bound, _ = _find_enclosing_pre_bound_names(
+            mod_tree,
+            u_start,
+            u_end,
+            u_start_col=u_start_col,
+            u_end_col=u_end_col,
+        )
+        if enclosing_chain:
+            innermost_stmt_fn, enc_nonlocals, enc_outer_globals = (
+                _extract_chain_nonlocals_and_outer_globals(
+                    enclosing_chain,
+                    u_start,
+                    u_end,
+                    u_start_col=u_start_col,
+                    u_end_col=u_end_col,
+                )
+            )
+            in_enclosing_class_body = isinstance(
+                _resolve_immediate_scope_in_fn(
+                    innermost_stmt_fn,
+                    u_start,
+                    u_end,
+                    u_start_col=u_start_col,
+                    u_end_col=u_end_col,
+                ),
+                ast.ClassDef,
+            )
+            enc_escaping = enc_nonlocals | enc_outer_globals
+            with _capture_unit_ctx_managers(unit_heuristic_mgrs, unit_wildcard_mgrs):
+                def_pre_bound = _find_enclosing_chain_definite_pre_bound(
+                    enclosing_chain,
+                    u_start,
+                    u_end,
+                    u_start_col=u_start_col,
+                    u_end_col=u_end_col,
+                    mod_tree=mod_tree,
+                    strict_with_suppression=strict_with_flag,
+                    extra_non_suppressing_ctx_managers=extra_non_sup,
+                )
+            write_only_cond_cands = {
+                v
+                for v in cond_escaping_cands
+                if v not in enc_escaping
+                and v not in visitor.loads
+                and v not in live_in_visitor.live_ins
+                and v in pre_bound
+                and v in def_pre_bound
+            }
+            live_write_only_cond: Set[str] = set()
+            if write_only_cond_cands:
+                pre_outs_decl = resolve_unit_declared_outputs(unit)
+                if is_non_string_sequence(pre_outs_decl) or isinstance(
+                    pre_outs_decl, AbstractSet
+                ):
+                    live_write_only_cond = write_only_cond_cands & set(pre_outs_decl)
+                else:
+                    full_src_text = get_full_source() or ""
+                    ds_unit: Dict[str, Any] = {
+                        **unit,
+                        "start": u_start,
+                        "end": u_end,
+                    }
+                    if u_start_col is not None:
+                        ds_unit["start_col"] = u_start_col
+                    if u_end_col is not None:
+                        ds_unit["end_col"] = u_end_col
+                    # Always include pre-unit closures when checking whether a
+                    # write-only conditional variable is live downstream: pruning
+                    # a required output in lenient mode would break callers.
+                    ds_live = collect_downstream_read_names(
+                        full_src_text,
+                        ds_unit,
+                        candidates=write_only_cond_cands,
+                        tree=mod_tree,
+                        closure_strictness="strict",
+                        source_digest=(
+                            None
+                            if full_src_text
+                            else _get_tree_sha256_digest(mod_tree)
+                        ),
+                    )
+                    live_write_only_cond = (
+                        set(write_only_cond_cands)
+                        if ds_live is None
+                        else (write_only_cond_cands & ds_live)
+                    )
+            for v in cond_escaping_cands:
+                if v in enc_escaping:
+                    if v in enc_nonlocals and v in pre_bound and v in def_pre_bound:
+                        if v not in visitor.loads:
+                            visitor.loads.append(v)
+                        if v not in visitor.read_before_write:
+                            visitor.read_before_write.append(v)
+                    else:
+                        rejected_escaping_vars.add(v)
+                        if v in visitor.read_before_write and v not in def_pre_bound:
+                            visitor.read_before_write.remove(v)
+                        if "severed_closure_cell" not in hazards:
+                            hazards.append("severed_closure_cell")
+                        sub_r = (
+                            "global_escape"
+                            if v in enc_outer_globals
+                            else "cell_severing"
+                        )
+                        if sub_r not in closure_hazard_reasons:
+                            closure_hazard_reasons.append(sub_r)
+                elif (
+                    not in_enclosing_class_body
+                    and not visitor.has_yield
+                    and v in pre_bound
+                    and v in def_pre_bound
+                    and (
+                        v in visitor.loads
+                        or v in live_in_visitor.live_ins
+                        or v in live_write_only_cond
+                    )
+                ):
+                    if v not in visitor.loads:
+                        visitor.loads.append(v)
+                    if v not in visitor.read_before_write:
+                        visitor.read_before_write.append(v)
+                elif in_enclosing_class_body or v not in def_pre_bound:
+                    rejected_escaping_vars.add(v)
+            for v in cond_live_ins:
+                if v not in def_pre_bound or (
+                    in_enclosing_class_body and v not in enc_escaping
+                ):
+                    rejected_escaping_vars.add(v)
+                    if v in pre_bound:
+                        if "severed_closure_cell" not in hazards:
+                            hazards.append("severed_closure_cell")
+                        if "conditional_live_in" not in closure_hazard_reasons:
+                            closure_hazard_reasons.append("conditional_live_in")
+    has_enclosing_context = mod_tree is not None and (
+        u_start > 1 or bool(_get_tree_scope_intervals(mod_tree))
+    )
+    for v in cond_live_ins:
+        if (
+            v not in rejected_escaping_vars
+            and (
+                v in pre_bound
+                or (not has_enclosing_context and v in def_assigned)
+            )
+            and v not in visitor.read_before_write
+        ):
+            visitor.read_before_write.append(v)
+
+
+def _resolve_unit_outputs(
+    unit: Dict[str, Any],
+    visitor: _ScopeVisitor,
+    *,
+    is_subroutine: bool,
+    inputs: Sequence[str],
+    def_assigned: Set[str],
+    cond_assigned: Set[str],
+    all_deleted: Set[str],
+    file_tree: Optional[ast.AST],
+    resolved_strictness: str,
+    get_full_source: Callable[[], Optional[str]],
+) -> Tuple[List[str], bool]:
+    """Computes ordered unit outputs and ambiguity flag from declared outputs, returns, or stores."""
+    pre_outs = resolve_unit_declared_outputs(unit)
+    outputs_ambiguous = False
+    alias_cands = visitor.type_aliases & (set(visitor.stores) | set(visitor.nonlocals))
+    downstream_aliases: Set[str] = set()
+    if is_subroutine and alias_cands:
+        full_src = get_full_source()
+        if full_src:
+            ds_reads = collect_downstream_read_names(
+                full_src,
+                unit,
+                candidates=alias_cands,
+                tree=file_tree,
+                closure_strictness=resolved_strictness,
+                unit_inputs=set(inputs),
+            )
+            downstream_aliases = set(alias_cands) if ds_reads is None else ds_reads
+        else:
+            downstream_aliases = set(alias_cands)
+    excluded_local_defs = (visitor.type_aliases - downstream_aliases) | set(
+        visitor.imported_names
+    )
+    uncond_deleted = all_deleted - (def_assigned | cond_assigned)
+
+    if is_subroutine and is_non_string_sequence(pre_outs):
+        outputs = list(dict.fromkeys(pre_outs))
+    elif is_subroutine and isinstance(pre_outs, AbstractSet):
+        if len(pre_outs) > 1:
+            logger.debug(
+                "Rejecting set-valued outputs (%s): unordered set cannot establish "
+                "positional order",
+                pre_outs,
+            )
+            outputs = []
+            outputs_ambiguous = True
+        else:
+            outputs = list(pre_outs)
+    elif visitor.returns:
+        outputs = list(visitor.returns)
+    elif is_subroutine:
+        seen: Set[str] = set()
+        outputs = []
+        for v in visitor.stores:
+            if (
+                v not in visitor.globals
+                and v not in BUILTIN_NAMES
+                and v not in visitor.except_vars
+                and v not in uncond_deleted
+                and v not in excluded_local_defs
+                and v not in seen
+            ):
+                seen.add(v)
+                outputs.append(v)
+    else:
+        outputs = []
+
+    for nl in visitor.nonlocals:
+        if (
+            nl in visitor.stores
+            and nl not in outputs
+            and nl not in visitor.except_vars
+            and nl not in uncond_deleted
+            and nl not in excluded_local_defs
+        ):
+            outputs.append(nl)
+    return outputs, outputs_ambiguous
+
+
+def _evaluate_unit_closure_and_lexical_hazards(
+    unit: Dict[str, Any],
+    tree: ast.AST,
+    candidate_stmts: Sequence[ast.stmt],
+    visitor: _ScopeVisitor,
+    *,
+    is_subroutine: bool,
+    inputs: Sequence[str],
+    outputs: Sequence[str],
+    free_vars: Sequence[str],
+    all_deleted: Set[str],
+    def_assigned: Set[str],
+    mod_tree: Optional[ast.AST],
+    full_mod_lines: Optional[Tuple[str, ...]],
+    enclosing_chain: Sequence[Tuple[int, int, ast.AST]],
+    u_start: int,
+    u_end: int,
+    resolved_s_col: Optional[int],
+    resolved_e_col: Optional[int],
+    cols_resolved: bool,
+    resolved_strictness: str,
+    extra_non_sup: FrozenSet[str],
+    get_full_source: Callable[[], Optional[str]],
+    hazards: List[str],
+    closure_hazard_reasons: List[str],
+    unit_heuristic_mgrs: Set[str],
+    unit_wildcard_mgrs: Set[Tuple[str, str]],
+) -> None:
+    """Validates lexical declarations and severed closure-cell hazards for a unit."""
+    lex_stmts: Sequence[ast.stmt] = (
+        tree.body
+        if isinstance(tree, ast.Module)
+        and len(tree.body) == 1
+        and isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))
+        and getattr(tree.body[0], "name", None) != _SYNTHETIC_WRAPPER_NAME
+        else candidate_stmts
+    )
+    if (
+        "severed_closure_cell" not in hazards
+        and _has_invalid_lexical_scope_declarations(
+            lex_stmts,
+            enclosing_chain=enclosing_chain,
+            mod_tree=mod_tree,
+            source_lines=full_mod_lines,
+        )
+    ):
+        hazards.append("severed_closure_cell")
+        if "invalid_lexical_declaration" not in closure_hazard_reasons:
+            closure_hazard_reasons.append("invalid_lexical_declaration")
+
+    if not (
+        is_subroutine
+        or unit.get("kind") in ("closure", "comprehension", "complex_expr")
+    ):
+        return
+    if u_start > 0 and mod_tree is not None:
+        if "severed_closure_cell" not in hazards:
+            with collect_heuristic_ctx_managers() as cell_heur_mgrs, collect_wildcard_ctx_managers() as cell_wc_mgrs:
+                hazard_res = _evaluate_severed_closure_cell_hazard(
+                    _UnitClosureHazardContext(
+                        candidate_stmts=candidate_stmts,
+                        mod_tree=mod_tree,
+                        u_start=u_start,
+                        u_end=u_end,
+                        u_start_col=resolved_s_col,
+                        u_end_col=resolved_e_col,
+                        is_subroutine=is_subroutine,
+                        unit_kind=str(unit.get("kind") or ""),
+                        inputs=inputs,
+                        outputs=outputs,
+                        stores=visitor.stores,
+                        deleted_names=all_deleted,
+                        unit_top_locals=visitor.unit_top_locals,
+                        free_vars=free_vars,
+                        nonlocals=visitor.nonlocals,
+                        has_yield=visitor.has_yield,
+                        is_async=visitor.is_async,
+                        closure_strictness=resolved_strictness,
+                        extra_non_suppressing_ctx_managers=extra_non_sup,
+                        definite_stores=def_assigned,
+                        cols_resolved=cols_resolved,
+                        enclosing_chain=enclosing_chain,
+                        lex_validated=True,
+                    )
+                )
+            unit_heuristic_mgrs.update(cell_heur_mgrs)
+            unit_wildcard_mgrs.update(cell_wc_mgrs)
+            if hazard_res.has_hazard:
+                hazards.append("severed_closure_cell")
+                for r in hazard_res.reasons:
+                    if r not in closure_hazard_reasons:
+                        closure_hazard_reasons.append(r)
+    elif "severed_closure_cell" not in hazards:
+        if bool(get_full_source()) or (
+            unit.get("kind") == "closure" and bool(free_vars)
+        ):
+            hazards.append("severed_closure_cell")
+            if "unresolved_span_bounds" not in closure_hazard_reasons:
+                closure_hazard_reasons.append("unresolved_span_bounds")
+        elif not bool(unit.get("allow_snippet_only")):
+            # Fail closed when enclosing module context is absent unless the
+            # caller explicitly opted into isolated snippet-only inspection.
+            hazards.append("severed_closure_cell")
+            if "snippet_only_missing_enclosing_context" not in closure_hazard_reasons:
+                closure_hazard_reasons.append(
+                    "snippet_only_missing_enclosing_context"
+                )
+
+
+def _resolve_unit_effective_async(
+    unit: Dict[str, Any],
+    visitor: _ScopeVisitor,
+    *,
+    is_subroutine: bool,
+    file_tree: Optional[ast.AST],
+    get_full_source: Callable[[], Optional[str]],
+) -> Optional[bool]:
+    """Resolves whether a unit executes inside an async context."""
+    is_sub_or_inner = is_subroutine or unit.get("kind") in (
+        "comprehension",
+        "complex_expr",
+        "class",
+        "data_table",
+    )
+    unit_is_async = unit.get("is_async")
+    if unit_is_async is None:
+        if is_sub_or_inner and not visitor.has_yield:
+            unit_is_async = visitor.is_async
+        else:
+            s_line = parse_unit_coord(unit, "start", default=1)
+            e_line = parse_unit_coord(unit, "end", default=s_line)
+            full_src = get_full_source()
+            if full_src:
+                unit_is_async = find_enclosing_function_is_async(
+                    full_src, s_line, e_line, tree=file_tree
+                )
+            else:
+                unit_is_async = None
+    if visitor.is_async or unit.get("kind") in ("async_function", "async_method"):
+        return True
+    if "is_async" in unit and unit.get("is_async") is not None:
+        return bool(unit.get("is_async"))
+    if visitor.has_yield:
+        return bool(unit_is_async) if unit_is_async is not None else None
+    if not is_sub_or_inner and unit.get("kind") not in (
+        "function",
+        "method",
+        "async_function",
+        "async_method",
+    ):
+        return bool(unit_is_async)
+    return False
+
+
+class _UnitEnclosingContext(NamedTuple):
+    """Resolved module AST, source lines, column bounds, and enclosing function chain for a unit."""
+
+    u_start: int
+    u_end: int
+    mod_tree: Optional[ast.AST]
+    full_mod_lines: Optional[Tuple[str, ...]]
+    resolved_s_col: Optional[int]
+    resolved_e_col: Optional[int]
+    cols_resolved: bool
+    enclosing_chain: List[Tuple[int, int, ast.AST]]
+
+
+def _resolve_unit_enclosing_context(
+    unit: Dict[str, Any],
+    candidate_stmts: Sequence[ast.stmt],
+    *,
+    inferred_s_col: Optional[int],
+    inferred_e_col: Optional[int],
+    file_tree: Optional[ast.AST],
+    get_full_source: Callable[[], Optional[str]],
+) -> _UnitEnclosingContext:
+    """Resolves the enclosing module tree, line table, column bounds, and enclosing function chain."""
+    u_start = parse_unit_coord(unit, "start", default=0)
+    u_end = parse_unit_coord(unit, "end", default=u_start)
+    mod_tree: Optional[ast.AST] = file_tree
+    full_mod_src = get_full_source()
+    if mod_tree is None and u_start > 0 and full_mod_src:
+        mod_tree = _get_or_parse_tree(full_mod_src)
+    resolved_s_col, resolved_e_col = inferred_s_col, inferred_e_col
+    cols_resolved = False
+    enclosing_chain: List[Tuple[int, int, ast.AST]] = []
+    if mod_tree is not None and full_mod_src:
+        full_mod_lines: Optional[Tuple[str, ...]] = _register_tree_source_lines(
+            mod_tree, source_text=full_mod_src
+        )
+    else:
+        full_mod_lines = (
+            _split_source_lines_stripped(full_mod_src) if full_mod_src else None
+        )
+    if mod_tree is not None and u_start > 0:
+        resolved_s_col, resolved_e_col = _resolve_unit_col_bounds(
+            candidate_stmts,
+            mod_tree,
+            u_start,
+            u_end,
+            resolved_s_col,
+            resolved_e_col,
+        )
+        cols_resolved = True
+        enclosing_chain = _find_enclosing_function_chain(
+            mod_tree,
+            u_start,
+            u_end,
+            resolved_s_col,
+            resolved_e_col,
+            source_lines=full_mod_lines,
+        )
+    return _UnitEnclosingContext(
+        u_start=u_start,
+        u_end=u_end,
+        mod_tree=mod_tree,
+        full_mod_lines=full_mod_lines,
+        resolved_s_col=resolved_s_col,
+        resolved_e_col=resolved_e_col,
+        cols_resolved=cols_resolved,
+        enclosing_chain=enclosing_chain,
+    )
+
+
+class _UnitInputsAndReceivers(NamedTuple):
+    """Ordered helper inputs, free variables, and receiver-binding metadata for a unit."""
+
+    free_vars: List[str]
+    inputs: List[str]
+    all_attrs: List[str]
+    has_instance_binding: bool
+    has_class_binding: bool
+    binding_kind: Optional[str]
+    has_receiver_access: bool
+
+
+def _compute_unit_inputs_and_receivers(
+    visitor: _ScopeVisitor,
+    *,
+    rec_param: Optional[str],
+    rec_kind: Optional[str],
+    inst_receivers: Set[str],
+    class_receivers: Set[str],
+    all_receivers: Set[str],
+) -> _UnitInputsAndReceivers:
+    """Computes ordered helper inputs, free variables, and instance/class receiver bindings."""
+    is_class_rec = rec_kind == "class"
+    free_vars = [
+        name
+        for name in visitor.loads
+        if name not in visitor.params
+        and (name not in visitor.stores or name in visitor.read_before_write)
+        and name not in visitor.globals
+        and name not in BUILTIN_NAMES
+    ]
+    inputs: List[str] = list(visitor.params)
+    for fv in free_vars:
+        if fv not in inputs:
+            inputs.append(fv)
+    for nl in visitor.nonlocals:
+        if nl not in inputs:
+            inputs.append(nl)
+    param_map = {
+        p["name"].lstrip("*"): p.get("kind", "pos") for p in visitor.param_details
+    }
+    inputs.sort(
+        key=lambda v: _rank_param_kind(
+            v, param_map, receiver_names=tuple(all_receivers)
+        )
+    )
+    all_attrs = visitor.attrs_read + visitor.attrs_written
+    has_instance_binding = any(
+        r in visitor.loads
+        or r in visitor.params
+        or any(a.startswith(f"{r}.") for a in all_attrs)
+        for r in inst_receivers
+        if r in ("self", "this")
+        or (rec_param and r == rec_param and rec_kind == "instance")
+        or any(a.startswith(f"{r}.") for a in all_attrs)
+    )
+    has_class_binding = any(
+        r in visitor.loads
+        or r in visitor.params
+        or any(a.startswith(f"{r}.") for a in all_attrs)
+        for r in class_receivers
+        if r in ("cls", "klass")
+        or (rec_param and r == rec_param and is_class_rec)
+        or any(a.startswith(f"{r}.") for a in all_attrs)
+    )
+    binding_kind = _determine_binding_kind(has_instance_binding, has_class_binding)
+    primary_rec = rec_param or ("cls" if is_class_rec else None)
+    _normalize_receiver_order(
+        inputs,
+        has_instance_binding,
+        has_class_binding,
+        primary_receiver=primary_rec,
+    )
+    has_receiver_access = bool(
+        any(
+            r in visitor.loads or any(a.startswith(f"{r}.") for a in all_attrs)
+            for r in all_receivers
+            if r in ("self", "cls", "this", "klass")
+            or any(a.startswith(f"{r}.") for a in all_attrs)
+        )
+    )
+    return _UnitInputsAndReceivers(
+        free_vars=free_vars,
+        inputs=inputs,
+        all_attrs=all_attrs,
+        has_instance_binding=has_instance_binding,
+        has_class_binding=has_class_binding,
+        binding_kind=binding_kind,
+        has_receiver_access=has_receiver_access,
+    )
+
+
+def _build_unit_scope_result_dict(
+    visitor: _ScopeVisitor,
+    io_info: _UnitInputsAndReceivers,
+    *,
+    outputs: List[str],
+    conditional_outputs: List[str],
+    def_assigned: Set[str],
+    may_deleted: Set[str],
+    hazards: List[str],
+    closure_hazard_reasons: List[str],
+    inst_receivers: Set[str],
+    class_receivers: Set[str],
+    outputs_ambiguous: bool,
+    has_class_scoped_type_params: bool,
+    effective_is_async: Optional[bool],
+    resolved_strictness: str,
+    extra_non_sup: AbstractSet[str],
+    unit_heuristic_mgrs: Set[str],
+    unit_wildcard_mgrs: Set[Tuple[str, str]],
+) -> Dict[str, Any]:
+    """Assembles the canonical schema-v2 unit scope analysis result dictionary."""
+    return {
+        "inputs": io_info.inputs,
+        "outputs": outputs,
+        "stores": visitor.stores,
+        "free_vars": io_info.free_vars,
+        "nonlocals": visitor.nonlocals,
+        "globals": visitor.globals,
+        "attrs_read": visitor.attrs_read,
+        "attrs_written": visitor.attrs_written,
+        "param_details": visitor.param_details,
+        "return_type": visitor.return_type,
+        "control_flow_hazards": hazards,
+        "closure_hazard_reasons": closure_hazard_reasons,
+        "is_control_flow_safe": not any(
+            h in BLOCKING_CONTROL_FLOW_HAZARDS for h in hazards
+        ),
+        "has_yield": visitor.has_yield,
+        "has_yield_assignment": visitor.has_yield_assignment,
+        "has_try_or_with": visitor.has_try_or_with,
+        "has_return": visitor.has_return,
+        "has_return_value": visitor.has_return_value,
+        "has_super": visitor.has_super,
+        "has_mangled_names": visitor.has_mangled_names,
+        "local_imports": visitor.local_imports,
+        "yield_expr_names": visitor.yield_expr_names,
+        "is_async": effective_is_async,
+        "conditional_outputs": conditional_outputs,
+        "definite_stores": sorted(def_assigned),
+        "has_instance_binding": io_info.has_instance_binding,
+        "has_class_binding": io_info.has_class_binding,
+        "binding_kind": io_info.binding_kind,
+        "has_receiver_access": io_info.has_receiver_access,
+        "instance_attrs": [
+            a
+            for a in io_info.all_attrs
+            if any(a.startswith(f"{r}.") for r in inst_receivers)
+        ],
+        "class_attrs": [
+            a
+            for a in io_info.all_attrs
+            if any(a.startswith(f"{r}.") for r in class_receivers)
+        ],
+        "outputs_ambiguous": outputs_ambiguous,
+        "type_params": list(visitor.type_params),
+        "type_param_free_vars": list(visitor.type_param_free_vars),
+        "has_class_scoped_type_params": has_class_scoped_type_params,
+        "deleted_names": sorted(may_deleted),
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
+        "closure_strictness": resolved_strictness,
+        "non_suppressing_ctx_managers": sorted(extra_non_sup),
+        "heuristic_ctx_managers": sorted(unit_heuristic_mgrs),
+        "wildcard_ctx_managers": sorted(unit_wildcard_mgrs),
+    }
+
+
+class _UnitVisitorSetup(NamedTuple):
+    """Initial AST visitor pass, receiver sets, and baseline control-flow hazards for a unit."""
+
+    visitor: _ScopeVisitor
+    is_subroutine: bool
+    rec_param: Optional[str]
+    rec_kind: Optional[str]
+    inst_receivers: Set[str]
+    class_receivers: Set[str]
+    all_receivers: Set[str]
+    hazards: List[str]
+    has_class_scoped_type_params: bool
+
+
+def _run_unit_visitor_and_initial_hazards(
+    unit: Dict[str, Any],
+    prep: Any,
+    parsed: Any,
+    *,
+    file_tree: Optional[ast.AST],
+    get_full_source: Callable[[], Optional[str]],
+) -> _UnitVisitorSetup:
+    """Runs _ScopeVisitor on the parsed unit AST and collects baseline control-flow hazards."""
+    if prep.normalized.is_subroutine_flag is not None:
+        is_subroutine = prep.normalized.is_subroutine_flag
+    elif prep.normalized.explicit_kind in _SUBROUTINE_KINDS:
+        is_subroutine = True
+    elif prep.normalized.explicit_kind in _WHOLE_UNIT_KINDS:
+        is_subroutine = False
+    else:
+        is_subroutine = is_subroutine_unit(
+            unit, source_text=get_full_source(), tree=file_tree
+        )
+
+    rec_param = unit.get("receiver_param")
+    rec_kind = unit.get("receiver_kind")
+    inst_receivers: Set[str] = {"self", "this"}
+    class_receivers: Set[str] = {"cls", "klass"}
+    if rec_param:
+        (class_receivers if rec_kind == "class" else inst_receivers).add(rec_param)
+    all_receivers = inst_receivers | class_receivers
+
+    visitor = _ScopeVisitor(
+        loop_offset=parsed.loop_offset,
+        source_lines=split_source_lines(parsed.cand_text),
+        is_subroutine=is_subroutine,
+        receiver_names=tuple(all_receivers),
+    )
+    visitor.visit(parsed.tree)
+
+    hazards: List[str] = []
+    if visitor.naked_breaks > 0:
+        hazards.append("naked_break")
+    if visitor.naked_continues > 0:
+        hazards.append("naked_continue")
+    if visitor.has_yield:
+        hazards.append("generator_yield")
+    if is_subroutine and visitor.has_return:
+        hazards.append("embedded_return")
+
+    has_class_scoped_type_params = (
+        _check_type_param_closure_capture(
+            unit,
+            parsed.tree,
+            visitor,
+            inferred_s_col=prep.inferred_s_col,
+            file_tree=file_tree,
+            get_full_source=get_full_source,
+            hazards=hazards,
+        )
+        if visitor.type_param_free_vars and not is_subroutine
+        else False
+    )
+    return _UnitVisitorSetup(
+        visitor=visitor,
+        is_subroutine=is_subroutine,
+        rec_param=rec_param,
+        rec_kind=rec_kind,
+        inst_receivers=inst_receivers,
+        class_receivers=class_receivers,
+        all_receivers=all_receivers,
+        hazards=hazards,
+        has_class_scoped_type_params=has_class_scoped_type_params,
+    )
+
+
+def _analyze_unit_block_flow_and_deletions(
+    tree: ast.AST,
+    candidate_stmts: Sequence[ast.stmt],
+    visitor: _ScopeVisitor,
+    enc: _UnitEnclosingContext,
+    prep: Any,
+    *,
+    is_subroutine: bool,
+    unit_heuristic_mgrs: Set[str],
+    unit_wildcard_mgrs: Set[Tuple[str, str]],
+) -> Tuple[Set[str], Set[str], Set[str]]:
+    """Runs block definite-assignment/deletion analysis and records live-in deletions on visitor."""
+    may_deleted: Set[str] = set()
+    live_in_deleted: Set[str] = set()
+    initial_sup_prov = _seed_unit_with_suppress_provenance(
+        tree,
+        candidate_stmts,
+        visitor,
+        mod_tree=enc.mod_tree,
+        full_mod_lines=enc.full_mod_lines,
+        enclosing_chain=enc.enclosing_chain,
+        is_subroutine=is_subroutine,
+        u_start=enc.u_start,
+        u_end=enc.u_end,
+        resolved_s_col=enc.resolved_s_col,
+        extra_non_sup=prep.extra_non_sup,
+        strict_with_flag=prep.strict_with_flag,
+    )
+    with _capture_unit_ctx_managers(unit_heuristic_mgrs, unit_wildcard_mgrs):
+        def_assigned, cond_assigned = _analyze_block_assignment(
+            candidate_stmts,
+            may_deleted=may_deleted,
+            live_in_deleted=live_in_deleted,
+            suppress_aliases=initial_sup_prov,
+            extra_non_suppressing_ctx_managers=prep.extra_non_sup,
+            strict_with_suppression=prep.strict_with_flag,
+        )
+    for del_name in sorted(live_in_deleted):
+        if (
+            del_name not in visitor.params
+            and del_name not in visitor.globals
+            and del_name not in BUILTIN_NAMES
+        ):
+            if del_name not in visitor.loads:
+                visitor.loads.append(del_name)
+            if del_name not in visitor.read_before_write:
+                visitor.read_before_write.append(del_name)
+    return def_assigned, cond_assigned, may_deleted
+
+
+def _inspect_unit_scope_impl(
+    unit: Dict[str, Any],
+    repo_root: Optional[str] = None,
+    file_tree: Optional[ast.AST] = None,
+    *,
+    allow_disk_read: bool = True,
+) -> Dict[str, Any]:
+    """Coordinates source preparation, AST parsing, block-flow, and closure-hazard analysis for one unit."""
     cached_full_source: List[Optional[str]] = [None]
     full_source_loaded: List[bool] = [False]
 
     def _get_full_source() -> Optional[str]:
         if not full_source_loaded[0]:
-            cached_full_source[0] = _load_unit_file_text(unit, repo_root=repo_root)
+            if allow_disk_read:
+                cached_full_source[0] = _load_unit_file_text(unit, repo_root=repo_root)
+            else:
+                buf = resolve_unit_source_buffer(
+                    unit,
+                    include_lines=False,
+                    is_sliced_lines_fn=_is_sliced_excerpt_for_file,
+                )
+                cached_full_source[0] = None if buf.is_invalid_notebook else buf.full_text
             full_source_loaded[0] = True
         return cached_full_source[0]
 
-    unit_code_lines = extract_unit_source_code(unit, repo_root=repo_root)
-    raw_lines = _slice_unit_token_lines(unit, unit_code_lines)
-    dedented = dedent_source_text("".join(raw_lines))
-    empty_res: Dict[str, Any] = {
-        "inputs": [],
-        "outputs": [],
-        "stores": [],
-        "free_vars": [],
-        "nonlocals": [],
-        "globals": [],
-        "attrs_read": [],
-        "attrs_written": [],
-        "param_details": [],
-        "return_type": None,
-        "control_flow_hazards": [],
-        "is_control_flow_safe": True,
-        "has_yield": False,
-        "has_yield_assignment": False,
-        "has_try_or_with": False,
-        "has_return": False,
-        "has_return_value": False,
-        "has_super": False,
-        "has_mangled_names": False,
-        "local_imports": [],
-        "yield_expr_names": [],
-        "is_async": False,
-        "conditional_outputs": [],
-        "definite_stores": [],
-        "has_instance_binding": False,
-        "has_class_binding": False,
-        "binding_kind": None,
-        "has_receiver_access": False,
-        "instance_attrs": [],
-        "class_attrs": [],
-        "outputs_ambiguous": False,
-        "type_params": [],
-        "type_param_free_vars": [],
-        "has_class_scoped_type_params": False,
-        "deleted_names": [],
-    }
-    if not dedented.strip():
-        return empty_res
+    prep = _prepare_unit_scope_source(
+        unit,
+        repo_root=repo_root,
+        file_tree=file_tree,
+        allow_disk_read=allow_disk_read,
+        get_full_source=_get_full_source,
+    )
+    if prep.early_result is not None:
+        return prep.early_result
 
-    tree: Optional[ast.AST] = None
-    loop_offset = 0
-    candidate_stmts: List[ast.stmt] = []
-
-    parse_candidates = [
-        (dedented, 0),
-        (f"if 1:\n{dedented}", 0),
-        (f"def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
-        (f"async def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
-        (
-            f"def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
-            f"{textwrap.indent(dedented, '        ')}",
-            1,
-        ),
-        (
-            f"async def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
-            f"{textwrap.indent(dedented, '        ')}",
-            1,
-        ),
-    ]
-
-    had_resource_error = False
-    for cand_text, offset in parse_candidates:
-        try:
-            tree = ast.parse(cand_text)
-            loop_offset = offset
-            if cand_text == dedented:
-                if isinstance(tree, ast.Module):
-                    if len(tree.body) == 1 and isinstance(
-                        tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)
-                    ):
-                        candidate_stmts = tree.body[0].body
-                    else:
-                        candidate_stmts = tree.body
-            elif cand_text.startswith("if 1:\n"):
-                if (
-                    isinstance(tree, ast.Module)
-                    and len(tree.body) == 1
-                    and isinstance(tree.body[0], ast.If)
-                ):
-                    inner_body = tree.body[0].body
-                    tree = ast.Module(body=inner_body, type_ignores=[])
-                    if len(inner_body) == 1 and isinstance(
-                        inner_body[0], (ast.FunctionDef, ast.AsyncFunctionDef)
-                    ):
-                        candidate_stmts = inner_body[0].body
-                    else:
-                        candidate_stmts = inner_body
-            elif offset == 1:
-                wrapper_fn = tree.body[0]  # type: ignore[attr-defined]
-                if isinstance(wrapper_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    for_loop = wrapper_fn.body[0]
-                    if isinstance(for_loop, (ast.For, ast.AsyncFor, ast.While)):
-                        candidate_stmts = for_loop.body
-            else:
-                wrapper_fn = tree.body[0]  # type: ignore[attr-defined]
-                if isinstance(wrapper_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    candidate_stmts = wrapper_fn.body
-            break
-        except (RecursionError, MemoryError):
-            had_resource_error = True
-            break
-        except (SyntaxError, ValueError, UnicodeDecodeError):
-            continue
-
-    if tree is None:
-        if had_resource_error:
+    parsed = _parse_unit_scope_ast(prep.dedented)
+    if parsed.tree is None:
+        if parsed.had_resource_error:
             return {
-                **empty_res,
+                **prep.empty_res,
                 "control_flow_hazards": ["pathological_ast"],
                 "is_control_flow_safe": False,
             }
-        return empty_res
+        return prep.empty_res
 
+    tree = parsed.tree
+    candidate_stmts = parsed.candidate_stmts
     try:
-        if "is_subroutine" in unit and unit.get("is_subroutine") is not None:
-            is_subroutine = bool(unit["is_subroutine"])
-        elif str(unit.get("kind") or "") in _SUBROUTINE_KINDS:
-            is_subroutine = True
-        elif str(unit.get("kind") or "") in _WHOLE_UNIT_KINDS:
-            is_subroutine = False
-        else:
-            is_subroutine = is_subroutine_unit(
-                unit, source_text=_get_full_source(), tree=file_tree
-            )
-
-        rec_param = unit.get("receiver_param")
-        rec_kind = unit.get("receiver_kind")
-        is_class_rec = rec_kind == "class"
-
-        inst_receivers: Set[str] = {"self", "this"}
-        class_receivers: Set[str] = {"cls", "klass"}
-        if rec_param:
-            if is_class_rec:
-                class_receivers.add(rec_param)
-            else:
-                inst_receivers.add(rec_param)
-
-        all_receivers = inst_receivers | class_receivers
-
-        cand_lines = split_source_lines(cand_text)
-        visitor = _ScopeVisitor(
-            loop_offset=loop_offset,
-            source_lines=cand_lines,
-            is_subroutine=is_subroutine,
-            receiver_names=tuple(all_receivers),
+        setup = _run_unit_visitor_and_initial_hazards(
+            unit, prep, parsed, file_tree=file_tree, get_full_source=_get_full_source
         )
-        visitor.visit(tree)
+        visitor = setup.visitor
+        is_subroutine = setup.is_subroutine
+        hazards = setup.hazards
+        closure_hazard_reasons: List[str] = []
 
-        hazards: List[str] = []
-        if visitor.naked_breaks > 0:
-            hazards.append("naked_break")
-        if visitor.naked_continues > 0:
-            hazards.append("naked_continue")
-        if visitor.has_yield:
-            hazards.append("generator_yield")
-        if is_subroutine and visitor.has_return:
-            hazards.append("embedded_return")
-
-        has_class_scoped_type_params = False
-        if visitor.type_param_free_vars and not is_subroutine:
-            s_line = parse_unit_coord(unit, "start", default=1)
-            e_line = parse_unit_coord(unit, "end", default=s_line)
-            u_col = parse_unit_coord(unit, "start_col", default=None)
-            if u_col is None:
-                u_col = parse_unit_coord(unit, "col_offset", default=None)
-            top_fn = (
-                tree.body[0]
-                if isinstance(tree, ast.Module)
-                and len(tree.body) == 1
-                and isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))
-                else None
-            )
-            top_fn_name = getattr(top_fn, "name", None) if top_fn is not None else None
-            top_fn_count = (
-                sum(
-                    1
-                    for n in ast.walk(top_fn)
-                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                )
-                if top_fn is not None
-                else None
-            )
-            parsed_tree = file_tree
-            if parsed_tree is None:
-                full_src = _get_full_source()
-                if full_src:
-                    parsed_tree = _get_or_parse_tree(full_src)
-            enclosing_fn_locals: Set[str] = set()
-            enclosing_cls_locals: Set[str] = set()
-            has_enclosing_fn = False
-            has_enclosing_cls = False
-            prev_enclosed_cls_name: Optional[str] = None
-            if parsed_tree is not None:
-                matched_self = False
-                for earliest_start, n_end, _span, scope_node in _get_tree_scope_intervals(
-                    parsed_tree
-                ):
-                    if earliest_start > s_line or e_line > n_end:
-                        continue
-                    if isinstance(scope_node, ast.ClassDef):
-                        if not has_enclosing_cls:
-                            has_enclosing_cls = True
-                            prev_enclosed_cls_name = getattr(scope_node, "name", None)
-                            enclosing_cls_locals.update(
-                                _extract_single_node_local_names(
-                                    scope_node, include_globals=False
-                                )
-                            )
-                        else:
-                            if isinstance(prev_enclosed_cls_name, str):
-                                enclosing_cls_locals.add(prev_enclosed_cls_name)
-                            prev_enclosed_cls_name = getattr(scope_node, "name", None)
-                            enclosing_cls_locals.update(
-                                _extract_type_param_names(scope_node)
-                            )
-                    elif isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        if (
-                            not matched_self
-                            and s_line
-                            in (
-                                earliest_start,
-                                getattr(scope_node, "lineno", earliest_start),
-                            )
-                            and (
-                                e_line == n_end
-                                or top_fn_name is not None
-                                or u_col is not None
-                            )
-                            and (
-                                u_col is None
-                                or getattr(scope_node, "col_offset", 0) == u_col
-                            )
-                            and (
-                                top_fn_name is None
-                                or getattr(scope_node, "name", None) == top_fn_name
-                            )
-                            and (
-                                top_fn_count is None
-                                or sum(
-                                    1
-                                    for n in ast.walk(scope_node)
-                                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                                )
-                                == top_fn_count
-                            )
-                        ):
-                            matched_self = True
-                            continue
-                        if (
-                            earliest_start < s_line
-                            or n_end > e_line
-                            or (u_col is None and matched_self)
-                            or (
-                                u_col is not None
-                                and getattr(scope_node, "col_offset", 0) < u_col
-                            )
-                        ):
-                            has_enclosing_fn = True
-                            enclosing_fn_locals.update(
-                                _extract_single_node_local_names(
-                                    scope_node, include_globals=False
-                                )
-                            )
-            if has_enclosing_fn and any(
-                fv in enclosing_fn_locals for fv in visitor.type_param_free_vars
-            ):
-                hazards.append("type_param_closure_capture")
-            elif (
-                not has_enclosing_fn
-                and not has_enclosing_cls
-                and unit.get("kind") == "closure"
-            ):
-                hazards.append("type_param_closure_capture")
-            if has_enclosing_cls and any(
-                fv in enclosing_cls_locals for fv in visitor.type_param_free_vars
-            ):
-                has_class_scoped_type_params = True
-                if (
-                    has_enclosing_fn
-                    or unit.get("kind") == "closure"
-                ) and "type_param_closure_capture" not in hazards:
-                    hazards.append("type_param_closure_capture")
-            elif not has_enclosing_cls and (
-                unit.get("enclosing_class")
-                or unit.get("kind") in ("method", "async_method")
-            ):
-                has_class_scoped_type_params = True
-
-        # Definite, conditional, and branch-aware deletion analysis across candidate statements
-        may_deleted: Set[str] = set()
-        live_in_deleted: Set[str] = set()
-        def_assigned, cond_assigned = _analyze_block_assignment(
+        enc = _resolve_unit_enclosing_context(
+            unit,
             candidate_stmts,
-            may_deleted=may_deleted,
-            live_in_deleted=live_in_deleted,
+            inferred_s_col=prep.inferred_s_col,
+            inferred_e_col=prep.inferred_e_col,
+            file_tree=file_tree,
+            get_full_source=_get_full_source,
         )
-        for del_name in sorted(live_in_deleted):
-            if (
-                del_name not in visitor.params
-                and del_name not in visitor.globals
-                and del_name not in BUILTIN_NAMES
-            ):
-                if del_name not in visitor.loads:
-                    visitor.loads.append(del_name)
-                if del_name not in visitor.read_before_write:
-                    visitor.read_before_write.append(del_name)
-
-        if is_subroutine:
-            live_in_visitor = _UnitLiveInVisitor(1, 10**9, include_annotations=False)
-            for stmt in candidate_stmts:
-                live_in_visitor.visit(stmt)
-            cond_live_ins = [
-                v
-                for v in sorted(live_in_visitor.live_ins)
-                if v in visitor.loads
-                and v not in visitor.params
-                and v not in visitor.globals
-                and v not in BUILTIN_NAMES
-                and v not in visitor.read_before_write
-            ]
-            if cond_live_ins:
-                pre_bound: Set[str] = set()
-                u_start = parse_unit_coord(unit, "start", default=0)
-                u_end = parse_unit_coord(unit, "end", default=u_start)
-                mod_tree = file_tree
-                if mod_tree is None and u_start > 0:
-                    full_src = _get_full_source()
-                    if full_src:
-                        mod_tree = _get_or_parse_tree(full_src)
-                if mod_tree is not None and u_start > 0:
-                    pre_bound, _ = _find_enclosing_pre_bound_names(
-                        mod_tree, u_start, u_end
-                    )
-                has_enclosing_context = mod_tree is not None and (
-                    u_start > 1 or bool(_get_tree_scope_intervals(mod_tree))
-                )
-                for v in cond_live_ins:
-                    if v in pre_bound or (not has_enclosing_context and v in def_assigned):
-                        visitor.read_before_write.append(v)
-
-        free_vars = [
-            name for name in visitor.loads
-            if name not in visitor.params
-            and (name not in visitor.stores or name in visitor.read_before_write)
-            and name not in visitor.globals
-            and name not in BUILTIN_NAMES
-        ]
-
-        inputs: List[str] = list(visitor.params)
-        for fv in free_vars:
-            if fv not in inputs:
-                inputs.append(fv)
-        for nl in visitor.nonlocals:
-            if nl not in inputs:
-                inputs.append(nl)
-
-        param_map = {p["name"].lstrip("*"): p.get("kind", "pos") for p in visitor.param_details}
-        inputs.sort(key=lambda v: _rank_param_kind(v, param_map, receiver_names=tuple(all_receivers)))
-
-        has_instance_binding = any(
-            r in visitor.loads
-            or r in visitor.params
-            or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
-            for r in inst_receivers
-            if r in ("self", "this")
-            or (rec_param and r == rec_param and rec_kind == "instance")
-            or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
+        unit_heuristic_mgrs: Set[str] = set()
+        unit_wildcard_mgrs: Set[Tuple[str, str]] = set()
+        def_assigned, cond_assigned, may_deleted = (
+            _analyze_unit_block_flow_and_deletions(
+                tree,
+                candidate_stmts,
+                visitor,
+                enc,
+                prep,
+                is_subroutine=is_subroutine,
+                unit_heuristic_mgrs=unit_heuristic_mgrs,
+                unit_wildcard_mgrs=unit_wildcard_mgrs,
+            )
         )
-        has_class_binding = any(
-            r in visitor.loads
-            or r in visitor.params
-            or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
-            for r in class_receivers
-            if r in ("cls", "klass")
-            or (rec_param and r == rec_param and is_class_rec)
-            or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
+
+        _analyze_subroutine_conditional_live_ins(
+            unit,
+            candidate_stmts,
+            visitor,
+            is_subroutine=is_subroutine,
+            def_assigned=def_assigned,
+            cond_assigned=cond_assigned,
+            mod_tree=enc.mod_tree,
+            full_mod_lines=enc.full_mod_lines,
+            enclosing_chain=enc.enclosing_chain,
+            u_start=enc.u_start,
+            u_end=enc.u_end,
+            resolved_s_col=enc.resolved_s_col,
+            resolved_e_col=enc.resolved_e_col,
+            strict_with_flag=prep.strict_with_flag,
+            extra_non_sup=prep.extra_non_sup,
+            get_full_source=_get_full_source,
+            hazards=hazards,
+            closure_hazard_reasons=closure_hazard_reasons,
+            unit_heuristic_mgrs=unit_heuristic_mgrs,
+            unit_wildcard_mgrs=unit_wildcard_mgrs,
         )
-        binding_kind = _determine_binding_kind(has_instance_binding, has_class_binding)
 
-        primary_rec = rec_param or ("cls" if is_class_rec else None)
-        _normalize_receiver_order(inputs, has_instance_binding, has_class_binding, primary_receiver=primary_rec)
-
-        # Unit outputs: explicit returns if present; for subroutines without explicit
-        # returns, all local variable stores act as unit outputs to preserve caller mutations.
-        pre_outs = resolve_unit_declared_outputs(unit)
-
-        outputs_ambiguous = False
-        alias_cands = visitor.type_aliases & (set(visitor.stores) | set(visitor.nonlocals))
-        downstream_aliases: Set[str] = set()
-        if is_subroutine and alias_cands:
-            full_src = _get_full_source()
-            if full_src:
-                ds_reads = collect_downstream_read_names(
-                    full_src,
-                    unit,
-                    candidates=alias_cands,
-                    tree=file_tree,
-                    unit_inputs=set(inputs),
-                )
-                downstream_aliases = (
-                    set(alias_cands) if ds_reads is None else ds_reads
-                )
-            else:
-                downstream_aliases = set(alias_cands)
-        excluded_local_defs = (visitor.type_aliases - downstream_aliases) | set(
-            visitor.imported_names
+        io_info = _compute_unit_inputs_and_receivers(
+            visitor,
+            rec_param=setup.rec_param,
+            rec_kind=setup.rec_kind,
+            inst_receivers=setup.inst_receivers,
+            class_receivers=setup.class_receivers,
+            all_receivers=setup.all_receivers,
         )
+
         all_deleted = _extract_deleted_names(candidate_stmts) | visitor.deleted_names
-        uncond_deleted = all_deleted - (def_assigned | cond_assigned)
-
-        if is_subroutine and isinstance(pre_outs, (list, tuple)):
-            outputs = list(dict.fromkeys(pre_outs))
-        elif is_subroutine and isinstance(pre_outs, (set, frozenset)):
-            if len(pre_outs) > 1:
-                logger.debug(
-                    "Rejecting set-valued outputs (%s): unordered set cannot establish "
-                    "positional order",
-                    pre_outs,
-                )
-                outputs = []
-                outputs_ambiguous = True
-            else:
-                outputs = list(pre_outs)
-        elif visitor.returns:
-            outputs = list(visitor.returns)
-        elif is_subroutine:
-            seen: Set[str] = set()
-            outputs = []
-            for v in visitor.stores:
-                if (
-                    v not in visitor.globals
-                    and v not in BUILTIN_NAMES
-                    and v not in visitor.except_vars
-                    and v not in uncond_deleted
-                    and v not in excluded_local_defs
-                    and v not in seen
-                ):
-                    seen.add(v)
-                    outputs.append(v)
-        else:
-            outputs = []
-
-        for nl in visitor.nonlocals:
-            if (
-                nl in visitor.stores
-                and nl not in outputs
-                and nl not in visitor.except_vars
-                and nl not in uncond_deleted
-                and nl not in excluded_local_defs
-            ):
-                outputs.append(nl)
-
-        # Detect conditional variable escapes (outputs assigned conditionally without prior
-        # unconditional assignment in this block, or potentially deleted along a path).
+        outputs, outputs_ambiguous = _resolve_unit_outputs(
+            unit,
+            visitor,
+            is_subroutine=is_subroutine,
+            inputs=io_info.inputs,
+            def_assigned=def_assigned,
+            cond_assigned=cond_assigned,
+            all_deleted=all_deleted,
+            file_tree=file_tree,
+            resolved_strictness=prep.resolved_strictness,
+            get_full_source=_get_full_source,
+        )
         conditional_outputs = [
-            v for v in outputs
-            if (v not in inputs or v in may_deleted) and v not in def_assigned
+            v
+            for v in outputs
+            if (v not in io_info.inputs or v in may_deleted) and v not in def_assigned
         ]
-
         if (
             is_subroutine
-            and bool((set(outputs) | set(inputs)) & may_deleted)
+            and bool((set(outputs) | set(io_info.inputs)) & may_deleted)
             and "deleted_output" not in hazards
         ):
             hazards.append("deleted_output")
 
-        is_control_flow_safe = not any(
-            h
-            in (
-                "naked_break",
-                "naked_continue",
-                "embedded_return",
-                "type_param_closure_capture",
-                "pathological_ast",
-                "deleted_output",
-            )
-            for h in hazards
+        _evaluate_unit_closure_and_lexical_hazards(
+            unit,
+            tree,
+            candidate_stmts,
+            visitor,
+            is_subroutine=is_subroutine,
+            inputs=io_info.inputs,
+            outputs=outputs,
+            free_vars=io_info.free_vars,
+            all_deleted=all_deleted,
+            def_assigned=def_assigned,
+            mod_tree=enc.mod_tree,
+            full_mod_lines=enc.full_mod_lines,
+            enclosing_chain=enc.enclosing_chain,
+            u_start=enc.u_start,
+            u_end=enc.u_end,
+            resolved_s_col=enc.resolved_s_col,
+            resolved_e_col=enc.resolved_e_col,
+            cols_resolved=enc.cols_resolved,
+            resolved_strictness=prep.resolved_strictness,
+            extra_non_sup=prep.extra_non_sup,
+            get_full_source=_get_full_source,
+            hazards=hazards,
+            closure_hazard_reasons=closure_hazard_reasons,
+            unit_heuristic_mgrs=unit_heuristic_mgrs,
+            unit_wildcard_mgrs=unit_wildcard_mgrs,
         )
 
-        has_receiver_access = bool(
-            any(
-                r in visitor.loads
-                or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
-                for r in all_receivers
-                if r in ("self", "cls", "this", "klass")
-                or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
-            )
+        effective_is_async = _resolve_unit_effective_async(
+            unit,
+            visitor,
+            is_subroutine=is_subroutine,
+            file_tree=file_tree,
+            get_full_source=_get_full_source,
         )
-
-        is_sub_or_inner = is_subroutine or unit.get("kind") in (
-            "comprehension",
-            "complex_expr",
-            "class",
-            "data_table",
+        return _build_unit_scope_result_dict(
+            visitor,
+            io_info,
+            outputs=outputs,
+            conditional_outputs=conditional_outputs,
+            def_assigned=def_assigned,
+            may_deleted=may_deleted,
+            hazards=hazards,
+            closure_hazard_reasons=closure_hazard_reasons,
+            inst_receivers=setup.inst_receivers,
+            class_receivers=setup.class_receivers,
+            outputs_ambiguous=outputs_ambiguous,
+            has_class_scoped_type_params=setup.has_class_scoped_type_params,
+            effective_is_async=effective_is_async,
+            resolved_strictness=prep.resolved_strictness,
+            extra_non_sup=prep.extra_non_sup,
+            unit_heuristic_mgrs=unit_heuristic_mgrs,
+            unit_wildcard_mgrs=unit_wildcard_mgrs,
         )
-        unit_is_async = unit.get("is_async")
-        if unit_is_async is None:
-            if is_sub_or_inner and not visitor.has_yield:
-                unit_is_async = visitor.is_async
-            else:
-                s_line = parse_unit_coord(unit, "start", default=1)
-                e_line = parse_unit_coord(unit, "end", default=s_line)
-                full_src = _get_full_source()
-                if full_src:
-                    unit_is_async = find_enclosing_function_is_async(
-                        full_src, s_line, e_line, tree=file_tree
-                    )
-                else:
-                    unit_is_async = None
-
-        effective_is_async: Optional[bool]
-        if visitor.is_async or unit.get("kind") in ("async_function", "async_method"):
-            effective_is_async = True
-        elif "is_async" in unit and unit.get("is_async") is not None:
-            effective_is_async = bool(unit.get("is_async"))
-        elif visitor.has_yield:
-            effective_is_async = bool(unit_is_async) if unit_is_async is not None else None
-        elif not is_sub_or_inner and unit.get("kind") not in (
-            "function",
-            "method",
-            "async_function",
-            "async_method",
-        ):
-            effective_is_async = bool(unit_is_async)
-        else:
-            effective_is_async = False
-
+    except RecursionError:
         return {
-            "inputs": inputs,
-            "outputs": outputs,
-            "stores": visitor.stores,
-            "free_vars": free_vars,
-            "nonlocals": visitor.nonlocals,
-            "globals": visitor.globals,
-            "attrs_read": visitor.attrs_read,
-            "attrs_written": visitor.attrs_written,
-            "param_details": visitor.param_details,
-            "return_type": visitor.return_type,
-            "control_flow_hazards": hazards,
-            "is_control_flow_safe": is_control_flow_safe,
-            "has_yield": visitor.has_yield,
-            "has_yield_assignment": visitor.has_yield_assignment,
-            "has_try_or_with": visitor.has_try_or_with,
-            "has_return": visitor.has_return,
-            "has_return_value": visitor.has_return_value,
-            "has_super": visitor.has_super,
-            "has_mangled_names": visitor.has_mangled_names,
-            "local_imports": visitor.local_imports,
-            "yield_expr_names": visitor.yield_expr_names,
-            "is_async": effective_is_async,
-            "conditional_outputs": conditional_outputs,
-            "definite_stores": sorted(def_assigned),
-            "has_instance_binding": has_instance_binding,
-            "has_class_binding": has_class_binding,
-            "binding_kind": binding_kind,
-            "has_receiver_access": has_receiver_access,
-            "instance_attrs": [
-                a for a in visitor.attrs_read + visitor.attrs_written
-                if any(a.startswith(f"{r}.") for r in inst_receivers)
-            ],
-            "class_attrs": [
-                a for a in visitor.attrs_read + visitor.attrs_written
-                if any(a.startswith(f"{r}.") for r in class_receivers)
-            ],
-            "outputs_ambiguous": outputs_ambiguous,
-            "type_params": list(visitor.type_params),
-            "type_param_free_vars": list(visitor.type_param_free_vars),
-            "has_class_scoped_type_params": has_class_scoped_type_params,
-            "deleted_names": sorted(may_deleted),
-        }
-    except (RecursionError, MemoryError):
-        return {
-            **empty_res,
+            **prep.empty_res,
             "control_flow_hazards": ["pathological_ast"],
             "is_control_flow_safe": False,
         }
-
 
 
 def inspect_single_unit_scope(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
     tree: Optional[ast.AST] = None,
+    *,
+    closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    allow_disk_read: bool = True,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping for an individual code unit."""
-    return _inspect_unit_scope(unit, repo_root=repo_root, file_tree=tree)
+    if closure_strictness is not None or non_suppressing_ctx_managers is not None:
+        normalized = normalize_unit_boundary(
+            unit,
+            closure_strictness=closure_strictness,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        )
+        unit = dict(unit)
+        if closure_strictness is not None:
+            unit["closure_strictness"] = normalized.policy.mode
+        if non_suppressing_ctx_managers is not None:
+            unit["non_suppressing_ctx_managers"] = list(
+                normalized.policy.non_suppressing_ctx_managers
+            )
+    return _inspect_unit_scope(
+        unit,
+        repo_root=repo_root,
+        file_tree=tree,
+        allow_disk_read=allow_disk_read,
+    )
 
 
 def _align_symmetric_var_list(list1: List[str], list2: List[str]) -> List[str]:
@@ -2376,115 +1800,264 @@ def _merge_type_params(tp1: Sequence[str], tp2: Sequence[str]) -> List[str]:
     ]
 
 
-def analyze_unit_variable_scope(
-    u1: Dict[str, Any],
-    u2: Optional[Dict[str, Any]] = None,
-    repo_root: Optional[str] = None,
-    tree1: Optional[ast.AST] = None,
-    tree2: Optional[ast.AST] = None,
-    scope1: Optional[Dict[str, Any]] = None,
-    scope2: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
-    info1 = scope1 if scope1 is not None else inspect_single_unit_scope(
-        u1, repo_root=repo_root, tree=tree1
-    )
-    if u2 is not None:
-        info2 = scope2 if scope2 is not None else inspect_single_unit_scope(
-            u2, repo_root=repo_root, tree=tree2
+def scope_matches_closure_mode(
+    scope: Optional[Dict[str, Any]],
+    expected_strictness: str,
+    *,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+) -> bool:
+    """Checks whether a precomputed scope dictionary matches the current schema and mode.
+
+    Requires ``scope_schema_version == SCOPE_SCHEMA_VERSION`` and an explicit canonical
+    ``closure_strictness`` string matching ``expected_strictness`` so unmarked or
+    mismatched serialized scopes are never trusted without recomputation.
+    """
+    if scope is None:
+        return False
+    if scope.get("scope_schema_version") != SCOPE_SCHEMA_VERSION:
+        return False
+    raw_mode = scope.get("closure_strictness")
+    if not isinstance(raw_mode, str):
+        return False
+    expected_mode = validate_closure_strictness(expected_strictness)
+    if raw_mode != expected_mode:
+        return False
+    scope_non_sup = frozenset(
+        normalize_non_suppressing_ctx_managers(
+            scope.get("non_suppressing_ctx_managers")
         )
+    )
+    target_non_sup = frozenset(
+        normalize_non_suppressing_ctx_managers(non_suppressing_ctx_managers)
+    )
+    if scope_non_sup != target_non_sup:
+        return False
+    return True
+
+
+def ensure_unit_scope_closure_mode(
+    unit: Dict[str, Any],
+    scope: Optional[Dict[str, Any]],
+    closure_strictness: str,
+    *,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    source_text: Optional[str] = None,
+    tree: Optional[ast.AST] = None,
+    repo_root: Optional[str] = None,
+    allow_disk_read: bool = True,
+) -> Dict[str, Any]:
+    """Returns scope if its schema version and closure mode match, else recomputes it.
+
+    Caller-supplied scopes lacking ``scope_schema_version == SCOPE_SCHEMA_VERSION`` (or
+    whose ``closure_strictness`` / ``non_suppressing_ctx_managers`` values differ from
+    the requested configuration) are discarded — losing any manual caller overrides in
+    those dicts — and recomputed from the backing module source/AST, or fail closed when
+    backing source is unavailable.
+
+    Note:
+        Scopes that record terminal ``"pathological_ast"``, ``"stale_source_code"``, or
+        ``"invalid_unit_columns"`` in ``control_flow_hazards`` alongside
+        ``is_control_flow_safe=False`` are returned directly without re-parsing or
+        mutating the terminal hazard dict, as they are unconditionally rejected
+        downstream regardless of closure mode. Caller-supplied scopes stamped with
+        matching ``scope_schema_version`` and ``closure_strictness`` are also
+        returned directly without re-running source validation (such as
+        ``stale_source_code``, ``invalid_unit_columns``, or
+        ``unavailable_source_placeholder`` checks). When a caller-supplied ``scope`` (or
+        ``unit["scope"]``) is discarded due to a missing schema stamp or mode mismatch,
+        a once-per-run ``WARNING`` is emitted.
+    """
+    eff_mode = resolve_closure_strictness_mode(closure_strictness)
+    eff_non_sup = normalize_non_suppressing_ctx_managers(
+        non_suppressing_ctx_managers,
+        unit.get("non_suppressing_ctx_managers"),
+    )
+    eff_scope: Optional[Dict[str, Any]] = (
+        scope
+        if scope is not None
+        else (unit.get("scope") if isinstance(unit.get("scope"), dict) else None)
+    )
+    if eff_scope is not None and (
+        scope_matches_closure_mode(
+            eff_scope,
+            eff_mode,
+            non_suppressing_ctx_managers=eff_non_sup,
+        )
+        or (
+            eff_scope.get("is_control_flow_safe") is False
+            and any(
+                h in eff_scope.get("control_flow_hazards", ())
+                for h in (
+                    "pathological_ast",
+                    "stale_source_code",
+                    "invalid_unit_columns",
+                )
+            )
+        )
+    ):
+        if eff_mode != "pedantic":
+            for mgr_name in normalize_heuristic_ctx_managers(
+                eff_scope.get("heuristic_ctx_managers")
+            ):
+                record_heuristic_non_suppressing_ctx_manager(mgr_name)
+        for pat, mgr_name in normalize_wildcard_ctx_manager_matches(
+            eff_scope.get("wildcard_ctx_managers")
+        ):
+            record_wildcard_ctx_manager_match(pat, mgr_name)
+        return eff_scope
+    u_copy = {
+        **unit,
+        "closure_strictness": eff_mode,
+    }
+    u_copy.pop("scope", None)
+    if eff_non_sup or "non_suppressing_ctx_managers" in u_copy:
+        u_copy["non_suppressing_ctx_managers"] = list(eff_non_sup)
+    if source_text is not None and not str(u_copy.get("source_text") or "").strip():
+        u_copy["source_text"] = source_text
+    if eff_scope is not None:
+        norm_copy = normalize_unit_boundary(u_copy)
+        buf_copy = resolve_unit_source_buffer(
+            u_copy,
+            include_lines=False,
+            is_sliced_lines_fn=_is_sliced_excerpt_for_file,
+        )
+        src_lines_val = u_copy.get("source_lines")
+        needs_enclosing_module = _is_subroutine_or_nested_expr_unit(
+            u_copy, source_text=source_text, tree=tree
+        )
+        has_full_module_source = (
+            tree is not None
+            or (
+                not buf_copy.is_invalid_notebook
+                and isinstance(buf_copy.full_text, str)
+                and bool(buf_copy.full_text.strip())
+            )
+            or (allow_disk_read and bool(_load_unit_file_text(u_copy, repo_root=repo_root)))
+        )
+        has_snippet_source = bool(norm_copy.source_code) or (
+            is_non_string_sequence(src_lines_val)
+            and any(
+                isinstance(ln, str) and bool(ln.strip())
+                for ln in src_lines_val
+            )
+        )
+        has_unit_source = has_full_module_source or (
+            has_snippet_source
+            and (not needs_enclosing_module or norm_copy.allow_snippet_only)
+        )
+        if should_warn_closure_event("precomputed_scope_discarded"):
+            discard_reason = (
+                f"missing scope_schema_version={SCOPE_SCHEMA_VERSION}"
+                if eff_scope.get("scope_schema_version") != SCOPE_SCHEMA_VERSION
+                else "closure mode or allowlist mismatch"
+            )
+            action_msg = (
+                "recomputing from source"
+                if has_unit_source
+                else "failing closed because backing source is unavailable"
+            )
+            logger.warning(
+                "Discarding caller-supplied precomputed scope (%s) and %s "
+                "(further occurrences suppressed for this run)",
+                discard_reason,
+                action_msg,
+            )
+        if not has_unit_source:
+            logger.debug(
+                "Precomputed scope for unit %r does not match active closure mode "
+                "and backing source is unavailable; failing closed",
+                unit.get("name"),
+            )
+            hazards = list(eff_scope.get("control_flow_hazards", ()))
+            if "unavailable_source_for_closure_mode" not in hazards:
+                hazards.append("unavailable_source_for_closure_mode")
+            if "severed_closure_cell" not in hazards:
+                hazards.append("severed_closure_cell")
+            reasons = list(eff_scope.get("closure_hazard_reasons", ()))
+            if "unavailable_source_for_closure_mode" not in reasons:
+                reasons.append("unavailable_source_for_closure_mode")
+            return {
+                **_make_empty_scope_result(eff_mode, eff_non_sup),
+                **eff_scope,
+                "control_flow_hazards": hazards,
+                "closure_hazard_reasons": reasons,
+                "is_control_flow_safe": False,
+                "scope_schema_version": SCOPE_SCHEMA_VERSION,
+                "closure_strictness": eff_mode,
+                "non_suppressing_ctx_managers": list(eff_non_sup),
+                "heuristic_ctx_managers": normalize_heuristic_ctx_managers(
+                    eff_scope.get("heuristic_ctx_managers")
+                ),
+                "wildcard_ctx_managers": normalize_wildcard_ctx_manager_matches(
+                    eff_scope.get("wildcard_ctx_managers")
+                ),
+            }
+        logger.debug(
+            "Recomputing precomputed scope for unit %r to match active closure mode",
+            unit.get("name"),
+        )
+    return inspect_single_unit_scope(
+        u_copy,
+        repo_root=repo_root,
+        tree=tree,
+        allow_disk_read=allow_disk_read,
+    )
+
+
+def _combine_unit_scope_dicts(
+    info1: Dict[str, Any],
+    info2: Optional[Dict[str, Any]],
+    u1: Dict[str, Any],
+    u2: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Combines one or two validated unit scope dictionaries into a unified scope dict."""
+    def _merge_list(key: str) -> List[Any]:
+        first = list(info1.get(key, []))
+        return (
+            list(dict.fromkeys(first + list(info2.get(key, []))))
+            if info2 is not None
+            else first
+        )
+
+    def _or_bool(key: str) -> bool:
+        return bool(info1.get(key, False) or (info2.get(key, False) if info2 is not None else False))
+
+    if info2 is not None:
         inputs = _align_symmetric_var_list(info1["inputs"], info2["inputs"])
         outputs = _align_symmetric_var_list(info1["outputs"], info2["outputs"])
-        free_vars = list(dict.fromkeys(info1["free_vars"] + info2["free_vars"]))
-        nonlocals = list(dict.fromkeys(info1["nonlocals"] + info2["nonlocals"]))
-        globals_ = list(dict.fromkeys(info1["globals"] + info2["globals"]))
-        attrs_read = list(dict.fromkeys(info1["attrs_read"] + info2["attrs_read"]))
-        attrs_written = list(dict.fromkeys(info1["attrs_written"] + info2["attrs_written"]))
-        if info1["return_type"] == info2["return_type"]:
-            return_type = info1["return_type"]
-        elif info1["return_type"] is None:
-            return_type = info2["return_type"]
-        elif info2["return_type"] is None:
-            return_type = info1["return_type"]
-        else:
-            return_type = None
-        hazards = list(dict.fromkeys(info1["control_flow_hazards"] + info2["control_flow_hazards"]))
+        rt1, rt2 = info1["return_type"], info2["return_type"]
+        return_type = rt1 if (rt1 == rt2 or rt2 is None) else (rt2 if rt1 is None else None)
         is_safe = info1["is_control_flow_safe"] and info2["is_control_flow_safe"]
-        has_yield = info1["has_yield"] or info2["has_yield"]
-        has_yield_assignment = bool(
-            info1.get("has_yield_assignment", False)
-            or info2.get("has_yield_assignment", False)
-        )
-        has_try_or_with = bool(
-            info1.get("has_try_or_with", False)
-            or info2.get("has_try_or_with", False)
-        )
-        has_return = info1["has_return"] or info2["has_return"]
-        has_return_value = bool(info1.get("has_return_value") or info2.get("has_return_value"))
-        has_super = bool(info1.get("has_super", False) or info2.get("has_super", False))
-        has_mangled = bool(
-            info1.get("has_mangled_names", False) or info2.get("has_mangled_names", False)
-        )
-        local_imports = list(dict.fromkeys(info1["local_imports"] + info2["local_imports"]))
         local_imports_by_unit = [info1["local_imports"], info2["local_imports"]]
         yield_expr_names = info1["yield_expr_names"] + info2["yield_expr_names"]
-        is_async = info1.get("is_async", False) or info2.get("is_async", False)
-        conditional_outputs = list(dict.fromkeys(
-            info1.get("conditional_outputs", []) + info2.get("conditional_outputs", [])
-        ))
         definite_stores = sorted(
             set(info1.get("definite_stores", [])) & set(info2.get("definite_stores", []))
-        )
-        outputs_ambiguous = bool(
-            info1.get("outputs_ambiguous", False) or info2.get("outputs_ambiguous", False)
         )
         type_params = _merge_type_params(
             info1.get("type_params", []), info2.get("type_params", [])
         )
-        deleted_names = list(
-            dict.fromkeys(
-                info1.get("deleted_names", []) + info2.get("deleted_names", [])
-            )
+        combined_strictness = combine_closure_strictness(
+            str(info1.get("closure_strictness") or "strict"),
+            str(info2.get("closure_strictness") or "strict"),
+        )
+        non_sup_out = sorted(
+            set(info1.get("non_suppressing_ctx_managers", ()))
+            & set(info2.get("non_suppressing_ctx_managers", ()))
         )
     else:
         inputs = info1["inputs"]
         outputs = info1["outputs"]
-        free_vars = info1["free_vars"]
-        nonlocals = info1["nonlocals"]
-        globals_ = info1["globals"]
-        attrs_read = info1["attrs_read"]
-        attrs_written = info1["attrs_written"]
         return_type = info1["return_type"]
-        hazards = info1["control_flow_hazards"]
         is_safe = info1["is_control_flow_safe"]
-        has_yield = info1["has_yield"]
-        has_yield_assignment = bool(info1.get("has_yield_assignment", False))
-        has_try_or_with = bool(info1.get("has_try_or_with", False))
-        has_return = info1["has_return"]
-        has_return_value = bool(info1.get("has_return_value"))
-        has_super = bool(info1.get("has_super", False))
-        has_mangled = bool(info1.get("has_mangled_names", False))
-        local_imports = info1["local_imports"]
         local_imports_by_unit = [info1["local_imports"]]
         yield_expr_names = info1["yield_expr_names"]
-        is_async = info1.get("is_async", False)
-        conditional_outputs = info1.get("conditional_outputs", [])
         definite_stores = info1.get("definite_stores", [])
-        outputs_ambiguous = bool(info1.get("outputs_ambiguous", False))
         type_params = list(info1.get("type_params", []))
-        deleted_names = list(info1.get("deleted_names", []))
+        combined_strictness = str(info1.get("closure_strictness") or "strict")
+        non_sup_out = sorted(set(info1.get("non_suppressing_ctx_managers", ())))
 
-    has_instance_binding = info1.get("has_instance_binding", False) or (
-        info2.get("has_instance_binding", False) if u2 is not None else False
-    )
-    has_class_binding = info1.get("has_class_binding", False) or (
-        info2.get("has_class_binding", False) if u2 is not None else False
-    )
-    has_receiver_access = info1.get("has_receiver_access", False) or (
-        info2.get("has_receiver_access", False) if u2 is not None else False
-    )
-    binding_kind = _determine_binding_kind(has_instance_binding, has_class_binding)
-
+    has_instance_binding = _or_bool("has_instance_binding")
+    has_class_binding = _or_bool("has_class_binding")
     primary_rec = (
         u1.get("receiver_param")
         or (u2.get("receiver_param") if u2 else None)
@@ -2503,65 +2076,118 @@ def analyze_unit_variable_scope(
         has_class_binding,
         primary_receiver=primary_rec,
     )
-
-    locals_ = [var for var in info1["stores"] if var not in inputs]
     return {
         "inputs": inputs,
         "outputs": outputs,
-        "locals": locals_,
-        "free_vars": free_vars,
-        "nonlocals": nonlocals,
-        "globals": globals_,
-        "attrs_read": attrs_read,
-        "attrs_written": attrs_written,
+        "locals": [var for var in info1["stores"] if var not in inputs],
+        "free_vars": _merge_list("free_vars"),
+        "nonlocals": _merge_list("nonlocals"),
+        "globals": _merge_list("globals"),
+        "attrs_read": _merge_list("attrs_read"),
+        "attrs_written": _merge_list("attrs_written"),
         "param_details": info1["param_details"],
         "return_type": return_type,
-        "control_flow_hazards": hazards,
+        "control_flow_hazards": _merge_list("control_flow_hazards"),
         "is_control_flow_safe": is_safe,
-        "has_yield": has_yield,
-        "has_yield_assignment": has_yield_assignment,
-        "has_try_or_with": has_try_or_with,
-        "has_return": has_return,
-        "has_return_value": has_return_value,
-        "has_super": has_super,
-        "has_mangled_names": has_mangled,
-        "local_imports": local_imports,
+        "has_yield": _or_bool("has_yield"),
+        "has_yield_assignment": _or_bool("has_yield_assignment"),
+        "has_try_or_with": _or_bool("has_try_or_with"),
+        "has_return": _or_bool("has_return"),
+        "has_return_value": _or_bool("has_return_value"),
+        "has_super": _or_bool("has_super"),
+        "has_mangled_names": _or_bool("has_mangled_names"),
+        "local_imports": _merge_list("local_imports"),
         "local_imports_by_unit": local_imports_by_unit,
         "yield_expr_names": yield_expr_names,
-        "is_async": is_async,
-        "conditional_outputs": conditional_outputs,
+        "is_async": _or_bool("is_async"),
+        "conditional_outputs": _merge_list("conditional_outputs"),
         "definite_stores": definite_stores,
         "has_instance_binding": has_instance_binding,
         "has_class_binding": has_class_binding,
-        "binding_kind": binding_kind,
-        "has_receiver_access": has_receiver_access,
-        "instance_attrs": list(
-            dict.fromkeys(
-                info1.get("instance_attrs", [])
-                + (info2.get("instance_attrs", []) if u2 is not None else [])
-            )
-        ),
-        "class_attrs": list(
-            dict.fromkeys(
-                info1.get("class_attrs", [])
-                + (info2.get("class_attrs", []) if u2 is not None else [])
-            )
-        ),
-        "outputs_ambiguous": outputs_ambiguous,
+        "binding_kind": _determine_binding_kind(has_instance_binding, has_class_binding),
+        "has_receiver_access": _or_bool("has_receiver_access"),
+        "instance_attrs": _merge_list("instance_attrs"),
+        "class_attrs": _merge_list("class_attrs"),
+        "outputs_ambiguous": _or_bool("outputs_ambiguous"),
         "type_params": type_params,
-        "type_param_free_vars": list(
-            dict.fromkeys(
-                info1.get("type_param_free_vars", [])
-                + (info2.get("type_param_free_vars", []) if u2 is not None else [])
-            )
+        "type_param_free_vars": _merge_list("type_param_free_vars"),
+        "has_class_scoped_type_params": _or_bool("has_class_scoped_type_params"),
+        "deleted_names": _merge_list("deleted_names"),
+        "closure_hazard_reasons": _merge_list("closure_hazard_reasons"),
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
+        "closure_strictness": combined_strictness,
+        "non_suppressing_ctx_managers": non_sup_out,
+        "heuristic_ctx_managers": normalize_heuristic_ctx_managers(
+            info1.get("heuristic_ctx_managers"),
+            info2.get("heuristic_ctx_managers") if info2 is not None else (),
         ),
-        "has_class_scoped_type_params": bool(
-            info1.get("has_class_scoped_type_params", False)
-            or (
-                info2.get("has_class_scoped_type_params", False)
-                if u2 is not None
-                else False
-            )
+        "wildcard_ctx_managers": normalize_wildcard_ctx_manager_matches(
+            info1.get("wildcard_ctx_managers"),
+            info2.get("wildcard_ctx_managers") if info2 is not None else (),
         ),
-        "deleted_names": deleted_names,
     }
+
+
+def analyze_unit_variable_scope(
+    u1: Dict[str, Any],
+    u2: Optional[Dict[str, Any]] = None,
+    repo_root: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
+    scope1: Optional[Dict[str, Any]] = None,
+    scope2: Optional[Dict[str, Any]] = None,
+    *,
+    closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes.
+
+    Note:
+        Precomputed ``scope1`` / ``scope2`` dictionaries (or ``unit["scope"]``) are validated
+        via ``ensure_unit_scope_closure_mode``: any caller-supplied scope missing
+        ``scope_schema_version == SCOPE_SCHEMA_VERSION`` or computed under a different
+        closure strictness / allowlist configuration is discarded (dropping manual caller
+        overrides) and recomputed from backing module source, or fails closed if backing
+        source is unavailable.
+    """
+    info2: Optional[Dict[str, Any]] = None
+    if u2 is not None:
+        pair_policy = resolve_pair_closure_policy(
+            u1,
+            u2,
+            closure_strictness=closure_strictness,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        )
+        eff_mode = pair_policy.effective_mode
+        with analysis_session():
+            info1 = ensure_unit_scope_closure_mode(
+                u1,
+                scope1,
+                eff_mode,
+                non_suppressing_ctx_managers=pair_policy.unit1.non_suppressing_ctx_managers,
+                repo_root=repo_root,
+                tree=tree1,
+            )
+            info2 = ensure_unit_scope_closure_mode(
+                u2,
+                scope2,
+                eff_mode,
+                non_suppressing_ctx_managers=pair_policy.unit2.non_suppressing_ctx_managers,
+                repo_root=repo_root,
+                tree=tree2,
+            )
+    else:
+        policy1 = resolve_unit_closure_policy(
+            u1,
+            closure_strictness=closure_strictness,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        )
+        info1 = ensure_unit_scope_closure_mode(
+            u1,
+            scope1,
+            policy1.mode,
+            non_suppressing_ctx_managers=policy1.non_suppressing_ctx_managers,
+            repo_root=repo_root,
+            tree=tree1,
+        )
+    return _combine_unit_scope_dicts(info1, info2, u1, u2)

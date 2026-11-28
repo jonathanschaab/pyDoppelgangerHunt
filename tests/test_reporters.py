@@ -22,9 +22,6 @@ from pydoppelgangerhunt import (
     generate_html_report,
     supports_color,
 )
-from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
-    _build_whole_method_delegation,
-)
 
 
 def test_sarif_210_report_generation() -> None:
@@ -447,11 +444,13 @@ def test_defensive_reporting_and_metrics_with_none_fields(tmp_path: Path) -> Non
 
 def test_syntax_error_fallback_delegation_and_defensive_extract_source_code() -> None:
     """Verifies scanner fallback delegation on SyntaxError and defensive source code / HTML report bounds."""
-    from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=protected-access
         _build_whole_method_delegation,
+    )
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=protected-access
         _scan_sig_line,
     )
-    from pydoppelgangerhunt.reporters import extract_unit_source_code, generate_html_report
+    from pydoppelgangerhunt.reporters import extract_unit_source_code
 
     # 1. _scan_sig_line paren and colon detection
     pos, depth = _scan_sig_line("def f(x: int = 1) -> int: return x", 0)
@@ -568,8 +567,8 @@ def test_extract_unit_source_code_relative_path_containment_in_repo_root(
     assert "CF-001" in html
     assert ":10-10</code> (member)" in html
 
-def test_batch_66_artifact_dirs_clustering_helper_and_defensive_scoring(tmp_path: Path) -> None:
-    """Batch 66: Verify artifact directory creation, clustering deduplication helper, and defensive scoring."""
+def test_artifact_dirs_clustering_helper_and_defensive_scoring(tmp_path: Path) -> None:
+    """Verifies artifact directory creation, clustering deduplication helper, and defensive scoring."""
     from pydoppelgangerhunt.cli import (  # pylint: disable=import-outside-toplevel
         _write_artifact_file,
         main as cli_main,
@@ -931,3 +930,1406 @@ def test_reports_with_colon_formatted_line_coordinates(tmp_path: Path) -> None:
     # 5. HTML report
     html_rep = generate_html_report(clones, target=str(tmp_path), threshold=0.8, families=[fam])
     assert "1-2" in html_rep
+
+
+@pytest.mark.parametrize("target_kind", ["suggestion", "html", "cache_resolve"])
+def test_reporters_memory_error_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_kind: str,
+) -> None:
+    """Verifies MemoryError is never swallowed as a per-pair diagnostic in reporters."""
+    from pydoppelgangerhunt.reporters import (
+        resolve_cached_unit_source_and_tree,
+        synthesize_refactoring_suggestion,
+    )
+
+    f1 = tmp_path / "mem1.py"
+    f1.write_text("def a(x):\n    return x + 1\n\ndef b(x):\n    return x + 1\n", encoding="utf-8")
+    u1 = {"name": "a", "file": str(f1), "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "b", "file": str(f1), "start": 4, "end": 5, "kind": "function"}
+
+    def _raise_mem(*_args: Any, **_kwargs: Any) -> Any:
+        raise MemoryError("synthetic OOM")
+
+    if target_kind == "suggestion":
+        monkeypatch.setattr("pydoppelgangerhunt.fixer.synthesis.synthesize_shared_helper_code", _raise_mem)
+        with pytest.raises(MemoryError, match="synthetic OOM"):
+            synthesize_refactoring_suggestion(u1, u2, repo_root=str(tmp_path))
+    elif target_kind == "html":
+        monkeypatch.setattr("pydoppelgangerhunt.reporters.synthesize_refactoring_suggestion", _raise_mem)
+        with pytest.raises(MemoryError, match="synthetic OOM"):
+            generate_html_report([(0.99, u1, u2)], str(tmp_path), 0.9, repo_root=str(tmp_path))
+    else:
+        monkeypatch.setattr("pydoppelgangerhunt.fixer._df_cache._get_or_parse_tree", _raise_mem)
+        with pytest.raises(MemoryError, match="synthetic OOM"):
+            resolve_cached_unit_source_and_tree(u1, repo_root=str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    ("exc_factory", "expected_reason"),
+    [
+        pytest.param(lambda: SyntaxError("bad token"), "unparseable or invalid syntax", id="syntax_error"),
+        pytest.param(lambda: OSError("disk error"), "source file read or decode failure", id="os_error"),
+        pytest.param(lambda: RecursionError("deep ast"), "pathological ast", id="recursion_error"),
+    ],
+)
+def test_synthesize_refactoring_suggestion_classifies_specific_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exc_factory: Any,
+    expected_reason: str,
+) -> None:
+    """Verifies suggestion synthesis reports accurate failure reasons for SyntaxError, OSError, and RecursionError."""
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    f1 = tmp_path / "err_mod.py"
+    f1.write_text("def a(x):\n    return x + 1\n\ndef b(x):\n    return x + 1\n", encoding="utf-8")
+    u1 = {"name": "a", "file": str(f1), "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "b", "file": str(f1), "start": 4, "end": 5, "kind": "function"}
+
+    def _boom(*_args: Any, **_kwargs: Any) -> str:
+        raise exc_factory()
+
+    monkeypatch.setattr("pydoppelgangerhunt.fixer.synthesis.synthesize_shared_helper_code", _boom)
+    sug = synthesize_refactoring_suggestion(u1, u2, repo_root=str(tmp_path))
+    assert expected_reason in sug
+
+
+def test_html_report_card_fallback_preserves_real_line_bounds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies per-pair HTML rendering fallback preserves real start/end bounds instead of collapsing to 1-1."""
+    f1 = tmp_path / "bounds1.py"
+    f2 = tmp_path / "bounds2.py"
+    f1.write_text("x = 1\n", encoding="utf-8")
+    f2.write_text("y = 1\n", encoding="utf-8")
+    u1 = {"name": "alpha", "file": str(f1), "start": 12, "end": 20, "kind": "function"}
+    u2 = {"name": "beta", "file": str(f2), "start": 35, "end": 44, "kind": "function"}
+
+    def _boom(*_args: Any, **_kwargs: Any) -> str:
+        raise RuntimeError("card failure")
+
+    monkeypatch.setattr("pydoppelgangerhunt.reporters.generate_clone_diff", _boom)
+    html_out = generate_html_report(
+        [(0.95, u1, u2)], str(tmp_path), 0.9, repo_root=str(tmp_path)
+    )
+    assert "Diagnostic: pair rendering failed" in html_out
+    assert "12-20" in html_out
+    assert "35-44" in html_out
+
+
+def test_public_exports_and_pathlike_unit_schema_contract(tmp_path: Path) -> None:
+    """Verifies _PHYSICAL_LINE_RE emits DeprecationWarning, fixer.__all__ is public-only, and validate_unit_schema accepts str PathLike."""
+    import warnings
+    import pydoppelgangerhunt as pkg
+    import pydoppelgangerhunt.fixer as fixer_pkg
+    from pydoppelgangerhunt.fixer.source import validate_unit_schema
+
+    assert "is_subroutine_unit" in fixer_pkg.__all__
+    assert "_PHYSICAL_LINE_RE" not in pkg.__all__
+    assert not [name for name in fixer_pkg.__all__ if name.startswith("_")]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", DeprecationWarning)
+        regex_val = getattr(pkg, "_PHYSICAL_LINE_RE")
+    assert regex_val.pattern
+    assert any(issubclass(w.category, DeprecationWarning) for w in caught)
+
+    class _StrPathLike:
+        def __fspath__(self) -> str:
+            return str(tmp_path / "mod.py")
+
+    class _BytesPathLike:
+        def __fspath__(self) -> bytes:
+            return b"mod.py"
+
+    validate_unit_schema({"file": _StrPathLike(), "start": 1, "end": 2})
+    with pytest.raises(ValueError, match="Expected str or str PathLike"):
+        validate_unit_schema({"file": _BytesPathLike(), "start": 1, "end": 2})
+
+
+def test_whitespace_source_text_falls_back_cleanly_in_reporters(tmp_path: Path) -> None:
+    """Verifies whitespace-only source_text falls back to file_source/disk and rejects all-whitespace sources."""
+    from pydoppelgangerhunt.reporters import (
+        resolve_cached_unit_source_and_tree,
+        synthesize_refactoring_suggestion,
+    )
+
+    real_src = (
+        "def compute_a(x):\n"
+        "    total = x + 1\n"
+        "    return total * 2\n"
+    )
+    f1 = tmp_path / "mod_a.py"
+    f2 = tmp_path / "mod_b.py"
+    f1.write_text(real_src, encoding="utf-8")
+    f2.write_text(
+        "def compute_b(x):\n"
+        "    total = x + 1\n"
+        "    return total * 2\n",
+        encoding="utf-8",
+    )
+
+    u_file_src = {
+        "name": "compute_a",
+        "file": str(tmp_path / "virtual.py"),
+        "start": 1,
+        "end": 3,
+        "kind": "function",
+        "source_text": "   \n\t  ",
+        "file_source": real_src,
+    }
+    resolved_src, resolved_tree = resolve_cached_unit_source_and_tree(
+        u_file_src, repo_root=str(tmp_path)
+    )
+    assert resolved_src == real_src
+    assert resolved_tree is not None
+
+    u_disk_1 = {
+        "name": "compute_a",
+        "file": str(f1),
+        "start": 1,
+        "end": 3,
+        "kind": "function",
+        "source_text": "   \n\t  ",
+    }
+    u_disk_2 = {
+        "name": "compute_b",
+        "file": str(f2),
+        "start": 1,
+        "end": 3,
+        "kind": "function",
+        "source_text": " \n ",
+    }
+    disk_src, disk_tree = resolve_cached_unit_source_and_tree(
+        u_disk_1, repo_root=str(tmp_path)
+    )
+    assert disk_src == real_src
+    assert disk_tree is not None
+
+    suggestion = synthesize_refactoring_suggestion(
+        u_disk_1, u_disk_2, repo_root=str(tmp_path)
+    )
+    assert "def _shared_compute(" in suggestion
+
+    html_out = generate_html_report(
+        [(0.95, u_disk_1, u_disk_2)], str(tmp_path), 0.9, repo_root=str(tmp_path)
+    )
+    assert "def compute_a" in html_out
+    assert "def compute_b" in html_out
+
+    u_all_whitespace = {
+        "name": "empty",
+        "file": str(tmp_path / "missing.py"),
+        "start": 1,
+        "end": 1,
+        "kind": "function",
+        "source_text": "   \n\t  ",
+        "file_source": "   \n  ",
+    }
+    assert resolve_cached_unit_source_and_tree(
+        u_all_whitespace, repo_root=str(tmp_path)
+    ) == (None, None)
+
+
+@pytest.mark.parametrize(
+    ("unit_in", "eff_src", "expected_source_text", "expected_source_lines"),
+    [
+        pytest.param(
+            {"start": 1, "end": 1, "source_text": "   \n\t"},
+            "x = 1\n",
+            "x = 1\n",
+            None,
+            id="whitespace_source_text_gets_attached",
+        ),
+        pytest.param(
+            {"start": 1, "end": 1, "source_lines": []},
+            "x = 1\n",
+            "x = 1\n",
+            [],
+            id="empty_source_lines_list_gets_attached",
+        ),
+        pytest.param(
+            {"start": 1, "end": 1, "source_lines": None, "source_text": ""},
+            "x = 1\n",
+            "x = 1\n",
+            None,
+            id="none_source_lines_and_empty_text_gets_attached",
+        ),
+        pytest.param(
+            {"start": 1, "end": 1},
+            "   \n",
+            None,
+            None,
+            id="control_blank_effective_source_not_attached",
+        ),
+        pytest.param(
+            {"start": 1, "end": 1, "source_text": "y = 2\n"},
+            "x = 1\n",
+            "y = 2\n",
+            None,
+            id="control_non_empty_source_text_preserved",
+        ),
+        pytest.param(
+            {"start": 1, "end": 1, "source_lines": ["y = 2\n"]},
+            "x = 1\n",
+            None,
+            ["y = 2\n"],
+            id="control_non_empty_source_lines_prevents_overwriting",
+        ),
+    ],
+)
+def test_with_unit_source_text_handles_empty_and_populated_fields(
+    unit_in: dict[str, Any],
+    eff_src: str,
+    expected_source_text: Any,
+    expected_source_lines: Any,
+) -> None:
+    """Verifies with_unit_source_text attaches eff_src only when both unit source_text and source_lines are unset or empty."""
+    from pydoppelgangerhunt.reporters import _prepare_effective_suggestion_unit
+    from pydoppelgangerhunt.source_lines import with_unit_source_text
+
+    res = with_unit_source_text(unit_in, eff_src)
+    assert res.get("source_text") == expected_source_text
+    if "source_lines" in unit_in:
+        assert res.get("source_lines") == expected_source_lines
+
+    rep_res = _prepare_effective_suggestion_unit(
+        unit_in, repo_root=None, source_text=eff_src, tree=None
+    )
+    assert rep_res.unit == res
+    assert rep_res.unit is not unit_in
+
+
+@pytest.mark.parametrize(
+    (
+        "src1",
+        "src2",
+        "unit_kind",
+        "expected_present",
+        "expected_absent",
+    ),
+    [
+        pytest.param(
+            "class A:\n    def f(self, items):\n        res = [self.a + x for x in items]\n        return res\n",
+            "class B:\n    def g(self, items):\n        return [self.b + x for x in items]\n",
+            "comprehension",
+            ("mismatched attribute access",),
+            ("output arity mismatch",),
+            id="whole_line_comprehension_reports_attr_mismatch_instead_of_output_arity",
+        ),
+        pytest.param(
+            "class A:\n    def f(self, x):\n        res = self.a + self.scale(x)\n        return res\n",
+            "class B:\n    def g(self, x):\n        return self.b + self.scale(x)\n",
+            "complex_expr",
+            ("mismatched attribute access",),
+            ("output arity mismatch",),
+            id="whole_line_complex_expr_reports_attr_mismatch_instead_of_output_arity",
+        ),
+        pytest.param(
+            "class A:\n    def f(self, out, items, z):\n        out[self.k] = [x + z for x in items]\n        return out\n",
+            "class B:\n    def g(self, items):\n        return [y + 1 for y in items]\n",
+            "comprehension",
+            ("skipped as structurally incompatible",),
+            ("output arity mismatch", "mismatched attribute access"),
+            id="whole_line_comprehension_prunes_lhs_attr_and_drops_output_arity",
+        ),
+        pytest.param(
+            "class A:\n    def f(self, items):\n        res = [self.a + x for x in items]\n        return res\n",
+            "class B:\n    def g(self, items):\n        return [self.b + x for x in items]\n",
+            "function",
+            ("output arity mismatch",),
+            (),
+            id="control_function_unit_keeps_output_arity_mismatch",
+        ),
+        pytest.param(
+            "class A:\n    def f(self, items):\n        res = [self.a + x for x in items]\n        return res\n",
+            "class B:\n    def g(self, items):\n        _unused = [self.a + x for x in items]\n",
+            "compound_block",
+            ("output arity mismatch",),
+            (),
+            id="control_compound_block_unit_keeps_output_arity_mismatch",
+        ),
+    ],
+)
+def test_expression_pair_ignores_superseded_output_arity_skip_reason(
+    src1: str,
+    src2: str,
+    unit_kind: str,
+    expected_present: tuple[str, ...],
+    expected_absent: tuple[str, ...],
+) -> None:
+    """Verifies expression pairs drop pre-pruning output arity skip reasons when LHS outputs are pruned."""
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    start1, end1 = (2, 4) if unit_kind == "function" else (3, 3)
+    start2, end2 = (2, 3) if unit_kind == "function" else (3, 3)
+    u1: dict[str, Any] = {
+        "name": f"f:{unit_kind}",
+        "kind": unit_kind,
+        "start": start1,
+        "end": end1,
+        "source_text": src1,
+        "enclosing_class": "A",
+        "receiver_param": "self",
+        "receiver_kind": "instance",
+        "outputs": ["res"],
+    }
+    u2: dict[str, Any] = {
+        "name": f"g:{unit_kind}",
+        "kind": unit_kind,
+        "start": start2,
+        "end": end2,
+        "source_text": src2,
+        "enclosing_class": "B",
+        "receiver_param": "self",
+        "receiver_kind": "instance",
+        "outputs": [],
+    }
+    sug = synthesize_refactoring_suggestion(u1, u2)
+    assert "skipped as structurally incompatible" in sug
+    for needle in expected_present:
+        assert needle in sug, sug
+    for forbidden in expected_absent:
+        assert forbidden not in sug, sug
+
+
+@pytest.mark.parametrize(
+    (
+        "src1",
+        "src2",
+        "unit_kind",
+        "line_no",
+        "start_col",
+        "end_col",
+        "expect_calls",
+        "expected_phrase",
+    ),
+    [
+        pytest.param(
+            "def f1(items):\n    total = 0\n    res = [(total := x) for x in items]\n    return res, total\n",
+            "def f2(items):\n    total = 0\n    res = [(total := y) for y in items]\n    return res, total\n",
+            "comprehension",
+            3,
+            10,
+            39,
+            0,
+            "severed closure cell",
+            id="unsafe_comprehension_skips_redundant_helper_synthesis",
+        ),
+        pytest.param(
+            "def f1(x):\n    return (x + 1)\n",
+            "def f2(x):\n    return (x + 1)\n",
+            "complex_expr",
+            2,
+            99,
+            120,
+            0,
+            "invalid unit columns",
+            id="invalid_col_complex_expr_skips_redundant_helper_synthesis",
+        ),
+        pytest.param(
+            "def f1(items):\n    return [x + 1 for x in items]\n",
+            "def f2(items):\n    return [y + 1 for y in items]\n",
+            "comprehension",
+            2,
+            11,
+            33,
+            1,
+            "Extract duplicated logic",
+            id="control_safe_comprehension_runs_helper_synthesis",
+        ),
+    ],
+)
+def test_synthesize_refactoring_suggestion_skips_synthesis_on_safety_skip_reasons(
+    monkeypatch: pytest.MonkeyPatch,
+    src1: str,
+    src2: str,
+    unit_kind: str,
+    line_no: int,
+    start_col: int,
+    end_col: int,
+    expect_calls: int,
+    expected_phrase: str,
+) -> None:
+    """Verifies unsafe expression pairs bypass redundant synthesize_shared_helper_code calls."""
+    from pydoppelgangerhunt.fixer import synthesis as synth_mod
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    call_count = 0
+    real_synth = synth_mod.synthesize_shared_helper_code
+
+    def _counting_synth(*args: Any, **kwargs: Any) -> str:
+        nonlocal call_count
+        call_count += 1
+        return real_synth(*args, **kwargs)
+
+    monkeypatch.setattr(synth_mod, "synthesize_shared_helper_code", _counting_synth)
+
+    u1: dict[str, Any] = {
+        "name": f"f1:{unit_kind}",
+        "kind": unit_kind,
+        "start": line_no,
+        "end": line_no,
+        "start_col": start_col,
+        "end_col": end_col,
+        "source_text": src1,
+    }
+    u2: dict[str, Any] = {
+        "name": f"f2:{unit_kind}",
+        "kind": unit_kind,
+        "start": line_no,
+        "end": line_no,
+        "start_col": start_col,
+        "end_col": end_col,
+        "source_text": src2,
+    }
+    sug = synthesize_refactoring_suggestion(
+        u1,
+        u2,
+        closure_strictness="strict",
+    )
+    assert call_count == expect_calls, sug
+    assert expected_phrase in sug, sug
+
+
+@pytest.mark.parametrize(
+    (
+        "kind1",
+        "kind2",
+        "bad_cols_on_u1",
+        "expect_synth_calls",
+        "expect_output_calls",
+        "expected_phrases",
+    ),
+    [
+        pytest.param(
+            "complex_expr",
+            "compound_block",
+            False,
+            0,
+            0,
+            ("skipped as structurally incompatible", "mismatched expression kinds"),
+            id="expr_vs_stmt_skips_synthesis_and_output_pairing",
+        ),
+        pytest.param(
+            "compound_block",
+            "comprehension",
+            False,
+            0,
+            0,
+            ("skipped as structurally incompatible", "mismatched expression kinds"),
+            id="stmt_vs_comprehension_skips_synthesis_and_output_pairing",
+        ),
+        pytest.param(
+            "complex_expr",
+            "compound_block",
+            True,
+            0,
+            0,
+            ("rejected as unsafe", "invalid unit columns", "mismatched expression kinds"),
+            id="expr_vs_stmt_preserves_safety_hazard_diagnostics",
+        ),
+        pytest.param(
+            "comprehension",
+            "complex_expr",
+            False,
+            1,
+            1,
+            ("Extract duplicated logic",),
+            id="control_comprehension_and_complex_expr_align_and_synthesize",
+        ),
+        pytest.param(
+            "complex_expr",
+            "comprehension",
+            False,
+            1,
+            1,
+            ("Extract duplicated logic",),
+            id="control_complex_expr_and_comprehension_align_and_synthesize",
+        ),
+        pytest.param(
+            "complex_expr",
+            None,
+            False,
+            1,
+            1,
+            ("Extract duplicated logic",),
+            id="control_missing_partner_kind_aligns_and_synthesizes",
+        ),
+    ],
+)
+def test_synthesize_refactoring_suggestion_short_circuits_mismatched_expr_kinds(
+    monkeypatch: pytest.MonkeyPatch,
+    kind1: str,
+    kind2: str | None,
+    bad_cols_on_u1: bool,
+    expect_synth_calls: int,
+    expect_output_calls: int,
+    expected_phrases: tuple[str, ...],
+) -> None:
+    """Verifies synthesize_refactoring_suggestion short-circuits on _align_pair_expr_kinds conflict."""
+    from pydoppelgangerhunt.fixer import dataflow as df_mod
+    from pydoppelgangerhunt.fixer import synthesis as synth_mod
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    synth_calls = 0
+    output_calls = 0
+    real_synth = synth_mod.synthesize_shared_helper_code
+    real_resolve = df_mod.resolve_clone_pair_outputs
+
+    def _spy_synth(*args: Any, **kwargs: Any) -> str:
+        nonlocal synth_calls
+        synth_calls += 1
+        return real_synth(*args, **kwargs)
+
+    def _spy_resolve(*args: Any, **kwargs: Any) -> Any:
+        nonlocal output_calls
+        output_calls += 1
+        return real_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(synth_mod, "synthesize_shared_helper_code", _spy_synth)
+    monkeypatch.setattr(df_mod, "resolve_clone_pair_outputs", _spy_resolve)
+
+    src1 = "def f1(items):\n    y = [i + 1 for i in items]\n    return y\n"
+    src2 = "def f2(items):\n    y = [i + 1 for i in items]\n    return y\n"
+    expr_start = src1.splitlines()[1].index("[")
+    expr_end = src1.splitlines()[1].index("]") + 1
+    u1: dict[str, Any] = {
+        "name": "f1:u",
+        "kind": kind1,
+        "start": 2,
+        "end": 2,
+        "source_text": src1,
+    }
+    if bad_cols_on_u1:
+        u1["start_col"] = 99
+        u1["end_col"] = 120
+    elif kind1 in ("complex_expr", "comprehension"):
+        u1["start_col"] = expr_start
+        u1["end_col"] = expr_end
+
+    u2: dict[str, Any] = {
+        "name": "f2:u",
+        "start": 2,
+        "end": 2,
+        "source_text": src2,
+    }
+    if kind2 is not None:
+        u2["kind"] = kind2
+    if kind2 in ("complex_expr", "comprehension") or kind2 is None:
+        u2["start_col"] = expr_start
+        u2["end_col"] = expr_end
+
+    sug = synthesize_refactoring_suggestion(u1, u2, closure_strictness="strict")
+    assert synth_calls == expect_synth_calls, sug
+    assert output_calls == expect_output_calls, sug
+    for phrase in expected_phrases:
+        assert phrase in sug, sug
+
+
+@pytest.mark.parametrize(
+    ("src1", "range1", "src2", "range2", "expect_rejected"),
+    [
+        pytest.param(
+            "def f1(x):\n    if x < 0:\n        return 0\n    y = x * 2\n    return y\n",
+            (2, 4),
+            "def f2(x):\n    if x < 0:\n        return 0\n    y = x * 2\n    return y\n",
+            (2, 4),
+            True,
+            id="nonterminal_early_return_before_fallthrough_assignment",
+        ),
+        pytest.param(
+            "def f1(x):\n    if x < 0:\n        return 0\n    return x * 2\n",
+            (2, 3),
+            "def f2(x):\n    if x < 0:\n        return 0\n    return x * 2\n",
+            (2, 3),
+            True,
+            id="standalone_conditional_if_return_block",
+        ),
+        pytest.param(
+            "def f1(x):\n    if x < 0:\n        return 0\n    return x * 2\n",
+            (2, 4),
+            "def f2(x):\n    if x < 0:\n        return 0\n    y = x * 2\n    return y\n",
+            (2, 4),
+            True,
+            id="asymmetric_one_terminal_one_nonterminal_return",
+        ),
+        pytest.param(
+            "def f1(x):\n    if x < 0:\n        return 0\n    return x * 2\n",
+            (2, 4),
+            "def f2(x):\n    if x < 0:\n        return 0\n    return x * 2\n",
+            (2, 4),
+            False,
+            id="control_unconditional_terminal_return_on_both_units",
+        ),
+    ],
+)
+def test_synthesize_refactoring_suggestion_rejects_nonterminal_embedded_return(
+    src1: str,
+    range1: tuple[int, int],
+    src2: str,
+    range2: tuple[int, int],
+    expect_rejected: bool,
+) -> None:
+    """Verifies synthesize_refactoring_suggestion rejects non-terminal embedded returns as unsafe while allowing unconditional terminal returns."""
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    lines1 = src1.splitlines(keepends=True)
+    lines2 = src2.splitlines(keepends=True)
+    u1: dict[str, Any] = {
+        "name": "f1:blk",
+        "file": "early_ret.py",
+        "start": range1[0],
+        "end": range1[1],
+        "kind": "compound_block",
+        "source_text": src1,
+        "source_code": "".join(lines1[range1[0] - 1 : range1[1]]),
+    }
+    u2: dict[str, Any] = {
+        "name": "f2:blk",
+        "file": "early_ret.py",
+        "start": range2[0],
+        "end": range2[1],
+        "kind": "compound_block",
+        "source_text": src2,
+        "source_code": "".join(lines2[range2[0] - 1 : range2[1]]),
+    }
+    sug = synthesize_refactoring_suggestion(u1, u2)
+    if expect_rejected:
+        assert "rejected as unsafe" in sug, sug
+        assert "embedded return" in sug, sug
+        assert "def _shared_" not in sug, sug
+    else:
+        assert "def _shared_" in sug, sug
+        assert "rejected as unsafe" not in sug, sug
+
+
+@pytest.mark.parametrize(
+    ("cand_lines", "expect_terminal"),
+    [
+        pytest.param(
+            ["    y = x + 1\n", "    return (\n", "        y * 2\n", "    )\n"],
+            True,
+            id="multiline_parenthesized_return",
+        ),
+        pytest.param(
+            ["    data = await fetch(x)\n", "    return data\n"],
+            True,
+            id="async_await_followed_by_return",
+        ),
+        pytest.param(
+            ["    if x < 0:\n", "        return 0\n"],
+            False,
+            id="conditional_return_inside_if",
+        ),
+        pytest.param(
+            ['    """\n', "    return 1\n", '    """\n'],
+            False,
+            id="triple_quoted_string_containing_return_text",
+        ),
+        pytest.param(
+            ["# Unable to read missing.py\n"],
+            False,
+            id="placeholder_comment_only",
+        ),
+    ],
+)
+def test_lines_end_with_unconditional_return_cases(
+    cand_lines: list[str],
+    expect_terminal: bool,
+) -> None:
+    """Verifies AST-based unconditional terminal return detection handles multiline, async, conditional, and string-literal edge cases."""
+    from pydoppelgangerhunt.fixer.source import lines_end_with_unconditional_return
+
+    assert lines_end_with_unconditional_return(cand_lines) is expect_terminal
+
+
+@pytest.mark.parametrize(
+    ("unit_kind", "u1_exists", "u2_exists", "u2_extra", "expect_helper"),
+    [
+        pytest.param(
+            "function",
+            True,
+            False,
+            {},
+            True,
+            id="whole_function_real_u1_missing_u2_synthesizes_preview",
+        ),
+        pytest.param(
+            "function",
+            False,
+            True,
+            {},
+            False,
+            id="control_missing_u1_rejected",
+        ),
+        pytest.param(
+            "compound_block",
+            True,
+            False,
+            {},
+            False,
+            id="control_subroutine_missing_u2_rejected",
+        ),
+        pytest.param(
+            "function",
+            True,
+            False,
+            {"start": 50, "end": 60, "source_text": "x = 1\n"},
+            False,
+            id="control_explicit_source_text2_placeholder_rejected",
+        ),
+    ],
+)
+def test_synthesize_refactoring_suggestion_missing_u2_preview_parity(
+    tmp_path: Path,
+    unit_kind: str,
+    u1_exists: bool,
+    u2_exists: bool,
+    u2_extra: dict[str, Any],
+    expect_helper: bool,
+) -> None:
+    """Verifies synthesize_refactoring_suggestion matches preview-only synthesis for missing u2 on whole functions while rejecting unsafe placeholders."""
+    from pydoppelgangerhunt.fixer import clear_dataflow_cache
+    from pydoppelgangerhunt.fixer.synthesis import synthesize_shared_helper_code
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    if unit_kind == "function":
+        src = "def compute_a(x):\n    y = x + 1\n    return y * 2\n"
+        start_ln, end_ln = 1, 3
+    else:
+        src = (
+            "def compute_a(x):\n"
+            "    if x > 0:\n"
+            "        y = x + 1\n"
+            "        z = y * 2\n"
+            "    return z\n"
+        )
+        start_ln, end_ln = 2, 4
+
+    f1 = tmp_path / "present_a.py"
+    f2 = tmp_path / "present_b.py"
+    if u1_exists:
+        f1.write_text(src, encoding="utf-8")
+    if u2_exists:
+        f2.write_text(src.replace("compute_a", "compute_b"), encoding="utf-8")
+
+    u1: dict[str, Any] = {
+        "name": "compute_a",
+        "file": str(f1),
+        "start": start_ln,
+        "end": end_ln,
+        "kind": unit_kind,
+    }
+    u2: dict[str, Any] = {
+        "name": "compute_b",
+        "file": str(f2),
+        "start": start_ln,
+        "end": end_ln,
+        "kind": unit_kind,
+        **u2_extra,
+    }
+    explicit_src2 = u2_extra.get("source_text")
+    clear_dataflow_cache()
+    sug = synthesize_refactoring_suggestion(
+        u1, u2, repo_root=str(tmp_path), source_text2=explicit_src2
+    )
+    helper = synthesize_shared_helper_code(
+        u1, u2, repo_root=str(tmp_path), source_text2=explicit_src2
+    )
+    if expect_helper:
+        assert "def _shared_" in sug, sug
+        assert "def _shared_" in helper, helper
+        assert "rejected as unsafe" not in sug, sug
+    else:
+        assert "def _shared_" not in sug, sug
+        assert helper == "", helper
+
+
+def test_copy_scope_dict_preserves_namedtuple_and_rejection_context_isolates_caller_scopes() -> None:
+    """Verifies _copy_scope_dict preserves NamedTuple subclasses and _resolve_rejection_scope_context avoids mutating caller scopes."""
+    from typing import NamedTuple
+    from pydoppelgangerhunt.fixer.source import _copy_scope_dict
+    from pydoppelgangerhunt.reporters import _resolve_rejection_scope_context
+
+    class _SampleMeta(NamedTuple):
+        label: str
+        items: list[str]
+
+    orig_meta = _SampleMeta("guard", ["a"])
+    orig_scope: dict[str, Any] = {
+        "inputs": ["x"],
+        "outputs": ["res"],
+        "meta": orig_meta,
+        "tags": {"t1"},
+    }
+    copied = _copy_scope_dict(orig_scope)
+    assert isinstance(copied["meta"], _SampleMeta)
+    assert copied["meta"].label == "guard"
+    assert copied["meta"].items == ["a"]
+    copied["meta"].items.append("b")
+    copied["inputs"].append("y")
+    copied["tags"].add("t2")
+    assert orig_meta.items == ["a"]
+    assert orig_scope["inputs"] == ["x"]
+    assert orig_scope["tags"] == {"t1"}
+
+    caller_sc1: dict[str, Any] = {"inputs": ["x"], "outputs": ["res"]}
+    caller_sc2: dict[str, Any] = {"inputs": ["y"], "outputs": ["out"]}
+
+    def _mutating_prune(
+        u: dict[str, Any], sc: dict[str, Any], _lines: Any
+    ) -> None:
+        u["mutated"] = True
+        sc["outputs"].clear()
+        sc["inputs"].append("pruned")
+
+    ctx = _resolve_rejection_scope_context(
+        {"name": "u1", "outputs": ["res"]},
+        {"name": "u2", "outputs": ["out"]},
+        caller_sc1,
+        caller_sc2,
+        ["res = [x for x in xs]\n"],
+        ["out = [y for y in ys]\n"],
+        is_expr_unit=True,
+        pair_skip_reason="output arity mismatch",
+        prune_lhs_fn=_mutating_prune,
+        superseded_skip_reasons=("output arity mismatch",),
+    )
+    assert ctx.pair_skip_reason is None
+    assert ctx.scope1["outputs"] == []
+    assert caller_sc1 == {"inputs": ["x"], "outputs": ["res"]}
+    assert caller_sc2 == {"inputs": ["y"], "outputs": ["out"]}
+
+
+@pytest.mark.parametrize(
+    ("u1_body", "u2_body", "expect_unsafe_label"),
+    [
+        pytest.param(
+            "    total = self.left + 1\n    return total\n",
+            "    total = self.right + 1\n    return total\n",
+            False,
+            id="terminal_embedded_return_structural_mismatch_not_labeled_unsafe",
+        ),
+        pytest.param(
+            "    if flag:\n        return self.left\n    total = self.left + 1\n",
+            "    if flag:\n        return self.right\n    total = self.right + 1\n",
+            True,
+            id="control_nonterminal_embedded_return_labeled_unsafe",
+        ),
+    ],
+)
+def test_terminal_embedded_return_not_misclassified_as_safety_hazard_in_suggestion(
+    tmp_path: Path,
+    u1_body: str,
+    u2_body: str,
+    expect_unsafe_label: bool,
+) -> None:
+    """Verifies terminal embedded returns are excluded from safety_reasons when synthesis fails for structural reasons."""
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    src = (
+        "class Box:\n"
+        "    def first(self, flag):\n"
+        + "".join("    " + ln for ln in u1_body.splitlines(keepends=True))
+        + "    def second(self, flag):\n"
+        + "".join("    " + ln for ln in u2_body.splitlines(keepends=True))
+    )
+    mod_file = tmp_path / "box.py"
+    mod_file.write_text(src, encoding="utf-8")
+    lines = src.splitlines()
+    first_def = next(i for i, ln in enumerate(lines, 1) if "def first(" in ln)
+    second_def = next(i for i, ln in enumerate(lines, 1) if "def second(" in ln)
+    u1: dict[str, Any] = {
+        "name": "Box.first:block",
+        "file": str(mod_file),
+        "start": first_def + 1,
+        "end": second_def - 1,
+        "kind": "sliding_window",
+    }
+    u2: dict[str, Any] = {
+        "name": "Box.second:block",
+        "file": str(mod_file),
+        "start": second_def + 1,
+        "end": len(lines),
+        "kind": "sliding_window",
+    }
+    suggestion = synthesize_refactoring_suggestion(u1, u2, repo_root=str(tmp_path))
+    if expect_unsafe_label:
+        assert "rejected as unsafe" in suggestion, suggestion
+        assert "embedded return" in suggestion, suggestion
+    else:
+        assert "skipped as structurally incompatible" in suggestion, suggestion
+        assert "rejected as unsafe" not in suggestion, suggestion
+        assert "embedded return" not in suggestion, suggestion
+
+
+@pytest.mark.parametrize(
+    ("mode", "allowlist", "with_expr", "reject_pair", "expected_summary_fragment"),
+    [
+        pytest.param(
+            "strict",
+            None,
+            "CustomTx()",
+            True,
+            None,
+            id="rejected_strict_heuristic_pair_does_not_emit_session_summary",
+        ),
+        pytest.param(
+            "strict",
+            None,
+            "CustomTx()",
+            False,
+            "CustomTx",
+            id="control_accepted_strict_heuristic_pair_emits_session_summary",
+        ),
+        pytest.param(
+            "pedantic",
+            ["*.atomic"],
+            "db.atomic()",
+            True,
+            None,
+            id="rejected_pedantic_wildcard_pair_does_not_emit_session_summary",
+        ),
+        pytest.param(
+            "pedantic",
+            ["*.atomic"],
+            "db.atomic()",
+            False,
+            "*.atomic",
+            id="control_accepted_pedantic_wildcard_pair_emits_session_summary",
+        ),
+    ],
+)
+def test_rejected_suggestion_pairs_do_not_leak_session_summary_warnings(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    mode: str,
+    allowlist: list[str] | None,
+    with_expr: str,
+    reject_pair: bool,
+    expected_summary_fragment: str | None,
+) -> None:
+    """Verifies rejected pairs in synthesize_refactoring_suggestion and generate_html_report do not leak heuristic/wildcard warnings."""
+    import logging  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        clear_closure_warning_cache,
+        heuristic_ctx_manager_session,
+    )
+    from pydoppelgangerhunt.reporters import (  # pylint: disable=import-outside-toplevel
+        synthesize_refactoring_suggestion,
+    )
+
+    body_tail = "    if items:\n        return res\n" if reject_pair else ""
+    src = (
+        "def alpha(db, items, step):\n"
+        f"    with {with_expr}:\n"
+        "        val = step(items)\n"
+        "    cb = lambda: val\n"
+        "    res = cb()\n"
+        + body_tail
+        + "    out = res + 1\n"
+        + "    return out\n\n"
+        + "def beta(db, items, step):\n"
+        + f"    with {with_expr}:\n"
+        + "        val = step(items)\n"
+        + "    cb = lambda: val\n"
+        + "    res = cb()\n"
+        + body_tail
+        + "    out = res + 1\n"
+        + "    return out\n"
+    )
+    mod_file = tmp_path / "summary_iso.py"
+    mod_file.write_text(src, encoding="utf-8")
+    lines = src.splitlines()
+    alpha_cb = next(i for i, ln in enumerate(lines, 1) if ln == "    cb = lambda: val")
+    beta_cb = next(
+        i
+        for i, ln in enumerate(lines, 1)
+        if i > alpha_cb and ln == "    cb = lambda: val"
+    )
+    span_len = 4 if reject_pair else 2
+    u1: dict[str, Any] = {
+        "name": "alpha:block",
+        "file": str(mod_file),
+        "start": alpha_cb,
+        "end": alpha_cb + span_len,
+        "kind": "sliding_window",
+    }
+    u2: dict[str, Any] = {
+        "name": "beta:block",
+        "file": str(mod_file),
+        "start": beta_cb,
+        "end": beta_cb + span_len,
+        "kind": "sliding_window",
+    }
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt.config"):
+        with heuristic_ctx_manager_session():
+            sug = synthesize_refactoring_suggestion(
+                u1,
+                u2,
+                repo_root=str(tmp_path),
+                closure_strictness=mode,
+                non_suppressing_ctx_managers=allowlist,
+            )
+    if expected_summary_fragment is None:
+        assert "rejected as unsafe" in sug
+        assert "Summary:" not in caplog.text
+    else:
+        assert "Extract duplicated logic" in sug
+        assert "# Note:" in sug
+        assert "Summary:" in caplog.text
+        assert expected_summary_fragment in caplog.text
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt.config"):
+        html_out = generate_html_report(
+            [(0.98, u1, u2)],
+            str(tmp_path),
+            0.9,
+            repo_root=str(tmp_path),
+            closure_strictness=mode,
+            non_suppressing_ctx_managers=allowlist,
+        )
+    if expected_summary_fragment is None:
+        assert "rejected as unsafe" in html_out
+        assert "Summary:" not in caplog.text
+    else:
+        assert "# Note:" in html_out
+        assert "Summary:" in caplog.text
+        assert expected_summary_fragment in caplog.text
+
+
+@pytest.mark.parametrize(
+    "failure_kind",
+    [
+        pytest.param("missing_file", id="missing_file_negative_cached_across_pairs"),
+        pytest.param("unreadable_file", id="unreadable_file_negative_cached_across_pairs"),
+    ],
+)
+def test_multi_pair_reports_negative_cache_missing_and_unreadable_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    """Verifies generate_html_report and CLI --suggest/--diff probe missing or unreadable files at most once across multiple clone pairs."""
+    from argparse import Namespace  # pylint: disable=import-outside-toplevel
+    from collections import OrderedDict  # pylint: disable=import-outside-toplevel
+    import pydoppelgangerhunt.cli as cli_mod  # pylint: disable=import-outside-toplevel
+    import pydoppelgangerhunt.fixer.source as fixer_source_mod  # pylint: disable=import-outside-toplevel
+    import pydoppelgangerhunt.reporters as reporters_mod  # pylint: disable=import-outside-toplevel
+    import pydoppelgangerhunt.source_lines as source_lines_mod  # pylint: disable=import-outside-toplevel
+
+    target_file = tmp_path / ("missing_mod.py" if failure_kind == "missing_file" else "unreadable_mod.py")
+    if failure_kind == "unreadable_file":
+        target_file.write_text("def a():\n    return 1\n", encoding="utf-8")
+
+    clones = [
+        (
+            0.99,
+            {"name": f"f{i}_a", "file": str(target_file), "start": 1, "end": 2, "kind": "function"},
+            {"name": f"f{i}_b", "file": str(target_file), "start": 4, "end": 5, "kind": "function"},
+        )
+        for i in range(3)
+    ]
+
+    orig_resolve_path = source_lines_mod.resolve_safe_unit_file_path
+    orig_load_text = fixer_source_mod._load_unit_file_text
+    orig_extract_lines = source_lines_mod.extract_unit_source_lines_with_state
+
+    counts = {"resolve_path": 0, "load_text": 0, "extract_lines": 0}
+
+    def _spy_resolve_path(*args: Any, **kwargs: Any) -> Any:
+        counts["resolve_path"] += 1
+        return orig_resolve_path(*args, **kwargs)
+
+    def _spy_load_text(*args: Any, **kwargs: Any) -> Any:
+        counts["load_text"] += 1
+        if failure_kind == "unreadable_file":
+            return None
+        return orig_load_text(*args, **kwargs)
+
+    def _spy_extract_lines(*args: Any, **kwargs: Any) -> Any:
+        counts["extract_lines"] += 1
+        return orig_extract_lines(*args, **kwargs)
+
+    monkeypatch.setattr(source_lines_mod, "resolve_safe_unit_file_path", _spy_resolve_path)
+    monkeypatch.setattr(reporters_mod, "resolve_safe_unit_file_path", _spy_resolve_path)
+    monkeypatch.setattr(fixer_source_mod, "_load_unit_file_text", _spy_load_text)
+    monkeypatch.setattr(source_lines_mod, "extract_unit_source_lines_with_state", _spy_extract_lines)
+
+    html_out = generate_html_report(clones, str(tmp_path), 0.9, repo_root=str(tmp_path))
+    assert "unavailable source placeholder" in html_out
+    if failure_kind == "missing_file":
+        assert counts["resolve_path"] == 1
+        assert counts["load_text"] == 0
+    else:
+        assert counts["load_text"] == 1
+    assert counts["extract_lines"] == 0
+
+    counts["resolve_path"] = 0
+    counts["load_text"] = 0
+    counts["extract_lines"] = 0
+    cli_cache: OrderedDict[str, tuple[str | None, Any]] = OrderedDict()
+    args = Namespace(suggest=True, diff=True)
+    rendered: list[str] = []
+    for _, u1, u2 in clones:
+        rendered.extend(
+            cli_mod._render_pair_diff_and_suggestions(
+                u1,
+                u2,
+                args=args,
+                repo_root=str(tmp_path),
+                target_repo_root=str(tmp_path),
+                use_color=False,
+                file_cache=cli_cache,
+            )
+        )
+    assert any("unavailable source placeholder" in ln for ln in rendered)
+    if failure_kind == "missing_file":
+        assert counts["resolve_path"] == 1
+        assert counts["load_text"] == 0
+    else:
+        assert counts["load_text"] == 1
+    assert counts["extract_lines"] == 0
+
+
+@pytest.mark.parametrize(
+    ("u1", "u2", "err_pattern"),
+    [
+        pytest.param(
+            {"name": "test_a", "start": 1, "end": 2, "inputs": {"x"}},
+            {"name": "test_b", "start": 1, "end": 2},
+            "ordered sequence",
+            id="test_pair_with_set_inputs_rejected_upfront",
+        ),
+        pytest.param(
+            {"name": "f1", "kind": "complex_expr", "start": 5, "end": 2},
+            {"name": "f2", "kind": "compound_block", "start": 1, "end": 2},
+            "Inverted line coordinates",
+            id="mismatched_kinds_with_inverted_lines_rejected_upfront",
+        ),
+        pytest.param(
+            {"name": "f1", "kind": "function", "start": 1, "end": 2},
+            {"name": "f2", "kind": "function", "start": 1, "end": 2, "outputs": {"y"}},
+            "ordered sequence",
+            id="u2_set_outputs_rejected_upfront",
+        ),
+    ],
+)
+def test_synthesize_refactoring_suggestion_validates_unit_schema_upfront(
+    u1: dict[str, Any],
+    u2: dict[str, Any],
+    err_pattern: str,
+) -> None:
+    """Verifies synthesize_refactoring_suggestion validates both unit schemas upfront even on early-return paths."""
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    with pytest.raises(ValueError, match=err_pattern):
+        synthesize_refactoring_suggestion(u1, u2)
+
+
+@pytest.mark.parametrize(
+    ("kinds_aligned", "expect_reason"),
+    [
+        pytest.param(False, True, id="explicit_kinds_aligned_false_emits_mismatch_reason"),
+        pytest.param(True, False, id="explicit_kinds_aligned_true_omits_mismatch_reason"),
+    ],
+)
+def test_collect_suggestion_rejection_reasons_respects_kinds_aligned_flag(
+    kinds_aligned: bool,
+    expect_reason: bool,
+) -> None:
+    """Verifies _collect_suggestion_rejection_reasons treats kinds_aligned as the single source of truth."""
+    from pydoppelgangerhunt.reporters import _collect_suggestion_rejection_reasons
+
+    empty_scope: dict[str, Any] = {
+        "control_flow_hazards": [],
+        "closure_hazard_reasons": [],
+        "is_async": False,
+        "has_yield": False,
+        "nonlocals": [],
+        "globals": [],
+        "attrs_read": [],
+        "attrs_written": [],
+    }
+    info = _collect_suggestion_rejection_reasons(
+        {"file": "a.py", "start": 1, "end": 1, "kind": "comprehension"},
+        {"file": "b.py", "start": 1, "end": 1, "kind": "complex_expr"},
+        empty_scope,
+        empty_scope,
+        pair_skip_reason=None,
+        has_async_gen_hazard=False,
+        kinds_aligned=kinds_aligned,
+    )
+    assert ("mismatched expression kinds" in info.reasons) is expect_reason
+
+
+@pytest.mark.parametrize(
+    (
+        "u1_exists",
+        "u2_exists",
+        "u1_kind",
+        "u2_kind",
+        "u2_file_name",
+        "u2_extra",
+        "expect_unsafe",
+        "expected_reason",
+    ),
+    [
+        pytest.param(
+            True,
+            False,
+            "function",
+            "function",
+            "missing_b.py",
+            {"is_async": False},
+            False,
+            "async mismatch",
+            id="preview_allowed_missing_u2_async_mismatch_is_structural",
+        ),
+        pytest.param(
+            True,
+            False,
+            "function",
+            "function",
+            "missing_b.py",
+            {},
+            False,
+            "async mismatch",
+            id="preview_allowed_missing_u2_default_sync_vs_async_u1_is_structural",
+        ),
+        pytest.param(
+            True,
+            False,
+            "compound_block",
+            "compound_block",
+            "missing_sub.py",
+            {"is_async": False},
+            True,
+            "unavailable source placeholder",
+            id="control_subroutine_missing_u2_still_rejected_as_unsafe",
+        ),
+        pytest.param(
+            True,
+            False,
+            "function",
+            "function",
+            "missing.ipynb#cell_0",
+            {"is_async": False},
+            True,
+            "unavailable source placeholder",
+            id="control_malformed_notebook_u2_still_rejected_as_unsafe",
+        ),
+        pytest.param(
+            False,
+            True,
+            "function",
+            "function",
+            "present_b.py",
+            {"is_async": False},
+            True,
+            "unavailable source placeholder",
+            id="control_missing_u1_still_rejected_as_unsafe",
+        ),
+    ],
+)
+def test_synthesize_refactoring_suggestion_missing_u2_structural_vs_safety_label(
+    tmp_path: Path,
+    u1_exists: bool,
+    u2_exists: bool,
+    u1_kind: str,
+    u2_kind: str,
+    u2_file_name: str,
+    u2_extra: dict[str, Any],
+    expect_unsafe: bool,
+    expected_reason: str,
+) -> None:
+    """Verifies preview-allowed missing u2 structural failures are not mislabeled as unsafe placeholder rejections."""
+    from pydoppelgangerhunt.fixer import clear_dataflow_cache
+    from pydoppelgangerhunt.reporters import synthesize_refactoring_suggestion
+
+    if u1_kind == "function":
+        src1 = "async def compute_a(x):\n    y = x + 1\n    return y * 2\n"
+        src2 = "def compute_b(x):\n    y = x + 1\n    return y * 2\n"
+        s_line, e_line = 1, 3
+    else:
+        src1 = (
+            "async def compute_a(x):\n"
+            "    if x > 0:\n"
+            "        y = x + 1\n"
+            "        z = y * 2\n"
+            "    return z\n"
+        )
+        src2 = src1.replace("async def compute_a", "def compute_b")
+        s_line, e_line = 2, 4
+
+    f1 = tmp_path / "present_a.py"
+    f2 = tmp_path / u2_file_name
+    if u1_exists:
+        f1.write_text(src1, encoding="utf-8")
+    if u2_exists:
+        f2.write_text(src2, encoding="utf-8")
+
+    u1: dict[str, Any] = {
+        "name": "compute_a",
+        "file": str(f1),
+        "start": s_line,
+        "end": e_line,
+        "kind": u1_kind,
+        "is_async": True,
+    }
+    u2: dict[str, Any] = {
+        "name": "compute_b",
+        "file": str(f2),
+        "start": s_line,
+        "end": e_line,
+        "kind": u2_kind,
+        **u2_extra,
+    }
+    clear_dataflow_cache()
+    sug = synthesize_refactoring_suggestion(u1, u2, repo_root=str(tmp_path))
+    assert expected_reason in sug, sug
+    if expect_unsafe:
+        assert "rejected as unsafe" in sug, sug
+    else:
+        assert "skipped as structurally incompatible" in sug, sug
+        assert "rejected as unsafe" not in sug, sug
+        assert "unavailable source placeholder" not in sug, sug
+
+
+def test_resolve_cached_unit_source_and_tree_uses_typed_cache_keys(tmp_path: Path) -> None:
+    """Verifies report file_cache stores typed _ReportFileCacheKey entries instead of NUL-delimited strings."""
+    from collections import OrderedDict  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.reporters import (  # pylint: disable=import-outside-toplevel,protected-access
+        _ReportFileCacheKey,
+        resolve_cached_unit_source_and_tree,
+    )
+
+    existing = tmp_path / "present.py"
+    existing.write_text("def alpha():\n    return 1\n", encoding="utf-8")
+    cache: OrderedDict[Any, tuple[str | None, Any]] = OrderedDict()
+
+    miss_res = resolve_cached_unit_source_and_tree(
+        {"file": "missing.py", "start": 1, "end": 2},
+        repo_root=str(tmp_path),
+        file_cache=cache,
+    )
+    hit_res = resolve_cached_unit_source_and_tree(
+        {"file": "present.py", "start": 1, "end": 2},
+        repo_root=str(tmp_path),
+        file_cache=cache,
+    )
+    assert miss_res == (None, None)
+    assert hit_res[0] == "def alpha():\n    return 1\n"
+    assert hit_res[1] is not None
+    assert len(cache) == 2
+    assert all(isinstance(k, _ReportFileCacheKey) for k in cache)
+    assert any(k.is_missing for k in cache)
+    assert any(not k.is_missing for k in cache)

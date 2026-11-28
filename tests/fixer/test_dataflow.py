@@ -1,9 +1,7 @@
-"""Unit tests for fixer dataflow analysis, downstream reads, and generator subroutines."""
+"""Unit tests for downstream read analysis, AST scope visitors, pre-unit closures, and try/with/loop hazards."""
 
 from __future__ import annotations
-
 import ast
-from collections import OrderedDict
 import concurrent.futures
 import gc
 import hashlib
@@ -11,62 +9,71 @@ import logging
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Dict
+from typing import (
+    Any,
+    Dict,
+)
 from unittest import mock
-
 import pytest
-
 from pydoppelgangerhunt import (
     generate_refactoring_patch,
     synthesize_shared_helper_code,
 )
-from pydoppelgangerhunt.fixer import dataflow
-from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
-    GeneratorCloneSideData,
-    _ClosurePos,
-    _DownstreamReadVisitor,
+from pydoppelgangerhunt.config import should_warn_closure_event
+from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=protected-access
     _MAX_DOWNSTREAM_CACHE_SIZE,
-    _MAX_SCOPE_CACHE_SIZE,
-    _VisitorPassMode,
+    _SessionBucket,
     _build_downstream_cache_key,
-    _classify_closure_position,
     _clear_downstream_reads_cache,
-    _collect_pre_unit_closures,
-    _collect_scope_closures,
     _downstream_cache_lock,
     _downstream_reads_cache,
-    _enclosing_try_reads_outputs,
-    _execute_read_pass,
-    _extract_effective_unit_outputs,
-    _extract_nested_scope_free_reads,
-    _extract_scope_local_names,
-    _extract_single_node_local_names,
-    _extract_unit_live_in_names,
-    _find_enclosing_loops,
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
     _get_scope_stmts_by_end_lineno,
-    _get_scope_try_and_with_blocks,
-    _is_ast_node_within_unit_bounds,
-    _is_eagerly_consumed_genexp,
-    _load_unit_file_text,
-    _pair_clone_outputs,
+)
+from pydoppelgangerhunt.fixer._df_span_index import (  # pylint: disable=protected-access
     _resolve_unit_ast_end_col,
-    _scope_closures_cache,
-    _scope_loops_cache,
-    _scope_parent_maps,
+)
+from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=protected-access
+    _ClosurePos,
+    _classify_closure_position,
+    _collect_pre_unit_closures,
+    _collect_scope_closures,
+    _extract_scope_local_names,
+    _extract_single_node_local_names,
+    _is_eagerly_consumed_genexp,
+)
+from pydoppelgangerhunt.fixer._df_hazards import (  # pylint: disable=protected-access
+    _enclosing_try_reads_outputs,
+    _execute_read_pass,
+    _find_enclosing_loops,
+    _get_scope_try_and_with_blocks,
     _scope_reads_outputs_after_line,
-    _scope_stmts_by_end,
-    _scope_try_with_cache,
     _stmts_enclose_unit,
-    _warned_lenient_closure,
+)
+from pydoppelgangerhunt.fixer._df_pairing import (  # pylint: disable=protected-access
+    _extract_effective_unit_outputs,
+    _pair_clone_outputs,
+)
+from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=protected-access
+    _DownstreamReadVisitor,
+    _VisitorPassMode,
+    _extract_nested_scope_free_reads,
+    _extract_unit_live_in_names,
+    _is_ast_node_within_unit_bounds,
+)
+from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
+    AnalysisSession,
+    GeneratorCloneSideData,
+    analysis_session,
     clear_dataflow_cache,
     collect_downstream_read_names,
-    has_async_generator_delegation_hazard,
-    is_async_generator_with_return_value,
     resolve_clone_generator_subroutine_outputs,
     resolve_clone_pair_outputs,
     resolve_generator_subroutine_outputs,
+)
+from pydoppelgangerhunt.fixer.source import (  # pylint: disable=protected-access
+    _load_unit_file_text,
 )
 
 
@@ -122,7 +129,6 @@ def test_collect_downstream_read_names_scope_and_closure_capture() -> None:
     reads_shadowed = collect_downstream_read_names(code_shadowed, unit, candidates={"total", "x"})
     assert reads_shadowed == {"total"}
 
-
 def test_collect_downstream_read_names_positional_and_expression_boundaries() -> None:
     """Verifies same-line boundaries, same-expression, enclosing-expression, and multiline expression reads."""
     # 1. Same-line unit boundary: statement after semicolon
@@ -177,72 +183,6 @@ def test_collect_downstream_read_names_positional_and_expression_boundaries() ->
     u_prior = {"start": 2, "end": 2, "end_col": 23}
     reads_prior = collect_downstream_read_names(code_prior, u_prior, candidates={"x"})
     assert reads_prior == set()
-
-
-def test_resolve_generator_subroutine_outputs_preserves_per_side_necessity_and_safe_fallback(
-) -> None:
-    """Verifies that resolve_generator_subroutine_outputs pairs renamed outputs and guards
-    against partial knowledge."""
-    u1_outs = ["total", "x"]
-    u2_outs = ["count", "x"]
-
-    # 1. Both sides known: only the mapped total/count slot is needed, x is discarded
-    res1 = resolve_generator_subroutine_outputs(
-        GeneratorCloneSideData(u1_outs, downstream={"total"}, definite={"total"}),
-        GeneratorCloneSideData(u2_outs, downstream={"count"}, definite={"count"}),
-    )
-    assert res1 is not None
-    out1, out2 = res1
-    assert out1 == ["total"]
-    assert out2 == ["count"]
-
-    # 2. Unknown fallback with definite sets: fails closed when candidate lacks definite store
-    res2 = resolve_generator_subroutine_outputs(
-        GeneratorCloneSideData(u1_outs, downstream={"total"}, definite={"total"}),
-        GeneratorCloneSideData(u2_outs, downstream=None, definite={"count"}),
-    )
-    assert res2 is None
-
-    res2_def = resolve_generator_subroutine_outputs(
-        GeneratorCloneSideData(u1_outs, downstream={"total"}, definite={"total", "x"}),
-        GeneratorCloneSideData(u2_outs, downstream=None, definite={"count", "x"}),
-    )
-    assert res2_def is not None
-    fb_def1, fb_def2 = res2_def
-    assert fb_def1 == ["total", "x"]
-    assert fb_def2 == ["count", "x"]
-
-    # 3. Unknown fallback without definite sets: fails closed on non-definite outputs
-    res3 = resolve_generator_subroutine_outputs(
-        GeneratorCloneSideData(u1_outs, downstream={"total"}),
-        GeneratorCloneSideData(u2_outs, downstream=None),
-    )
-    assert res3 is None
-
-    # 4. Neither side needs outputs
-    res4 = resolve_generator_subroutine_outputs(
-        GeneratorCloneSideData(u1_outs, downstream=set()),
-        GeneratorCloneSideData(u2_outs, downstream=set()),
-    )
-    assert res4 is not None
-    none_out1, none_out2 = res4
-    assert not none_out1
-    assert not none_out2
-
-    # 5. Unequal output counts where needed output has no counterpart: fails closed (returns None)
-    res_unequal = resolve_generator_subroutine_outputs(
-        GeneratorCloneSideData(["total"], downstream={"total"}),
-        GeneratorCloneSideData(["count", "status"], downstream={"count"}),
-    )
-    assert res_unequal is None
-
-    # 6. Downstream explicitly requires output assigned in loop: fails closed if not definite
-    res_needed = resolve_generator_subroutine_outputs(
-        GeneratorCloneSideData(["x"], downstream={"x"}, definite=set()),
-        GeneratorCloneSideData(["x"], downstream={"x"}, definite=set()),
-    )
-    assert res_needed is None
-
 
 def test_collect_downstream_read_names_comprehensions_and_walrus() -> None:
     """Verifies that comprehension targets do not pollute enclosing scope and walrus bindings are scoped correctly."""
@@ -316,7 +256,6 @@ def test_collect_downstream_read_names_comprehensions_and_walrus() -> None:
     reads_class = collect_downstream_read_names(code_class_comp, u_direct, candidates={"x", "data"})
     assert reads_class == {"data"}
 
-
 def test_generator_clone_with_nested_genexpr(tmp_path: Path) -> None:
     """Verifies that nested generator expressions inside generator units do not leak comprehension targets into scope."""
     code1 = (
@@ -379,7 +318,6 @@ def test_generator_clone_with_nested_genexpr(tmp_path: Path) -> None:
     assert patch != ""
     assert "_shared" in patch
 
-
 def test_generator_clone_with_yield_from_and_returns(tmp_path: Path) -> None:
     """Verifies that generator clones containing yield from delegate return values and propagate outputs correctly."""
     code1 = (
@@ -433,7 +371,6 @@ def test_generator_clone_with_yield_from_and_returns(tmp_path: Path) -> None:
     assert patch != ""
     assert "(yield from _shared" in patch
 
-
 def test_collect_downstream_read_names_nonlocal_and_global_declarations() -> None:
     """Verifies that downstream nonlocal declarations are captured as escaping free reads, while globals are excluded."""
 
@@ -470,7 +407,6 @@ def test_collect_downstream_read_names_nonlocal_and_global_declarations() -> Non
     reads_with_tree = collect_downstream_read_names(code_nonlocal, u, candidates={"x"}, tree=tree)
     assert reads_with_tree == {"x"}
 
-
 def test_generator_clone_side_data_interface() -> None:
     """Verifies that GeneratorCloneSideData cleanly encapsulates per-side clone context."""
     side1 = GeneratorCloneSideData(
@@ -495,41 +431,6 @@ def test_generator_clone_side_data_interface() -> None:
     )
     assert resolve_generator_subroutine_outputs(side1, side_unpaired) is None
 
-
-def test_is_async_generator_with_return_value_policy() -> None:
-    """Verifies that is_async_generator_with_return_value strictly enforces PEP 525 constraints."""
-    assert is_async_generator_with_return_value is has_async_generator_delegation_hazard
-
-    # Clean sync generator with return value (allowed in Python 3.3+)
-    sync_gen = {"has_yield": True, "is_async": False, "has_return_value": True}
-    assert not is_async_generator_with_return_value(sync_gen)
-
-    # Clean async function with return value (allowed)
-    async_fn = {"has_yield": False, "is_async": True, "has_return_value": True}
-    assert not is_async_generator_with_return_value(async_fn)
-
-    # Async generator without return value (allowed)
-    async_gen_no_ret = {"has_yield": True, "is_async": True, "has_return_value": False}
-    assert not is_async_generator_with_return_value(async_gen_no_ret)
-
-    # Async generator with explicit return value (illegal under PEP 525)
-    async_gen_with_ret = {"has_yield": True, "is_async": True, "has_return_value": True}
-    assert is_async_generator_with_return_value(async_gen_with_ret)
-
-    # Multi-scope evaluation: if the merged helper combines yield, async, and return value, it is rejected
-    assert is_async_generator_with_return_value(async_gen_no_ret, async_gen_with_ret)
-    assert is_async_generator_with_return_value(async_gen_no_ret, sync_gen)
-
-    # When no scope contains return values and has_outputs is False, not rejected
-    clean_async = {"has_yield": False, "is_async": True, "has_return_value": False}
-    sync_gen_no_ret = {"has_yield": True, "is_async": False, "has_return_value": False}
-    assert not is_async_generator_with_return_value(clean_async, sync_gen_no_ret)
-
-    # Async generator attempting to propagate downstream outputs (illegal under PEP 525)
-    assert is_async_generator_with_return_value(async_gen_no_ret, has_outputs=True)
-    assert not is_async_generator_with_return_value(sync_gen, has_outputs=True)
-
-
 def test_downstream_read_visitor_aug_assign() -> None:
     """Verifies that augmented assignments downstream of a unit are captured as reads."""
 
@@ -543,26 +444,6 @@ def test_downstream_read_visitor_aug_assign() -> None:
     unit = {"start": 2, "end": 3}
     reads = collect_downstream_read_names(code, unit, candidates={"total", "x"})
     assert reads == {"total", "x"}
-
-
-def test_pair_clone_outputs_duplicate_names() -> None:
-    """Verifies that _pair_clone_outputs does not raise KeyError on duplicate output names."""
-    # Equal lengths with duplicates on one side (len(dedup) differs -> unequal arities fail closed)
-    pairs1 = _pair_clone_outputs(["a", "b"], ["a", "a"])
-    assert pairs1 == []
-
-    # Equal raw lengths with duplicate on one side and disjoint names (returns empty without KeyError)
-    pairs2 = _pair_clone_outputs(["x", "y"], ["z", "z"])
-    assert pairs2 == []
-
-    # Equal deduplicated lengths with duplicates on both sides
-    pairs3 = _pair_clone_outputs(["a", "b", "a"], ["c", "d", "c"])
-    assert pairs3 == [("a", "c"), ("b", "d")]
-
-    # Unequal raw lengths with duplicates (unequal arities fail closed)
-    pairs4 = _pair_clone_outputs(["a", "b", "a"], ["a", "a"])
-    assert pairs4 == []
-
 
 def test_extract_nested_scope_free_reads_type_annotations() -> None:
     """Verifies that type annotations on parameters and return types in nested functions are captured as free reads."""
@@ -583,30 +464,6 @@ def test_extract_nested_scope_free_reads_type_annotations() -> None:
     assert reads is not None
     assert "MyType" in reads
     assert "ReturnType" in reads
-
-
-def test_pair_clone_outputs_positional_alignment() -> None:
-    """Verifies that _pair_clone_outputs pairs outputs by position and fails closed on conflicts."""
-    # Colliding variable names across different semantic positions fail closed
-    pairs_conflict = _pair_clone_outputs(["a", "b"], ["b", "c"])
-    assert pairs_conflict == []
-
-    # Partial common names with conflicting indices fail closed to prevent variable swapping
-    pairs_scrambled = _pair_clone_outputs(["a", "b", "c"], ["x", "a", "b"])
-    assert pairs_scrambled == []
-
-    # Common names at matching positions succeed with 1-to-1 positional pairing
-    pairs_aligned = _pair_clone_outputs(["a", "b", "c"], ["a", "x", "c"])
-    assert pairs_aligned == [("a", "a"), ("b", "x"), ("c", "c")]
-
-    # Differing variable orders (permuted outputs) fail closed when allow_permuted_outputs is False
-    pairs_swapped = _pair_clone_outputs(["x", "y"], ["y", "x"])
-    assert pairs_swapped == []
-    assert _pair_clone_outputs(["x", "y"], ["y", "x"], allow_permuted_outputs=True) == [
-        ("x", "y"),
-        ("y", "x"),
-    ]
-
 
 def test_extract_nested_scope_free_reads_outer_scope_shadowing() -> None:
     """Verifies that defaults, decorators, and annotations in nested functions are not wiped by inner local stores."""
@@ -635,7 +492,6 @@ def test_extract_nested_scope_free_reads_outer_scope_shadowing() -> None:
     assert reads is not None
     assert "x" in reads
 
-
 def test_downstream_reads_in_enclosing_class() -> None:
     """Verifies that collect_downstream_read_names traverses statements and methods in an enclosing class."""
 
@@ -651,7 +507,6 @@ def test_downstream_reads_in_enclosing_class() -> None:
     reads = collect_downstream_read_names(code, unit, candidates={"total", "x"})
     assert reads is not None
     assert "total" in reads
-
 
 def test_downstream_read_visitor_reaching_definitions_reassigned_variable() -> None:
     """Verifies that reaching definitions clear variables killed by unconditional assignments before reads."""
@@ -726,7 +581,6 @@ def test_downstream_read_visitor_reaching_definitions_reassigned_variable() -> N
     )
     assert "x" in collect_downstream_read_names(code5_no_val, {"start": 2, "end": 2}, candidates={"x"})  # type: ignore[operator]
 
-
 def test_same_line_unit_boundaries_semicolon_downstream_resolution() -> None:
     """Verifies that same-line units without column offsets fail closed and treat
     same-line statements as downstream when end column is ambiguous."""
@@ -749,7 +603,6 @@ def test_same_line_unit_boundaries_semicolon_downstream_resolution() -> None:
     assert "total" in reads_col
     assert "x" not in reads_col
 
-
 def test_downstream_read_visitor_try_except_else_kills() -> None:
     """Verifies that exception handler kills do not leak into node.orelse in visit_Try."""
 
@@ -767,7 +620,6 @@ def test_downstream_read_visitor_try_except_else_kills() -> None:
     reads = collect_downstream_read_names(code, unit, candidates={"total"})
     assert reads is not None
     assert "total" in reads
-
 
 def test_downstream_read_visitor_try_finally_unconditional_kills() -> None:
     """Verifies that unconditional assignments in finally: kill reaching definitions downstream."""
@@ -798,7 +650,6 @@ def test_downstream_read_visitor_try_finally_unconditional_kills() -> None:
     reads_retained = collect_downstream_read_names(code_retained, unit, candidates={"total"})
     assert reads_retained is not None
     assert "total" in reads_retained
-
 
 def test_downstream_read_visitor_try_except_else_joint_kills() -> None:
     """Verifies that reaching definitions are killed only when all try/except/else branches assign."""
@@ -866,7 +717,6 @@ def test_downstream_read_visitor_try_except_else_joint_kills() -> None:
     assert reads_as_name is not None
     assert "total" in reads_as_name
 
-
 def test_downstream_read_visitor_chained_with_context_managers() -> None:
     """Verifies that earlier context manager targets kill prior reaching definitions for later items."""
 
@@ -892,7 +742,6 @@ def test_downstream_read_visitor_chained_with_context_managers() -> None:
     reads_intra = collect_downstream_read_names(code_intra, unit, candidates={"x"})
     assert reads_intra is not None
     assert "x" in reads_intra
-
 
 def test_class_scope_visitor_global_and_nonlocal() -> None:
     """Verifies that global declarations in class bodies are excluded from free reads and class stores."""
@@ -924,7 +773,6 @@ def test_class_scope_visitor_global_and_nonlocal() -> None:
     # n_val is nonlocal to Inner, so it escapes Inner as a free read referencing outer scope
     assert "n_val" in escaped_nl
 
-
 @pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 type_params syntax requires Python 3.12+")
 def test_extract_nested_scope_free_reads_pep695_type_params() -> None:
     """Verifies that PEP 695 type parameter scopes do not treat type vars as free reads."""
@@ -937,80 +785,6 @@ def test_extract_nested_scope_free_reads_pep695_type_params() -> None:
     escaped = _extract_nested_scope_free_reads(fn_node)  # type: ignore[arg-type]
     assert "T" not in escaped
     assert "BoundType" in escaped
-
-
-def test_resolve_clone_generator_subroutine_outputs_precomputed_and_fallback(
-    tmp_path: Path,
-) -> None:
-    """Verifies generator subroutine output resolution with precomputed outputs and fallback."""
-    # Case 1: Precomputed outputs present on u1 and u2
-    u1_pre = {
-        "outputs": ["a", "b"],
-        "source_text": "def f():\n    a = 1\n    print(a)\n",
-        "start": 2,
-        "end": 2,
-    }
-    u2_pre = {
-        "outputs": ["x", "y"],
-        "source_text": "def g():\n    x = 1\n    print(x)\n",
-        "start": 2,
-        "end": 2,
-    }
-    s1 = {"definite_stores": ["a"], "globals": ["b"], "nonlocals": []}
-    s2 = {"definite_stores": ["x"], "globals": [], "nonlocals": ["y"]}
-    res = resolve_clone_generator_subroutine_outputs(u1_pre, u2_pre, s1, s2)
-    assert res is not None
-    outs1, outs2 = res
-    assert outs1 == ["a"]
-    assert outs2 == ["x"]
-
-    # Case 2: On-disk file resolution and downstream reads
-    src1 = (
-        "def gen1():\n"
-        "    total = 0\n"
-        "    yield total\n"
-        "    print(total)\n"
-    )
-    src2 = (
-        "def gen2():\n"
-        "    total = 0\n"
-        "    yield total\n"
-        "    print(total)\n"
-    )
-    f1 = tmp_path / "mod1.py"
-    f2 = tmp_path / "mod2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    unit1 = {"file": str(f1), "start": 2, "end": 3}
-    unit2 = {"file": str(f2), "start": 2, "end": 3}
-    scope1 = {"outputs": ["total"], "definite_stores": ["total"], "inputs": []}
-    scope2 = {"outputs": ["total"], "definite_stores": ["total"], "inputs": []}
-    res_disk = resolve_clone_generator_subroutine_outputs(
-        unit1, unit2, scope1, scope2, repo_root=str(tmp_path)
-    )
-    assert res_disk is not None
-    assert res_disk == (["total"], ["total"])
-
-    # Case 3: Fail-closed counterpart mismatch on unequal arity with needed downstream output
-    src3_extra = (
-        "def gen1():\n"
-        "    total = 0\n"
-        "    extra = 1\n"
-        "    yield total\n"
-        "    print(total, extra)\n"
-    )
-    scope1_extra = {
-        "outputs": ["total", "extra"],
-        "definite_stores": ["total", "extra"],
-        "inputs": [],
-    }
-    scope2_single = {"outputs": ["other"], "definite_stores": ["other"], "inputs": []}
-    res_mismatch = resolve_clone_generator_subroutine_outputs(
-        unit1, unit2, scope1_extra, scope2_single, source_text1=src3_extra, source_text2=src2
-    )
-    assert res_mismatch is None
-
 
 def test_downstream_read_visitor_record_downstream_read_and_comprehensions() -> None:
     """Verifies that _record_downstream_read respects comprehension scoping and killed variables."""
@@ -1037,7 +811,6 @@ def test_downstream_read_visitor_record_downstream_read_and_comprehensions() -> 
     assert "elem" not in reads
     assert "total" not in reads
 
-
 def test_class_body_comprehension_free_reads() -> None:
     """Verifies that class-body comprehensions do not resolve class attributes (PEP 227)."""
     code = (
@@ -1053,7 +826,6 @@ def test_class_body_comprehension_free_reads() -> None:
     assert reads is not None
     assert "x" in reads
 
-
 def test_conditional_named_expr_does_not_kill_variables() -> None:
     """Verifies that conditionally evaluated named expressions do not kill reaching definitions."""
     code = (
@@ -1067,26 +839,6 @@ def test_conditional_named_expr_does_not_kill_variables() -> None:
     reads = collect_downstream_read_names(code, unit, candidates={"total"})
     assert reads is not None
     assert "total" in reads
-
-
-def test_pair_clone_outputs_swapped_names_and_positional_roles() -> None:
-    """Verifies positional pairing across renamed variable roles and identity on permutations."""
-    # Equal arity with different names: preserves positional sequence
-    pairs_pos = _pair_clone_outputs(["x", "y"], ["b", "a"])
-    assert pairs_pos == [("x", "b"), ("y", "a")]
-
-    # Identical name sets with conflicting order fail closed when allow_permuted_outputs is False
-    pairs_ident = _pair_clone_outputs(["x", "y"], ["y", "x"])
-    assert pairs_ident == []
-    assert _pair_clone_outputs(["x", "y"], ["y", "x"], allow_permuted_outputs=True) == [
-        ("x", "y"),
-        ("y", "x"),
-    ]
-
-    # Mismatched arity fails closed
-    pairs_mismatched = _pair_clone_outputs(["a", "b"], ["b"])
-    assert pairs_mismatched == []
-
 
 def test_except_handler_name_not_treated_as_escaping_free_read() -> None:
     """Verifies ast.ExceptHandler.name is recorded as local store and not an escaping read."""
@@ -1115,25 +867,6 @@ def test_except_handler_name_not_treated_as_escaping_free_read() -> None:
     assert isinstance(cls_node, ast.ClassDef)
     cls_free = _extract_nested_scope_free_reads(cls_node)
     assert "err" not in cls_free
-
-
-def test_resolve_clone_generator_subroutine_outputs_requires_both_outputs() -> None:
-    """Verifies resolve_clone_generator_subroutine_outputs requires both sides to have outputs."""
-    u1 = {"outputs": ["a"], "start": 2, "end": 2}
-    u2 = {"start": 2, "end": 2}  # No precomputed outputs
-    scope1 = {"outputs": ["a"], "definite_stores": ["a"], "inputs": []}
-    scope2 = {"outputs": ["b"], "definite_stores": ["b"], "inputs": []}
-
-    src1 = "def f1():\n    a = 1\n    return a\n"
-    src2 = "def f2():\n    b = 2\n    return b\n"
-    res = resolve_clone_generator_subroutine_outputs(
-        u1, u2, scope1, scope2, source_text1=src1, source_text2=src2
-    )
-    assert res is not None
-    outs1, outs2 = res
-    assert outs1 == ["a"]
-    assert outs2 == ["b"]
-
 
 def test_downstream_reads_preserve_exception_alias_reassigned_in_same_handler() -> None:
     """Verifies reassigning an exception alias in handler preserves downstream reads."""
@@ -1164,7 +897,6 @@ def test_downstream_reads_preserve_exception_alias_reassigned_in_same_handler() 
     assert reads_try is not None
     assert "err" not in reads_try
 
-
 def test_collect_downstream_read_names_loop_carried_dependence() -> None:
     """Verifies that reads earlier in an enclosing loop body are captured as downstream reads."""
     code = (
@@ -1181,7 +913,6 @@ def test_collect_downstream_read_names_loop_carried_dependence() -> None:
     reads = collect_downstream_read_names(code, unit, candidates={"total"})
     assert reads is not None
     assert "total" in reads
-
 
 def test_collect_downstream_read_names_loop_carried_unit_inputs_without_preceding_read() -> None:
     """Verifies that unit inputs updated in an enclosing loop are captured as live across
@@ -1200,7 +931,6 @@ def test_collect_downstream_read_names_loop_carried_unit_inputs_without_precedin
     assert reads is not None
     assert "total" in reads
 
-
 def test_collect_downstream_read_names_loop_carried_killed_before_unit() -> None:
     """Verifies that variables reassigned before the unit inside the enclosing loop
     are not captured as live across iterations."""
@@ -1217,7 +947,6 @@ def test_collect_downstream_read_names_loop_carried_killed_before_unit() -> None
     reads = collect_downstream_read_names(code, unit, candidates={"total"})
     assert reads is not None
     assert "total" not in reads
-
 
 def test_collect_downstream_read_names_loop_carried_conditional_reset() -> None:
     """Verifies that conditional resets before the unit inside an enclosing loop do not
@@ -1238,7 +967,6 @@ def test_collect_downstream_read_names_loop_carried_conditional_reset() -> None:
     assert reads is not None
     assert "total" in reads
 
-
 def test_collect_downstream_read_names_try_finally_exceptional_path() -> None:
     """Verifies that try body stores do not kill variables in finally block across
     exceptional paths."""
@@ -1258,7 +986,6 @@ def test_collect_downstream_read_names_try_finally_exceptional_path() -> None:
     # so line 2's total must be considered read downstream.
     assert "total" in reads
 
-
 def test_downstream_reads_pre_unit_loop_assign_does_not_kill_post_unit() -> None:
     """Verifies that pre-unit assignments in enclosing loops do not kill post-unit reads."""
     src = (
@@ -1275,7 +1002,6 @@ def test_downstream_reads_pre_unit_loop_assign_does_not_kill_post_unit() -> None
     assert reads is not None
     assert "total" in reads
 
-
 def test_downstream_reads_recursive_closure_no_infinite_recursion() -> None:
     """Verifies that recursive pre-unit closures do not cause infinite recursion."""
     src = (
@@ -1290,7 +1016,6 @@ def test_downstream_reads_recursive_closure_no_infinite_recursion() -> None:
     reads = collect_downstream_read_names(src, unit, candidates={"helper", "x", "y"})
     assert reads is not None
     assert "helper" in reads
-
 
 def test_downstream_reads_mutually_recursive_closures_no_recursion_error() -> None:
     """Verifies that mutually recursive pre-unit closures do not cause recursion errors.
@@ -1316,7 +1041,6 @@ def test_downstream_reads_mutually_recursive_closures_no_recursion_error() -> No
     assert "foo" in reads
     assert "bar" in reads
 
-
 def test_downstream_reads_named_expr_target_is_not_recorded_as_read() -> None:
     """Verifies that walrus expression targets in downstream code are not recorded as reads."""
     src = (
@@ -1328,7 +1052,6 @@ def test_downstream_reads_named_expr_target_is_not_recorded_as_read() -> None:
     reads = collect_downstream_read_names(src, unit, candidates={"z"})
     assert reads is not None
     assert "z" not in reads
-
 
 def test_downstream_reads_del_bare_name_is_read_not_killed() -> None:
     """Verifies that bare 'del name' downstream is counted as a read and not added to killed."""
@@ -1344,7 +1067,6 @@ def test_downstream_reads_del_bare_name_is_read_not_killed() -> None:
     reads = collect_downstream_read_names(src, unit, candidates={"total"})
     assert reads is not None
     assert "total" in reads
-
 
 def test_downstream_reads_pre_unit_def_in_if_block() -> None:
     """Verifies that pre-unit closures defined in nested blocks (if, try, for) are discovered."""
@@ -1363,7 +1085,6 @@ def test_downstream_reads_pre_unit_def_in_if_block() -> None:
     assert reads is not None
     assert "total" in reads
 
-
 def test_downstream_reads_pre_unit_lambda_assignment() -> None:
     """Verifies that pre-unit lambda assignments (cb = lambda: total) have their captured
     reads preserved under the blanket pre-unit rule without requiring alias tracking or
@@ -1381,7 +1102,6 @@ def test_downstream_reads_pre_unit_lambda_assignment() -> None:
     assert reads is not None
     assert "total" in reads
 
-
 def test_downstream_reads_pre_unit_loop_assign_inside_def_exercises_innermost_node() -> None:
     """Verifies that pre-unit loop assignments inside a function do not kill post-unit reads,
     exercising _find_innermost_enclosing_node."""
@@ -1398,7 +1118,6 @@ def test_downstream_reads_pre_unit_loop_assign_inside_def_exercises_innermost_no
     reads = collect_downstream_read_names(src, unit, candidates={"total", "x"})
     assert reads is not None
     assert "total" in reads
-
 
 def test_downstream_reads_class_method_deferred_read() -> None:
     """Verifies that pre-unit class methods capturing candidate variables have their free
@@ -1419,7 +1138,6 @@ def test_downstream_reads_class_method_deferred_read() -> None:
     assert reads is not None
     assert "total" in reads
 
-
 def test_downstream_reads_class_instance_alias_deferred_read() -> None:
     """Verifies that pre-unit class methods capturing candidate variables are preserved
     by the blanket pre-unit rule regardless of instance aliasing (obj = K())."""
@@ -1439,7 +1157,6 @@ def test_downstream_reads_class_instance_alias_deferred_read() -> None:
     reads = collect_downstream_read_names(src, unit, candidates={"total"})
     assert reads is not None
     assert "total" in reads
-
 
 def test_downstream_reads_pre_unit_closure_redefinition_in_branches() -> None:
     """Verifies that closures redefined across conditional branches merge free variable sets."""
@@ -1462,7 +1179,6 @@ def test_downstream_reads_pre_unit_closure_redefinition_in_branches() -> None:
     assert reads is not None
     assert "total" in reads
 
-
 def test_downstream_reads_escaping_closure_registered_before_unit() -> None:
     """Verifies that pre-unit closures capturing candidate variables are treated as live
     even when invoked indirectly through pre-registered handlers."""
@@ -1482,7 +1198,6 @@ def test_downstream_reads_escaping_closure_registered_before_unit() -> None:
     assert reads is not None
     assert "total" in reads
 
-
 def test_downstream_reads_compound_statement_lambda_after_unit_not_pre_captured() -> None:
     """Verifies that lambdas occurring after u_start inside an enclosing compound statement
     are not prematurely captured into pre_unit_captured_reads."""
@@ -1500,38 +1215,12 @@ def test_downstream_reads_compound_statement_lambda_after_unit_not_pre_captured(
     assert reads is not None
     assert "total" not in reads
 
-
 def test_collect_downstream_read_names_inverted_coordinates() -> None:
     """Verifies that inverted unit coordinates (start > end) safely return None."""
     src = "x = 1\ny = 2\nz = x + y\n"
     unit = {"file": "mod.py", "start": 3, "end": 1, "name": "inverted"}
     reads = collect_downstream_read_names(src, unit, candidates={"x", "y", "z"})
     assert reads is None
-
-
-def test_resolve_clone_generator_subroutine_outputs_duplicate_names_fails_closed() -> None:
-    """Verifies that resolve_clone_generator_subroutine_outputs returns ([], []) when outputs
-    are unneeded downstream, and fails closed (returns None) when downstream reads outputs and
-    precomputed outputs contain duplicate names causing arity collapse."""
-    u1 = {"file": "mod1.py", "start": 1, "end": 2, "outputs": ["a", "b"]}
-    u2 = {"file": "mod2.py", "start": 1, "end": 2, "outputs": ["c", "c"]}
-    scope1 = {"inputs": [], "definite_stores": ["a", "b"]}
-    scope2 = {"inputs": [], "definite_stores": ["c"]}
-    res_unneeded = resolve_clone_generator_subroutine_outputs(
-        u1, u2, scope1, scope2, source_text1="yield 1", source_text2="yield 1"
-    )
-    assert res_unneeded == ([], [])
-
-    res_needed = resolve_clone_generator_subroutine_outputs(
-        u1,
-        u2,
-        scope1,
-        scope2,
-        source_text1="yield 1\nyield 2\nprint(a, b)",
-        source_text2="yield 1\nyield 2\nprint(c)",
-    )
-    assert res_needed is None
-
 
 def test_load_unit_file_text_source_lines_fallback() -> None:
     """Verifies that _load_unit_file_text falls back to in-memory source_lines
@@ -1545,7 +1234,6 @@ def test_load_unit_file_text_source_lines_fallback() -> None:
     }
     loaded = _load_unit_file_text(unit)
     assert loaded == "def foo():\n    pass\n"
-
 
 def test_extract_nested_scope_free_reads_class_assigned_nonlocal() -> None:
     """Verifies that _extract_nested_scope_free_reads unions assigned nonlocal variables
@@ -1561,7 +1249,6 @@ def test_extract_nested_scope_free_reads_class_assigned_nonlocal() -> None:
     assert isinstance(class_node, ast.ClassDef)
     free_reads = _extract_nested_scope_free_reads(class_node)
     assert "captured_var" in free_reads
-
 
 def test_load_unit_file_text_prioritizes_disk_file_over_sliced_source_lines(
     tmp_path: Path,
@@ -1583,7 +1270,6 @@ def test_load_unit_file_text_prioritizes_disk_file_over_sliced_source_lines(
     }
     loaded = _load_unit_file_text(unit, repo_root=str(tmp_path))
     assert loaded == disk_content
-
 
 def test_load_unit_file_text_prioritizes_repo_root_over_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1608,21 +1294,28 @@ def test_load_unit_file_text_prioritizes_repo_root_over_cwd(
     text_cwd = _load_unit_file_text(unit)
     assert text_cwd == "# cwd version\n"
 
-
-def test_load_unit_file_text_explicit_empty_string_source_text(tmp_path: Path) -> None:
-    """Verifies that an explicit empty string in source_text or file_source does not fall
-    through to disk."""
+def test_load_unit_file_text_empty_string_source_text_falls_back(tmp_path: Path) -> None:
+    """Verifies empty or whitespace source_text/file_source falls back to backing source consistently with source_lines."""
     f = tmp_path / "on_disk.py"
     f.write_text("# disk content\n", encoding="utf-8")
 
-    # Explicit empty string in source_text must return "" and not read disk
-    unit_empty = {"file": str(f), "source_text": ""}
-    assert _load_unit_file_text(unit_empty) == ""
+    # Empty/whitespace source_text falls back to file_source or repo_root disk file
+    unit_empty_with_file_src = {
+        "file": str(f),
+        "source_text": "",
+        "file_source": "# file_source content\n",
+    }
+    assert _load_unit_file_text(unit_empty_with_file_src, repo_root=str(tmp_path)) == "# file_source content\n"
 
-    # Explicit empty string in file_source when source_text is None
+    unit_empty_disk = {"file": str(f), "source_text": "   \n"}
+    assert _load_unit_file_text(unit_empty_disk, repo_root=str(tmp_path)) == "# disk content\n"
+
     unit_empty_file_source = {"file": str(f), "file_source": ""}
-    assert _load_unit_file_text(unit_empty_file_source) == ""
+    assert _load_unit_file_text(unit_empty_file_source, repo_root=str(tmp_path)) == "# disk content\n"
 
+    # Without an allowed repo_root or non-blank buffer, returns None rather than an empty string
+    assert _load_unit_file_text(unit_empty_disk) is None
+    assert _load_unit_file_text(unit_empty_file_source) is None
 
 def test_loop_orelse_reaching_definitions_for_and_while() -> None:
     """Verifies that reads in loop orelse blocks see reaching definitions entering the loop.
@@ -1655,7 +1348,6 @@ def test_loop_orelse_reaching_definitions_for_and_while() -> None:
     reads_while = collect_downstream_read_names(src_while, unit_while, candidates={"total"})
     assert reads_while == {"total"}
 
-
 def test_module_level_unit_prior_function_free_reads() -> None:
     """Verifies that module-level units treat free reads from prior top-level functions as live."""
     src = (
@@ -1669,13 +1361,11 @@ def test_module_level_unit_prior_function_free_reads() -> None:
     reads = collect_downstream_read_names(src, unit, candidates={"g_total"})
     assert reads == {"g_total"}
 
-
 def test_collect_downstream_read_names_empty_candidates_early_out() -> None:
     """Verifies that empty candidates set triggers early-out returning empty set."""
     src = "x = 1\ny = 2\n"
     unit = {"start": 1, "end": 1}
     assert collect_downstream_read_names(src, unit, candidates=set()) == set()
-
 
 def test_collect_downstream_read_names_skip_pre_unit_closures() -> None:
     """Verifies that skip_pre_unit_closures=True bypasses pre-unit closure read extraction."""
@@ -1690,10 +1380,9 @@ def test_collect_downstream_read_names_skip_pre_unit_closures() -> None:
     assert reads_default == {"val"}
 
     reads_skipped = collect_downstream_read_names(
-        src, unit, candidates={"val"}, skip_pre_unit_closures=True
+        src, unit, candidates={"val"}, closure_strictness="lenient"
     )
     assert reads_skipped == set()
-
 
 def test_extract_nested_scope_free_reads_pure_ast_immutability() -> None:
     """Verifies that _extract_nested_scope_free_reads does not mutate AST nodes."""
@@ -1707,7 +1396,6 @@ def test_extract_nested_scope_free_reads_pure_ast_immutability() -> None:
     assert free_reads == {"b", "c"}
     assert not hasattr(fn_node, "_free_reads_cache")
 
-
 def test_extract_nested_scope_free_reads_generator_scope_isolation() -> None:
     """Verifies that generator expressions isolate inner comprehensions and lambdas
     without leaking loop targets or inner parameters as free reads."""
@@ -1720,7 +1408,6 @@ def test_extract_nested_scope_free_reads_generator_scope_isolation() -> None:
     gen_node2 = ast.parse(code2, mode="eval").body
     free2 = _extract_nested_scope_free_reads(gen_node2)  # type: ignore[arg-type]
     assert free2 == {"items", "offset"}
-
 
 def test_collect_downstream_read_names_lru_caching() -> None:
     """Verifies that collect_downstream_read_names uses an LRU cache across repeated calls."""
@@ -1747,7 +1434,6 @@ def test_collect_downstream_read_names_lru_caching() -> None:
     reads3 = collect_downstream_read_names(code, unit, candidates={"extra"}, tree=tree)
     assert reads3 == {"extra"}
 
-
 def test_collect_pre_unit_closures_deeply_nested_compound_statements() -> None:
     """Verifies that _collect_pre_unit_closures discovers pre-unit closures across nested
     compound statements (if/for/try/with) without missing headers or corrupting scopes."""
@@ -1772,7 +1458,6 @@ def test_collect_pre_unit_closures_deeply_nested_compound_statements() -> None:
     }
     assert expected.issubset(captured)
 
-
 def test_collect_downstream_read_names_source_digest_optimization() -> None:
     """Verifies that collect_downstream_read_names uses precomputed source_digest in cache key."""
     _clear_downstream_reads_cache()
@@ -1796,18 +1481,9 @@ def test_collect_downstream_read_names_source_digest_optimization() -> None:
     )
     assert cached_reads == {"extra"}
 
-
 def test_collect_downstream_read_names_malformed_coordinates() -> None:
     """Verifies that collect_downstream_read_names handles malformed coordinates gracefully."""
     assert collect_downstream_read_names("x = 1\n", {"start": "invalid"}) is None
-
-
-def test_extract_effective_unit_outputs_set_handling() -> None:
-    """Verifies that multi-item set outputs are rejected to prevent unpositional pairing,
-    while single-item sets are supported."""
-    assert _extract_effective_unit_outputs({"outputs": {"z", "a", "m"}}, {}) == []
-    assert _extract_effective_unit_outputs({"outputs": {"single"}}, {}) == ["single"]
-
 
 def test_collect_downstream_read_names_cache_isolation_on_content_change() -> None:
     """Verifies that downstream read cache isolates entries when source content changes."""
@@ -1819,7 +1495,6 @@ def test_collect_downstream_read_names_cache_isolation_on_content_change() -> No
     reads2 = collect_downstream_read_names(code2, unit)
     assert reads1 == {"x"}
     assert reads2 == {"y"}
-
 
 def test_load_unit_file_text_resilience_to_non_utf8_bytes(tmp_path: Path) -> None:
     """Verifies that _load_unit_file_text uses errors='replace' on non-UTF-8 bytes
@@ -1834,7 +1509,6 @@ def test_load_unit_file_text_resilience_to_non_utf8_bytes(tmp_path: Path) -> Non
     # When repo_root is omitted, files in global tempdir outside CWD are rejected fail-closed
     assert _load_unit_file_text({"file": str(latin1_file)}, repo_root=None) is None
 
-
 def test_collect_downstream_read_names_content_digest_cache_sharing() -> None:
     """Verifies that identical content shares cache entries across distinct unit dicts."""
     _clear_downstream_reads_cache()
@@ -1847,7 +1521,6 @@ def test_collect_downstream_read_names_content_digest_cache_sharing() -> None:
     assert reads2 == {"x"}
     # Content digest deduplication: identical content shares the cache
     assert len(_downstream_reads_cache) == 1
-
 
 def test_collect_downstream_read_names_digest_invalidation(tmp_path: Path) -> None:
     """Verifies that differing content digest produces distinct cache entries for
@@ -1866,7 +1539,6 @@ def test_collect_downstream_read_names_digest_invalidation(tmp_path: Path) -> No
     assert reads2 == {"x"}
     assert len(_downstream_reads_cache) == 2
 
-
 def test_collect_downstream_read_names_in_memory_no_disk_dependency() -> None:
     """Verifies that collect_downstream_read_names executes purely in-memory from source_text."""
     _clear_downstream_reads_cache()
@@ -1874,72 +1546,6 @@ def test_collect_downstream_read_names_in_memory_no_disk_dependency() -> None:
     unit = {"file": "virtual/nonexistent_path/mod.py", "start": 2, "end": 2}
     reads = collect_downstream_read_names(code, unit)
     assert reads == {"x"}
-
-
-def test_resolve_clone_generator_subroutine_outputs_precomputed_definite_stores() -> None:
-    """Verifies precomputed outputs are validated against definite stores when available."""
-    u1 = {
-        "outputs": ["x", "unassigned"],
-        "source_text": "def f():\n    x = 1\n    print(x, unassigned)\n",
-        "start": 2,
-        "end": 2,
-    }
-    u2 = {
-        "outputs": ["a", "b"],
-        "source_text": "def g():\n    a = 1\n    print(a, b)\n",
-        "start": 2,
-        "end": 2,
-    }
-    # Scope 1 only definitely assigns x, leaving unassigned lacking definite store
-    s1 = {"definite_stores": ["x"], "inputs": []}
-    s2 = {"definite_stores": ["a", "b"], "inputs": []}
-    res_rejected = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
-    assert res_rejected is None
-
-    # When both sides definitely assign all precomputed outputs, pairing succeeds
-    s1_valid = {"definite_stores": ["x", "unassigned"], "inputs": []}
-    res_valid = resolve_clone_generator_subroutine_outputs(u1, u2, s1_valid, s2)
-    assert res_valid == (["x", "unassigned"], ["a", "b"])
-
-
-def test_resolve_clone_generator_subroutine_outputs_inverted_and_zero_coords() -> None:
-    """Verifies that resolve_clone_generator_subroutine_outputs safely clamps inverted
-    or zero coordinates when inspecting enclosing try cleanup."""
-    code1 = (
-        "def gen1():\n"
-        "    try:\n"
-        "        for x in range(10):\n"
-        "            yield x\n"
-        "    finally:\n"
-        "        cleanup = total\n"
-    )
-    code2 = (
-        "def gen2():\n"
-        "    try:\n"
-        "        for y in range(10):\n"
-        "            yield y\n"
-        "    finally:\n"
-        "        cleanup = count\n"
-    )
-    u1 = {
-        "file": "mod1.py",
-        "start": 4,
-        "end": 3,
-        "source_text": code1,
-        "outputs": ["total"],
-    }
-    u2 = {
-        "file": "mod2.py",
-        "start": 0,
-        "end": 0,
-        "source_text": code2,
-        "outputs": ["count"],
-    }
-    s1 = {"definite_stores": ["total"], "inputs": []}
-    s2 = {"definite_stores": ["count"], "inputs": []}
-    res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
-    assert res is None
-
 
 def test_load_unit_file_text_honors_sliced_lines() -> None:
     """Verifies that _load_unit_file_text returns None when source_lines is marked as sliced,
@@ -1987,7 +1593,6 @@ def test_load_unit_file_text_honors_sliced_lines() -> None:
     }
     assert _load_unit_file_text(unit_no_newlines) == "x = 1\ny = 2\nz = 3\n"
 
-
 def test_downstream_reads_non_ascii_same_line_semicolon() -> None:
     """Verifies downstream read analysis with non-ASCII characters preceding same-line unit."""
     code = (
@@ -2018,7 +1623,6 @@ def test_downstream_reads_non_ascii_same_line_semicolon() -> None:
     )
     assert reads_fallback == {"total"}
 
-
 def test_find_enclosing_loops_explicit_none_end_lineno() -> None:
     """Verifies that _find_enclosing_loops handles AST nodes with end_lineno explicitly None."""
     code = (
@@ -2033,7 +1637,6 @@ def test_find_enclosing_loops_explicit_none_end_lineno() -> None:
     # Should not raise TypeError when end_lineno is None
     loops = _find_enclosing_loops(tree, u_start=2, u_end=2)
     assert loops == []
-
 
 def test_downstream_cache_update_prevents_premature_eviction(
     monkeypatch: pytest.MonkeyPatch,
@@ -2077,19 +1680,6 @@ def test_downstream_cache_update_prevents_premature_eviction(
             assert list(_downstream_reads_cache.keys())[-1] == keys_before[-1]
     finally:
         _clear_downstream_reads_cache()
-
-
-def test_resolve_clone_generator_subroutine_outputs_missing_source_fails_closed() -> None:
-    """Verifies that resolve_clone_generator_subroutine_outputs fails closed when outputs
-    are needed but source text and AST trees are unavailable to verify try-cleanup safety."""
-    u1 = {"outputs": ["x"]}
-    u2 = {"outputs": ["a"]}
-    s1 = {"definite_stores": ["x"], "inputs": []}
-    s2 = {"definite_stores": ["a"], "inputs": []}
-    # No source_text, file, or tree is provided
-    res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
-    assert res is None
-
 
 def test_enclosing_try_reads_outputs_in_else_and_except_finally_reads() -> None:
     """Verifies that _enclosing_try_reads_outputs flags units in try/else/except when
@@ -2151,7 +1741,6 @@ def test_enclosing_try_reads_outputs_in_else_and_except_finally_reads() -> None:
     res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
     assert res is None
 
-
 def test_downstream_read_visitor_trailing_same_line_without_col() -> None:
     """Verifies that trailing nodes on the same line are detected as downstream when
     u_end_col is None."""
@@ -2168,7 +1757,6 @@ def test_downstream_read_visitor_trailing_same_line_without_col() -> None:
     visitor.visit(tree)
     # The read of x in 'y = x + 1' must be detected as downstream because u_end_col is None.
     assert "x" in visitor.loaded
-
 
 def test_enclosing_swallowing_with_block_rejects_outputs() -> None:
     """Verifies that units enclosed in contextlib.suppress blocks with downstream reads
@@ -2206,18 +1794,6 @@ def test_enclosing_swallowing_with_block_rejects_outputs() -> None:
     res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
     assert res is None
 
-
-def test_generator_subroutine_outputs_mocked_scope_fails_closed() -> None:
-    """Verifies that mocked/hand-built scopes lacking definite_stores and inputs fail closed."""
-    u1 = {"outputs": ["val"], "source_text": "def f():\n    val = 1\n"}
-    u2 = {"outputs": ["val"], "source_text": "def g():\n    val = 2\n"}
-    # Scope dict missing both definite_stores and inputs
-    s1: Dict[str, Any] = {"globals": [], "nonlocals": []}
-    s2: Dict[str, Any] = {"globals": [], "nonlocals": []}
-    res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
-    assert res is None
-
-
 def test_downstream_dynamic_reads_fail_closed() -> None:
     """Verifies that downstream calls to dynamic read functions (locals, vars, eval, exec, dir)
     mark all candidate outputs as loaded fail-closed."""
@@ -2241,7 +1817,6 @@ def test_downstream_dynamic_reads_fail_closed() -> None:
     reads_g = collect_downstream_read_names(code_eval, unit_g, candidates={"x"})
     assert reads_g == {"x"}
 
-
 def test_enclosing_with_reads_fail_closed() -> None:
     """Verifies that an enclosing with statement (custom or non-suppress) whose outputs are read
     downstream causes generator subroutine extraction to fail closed."""
@@ -2256,7 +1831,6 @@ def test_enclosing_with_reads_fail_closed() -> None:
     scope_node = tree.body[0]
     assert _enclosing_try_reads_outputs(scope_node, 3, 4, {"total"}) is True
     assert _enclosing_try_reads_outputs(scope_node, 3, 4, {"other"}) is False
-
 
 def test_collect_scope_closures_method_param_genexp_does_not_leak() -> None:
     """Verifies that method parameters used in generator expressions inside pre-unit classes
@@ -2275,7 +1849,6 @@ def test_collect_scope_closures_method_param_genexp_does_not_leak() -> None:
     captured = _collect_pre_unit_closures(tree, u_start=6)
     assert "total" not in captured
     assert "outer_var" in captured
-
 
 def test_scope_reads_outputs_after_line_boundary_precision() -> None:
     """Verifies that _scope_reads_outputs_after_line evaluates reads strictly post-line."""
@@ -2303,7 +1876,6 @@ def test_scope_reads_outputs_after_line_boundary_precision() -> None:
     # Reads on line 5 (after the with-block on line 4) MUST be detected
     assert _scope_reads_outputs_after_line(func_node_with_post, 4, {"total"})
 
-
 def test_scope_reads_outputs_after_line_same_line_semicolon() -> None:
     """Verifies that _scope_reads_outputs_after_line flags same-line reads when end_col provided."""
     code = (
@@ -2318,7 +1890,6 @@ def test_scope_reads_outputs_after_line_same_line_semicolon() -> None:
 
     # Without end_col, reads on line 2 itself are not treated as post-line
     assert not _scope_reads_outputs_after_line(func_node, 2, {"total"})
-
 
 def test_enclosing_try_reads_outputs_same_line_with_semicolon() -> None:
     """Verifies that _enclosing_try_reads_outputs permits intra-with reads,
@@ -2342,7 +1913,6 @@ def test_enclosing_try_reads_outputs_same_line_with_semicolon() -> None:
     # Post-with read is detected as a cleanup hazard
     assert _enclosing_try_reads_outputs(func_post, 2, 2, {"total"}) is True
 
-
 def test_collect_scope_closures_class_compound_blocks() -> None:
     """Verifies that _collect_scope_closures inspects methods inside compound blocks in classes."""
     code = (
@@ -2363,11 +1933,10 @@ def test_collect_scope_closures_class_compound_blocks() -> None:
     tree = ast.parse(code)
     func_node = tree.body[0]
     closures = _collect_scope_closures(func_node)
-    captured_vars = set()
+    captured_vars: set[str] = set()
     for _, names in closures:
         captured_vars.update(names)
     assert "outer_var" in captured_vars
-
 
 def test_enclosing_try_reads_outputs_empty_body_nodes_mock() -> None:
     """Verifies that _enclosing_try_reads_outputs gracefully handles empty body nodes."""
@@ -2381,7 +1950,6 @@ def test_enclosing_try_reads_outputs_empty_body_nodes_mock() -> None:
     dummy_module_try = ast.Module(body=[empty_try], type_ignores=[])
     assert not _enclosing_try_reads_outputs(dummy_module_try, 1, 2, {"out"})
 
-
 def test_get_scope_stmts_by_end_lineno_none_end_lineno() -> None:
     """Verifies _get_scope_stmts_by_end_lineno gracefully handles nodes with end_lineno=None."""
     stmt = ast.Pass()
@@ -2391,7 +1959,6 @@ def test_get_scope_stmts_by_end_lineno_none_end_lineno() -> None:
     res = _get_scope_stmts_by_end_lineno(mod)
     assert 5 in res
     assert res[5] == [stmt]
-
 
 def test_enclosing_try_reads_outputs_fallback_b_end() -> None:
     """Verifies _enclosing_try_reads_outputs fallback b_end when end_lineno is None."""
@@ -2410,7 +1977,6 @@ def test_enclosing_try_reads_outputs_fallback_b_end() -> None:
     try_node.end_lineno = None  # Force fallback calculation of b_end
     # With b_end spanning through finally (line 7), line 8 (return x) is recognized as downstream!
     assert _enclosing_try_reads_outputs(tree.body[0], 3, 3, {"x"})
-
 
 def test_collect_scope_closures_decorator_none_lineno() -> None:
     """Verifies that _collect_scope_closures safely handles decorator AST nodes with
@@ -2433,7 +1999,6 @@ def outer():
     assert closures[0][0].line == inner_func.lineno
     assert "x" in closures[0][1]
 
-
 def test_set_valued_outputs_inverting_semantic_order_rejected() -> None:
     """Verifies that set-valued outputs whose alphabetical ordering would invert semantic
     store order are rejected to prevent unpositional pairing."""
@@ -2453,50 +2018,9 @@ def test_set_valued_outputs_inverting_semantic_order_rejected() -> None:
     res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
     assert res is None
 
-    # 3. Helper synthesis fails closed on multi-item set outputs
-    assert synthesize_shared_helper_code(u1, u2) == ""
-
-
-def test_resolve_clone_generator_subroutine_outputs_side2_zero_coords_rejected() -> None:
-    """Verifies that resolve_clone_generator_subroutine_outputs rejects when side 1 has clean
-    coordinates but side 2 has (0, 0) coordinates."""
-    code1 = (
-        "def gen1():\n"
-        "    try:\n"
-        "        for x in range(10):\n"
-        "            yield x\n"
-        "    finally:\n"
-        "        cleanup = total\n"
-    )
-    code2 = (
-        "def gen2():\n"
-        "    try:\n"
-        "        for y in range(10):\n"
-        "            yield y\n"
-        "    finally:\n"
-        "        cleanup = count\n"
-    )
-    # Side 1 is clean and valid (lines 3-4)
-    u1 = {
-        "file": "mod1.py",
-        "start": 3,
-        "end": 4,
-        "source_text": code1,
-        "outputs": ["total"],
-    }
-    # Side 2 has invalid zero coordinates (0, 0)
-    u2 = {
-        "file": "mod2.py",
-        "start": 0,
-        "end": 0,
-        "source_text": code2,
-        "outputs": ["count"],
-    }
-    s1 = {"definite_stores": ["total"], "inputs": []}
-    s2 = {"definite_stores": ["count"], "inputs": []}
-    res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
-    assert res is None
-
+    # 3. Helper synthesis rejects unordered set-valued outputs at entry-point schema validation
+    with pytest.raises(ValueError, match="outputs"):
+        synthesize_shared_helper_code(u1, u2)
 
 def test_collect_downstream_read_names_source_digest_avoids_rehash() -> None:
     """Verifies that providing source_digest uses it directly and avoids rehashing source_text."""
@@ -2523,7 +2047,6 @@ def test_collect_downstream_read_names_source_digest_avoids_rehash() -> None:
         mock_sha_wrap.assert_called()
         assert reads3 == {"var_a"}
 
-
 def test_stmts_enclose_unit_with_explicit_none_lineno() -> None:
     """Verifies that _stmts_enclose_unit handles statements where lineno is explicitly None."""
     node = ast.Pass()
@@ -2531,9 +2054,8 @@ def test_stmts_enclose_unit_with_explicit_none_lineno() -> None:
     node.end_lineno = None  # type: ignore[assignment]
     assert _stmts_enclose_unit([node], 1, 2) is False
 
-
 def test_scope_metadata_caching_and_cache_clear() -> None:
-    """Verifies that scope metadata is cached in bounded OrderedDicts (LRU) and purged on clear."""
+    """Verifies that scope metadata is cached inside an active AnalysisSession and purged on clear."""
     code = (
         "def f(x):\n"
         "    for i in range(10):\n"
@@ -2545,34 +2067,34 @@ def test_scope_metadata_caching_and_cache_clear() -> None:
     tree = ast.parse(code)
     func_node = tree.body[0]
 
-    parent_map = _get_scope_parent_map(func_node)
-    assert func_node in _scope_parent_maps
-    assert _get_scope_parent_map(func_node) is parent_map
+    with analysis_session() as sess:
+        parent_map = _get_scope_parent_map(func_node)
+        assert func_node in sess.parent_maps
+        assert _get_scope_parent_map(func_node) is parent_map
 
-    stmts_by_end = _get_scope_stmts_by_end_lineno(func_node)
-    assert func_node in _scope_stmts_by_end
-    assert _get_scope_stmts_by_end_lineno(func_node) is stmts_by_end
+        stmts_by_end = _get_scope_stmts_by_end_lineno(func_node)
+        assert func_node in sess.get_bucket(_SessionBucket.STMTS_BY_END)
+        assert _get_scope_stmts_by_end_lineno(func_node) is stmts_by_end
 
-    closures = _collect_scope_closures(func_node)
-    assert func_node in _scope_closures_cache
-    assert _collect_scope_closures(func_node) is closures
+        closures = _collect_scope_closures(func_node)
+        assert func_node in sess.get_bucket(_SessionBucket.CLOSURES)
+        assert _collect_scope_closures(func_node) is closures
 
-    loops = _find_enclosing_loops(func_node, 3, 4)
-    assert func_node in _scope_loops_cache
-    assert _find_enclosing_loops(func_node, 3, 4) == loops
+        loops = _find_enclosing_loops(func_node, 3, 4)
+        assert func_node in sess.get_bucket(_SessionBucket.LOOPS)
+        assert _find_enclosing_loops(func_node, 3, 4) == loops
 
-    try_with = _get_scope_try_and_with_blocks(func_node)
-    assert func_node in _scope_try_with_cache
-    assert _get_scope_try_and_with_blocks(func_node) is try_with
+        try_with = _get_scope_try_and_with_blocks(func_node)
+        assert func_node in sess.get_bucket(_SessionBucket.TRY_WITH)
+        assert _get_scope_try_and_with_blocks(func_node) is try_with
 
-    _clear_downstream_reads_cache()
+        _clear_downstream_reads_cache()
 
-    assert func_node not in _scope_parent_maps
-    assert func_node not in _scope_stmts_by_end
-    assert func_node not in _scope_closures_cache
-    assert func_node not in _scope_loops_cache
-    assert func_node not in _scope_try_with_cache
-
+        assert func_node not in sess.parent_maps
+        assert func_node not in sess.get_bucket(_SessionBucket.STMTS_BY_END)
+        assert func_node not in sess.get_bucket(_SessionBucket.CLOSURES)
+        assert func_node not in sess.get_bucket(_SessionBucket.LOOPS)
+        assert func_node not in sess.get_bucket(_SessionBucket.TRY_WITH)
 
 def test_scope_metadata_caching_unhashable_object_fallback() -> None:
     """Verifies that unhashable objects fall back gracefully without raising TypeError."""
@@ -2580,24 +2102,30 @@ def test_scope_metadata_caching_unhashable_object_fallback() -> None:
         __hash__ = None  # type: ignore[assignment]
 
     node = _MockUnhashableNode()
-    cache: OrderedDict[ast.AST, str] = OrderedDict()
-
-    result = _get_or_compute_scope_cached(cache, node, lambda: "computed_val")
-    assert result == "computed_val"
-    assert len(cache) == 0
-
+    with analysis_session() as sess:
+        result = _get_or_compute_scope_cached(
+            _SessionBucket.CELL_INFO, node, lambda: "computed_val"
+        )
+        assert result == "computed_val"
+        assert len(sess.get_bucket(_SessionBucket.CELL_INFO)) == 0
 
 def test_scope_metadata_caching_lru_eviction() -> None:
-    """Verifies that scope cache evicts oldest entries when capacity is exceeded."""
-    cache: OrderedDict[ast.AST, str] = OrderedDict()
-    nodes = [ast.Pass() for _ in range(_MAX_SCOPE_CACHE_SIZE + 5)]
-    for idx, n in enumerate(nodes):
-        val_str = f"val_{idx}"
-        _get_or_compute_scope_cached(cache, n, lambda: val_str)
-    assert len(cache) == _MAX_SCOPE_CACHE_SIZE
-    assert nodes[0] not in cache
-    assert nodes[-1] in cache
+    """Verifies that session buckets evict oldest entries when capacity is exceeded."""
+    with analysis_session(AnalysisSession(max_bucket_entries=32)) as sess:
+        nodes = [ast.Pass() for _ in range(37)]
+        for idx, n in enumerate(nodes):
+            val_str = f"val_{idx}"
 
+            def _make_val(v: str = val_str) -> str:
+                return v
+
+            _get_or_compute_scope_cached(
+                _SessionBucket.CELL_INFO, n, _make_val
+            )
+        bucket = sess.get_bucket(_SessionBucket.CELL_INFO)
+        assert len(bucket) == 32
+        assert nodes[0] not in bucket
+        assert nodes[-1] in bucket
 
 def test_extract_nested_scope_free_reads_generator_shadowed_builtin() -> None:
     """Verifies that generator expressions preserve free variables shadowing builtins."""
@@ -2614,7 +2142,6 @@ def test_extract_nested_scope_free_reads_generator_shadowed_builtin() -> None:
         gen_node, candidates={"other"}  # type: ignore[arg-type]
     ) == set()
 
-
 def test_collect_downstream_read_names_pre_unit_genexp_shadowed_builtin() -> None:
     """Verifies that pre-unit generator expressions capturing shadowed builtins are detected."""
     _clear_downstream_reads_cache()
@@ -2626,15 +2153,14 @@ def test_collect_downstream_read_names_pre_unit_genexp_shadowed_builtin() -> Non
     )
     unit = {"file": "test_id.py", "start": 4, "end": 4}
     reads = collect_downstream_read_names(
-        code, unit, candidates={"id"}, skip_pre_unit_closures=False
+        code, unit, candidates={"id"}, closure_strictness="strict"
     )
     assert reads == {"id"}
 
     reads_lenient = collect_downstream_read_names(
-        code, unit, candidates={"id"}, skip_pre_unit_closures=True
+        code, unit, candidates={"id"}, closure_strictness="lenient"
     )
     assert reads_lenient == set()
-
 
 def test_stmts_enclose_unit_synthetic_or_unlocated_nodes() -> None:
     """Verifies that synthetic or unlocated nodes (lineno=None or 0) do not cause underflow."""
@@ -2651,38 +2177,6 @@ def test_stmts_enclose_unit_synthetic_or_unlocated_nodes() -> None:
     # Sequence of only synthetic statements with no lineno
     assert not _stmts_enclose_unit([synthetic], 1, 5)
 
-
-def test_resolve_clone_pair_outputs_clean_pair() -> None:
-    """Verifies that resolve_clone_pair_outputs successfully pairs matching outputs."""
-    u1 = {"kind": "function", "outputs": ["a", "b"]}
-    u2 = {"kind": "function", "outputs": ["x", "y"]}
-    s1: Dict[str, Any] = {"inputs": [], "definite_stores": ["a", "b"]}
-    s2: Dict[str, Any] = {"inputs": [], "definite_stores": ["x", "y"]}
-
-    res = resolve_clone_pair_outputs(u1, u2, s1, s2)
-    assert res == (["a", "b"], ["x", "y"])
-
-
-def test_resolve_clone_pair_outputs_mismatched_subroutine_kinds() -> None:
-    """Verifies that resolve_clone_pair_outputs rejects mismatched subroutine kinds."""
-    u1 = {"kind": "compound_block"}
-    u2 = {"kind": "function"}
-    s1: Dict[str, Any] = {"inputs": []}
-    s2: Dict[str, Any] = {"inputs": []}
-
-    assert resolve_clone_pair_outputs(u1, u2, s1, s2) is None
-
-
-def test_resolve_clone_pair_outputs_set_valued_rejection() -> None:
-    """Verifies that resolve_clone_pair_outputs rejects set-valued outputs with multiple items."""
-    u1 = {"kind": "function", "outputs": {"a", "b"}}
-    u2 = {"kind": "function", "outputs": ["x", "y"]}
-    s1: Dict[str, Any] = {"inputs": []}
-    s2: Dict[str, Any] = {"inputs": []}
-
-    assert resolve_clone_pair_outputs(u1, u2, s1, s2) is None
-
-
 def test_collect_scope_closures_class_header_expressions() -> None:
     """Verifies that _collect_scope_closures inspects class decorators, bases, and keywords."""
     code = (
@@ -2694,13 +2188,12 @@ def test_collect_scope_closures_class_header_expressions() -> None:
     tree = ast.parse(code)
     func_node = tree.body[0]
     closures = _collect_scope_closures(func_node)
-    captured = set()
+    captured: set[str] = set()
     for _, names in closures:
         captured.update(names)
     assert "val1" in captured
     assert "val2" in captured
     assert "val3" in captured
-
 
 @pytest.mark.skipif(
     sys.version_info < (3, 12), reason="PEP 695 type_params syntax requires Python 3.12+"
@@ -2714,11 +2207,10 @@ def test_collect_scope_closures_class_type_params() -> None:
     )
     tree_gen = ast.parse(code_gen)
     closures_gen = _collect_scope_closures(tree_gen.body[0])
-    captured_gen = set()
+    captured_gen: set[str] = set()
     for _, names in closures_gen:
         captured_gen.update(names)
     assert "val4" in captured_gen
-
 
 def test_collect_pre_unit_closures_same_line_semicolon() -> None:
     """Verifies that pre-unit closures defined before a semicolon on the same line are captured."""
@@ -2734,7 +2226,6 @@ def test_collect_pre_unit_closures_same_line_semicolon() -> None:
     )
     assert "val" not in pre_closures_prior
 
-
 def test_closure_pos_attributes_and_iteration() -> None:
     """Verifies that _ClosurePos behaves as a NamedTuple with line, col, and tuple unpacking."""
     pos = _ClosurePos(12, 4)
@@ -2747,7 +2238,6 @@ def test_closure_pos_attributes_and_iteration() -> None:
     line_val, col_val = pos
     assert line_val == 12 and col_val == 4
     assert pos.line < 15
-
 
 def test_collect_scope_closures_falsy_col_offset_preserved() -> None:
     """Verifies that decorator and subnode column offset 0 is preserved and does not fall back."""
@@ -2799,7 +2289,6 @@ def test_collect_scope_closures_falsy_col_offset_preserved() -> None:
     assert getattr(pos, "line", None) == 2
     assert getattr(pos, "col", None) == 0  # Preserved as 0, not overridden by fn.col_offset (8)
 
-
 @pytest.mark.skipif(
     sys.version_info < (3, 12), reason="PEP 695 type_params syntax requires Python 3.12+"
 )
@@ -2833,7 +2322,6 @@ def test_extract_nested_scope_free_reads_inner_type_params() -> None:
     assert "external_var" in reads_alias
     assert "U" not in reads_alias
 
-
 def test_resolve_unit_ast_end_col_single_line_multiple_semicolons() -> None:
     """Verifies that single-line units with multiple trailing semicolons fail closed by returning
     None when columns are ambiguous, but resolve accurately when uniquely matched."""
@@ -2860,7 +2348,6 @@ def test_resolve_unit_ast_end_col_single_line_multiple_semicolons() -> None:
         "is_subroutine": True,
     }
     assert _resolve_unit_ast_end_col(tree, unit_unique) == 35
-
 
 def test_frozenset_outputs_defensive_handling() -> None:
     """Verifies that frozenset outputs are handled defensively across output pairing routines."""
@@ -2898,11 +2385,9 @@ def test_frozenset_outputs_defensive_handling() -> None:
         is None
     )
 
-
 def test_scope_parent_map_excludes_scope_node_and_stays_bounded() -> None:
-    """Verifies that _scope_parent_maps excludes scope_node as key to prevent circular
-    references, maps direct children to scope_node, and that cache size stays bounded."""
-    # 1. Verify parent_map maps children to scope_node and does not assign a parent to scope_node
+    """Verifies that parent_map excludes scope_node as key to prevent circular
+    references, maps direct children to scope_node, and stays bounded in an AnalysisSession."""
     code = "def sample():\n    x = 1\n    return x\n"
     tree = ast.parse(code)
     fn = tree.body[0]
@@ -2911,27 +2396,24 @@ def test_scope_parent_map_excludes_scope_node_and_stays_bounded() -> None:
     assert fn not in parent_map
     assert parent_map[fn.body[0]] is fn
 
-    # 2. Stress test: collect_downstream_read_names across 2,000 synthetic AST modules
-    for i in range(2000):
-        src = f"def f_{i}():\n    x = {i}\n    print(x)\n"
-        unit = {"file": f"mod_{i}.py", "start": 2, "end": 2}
-        collect_downstream_read_names(src, unit)
-
-    # Cache must stay bounded to _MAX_SCOPE_CACHE_SIZE (1024)
-    assert len(_scope_parent_maps) <= 1024
+    with analysis_session(AnalysisSession(max_bucket_entries=64)) as sess:
+        for i in range(150):
+            src = f"def f_{i}():\n    x = {i}\n    print(x)\n"
+            unit = {"file": f"mod_{i}.py", "start": 2, "end": 2}
+            collect_downstream_read_names(src, unit)
+        assert len(sess.parent_maps) <= 64
+    assert len(_downstream_reads_cache) <= _MAX_DOWNSTREAM_CACHE_SIZE
     gc.collect()
 
-
 def test_load_unit_file_text_fails_closed_on_notebook(tmp_path: Path) -> None:
-    """Verifies that _load_unit_file_text restricts disk fallback to .py files and fails closed
-    (returns None) for Jupyter notebooks (.ipynb) to prevent unsafe patch synthesis."""
+    """Verifies that _load_unit_file_text fails closed (returns None) for unanchored
+    or invalid Jupyter notebook (.ipynb) paths rather than returning raw nbformat JSON."""
     nb_file = tmp_path / "notebook.ipynb"
     nb_file.write_text('{"cells": []}', encoding="utf-8")
 
     unit = {"file": str(nb_file), "start": 1, "end": 5}
     loaded = _load_unit_file_text(unit, repo_root=str(tmp_path))
     assert loaded is None
-
 
 def test_collect_downstream_read_names_multithreaded_cache_concurrency() -> None:
     """Verifies that concurrent invocations across worker threads execute safely,
@@ -2957,67 +2439,13 @@ def test_collect_downstream_read_names_multithreaded_cache_concurrency() -> None
     for cached_val in _downstream_reads_cache.values():
         assert "SENTINEL_MUTATION" not in cached_val
 
-
-def test_subroutine_outputs_duplicate_stores_deduplicated_and_paired() -> None:
-    """Verifies that multiple assignments to the same root variable in subroutines do not produce
-    duplicate outputs or cause unwarranted rejection in resolve_clone_pair_outputs."""
-    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
-        inspect_single_unit_scope,
-    )
-
-    code1 = (
-        "def outer1(step):\n"
-        "    total = 0\n"
-        "    total += step\n"
-        "    print(total)\n"
-    )
-    code2 = (
-        "def outer2(delta):\n"
-        "    count = 0\n"
-        "    count += delta\n"
-        "    print(count)\n"
-    )
-
-    u1 = {
-        "kind": "compound_block",
-        "start": 2,
-        "end": 3,
-        "file": "f1.py",
-        "source_text": code1,
-    }
-    u2 = {
-        "kind": "compound_block",
-        "start": 2,
-        "end": 3,
-        "file": "f2.py",
-        "source_text": code2,
-    }
-
-    s1 = inspect_single_unit_scope(u1)
-    s2 = inspect_single_unit_scope(u2)
-
-    # Scopes must deduplicate outputs in order of first store
-    assert s1["outputs"] == ["total"]
-    assert s2["outputs"] == ["count"]
-
-    # resolve_clone_pair_outputs must successfully pair them
-    res = resolve_clone_pair_outputs(u1, u2, s1, s2)
-    assert res == (["total"], ["count"])
-
-    # Even if precomputed outputs contain duplicates, it must safely deduplicate and pair
-    u1_dup = dict(u1, outputs=["total", "total"])
-    u2_dup = dict(u2, outputs=["count", "count"])
-    res_dup = resolve_clone_pair_outputs(u1_dup, u2_dup, s1, s2)
-    assert res_dup == (["total"], ["count"])
-
-
 def test_clear_downstream_reads_cache_resets_warned_lenient_closure() -> None:
-    """Verifies that _clear_downstream_reads_cache resets _warned_lenient_closure flag."""
-    _warned_lenient_closure[0] = True
-    assert _warned_lenient_closure[0] is True
+    """Verifies that _clear_downstream_reads_cache resets the one-shot lenient-closure warning state."""
     _clear_downstream_reads_cache()
-    assert _warned_lenient_closure[0] is False
-
+    assert should_warn_closure_event("lenient_closure_mode") is True
+    assert should_warn_closure_event("lenient_closure_mode") is False
+    _clear_downstream_reads_cache()
+    assert should_warn_closure_event("lenient_closure_mode") is True
 
 def test_collect_downstream_read_names_cache_hit_with_and_without_end_col() -> None:
     """Verifies that cache keys do not diverge whether end_col is pre-provided or AST-resolved."""
@@ -3050,45 +2478,6 @@ def test_collect_downstream_read_names_cache_hit_with_and_without_end_col() -> N
     # Cache size must still be 1 (cache hit, no key divergence!)
     assert len(_downstream_reads_cache) == 1
 
-
-def test_resolve_clone_generator_subroutine_outputs_closure_pos_tuple_normalization(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Verifies that resolve_clone_generator_subroutine_outputs safely normalizes
-    (line, col) tuple instances from _collect_scope_closures without TypeError."""
-    code1 = (
-        "def g1():\n"
-        "    val = 1\n"
-        "    yield val\n"
-        "    print(val)\n"
-    )
-    code2 = (
-        "def g2():\n"
-        "    val = 2\n"
-        "    yield val\n"
-        "    print(val)\n"
-    )
-
-    u1 = {"start": 2, "end": 3, "file": "mod1.py", "source_text": code1}
-    u2 = {"start": 2, "end": 3, "file": "mod2.py", "source_text": code2}
-    s1 = {"has_yield": True, "inputs": [], "outputs": ["val"], "definite_stores": ["val"]}
-    s2 = {"has_yield": True, "inputs": [], "outputs": ["val"], "definite_stores": ["val"]}
-
-    # Without closures, resolution succeeds and returns (["val"], ["val"])
-    res_clean = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
-    assert res_clean == (["val"], ["val"])
-
-    def _mock_closures(scope_node: Any, **kwargs: Any) -> list[tuple[Any, set[str]]]:
-        return [((2, 4), {"val"})]
-
-    monkeypatch.setattr(
-        "pydoppelgangerhunt.fixer._df_pairing._collect_scope_closures", _mock_closures
-    )
-
-    res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
-    assert res is None
-
-
 def test_collect_pre_unit_closures_same_line_missing_col_fails_closed() -> None:
     """Verifies that same-line closures fail closed when column info is missing."""
     code = "cb = lambda: total; total = 1\n"
@@ -3098,7 +2487,6 @@ def test_collect_pre_unit_closures_same_line_missing_col_fails_closed() -> None:
         tree, u_start=1, candidates={"total"}, u_start_col=None
     )
     assert "total" in pre_closures
-
 
 def test_precomputed_outputs_empty_list_precedence() -> None:
     """Verifies that an explicitly empty precomputed_outputs list is honored over outputs."""
@@ -3121,7 +2509,6 @@ def test_precomputed_outputs_empty_list_precedence() -> None:
     scope = _inspect_unit_scope(unit)
     assert scope["outputs"] == []
 
-
 def test_downstream_read_crlf_and_lone_cr_line_handling() -> None:
     """Verifies that collect_downstream_read_names handles CRLF and lone-CR line endings."""
     crlf_code = "def f():\r\n    x = 1\r\n    y = x + 1\r\n    return y\r\n"
@@ -3135,7 +2522,6 @@ def test_downstream_read_crlf_and_lone_cr_line_handling() -> None:
     reads_cr = collect_downstream_read_names(lone_cr_code, u_cr, {"x"})
     assert reads_cr is not None and "x" in reads_cr
 
-
 def test_resolve_unit_ast_end_col_invalid_coords_fails_closed() -> None:
     """Verifies that _resolve_unit_ast_end_col returns None on invalid coordinates."""
     tree = ast.parse("def f():\n    x = 1\n")
@@ -3143,7 +2529,6 @@ def test_resolve_unit_ast_end_col_invalid_coords_fails_closed() -> None:
     assert _resolve_unit_ast_end_col(tree, {"start": 1, "end": "invalid"}) is None
     assert _resolve_unit_ast_end_col(tree, {"start": -1}) is None
     assert _resolve_unit_ast_end_col(tree, {"start": 5, "end": 2}) is None
-
 
 def test_clear_downstream_reads_cache_resets_closure_warning_cache() -> None:
     """Verifies that _clear_downstream_reads_cache resets closure warning cache."""
@@ -3155,11 +2540,10 @@ def test_clear_downstream_reads_cache_resets_closure_warning_cache() -> None:
 
     clear_closure_warning_cache()
     resolve_closure_strictness_mode("unrecognized_mode_foo")
-    assert "unrecognized_mode_foo" in _warned_closure_strictness_values
+    assert "unrecognized_strictness:unrecognized_mode_foo" in _warned_closure_strictness_values
 
     _clear_downstream_reads_cache()
     assert len(_warned_closure_strictness_values) == 0
-
 
 def test_outer_expr_visitor_multi_clause_comprehension_scoping() -> None:
     """Verifies that multi-clause comprehensions evaluate first iter in outer scope
@@ -3196,7 +2580,6 @@ def test_outer_expr_visitor_multi_clause_comprehension_scoping() -> None:
     )
     assert reads_first == {"row"}
 
-
 def test_eagerly_consumed_genexp_not_treated_as_escaping_closure() -> None:
     """Verifies that generator expressions directly consumed by eager built-ins
     (e.g., sum) are not treated as escaping closures."""
@@ -3231,54 +2614,6 @@ def test_eagerly_consumed_genexp_not_treated_as_escaping_closure() -> None:
     res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
     assert res == (["total"], ["total"])
 
-
-def test_async_generator_try_without_yield_not_flagged_as_hazard() -> None:
-    """Verifies that an async generator with try/except around an await
-    (no yield inside the try) is not flagged as a control flow hazard."""
-    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
-        inspect_single_unit_scope,
-    )
-
-    code_safe = (
-        "async def fetch_stream():\n"
-        "    try:\n"
-        "        data = await fetch()\n"
-        "    except Exception:\n"
-        "        data = []\n"
-        "    yield data\n"
-    )
-    unit_safe = {
-        "file": "f.py",
-        "start": 1,
-        "end": 6,
-        "kind": "function",
-        "source_text": code_safe,
-    }
-    scope_safe = inspect_single_unit_scope(unit_safe)
-    assert scope_safe["has_yield"] is True
-    assert scope_safe["has_try_or_with"] is False
-    assert has_async_generator_delegation_hazard(scope_safe) is False
-
-    code_hazard = (
-        "async def fetch_stream_hazard():\n"
-        "    try:\n"
-        "        yield 1\n"
-        "    finally:\n"
-        "        cleanup()\n"
-    )
-    unit_hazard = {
-        "file": "f.py",
-        "start": 1,
-        "end": 5,
-        "kind": "function",
-        "source_text": code_hazard,
-    }
-    scope_hazard = inspect_single_unit_scope(unit_hazard)
-    assert scope_hazard["has_yield"] is True
-    assert scope_hazard["has_try_or_with"] is True
-    assert has_async_generator_delegation_hazard(scope_hazard) is True
-
-
 def test_handbuilt_unit_without_kind_treated_as_subroutine_mid_function() -> None:
     """Verifies that hand-built units lacking kind or is_subroutine are detected
     structurally as subroutines when located mid-function to prevent silent miscompilation."""
@@ -3304,7 +2639,6 @@ def test_handbuilt_unit_without_kind_treated_as_subroutine_mid_function() -> Non
     # Because it is treated as a subroutine, variable assignments are captured as outputs
     assert "b" in scope["outputs"]
     assert "a" in scope["inputs"] or "x" in scope["inputs"]
-
 
 def test_concurrent_generate_refactoring_patch_calls(tmp_path: Path) -> None:
     """Verifies that concurrent calls to generate_refactoring_patch do not corrupt
@@ -3371,36 +2705,36 @@ def test_concurrent_generate_refactoring_patch_calls(tmp_path: Path) -> None:
     for _, patch_text in results[1:]:
         assert patch_text == first_patch_text
 
-
 def test_clear_dataflow_cache_public_export() -> None:
-    """Verifies that clear_dataflow_cache is publicly exported and resets caches."""
+    """Verifies that clear_dataflow_cache, AnalysisSession, and analysis_session are publicly exported and reset caches."""
     import pydoppelgangerhunt.fixer as fixer_mod
     import pydoppelgangerhunt.fixer.dataflow as dataflow_mod
 
     assert "clear_dataflow_cache" in fixer_mod.__all__
     assert "clear_dataflow_cache" in dataflow_mod.__all__
+    assert "AnalysisSession" in fixer_mod.__all__
+    assert "analysis_session" in fixer_mod.__all__
     assert callable(fixer_mod.clear_dataflow_cache)
     assert fixer_mod.clear_dataflow_cache is dataflow_mod.clear_dataflow_cache
 
-    # Seed caches
-    with _downstream_cache_lock:
-        _downstream_reads_cache[("dummy",)] = frozenset({"x"})
-        _scope_closures_cache[ast.Pass()] = []
+    with analysis_session() as sess:
+        with _downstream_cache_lock:
+            _downstream_reads_cache[("dummy",)] = frozenset({"x"})
+        sess.get_bucket(_SessionBucket.CLOSURES)[ast.Pass()] = []
 
-    assert len(_downstream_reads_cache) > 0
-    assert len(_scope_closures_cache) > 0
+        assert len(_downstream_reads_cache) > 0
+        assert len(sess.get_bucket(_SessionBucket.CLOSURES)) > 0
 
-    clear_dataflow_cache()
+        clear_dataflow_cache()
 
-    assert len(_downstream_reads_cache) == 0
-    assert len(_scope_closures_cache) == 0
+        assert len(_downstream_reads_cache) == 0
+        assert len(sess.get_bucket(_SessionBucket.CLOSURES)) == 0
 
     # Ensure backwards compatibility alias works identically
     with _downstream_cache_lock:
         _downstream_reads_cache[("dummy",)] = frozenset({"y"})
     _clear_downstream_reads_cache()
     assert len(_downstream_reads_cache) == 0
-
 
 def test_extract_scope_local_names() -> None:
     """Verifies extraction of parameters and local stores without comprehension leakage."""
@@ -3451,7 +2785,6 @@ def test_extract_scope_local_names() -> None:
     assert "class_attr" not in names
     assert "math" not in names
     assert "path" not in names
-
 
 def test_eager_builtin_scope_shadowing_scenarios() -> None:
     """Verifies that shadowed built-in eager consumers treat generator
@@ -3546,7 +2879,6 @@ def test_eager_builtin_scope_shadowing_scenarios() -> None:
     # Expect 1 closure because sum is treated as potentially shadowed/escaping
     assert len(closures_star) == 1
 
-
 def test_module_level_shadowing_of_eager_builtins() -> None:
     """Verifies that module-level symbols shadowing eager built-ins prevent
     inner generator expressions from being treated as eagerly consumed."""
@@ -3613,7 +2945,6 @@ def test_module_level_shadowing_of_eager_builtins() -> None:
     closures_compound_star = _collect_scope_closures(fn_compound, module_tree=tree_compound_star)
     assert len(closures_compound_star) == 1
 
-
 def test_has_wildcard_star_import_in_module_compound_stmt() -> None:
     """Verifies that _has_wildcard_star_import detects wildcard imports nested in
     module-level compound statements like if, try, etc."""
@@ -3631,8 +2962,6 @@ def test_has_wildcard_star_import_in_module_compound_stmt() -> None:
     tree = ast.parse(code)
     fn_node = tree.body[1]
     assert _has_wildcard_star_import(fn_node, module_tree=tree) is True
-
-
 
 def test_eager_consumed_genexp_non_str_receiver_join() -> None:
     """Verifies that .join() calls only count as eager consumption when the
@@ -3672,40 +3001,6 @@ def test_eager_consumed_genexp_non_str_receiver_join() -> None:
     closures_str_call = _collect_scope_closures(tree_str_call.body[0])
     assert len(closures_str_call) == 0
 
-
-def test_resolve_clone_pair_outputs_forwards_source_text_and_tree() -> None:
-    """Verifies resolve_clone_pair_outputs passes source_text and tree to is_subroutine_unit."""
-    src1 = (
-        "def outer1():\n"
-        "    x = 1\n"
-        "    y = 2\n"
-        "    return x + y\n"
-    )
-    src2 = (
-        "def outer2():\n"
-        "    x = 1\n"
-        "    y = 2\n"
-        "    return x + y\n"
-    )
-    u1 = {"file": "mod1.py", "start": 2, "end": 3}
-    u2 = {"file": "mod2.py", "start": 2, "end": 3}
-    s1 = {"stores": ["x", "y"], "inputs": []}
-    s2 = {"stores": ["x", "y"], "inputs": []}
-    t1 = ast.parse(src1)
-    t2 = ast.parse(src2)
-    res = resolve_clone_pair_outputs(
-        u1,
-        u2,
-        s1,
-        s2,
-        source_text1=src1,
-        source_text2=src2,
-        tree1=t1,
-        tree2=t2,
-    )
-    assert res is not None
-
-
 def test_is_eagerly_consumed_genexp_call_arg_validation() -> None:
     """Verifies that _is_eagerly_consumed_genexp checks that genexp is actually an argument."""
     # 1. Genexp called directly as func: (x for x in data)()
@@ -3742,7 +3037,6 @@ def test_is_eagerly_consumed_genexp_call_arg_validation() -> None:
     parent_map_wrong: Dict[ast.AST, ast.AST] = {genexp: join_call_wrong_pos}
     assert _is_eagerly_consumed_genexp(genexp, parent_map_wrong) is False
 
-
 def test_is_confirmed_str_receiver_shadowed_builtins() -> None:
     """Verifies that _is_confirmed_str_receiver rejects builtins.str when builtins is shadowed."""
     from pydoppelgangerhunt.fixer._df_closures import _is_confirmed_str_receiver
@@ -3763,7 +3057,6 @@ def test_is_confirmed_str_receiver_shadowed_builtins() -> None:
     assert _is_confirmed_str_receiver(node_dunder, shadowed_names=None) is True
     assert _is_confirmed_str_receiver(node_dunder, shadowed_names={"__builtins__"}) is False
 
-
 def test_eager_consumed_genexp_shadowed_builtins_rejects_join() -> None:
     """Verifies that when builtins is shadowed by local assignment, builtins.str.join
     is not treated as an eager consumer."""
@@ -3778,7 +3071,6 @@ def test_eager_consumed_genexp_shadowed_builtins_rejects_join() -> None:
     tree = ast.parse(code)
     closures = _collect_scope_closures(tree.body[0])
     assert len(closures) == 1
-
 
 def test_parsed_tree_cache_key_without_redundant_source_text() -> None:
     """Verifies that _parsed_tree_cache keys on (content_hash, length) without full source text."""
@@ -3801,7 +3093,6 @@ def test_parsed_tree_cache_key_without_redundant_source_text() -> None:
     clear_dataflow_cache()
     assert len(_parsed_tree_cache) == 0
 
-
 def test_load_unit_file_text_synthetic_in_memory_fallback() -> None:
     """Verifies that _load_unit_file_text falls back to in-memory lines for virtual units."""
     unit = {
@@ -3815,10 +3106,9 @@ def test_load_unit_file_text_synthetic_in_memory_fallback() -> None:
     text = _load_unit_file_text(unit)
     assert text == "def foo():\n    return 42\n"
 
-
 def test_build_downstream_cache_key_content_digest_isolation() -> None:
     """Verifies that _build_downstream_cache_key shares entries across file paths and unit names."""
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
         _build_downstream_cache_key,
     )
 
@@ -3836,7 +3126,7 @@ def test_build_downstream_cache_key_content_digest_isolation() -> None:
         u_start=2,
         u_end=3,
         candidates={"a", "b"},
-        skip_pre_unit_closures=False,
+        is_lenient=False,
     )
     key2 = _build_downstream_cache_key(
         source_text=code,
@@ -3844,18 +3134,16 @@ def test_build_downstream_cache_key_content_digest_isolation() -> None:
         u_start=2,
         u_end=3,
         candidates={"a", "b"},
-        skip_pre_unit_closures=False,
+        is_lenient=False,
     )
     # Identical content digest and coordinates share cache entries regardless of file/name/kind
     assert key1 == key2
-
 
 def test_extract_single_node_local_names_lambda_non_list_body() -> None:
     """Verifies that _extract_single_node_local_names safely processes non-list scope bodies."""
     expr = ast.parse("lambda x: (y := x + 1)").body[0].value  # type: ignore[attr-defined]
     names = _extract_single_node_local_names(expr)
     assert names == {"x", "y"}
-
 
 def test_extract_single_node_local_names_wildcard_import_filtered(
     caplog: pytest.LogCaptureFixture,
@@ -3873,7 +3161,6 @@ def test_extract_single_node_local_names_wildcard_import_filtered(
     assert "*" not in names
     assert names == {"func", "os", "sys_path", "val"}
     assert "Wildcard import detected ('from math import *')" in caplog.text
-
 
 def test_subroutine_same_line_semicolon_in_with_without_end_col() -> None:
     """Verifies resolve_clone_generator_subroutine_outputs when a compound unit is followed
@@ -3896,30 +3183,6 @@ def test_subroutine_same_line_semicolon_in_with_without_end_col() -> None:
     )
     # Intra-with reads are permitted; total is safely paired as an output
     assert res == (["total"], ["total"])
-
-
-def test_resolve_clone_generator_subroutine_outputs_unflagged_sliced_lines() -> None:
-    """Verifies that unflagged sliced source_lines fails closed when resolving
-    subroutine outputs.
-    """
-    u1 = {
-        "file": "virtual1.py",
-        "start": 10,
-        "end": 12,
-        "source_lines": ["    x = yield\n", "    total += x\n", "    yield total\n"],
-    }
-    u2 = {
-        "file": "virtual2.py",
-        "start": 10,
-        "end": 12,
-        "source_lines": ["    x = yield\n", "    total += x\n", "    yield total\n"],
-    }
-    scope1 = {"inputs": ["total"], "outputs": ["total"], "definite_stores": ["total"]}
-    scope2 = {"inputs": ["total"], "outputs": ["total"], "definite_stores": ["total"]}
-    # Sliced lines with len(source_lines) < end fail closed because full file text is unavailable
-    res = resolve_clone_generator_subroutine_outputs(u1, u2, scope1, scope2)
-    assert res is None
-
 
 def test_downstream_cache_key_differentiation_for_unit_inputs() -> None:
     """Verifies that unit_inputs are normalized into the downstream cache key."""
@@ -3953,13 +3216,13 @@ def test_downstream_cache_key_differentiation_for_unit_inputs() -> None:
         "inputs": [],
     }
     key1 = _build_downstream_cache_key(
-        src, u_with_inputs, 4, 6, candidates={"total"}, skip_pre_unit_closures=False
+        src, u_with_inputs, 4, 6, candidates={"total"}, is_lenient=False
     )
     key2 = _build_downstream_cache_key(
-        src, u_without_inputs, 4, 6, candidates={"total"}, skip_pre_unit_closures=False
+        src, u_without_inputs, 4, 6, candidates={"total"}, is_lenient=False
     )
     key3 = _build_downstream_cache_key(
-        src, u_empty_inputs, 4, 6, candidates={"total"}, skip_pre_unit_closures=False
+        src, u_empty_inputs, 4, 6, candidates={"total"}, is_lenient=False
     )
     assert key1.unit_inputs == frozenset({"total"})
     assert key2.unit_inputs is None
@@ -3972,7 +3235,6 @@ def test_downstream_cache_key_differentiation_for_unit_inputs() -> None:
     reads2 = collect_downstream_read_names(src, u_empty_inputs, candidates={"total"})
     assert reads1 is not None and "total" in reads1
     assert reads2 is not None and "total" not in reads2
-
 
 def test_build_downstream_cache_key_unhashable_and_coercion_guards() -> None:
     """Verifies that _build_downstream_cache_key safely coerces and filters unhashable inputs."""
@@ -3989,7 +3251,7 @@ def test_build_downstream_cache_key_unhashable_and_coercion_guards() -> None:
         1,
         2,
         candidates={"valid_var"},
-        skip_pre_unit_closures=False,
+        is_lenient=False,
     )
     assert key.unit_inputs == frozenset({"valid_var", "99"})
 
@@ -4000,10 +3262,9 @@ def test_build_downstream_cache_key_unhashable_and_coercion_guards() -> None:
         1,
         2,
         candidates=[["bad_cand"], "good_cand", 10],  # type: ignore[arg-type]
-        skip_pre_unit_closures=False,
+        is_lenient=False,
     )
     assert key_cands.candidates == frozenset({"good_cand", "10"})
-
 
 def test_downstream_cache_lock_reentrancy() -> None:
     """Verifies that _downstream_cache_lock is re-entrant to prevent thread deadlocks."""
@@ -4012,7 +3273,6 @@ def test_downstream_cache_lock_reentrancy() -> None:
     with _downstream_cache_lock:
         with _downstream_cache_lock:
             pass
-
 
 def test_store_lru_cache_entry_double_checked_locking() -> None:
     """Verifies that _store_lru_cache_entry returns previously cached value on race condition."""
@@ -4028,7 +3288,6 @@ def test_store_lru_cache_entry_double_checked_locking() -> None:
     res2 = _store_lru_cache_entry(cache, "k1", "val1_duplicate", 10)
     assert res2 == "val1"
     assert cache["k1"] == "val1"
-
 
 def test_is_ast_node_within_unit_bounds_unresolved_column_fallback() -> None:
     """Verifies that _is_ast_node_within_unit_bounds falls back to whole-line containment
@@ -4053,7 +3312,6 @@ def test_is_ast_node_within_unit_bounds_unresolved_column_fallback() -> None:
     # Node missing lineno attribute
     nodeless = ast.Pass()
     assert _is_ast_node_within_unit_bounds(nodeless, 5, 5, u_end_col=None) is False
-
 
 def test_single_line_unit_unresolved_end_col_live_in_and_loop_carried() -> None:
     """Verifies that single-line units without end column or precomputed inputs discover
@@ -4085,7 +3343,6 @@ def test_single_line_unit_unresolved_end_col_live_in_and_loop_carried() -> None:
     assert reads is not None
     assert "running_sum" in reads
 
-
 def test_classify_closure_position_boundary_at_end_col() -> None:
     """Verifies that a closure starting exactly at u_end_col is classified as is_post
     and not as intra-unit."""
@@ -4103,7 +3360,6 @@ def test_classify_closure_position_boundary_at_end_col() -> None:
     )
     assert is_post is False
     assert is_intra is True
-
 
 def test_enclosing_try_reads_outputs_same_line_unit_accumulator_in_with() -> None:
     """Verifies that intra-with reads do not trigger enclosing with cleanup rejection,
@@ -4142,10 +3398,9 @@ def test_enclosing_try_reads_outputs_same_line_unit_accumulator_in_with() -> Non
     )
     assert result_after is True
 
-
 def test_extract_unit_end_col_precedence() -> None:
     """Verifies that _extract_unit_end_col prioritizes canonical end_col over end_col_offset."""
-    from pydoppelgangerhunt.fixer.dataflow import _extract_unit_end_col
+    from pydoppelgangerhunt.fixer._df_cache import _extract_unit_end_col
 
     # end_col takes precedence over end_col_offset
     unit_both = {"end_col": 25, "end_col_offset": 10}
@@ -4155,11 +3410,10 @@ def test_extract_unit_end_col_precedence() -> None:
     unit_offset_only = {"end_col_offset": 15}
     assert _extract_unit_end_col(unit_offset_only) == 15
 
-
 def test_enclosing_with_loop_carried_read_at_loop_top_rejected() -> None:
     """Verifies that a unit inside an enclosing with block whose output is read at
     the top of an enclosing loop is identified as reading outputs downstream."""
-    from pydoppelgangerhunt.fixer.dataflow import _enclosing_try_reads_outputs
+    from pydoppelgangerhunt.fixer._df_hazards import _enclosing_try_reads_outputs
 
     src = (
         "def run(items):\n"
@@ -4176,34 +3430,6 @@ def test_enclosing_with_loop_carried_read_at_loop_top_rejected() -> None:
         fn_node, u_start=5, u_end=5, outputs={"total"}
     )
     assert reads is True
-
-
-def test_pair_clone_outputs_allow_permuted_outputs() -> None:
-    """Verifies that _pair_clone_outputs rejects permuted outputs when disabled
-    and pairs positionally when enabled."""
-    from pydoppelgangerhunt.fixer.dataflow import _pair_clone_outputs
-
-    u1_outs = ["x", "y"]
-    u2_outs = ["y", "x"]
-
-    # When allow_permuted_outputs is False, differing order fails closed
-    assert _pair_clone_outputs(u1_outs, u2_outs, allow_permuted_outputs=False) == []
-
-    # Enabled allows positional 1-to-1 pairing for permuted outputs
-    assert _pair_clone_outputs(u1_outs, u2_outs, allow_permuted_outputs=True) == [
-        ("x", "y"),
-        ("y", "x"),
-    ]
-
-    # Partial conflicting names fail closed when allow_permuted_outputs is False
-    assert _pair_clone_outputs(["x", "y"], ["y", "z"], allow_permuted_outputs=False) == []
-
-    # Enabled allows positional 1-to-1 pairing
-    assert _pair_clone_outputs(["x", "y"], ["y", "z"], allow_permuted_outputs=True) == [
-        ("x", "y"),
-        ("y", "z"),
-    ]
-
 
 def test_execute_read_pass_and_collect_closures_scalar_body() -> None:
     """Verifies that _execute_read_pass and _collect_scope_closures handle expression
@@ -4239,7 +3465,6 @@ def test_execute_read_pass_and_collect_closures_scalar_body() -> None:
     closures = _collect_scope_closures(lambda_node)
     assert isinstance(closures, list)
 
-
 def test_extract_unit_live_in_names_prunes_nested_scope_params_and_comprehensions() -> None:
     """Verifies _extract_unit_live_in_names ignores parameters of nested functions and
     lambdas, as well as comprehension targets, while preserving true live-in variables."""
@@ -4266,7 +3491,6 @@ def test_extract_unit_live_in_names_prunes_nested_scope_params_and_comprehension
     assert "temp" not in live_ins
     assert "inner" not in live_ins
     assert live_ins == {"a", "items", "numbers", "pairs", "outer_val"}
-
 
 def test_downstream_read_visitor_augassign_unresolved_boundary_does_not_kill() -> None:
     """Verifies that an AugAssign on u_end does not kill variable when u_end_col is None."""
@@ -4314,7 +3538,6 @@ def test_downstream_read_visitor_augassign_unresolved_boundary_does_not_kill() -
     visitor3.visit(tree)
     assert "x" in visitor3.killed
 
-
 def test_unit_live_in_visitor_flow_sensitivity_and_non_name_targets() -> None:
     """Verifies flow sensitivity for branches, bare AnnAssign, and non-Name AugAssign."""
     from pydoppelgangerhunt.fixer._df_visitors import _extract_unit_live_in_names
@@ -4353,32 +3576,6 @@ def test_unit_live_in_visitor_flow_sensitivity_and_non_name_targets() -> None:
     assert "val" in live_ins3
     assert "res" not in live_ins3
 
-
-def test_pair_clone_outputs_role_swapped_rejection_and_positional_pairing() -> None:
-    """Verifies that role-swapped clones ([x, y] vs [y, x]) are rejected under
-    allow_permuted_outputs=False, but pair positionally when allow_permuted_outputs=True,
-    while alpha-renamed outputs ([x, y] vs [a, b]) pair positionally by default."""
-    from pydoppelgangerhunt.fixer.dataflow import _pair_clone_outputs
-
-    # Role-swapped clones sharing the same variable names in reverse order
-    # Clone 1: x = a * 10; y = b * 20 -> outputs: [x, y]
-    # Clone 2: y = a * 10; x = b * 20 -> outputs: [y, x]
-    # Under allow_permuted_outputs=False, must reject to prevent silent miscompile
-    assert _pair_clone_outputs(["x", "y"], ["y", "x"], allow_permuted_outputs=False) == []
-
-    # When allow_permuted_outputs=True, pairs positionally
-    assert _pair_clone_outputs(["x", "y"], ["y", "x"], allow_permuted_outputs=True) == [
-        ("x", "y"),
-        ("y", "x"),
-    ]
-
-    # Pure alpha-renaming with disjoint names pairs positionally by default
-    assert _pair_clone_outputs(["x", "y"], ["a", "b"], allow_permuted_outputs=False) == [
-        ("x", "a"),
-        ("y", "b"),
-    ]
-
-
 def test_collect_downstream_reads_wildcard_import_module_scope() -> None:
     """Verifies that downstream wildcard imports in module scope treat candidates
     as dynamically read, failing closed."""
@@ -4410,7 +3607,6 @@ def test_collect_downstream_reads_wildcard_import_module_scope() -> None:
     assert reads_fn is not None
     assert "x" not in reads_fn
 
-
 def test_downstream_read_visitor_wildcard_import_dynamic_read() -> None:
     """Verifies that _DownstreamReadVisitor marks has_dynamic_read and records
     reads for all candidates on encountering a downstream wildcard import."""
@@ -4435,24 +3631,21 @@ def test_downstream_read_visitor_wildcard_import_dynamic_read() -> None:
     assert "x" in visitor.loaded
     assert "y" in visitor.loaded
 
-
 def test_get_or_compute_scope_cached_canonical_instance_return() -> None:
     """Verifies that _get_or_compute_scope_cached returns the canonical cached instance
-    when another thread populates the cache concurrently during computation."""
-    from collections import OrderedDict
-    from pydoppelgangerhunt.fixer._df_cache import _get_or_compute_scope_cached
-
-    cache: OrderedDict[str, list[str]] = OrderedDict()
+    when another thread populates the session bucket concurrently during computation."""
     canonical_list: list[str] = ["canonical"]
 
-    def compute_fn() -> list[str]:
-        # Simulate another thread storing the canonical entry during our compute_fn
-        cache["scope_node"] = canonical_list
-        return ["duplicate_computed"]
+    with analysis_session() as sess:
+        def compute_fn() -> list[str]:
+            # Simulate another thread storing the canonical entry during our compute_fn
+            sess.get_bucket(_SessionBucket.CELL_INFO)["scope_node"] = canonical_list
+            return ["duplicate_computed"]
 
-    result = _get_or_compute_scope_cached(cache, "scope_node", compute_fn)
-    assert result is canonical_list
-
+        result = _get_or_compute_scope_cached(
+            _SessionBucket.CELL_INFO, "scope_node", compute_fn
+        )
+        assert result is canonical_list
 
 def test_check_enclosing_try_cleanup_hazard_precomputed_scope_and_bounds() -> None:
     """Verifies that _check_enclosing_try_cleanup_hazard correctly accepts precomputed
@@ -4489,75 +3682,34 @@ def test_check_enclosing_try_cleanup_hazard_precomputed_scope_and_bounds() -> No
     assert resolution is not None
     assert resolution.skip_reason == "enclosing try or with cleanup hazard"
 
-
-def test_evict_tree_scopes_purges_scope_roots_and_retains_unrelated_entries() -> None:
-    """Verifies that _evict_tree_scopes accurately purges scope roots and leaves unrelated entries intact."""
-    from pydoppelgangerhunt.fixer._df_cache import (
-        _evict_tree_scopes,
-        _scope_parent_maps,
-        _scope_stmts_by_end,
-        _scope_closures_cache,
-        _scope_loops_cache,
-        _scope_try_with_cache,
-        _get_scope_parent_map,
-        _get_scope_stmts_by_end_lineno,
-        clear_dataflow_cache,
-    )
-
+def test_analysis_session_isolates_distinct_runs_and_releases_on_exit() -> None:
+    """Verifies that separate AnalysisSessions hold isolated AST maps and do not leak entries across runs."""
     clear_dataflow_cache()
 
-    # None and non-AST inputs do not raise
-    _evict_tree_scopes(None)
-    _evict_tree_scopes("not_an_ast")  # type: ignore[arg-type]
-
-    code1 = "def f1(a):\n    return a + 1\n"
-    code2 = "def f2(b):\n    return b + 2\n"
-
-    tree1 = ast.parse(code1)
-    tree2 = ast.parse(code2)
-
+    tree1 = ast.parse("def f1(a):\n    return a + 1\n")
+    tree2 = ast.parse("def f2(b):\n    return b + 2\n")
     fn1 = tree1.body[0]
     fn2 = tree2.body[0]
 
-    # Populate scope metadata for tree1 and tree2
-    _get_scope_parent_map(fn1)
-    _get_scope_stmts_by_end_lineno(fn1)
-    _scope_closures_cache[fn1] = []
-    _scope_closures_cache[(fn1, tree1)] = []
-    _scope_loops_cache[fn1] = []
-    _scope_try_with_cache[fn1] = []
+    with analysis_session() as sess1:
+        _get_scope_parent_map(fn1)
+        _get_scope_stmts_by_end_lineno(fn1)
+        _collect_scope_closures(fn1)
+        _find_enclosing_loops(fn1, 1, 2)
+        _get_scope_try_and_with_blocks(fn1)
+        assert fn1 in sess1.parent_maps
+        assert fn1 in sess1.get_bucket(_SessionBucket.STMTS_BY_END)
+        assert fn1 in sess1.get_bucket(_SessionBucket.CLOSURES)
 
-    _get_scope_parent_map(fn2)
-    _get_scope_stmts_by_end_lineno(fn2)
-    _scope_closures_cache[fn2] = []
-    _scope_closures_cache[(fn2, tree2)] = []
-    _scope_loops_cache[fn2] = []
-    _scope_try_with_cache[fn2] = []
-
-    assert fn1 in _scope_parent_maps
-    assert fn2 in _scope_parent_maps
-
-    # Evict tree1
-    _evict_tree_scopes(tree1)
-
-    # tree1 scope entries are purged
-    assert fn1 not in _scope_parent_maps
-    assert fn1 not in _scope_stmts_by_end
-    assert fn1 not in _scope_closures_cache
-    assert (fn1, tree1) not in _scope_closures_cache
-    assert fn1 not in _scope_loops_cache
-    assert fn1 not in _scope_try_with_cache
-
-    # tree2 scope entries remain untouched
-    assert fn2 in _scope_parent_maps
-    assert fn2 in _scope_stmts_by_end
-    assert fn2 in _scope_closures_cache
-    assert (fn2, tree2) in _scope_closures_cache
-    assert fn2 in _scope_loops_cache
-    assert fn2 in _scope_try_with_cache
+    with analysis_session() as sess2:
+        _get_scope_parent_map(fn2)
+        assert fn1 not in sess2.parent_maps
+        assert fn1 not in sess2.get_bucket(_SessionBucket.CLOSURES)
+        assert fn2 in sess2.parent_maps
+        sess2.clear()
+        assert fn2 not in sess2.parent_maps
 
     clear_dataflow_cache()
-
 
 def test_extract_scope_local_names_module_tree_single_visit(
     monkeypatch: pytest.MonkeyPatch,
@@ -4598,7 +3750,6 @@ def test_extract_scope_local_names_module_tree_single_visit(
     mod_visits = [n for n in calls if n is tree]
     assert len(mod_visits) == 1
 
-
 def test_find_enclosing_loops_synthetic_node_none_lineno() -> None:
     """Verifies that _find_enclosing_loops handles synthetic AST nodes with
     explicit lineno=None without raising TypeError."""
@@ -4614,7 +3765,6 @@ def test_find_enclosing_loops_synthetic_node_none_lineno() -> None:
 
     loops = _find_enclosing_loops(tree, u_start=1, u_end=2)
     assert loops == []
-
 
 def test_ast_node_bounds_synthetic_node_none_col_offset() -> None:
     """Verifies that _is_ast_node_within_unit_bounds and _is_node_after_unit
@@ -4634,7 +3784,6 @@ def test_ast_node_bounds_synthetic_node_none_col_offset() -> None:
     # After unit visitor: fails closed and treats same-line node on u_end as downstream
     visitor = _DownstreamReadVisitor(u_start=1, u_end=5, u_end_col=10)
     assert visitor._is_node_after_unit(node)
-
 
 def test_u_start_col_loop_carried_read_and_unit_entry_killed() -> None:
     """Verifies that u_start_col prevents statements preceding the unit start on u_start
@@ -4676,7 +3825,6 @@ def test_u_start_col_loop_carried_read_and_unit_entry_killed() -> None:
     )
     assert reads is not None
     assert "total" in reads
-
 
 def test_unit_live_in_loop_try_flow_sensitive() -> None:
     """Verifies that _UnitLiveInVisitor treats loops, try blocks, with blocks,
@@ -4729,57 +3877,6 @@ def test_unit_live_in_loop_try_flow_sensitive() -> None:
     )
     assert "c" in live_ins_with
 
-
-def test_generator_subroutine_pair_preserves_try_hazard_skip_reason() -> None:
-    """Verifies that resolve_clone_generator_subroutine_outputs returns the exact
-    hazard resolution skip reason instead of a generic message."""
-    from pydoppelgangerhunt.fixer._df_pairing import resolve_clone_generator_subroutine_outputs
-
-    code1 = (
-        "def gen1():\n"
-        "    try:\n"
-        "        x = 1\n"
-        "        yield x\n"
-        "    finally:\n"
-        "        use(x)\n"
-    )
-    code2 = (
-        "def gen2():\n"
-        "    x = 1\n"
-        "    yield x\n"
-    )
-    u1 = {
-        "file": "m1.py",
-        "start": 3,
-        "end": 4,
-        "kind": "generator",
-        "inputs": [],
-        "outputs": ["x"],
-    }
-    u2 = {
-        "file": "m2.py",
-        "start": 2,
-        "end": 3,
-        "kind": "generator",
-        "inputs": [],
-        "outputs": ["x"],
-    }
-    scope1 = {"inputs": [], "outputs": ["x"], "definite_stores": ["x"]}
-    scope2 = {"inputs": [], "outputs": ["x"], "definite_stores": ["x"]}
-    res = resolve_clone_generator_subroutine_outputs(
-        u1,
-        u2,
-        scope1,
-        scope2,
-        source_text1=code1,
-        source_text2=code2,
-        return_details=True,
-    )
-    assert res is not None
-    assert res.outputs is None
-    assert res.skip_reason == "enclosing try or with cleanup hazard"
-
-
 def test_unit_live_in_visitor_try_orelse_no_handler_leak() -> None:
     """Verifies that variables stored in except handlers do not leak into try-else,
     correctly capturing live-ins in orelse."""
@@ -4816,7 +3913,6 @@ def test_unit_live_in_visitor_try_orelse_no_handler_leak() -> None:
         tree2.body[0], u_start=2, u_end=7, candidates={"val", "use"}
     )
     assert "val" not in live_ins2
-
 
 def test_unit_live_in_visitor_loop_orelse_resets_stored() -> None:
     """Verifies that loop orelse stores do not leak past the loop,
@@ -4855,7 +3951,6 @@ def test_unit_live_in_visitor_loop_orelse_resets_stored() -> None:
     )
     assert "val" in live_ins2
 
-
 def test_nested_enclosing_loops_kills_do_not_leak_into_inner_loop() -> None:
     """Verifies that kills in outer enclosing loops do not prune variables
     accumulating across iterations of inner enclosing loops."""
@@ -4879,7 +3974,6 @@ def test_nested_enclosing_loops_kills_do_not_leak_into_inner_loop() -> None:
     assert reads is not None
     assert "total" in reads
 
-
 def test_unit_live_in_visitor_except_handler_type_visited() -> None:
     """Verifies that dynamically bound exception handler types are captured as live-ins."""
     from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=protected-access
@@ -4901,7 +3995,6 @@ def test_unit_live_in_visitor_except_handler_type_visited() -> None:
         candidates={"allowed_exceptions", "do_work", "handle"},
     )
     assert "allowed_exceptions" in live_ins
-
 
 def test_unit_live_in_visitor_conditional_walrus_does_not_kill_subsequent_reads() -> None:
     """Verifies that walrus expressions in short-circuiting or ternary expressions
@@ -4935,7 +4028,6 @@ def test_unit_live_in_visitor_conditional_walrus_does_not_kill_subsequent_reads(
     )
     assert "total" in live_ins2
 
-
 def test_extract_nested_scope_free_reads_inner_generic_does_not_mask_outer_capture() -> None:
     """Verifies that inner generic definitions do not mask outer captures of the same name."""
     import sys
@@ -4958,7 +4050,6 @@ def test_extract_nested_scope_free_reads_inner_generic_does_not_mask_outer_captu
     free = _extract_nested_scope_free_reads(inner_fn)
     assert "T" in free
 
-
 def test_extract_nested_scope_free_reads_type_alias_preserves_external_reads() -> None:
     """Verifies that type alias type params do not leak and external type reads are captured."""
     import sys
@@ -4980,7 +4071,6 @@ def test_extract_nested_scope_free_reads_type_alias_preserves_external_reads() -
     free = _extract_nested_scope_free_reads(inner_fn)
     assert "ExternalType" in free
     assert "T" not in free
-
 
 def test_is_eagerly_consumed_genexp_slot_validation() -> None:
     """Verifies that generator expressions in non-iterated argument slots are not marked as eager."""
@@ -5024,7 +4114,6 @@ def test_is_eagerly_consumed_genexp_slot_validation() -> None:
     # j2 = str.join(',', ...) -> 2nd positional arg on str class
     assert _is_eagerly_consumed_genexp(genexps[6], parent_map) is True
 
-
 def test_scope_reads_outputs_after_line_reentering_compound_with_and_try() -> None:
     """Verifies that loop-carried re-entry reads inside with/try blocks detect downstream reads."""
     from pydoppelgangerhunt.fixer._df_hazards import (  # pylint: disable=protected-access
@@ -5042,7 +4131,6 @@ def test_scope_reads_outputs_after_line_reentering_compound_with_and_try() -> No
         tree, line=4, outputs={"acc"}, start_line=2
     )
     assert reads_after is True
-
 
 def test_extract_unit_live_in_names_enclosing_compound_branch_isolation() -> None:
     """Verifies that live-in extraction preserves branch isolation when enclosing compound starts before unit."""
@@ -5067,7 +4155,6 @@ def test_extract_unit_live_in_names_enclosing_compound_branch_isolation() -> Non
     assert "y" in live_ins
     assert "flag" in live_ins
 
-
 def test_extract_unit_live_in_names_scope_node_at_unit_start() -> None:
     """Verifies that scope_node starting on u_start is not treated as a nested closure."""
     from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=protected-access
@@ -5080,7 +4167,6 @@ def test_extract_unit_live_in_names_scope_node_at_unit_start() -> None:
     live_ins = _extract_unit_live_in_names(fn_node, u_start=1, u_end=2)
     assert "a" in live_ins
     assert "b" in live_ins
-
 
 def test_extract_unit_live_in_names_outer_except_handler() -> None:
     """Verifies that an exception variable bound by an enclosing except header before u_start
@@ -5102,7 +4188,6 @@ def test_extract_unit_live_in_names_outer_except_handler() -> None:
     live_ins = _extract_unit_live_in_names(fn_node, u_start=5, u_end=6)
     assert "err" in live_ins
     assert "msg" not in live_ins
-
 
 @pytest.mark.skipif(sys.version_info < (3, 10), reason="match syntax requires Python 3.10+")
 def test_extract_unit_live_in_names_match_pattern_bindings() -> None:
@@ -5131,7 +4216,6 @@ def test_extract_unit_live_in_names_match_pattern_bindings() -> None:
     assert "val" not in live_ins
     assert "rest" not in live_ins
 
-
 @pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 type alias requires Python 3.12+")
 def test_extract_single_node_local_names_type_alias_excludes_type_params() -> None:
     """Verifies that PEP 695 TypeAlias statements record the alias name in local names
@@ -5152,7 +4236,6 @@ def test_extract_single_node_local_names_type_alias_excludes_type_params() -> No
     assert "items" in local_names
     assert "sum" not in local_names
 
-
 def test_has_wildcard_star_import_detached_vs_attached_scope() -> None:
     """Verifies _has_wildcard_star_import across attached module trees and detached subtrees."""
     from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=protected-access
@@ -5165,7 +4248,6 @@ def test_has_wildcard_star_import_detached_vs_attached_scope() -> None:
 
     detached_star = ast.parse("def g():\n    from math import *\n    return 1\n").body[0]
     assert _has_wildcard_star_import(detached_star, mod_clean) is True
-
 
 def test_collect_downstream_read_names_single_line_enclosing_loop() -> None:
     """Verifies that a single-line loop enclosing a sub-line unit is retained by
@@ -5187,7 +4269,6 @@ def test_collect_downstream_read_names_single_line_enclosing_loop() -> None:
     reads = collect_downstream_read_names(code, unit, candidates={"total", "x"})
     assert reads is not None
     assert "total" in reads
-
 
 def test_extract_unit_live_in_names_annassign_annotations_and_bare_subscript() -> None:
     """Verifies that _UnitLiveInVisitor visits AnnAssign annotations and bare subscript/attribute
@@ -5217,7 +4298,6 @@ def test_extract_unit_live_in_names_annassign_annotations_and_bare_subscript() -
     assert "x" not in live_ins
     assert "y" not in live_ins
 
-
 @pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 type alias requires Python 3.12+")
 def test_extract_unit_live_in_names_pep695_type_alias() -> None:
     """Verifies that _UnitLiveInVisitor isolates PEP 695 TypeAlias type_params from live-ins
@@ -5240,7 +4320,6 @@ def test_extract_unit_live_in_names_pep695_type_alias() -> None:
     assert "K" not in live_ins
     assert "V" not in live_ins
 
-
 @pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 syntax requires Python 3.12+")
 def test_extract_single_node_local_names_includes_own_type_params() -> None:
     """Verifies that _extract_single_node_local_names includes scope_node's own PEP 695
@@ -5259,7 +4338,6 @@ def test_extract_single_node_local_names_includes_own_type_params() -> None:
     assert "sum" in local_names
     assert "items" in local_names
 
-
 def test_collect_downstream_read_names_lenient_closure_logs_at_debug(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -5276,7 +4354,7 @@ def test_collect_downstream_read_names_lenient_closure_logs_at_debug(
     unit = {"file": "mod.py", "start": 2, "end": 2}
     with caplog.at_level(logging.DEBUG, logger="pydoppelgangerhunt"):
         reads = collect_downstream_read_names(
-            code, unit, candidates={"x"}, skip_pre_unit_closures=True
+            code, unit, candidates={"x"}, closure_strictness="lenient"
         )
     assert reads == {"x"}
     warning_msgs = [
@@ -5287,7 +4365,6 @@ def test_collect_downstream_read_names_lenient_closure_logs_at_debug(
         r.message for r in caplog.records if r.levelno == logging.DEBUG
     ]
     assert any("Lenient closure mode active" in m for m in debug_msgs)
-
 
 def test_nested_lambda_and_comprehension_closure_no_false_positive_free_reads() -> None:
     """Verifies that nested lambdas (lambda x: (lambda: x)) and lambdas/scopes inside
@@ -5332,7 +4409,6 @@ def test_nested_lambda_and_comprehension_closure_no_false_positive_free_reads() 
     assert "ext_val" in free_reads
     assert "items" in free_reads
 
-
 def test_find_enclosing_loops_whole_loop_with_col_metadata_not_self_enclosing() -> None:
     """Verifies that a whole-loop unit with start_col == loop.col_offset or end_col metadata
     is not treated as enclosing itself, while sub-line units starting after loop.col_offset are."""
@@ -5364,7 +4440,6 @@ def test_find_enclosing_loops_whole_loop_with_col_metadata_not_self_enclosing() 
     reads = collect_downstream_read_names(code, unit_whole_loop, candidates={"acc"})
     assert reads == set()
 
-
 def test_extract_single_node_local_names_lambda_root_comprehension_and_nested_lambda() -> None:
     """Verifies that _extract_single_node_local_names on an ast.Lambda does not leak
     comprehension loop targets or inner lambda walrus stores when the lambda body is itself
@@ -5384,7 +4459,6 @@ def test_extract_single_node_local_names_lambda_root_comprehension_and_nested_la
     assert "items" in walrus_locals
     assert "w" in walrus_locals
     assert "x" not in walrus_locals
-
 
 def test_downstream_read_visitor_for_and_with_subscript_attribute_targets() -> None:
     """Verifies that _DownstreamReadVisitor visits Load sub-expressions inside For.target
@@ -5407,7 +4481,6 @@ def test_downstream_read_visitor_for_and_with_subscript_attribute_targets() -> N
     )
     assert reads == {"arr", "idx", "obj", "k"}
 
-
 def test_unit_live_in_visitor_multiline_assign_starting_before_u_start() -> None:
     """Verifies that _UnitLiveInVisitor visits Assign.value before Assign.targets even when
     the multi-line Assign node starts on u_start - 1."""
@@ -5425,7 +4498,6 @@ def test_unit_live_in_visitor_multiline_assign_starting_before_u_start() -> None
     # Assign starts on line 2; unit starts on line 3 (covering target on line 3 and value on line 5)
     live_ins = _extract_unit_live_in_names(fn_node, u_start=3, u_end=6)
     assert "val" in live_ins
-
 
 def test_unit_live_in_visitor_subline_boolop_ifexp_namedexpr_evaluation_order() -> None:
     """Verifies that _UnitLiveInVisitor preserves conditional depth and value-before-target
@@ -5480,7 +4552,7 @@ def test_unit_live_in_visitor_subline_boolop_ifexp_namedexpr_evaluation_order() 
     assert "w" in live_cb
 
     # Sub-line start_col without end_col in _resolve_unit_ast_end_col returns None
-    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer._df_span_index import (  # pylint: disable=import-outside-toplevel
         _resolve_unit_ast_end_col,
     )
 
@@ -5489,7 +4561,6 @@ def test_unit_live_in_visitor_subline_boolop_ifexp_namedexpr_evaluation_order() 
 
     semi_stmt_fn = ast.parse("def f(x, y):\n    res = (yield x); print(y)\n").body[0]
     assert _resolve_unit_ast_end_col(semi_stmt_fn, {"start": 2, "end": 2, "start_col": 10}) is None
-
 
 @pytest.mark.skipif(sys.version_info < (3, 10), reason="match/case requires Python 3.10+")
 def test_pattern_binding_visits_value_and_key_loads_before_store() -> None:
@@ -5514,7 +4585,6 @@ def test_pattern_binding_visits_value_and_key_loads_before_store() -> None:
     reads = collect_downstream_read_names(code, unit, candidates={"x", "y"})
     assert reads == {"x", "y"}
 
-
 @pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 requires Python 3.12+")
 def test_pep695_generic_class_type_params_excluded_from_method_closures() -> None:
     """Verifies that PEP 695 class type_params (class C[T]:) are excluded from closures
@@ -5536,7 +4606,6 @@ def test_pep695_generic_class_type_params_excluded_from_method_closures() -> Non
     assert "V" in captured
     assert "T" not in captured
     assert "K" not in captured
-
 
 @pytest.mark.skipif(sys.version_info < (3, 10), reason="match/case requires Python 3.10+")
 def test_collect_scope_closures_match_case_pattern_bindings() -> None:
@@ -5561,7 +4630,6 @@ def test_collect_scope_closures_match_case_pattern_bindings() -> None:
     assert "rest" not in captured
     assert "v" not in captured
     assert "kw" not in captured
-
 
 def test_scope_hierarchy_visitor_header_expressions_async_context() -> None:
     """Verifies that _ScopeHierarchyVisitor records enclosing async context for header
@@ -5592,7 +4660,6 @@ def test_scope_hierarchy_visitor_header_expressions_async_context() -> None:
     assert func_is_async.get(id(comps[3])) is False
     assert func_is_async.get(id(comps[6])) is False
 
-
 def test_unit_live_in_visitor_intra_unit_delete() -> None:
     """Verifies that _UnitLiveInVisitor records del targets as live-ins when not yet stored
     and discards deleted identifiers from self.stored so subsequent reads are captured."""
@@ -5608,7 +4675,6 @@ def test_unit_live_in_visitor_intra_unit_delete() -> None:
     assert "pre_existing" in live_ins
     assert "local_var" in live_ins
     assert "arr" in live_ins
-
 
 def test_pre_unit_closure_except_handler_bound_name() -> None:
     """Verifies that a lambda inside an except-as handler binding err does not trigger
@@ -5626,7 +4692,6 @@ def test_pre_unit_closure_except_handler_bound_name() -> None:
     fn_node = tree.body[0]
     closures = _collect_scope_closures(fn_node)
     assert all("err" not in free_reads for _, free_reads in closures)
-
 
 def test_comprehension_subscript_target_and_class_walrus() -> None:
     """Verifies that subscript/attribute targets in comprehension generators record Load reads
@@ -5654,7 +4719,6 @@ def test_comprehension_subscript_target_and_class_walrus() -> None:
     free_reads = _extract_nested_scope_free_reads(cls_node)  # type: ignore[arg-type]
     assert "seq" in free_reads
     assert "w" in free_reads
-
 
 @pytest.mark.skipif(
     sys.version_info < (3, 12),
@@ -5687,7 +4751,6 @@ def test_scope_hierarchy_visitor_pep695_type_params_traversal() -> None:
     assert func_is_async.get(id(comps[0])) is True
     assert func_is_async.get(id(comps[1])) is False
     assert enclosing_classes.get(id(comps[1])) == "GenericCls"
-
 
 @pytest.mark.skipif(
     sys.version_info < (3, 12),
@@ -5781,7 +4844,7 @@ def test_extract_nested_scope_free_reads_pep695_decorators_and_defaults() -> Non
     eager_closures = _collect_scope_closures(eager_arity_fn)
     assert len(eager_closures) == 3
 
-    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer._df_span_index import (  # pylint: disable=import-outside-toplevel
         _resolve_unit_ast_end_col,
     )
 
@@ -5875,3 +4938,219 @@ def test_extract_nested_scope_free_reads_pep695_decorators_and_defaults() -> Non
         for s in ta_unres_fn.body:
             v_ta.visit(s)
         assert "T" in v_ta.loaded
+
+@pytest.mark.parametrize("col_key", ["start_col", "start_col_offset", "col_offset"])
+def test_extract_unit_start_col_col_offset_parity_across_dataflow(
+    col_key: str,
+) -> None:
+    """Verifies start_col, start_col_offset, and col_offset resolve identically across dataflow helpers."""
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
+        _build_downstream_cache_key,
+        _extract_unit_start_col,
+    )
+    from pydoppelgangerhunt.fixer._df_span_index import (  # pylint: disable=import-outside-toplevel
+        _resolve_unit_ast_end_col,
+    )
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        PairSkipReason,
+        resolve_clone_generator_subroutine_outputs,
+    )
+
+    # Precedence: start_col > start_col_offset > col_offset
+    assert (
+        _extract_unit_start_col(
+            {"start_col": 4, "start_col_offset": 8, "col_offset": 12}
+        )
+        == 4
+    )
+    assert _extract_unit_start_col({"start_col_offset": 8, "col_offset": 12}) == 8
+    assert _extract_unit_start_col({col_key: 12}) == 12
+
+    # 1. Downstream cache key parity and semicolon-line statement end_col resolution
+    semi_src = "def f():\n    x = 1; y = 2\n    return x, y\n"
+    semi_tree = ast.parse(semi_src)
+    fn_node = semi_tree.body[0]
+    assert isinstance(fn_node, ast.FunctionDef)
+    second_stmt = fn_node.body[1]
+    second_col = second_stmt.col_offset
+    second_end = second_stmt.end_col_offset
+    assert second_end is not None
+
+    ref_unit: Dict[str, Any] = {"start": 2, "end": 2, "start_col": second_col}
+    test_unit: Dict[str, Any] = {"start": 2, "end": 2, col_key: second_col}
+    no_col_unit: Dict[str, Any] = {"start": 2, "end": 2}
+    assert _resolve_unit_ast_end_col(fn_node, test_unit) == second_end
+    assert _build_downstream_cache_key(
+        semi_src, test_unit, 2, 2, {"y"}, False
+    ) == _build_downstream_cache_key(semi_src, ref_unit, 2, 2, {"y"}, False)
+    assert _build_downstream_cache_key(
+        semi_src, test_unit, 2, 2, {"y"}, False
+    ) != _build_downstream_cache_key(semi_src, no_col_unit, 2, 2, {"y"}, False)
+
+    # 2. Single-line enclosing loop detection in collect_downstream_read_names
+    loop_src = "def g(xs):\n    total = 0\n    for i in xs: total = i; out = total\n    return out\n"
+    loop_tree = ast.parse(loop_src)
+    loop_fn = loop_tree.body[0]
+    assert isinstance(loop_fn, ast.FunctionDef)
+    for_stmt = loop_fn.body[1]
+    assert isinstance(for_stmt, ast.For)
+    body_assign = for_stmt.body[0]
+    assert body_assign.end_col_offset is not None
+    reads = collect_downstream_read_names(
+        loop_src,
+        {
+            "start": 3,
+            "end": 3,
+            col_key: body_assign.col_offset,
+            "end_col": body_assign.end_col_offset,
+        },
+        candidates={"total"},
+        tree=loop_tree,
+    )
+    assert reads == {"total"}
+
+    # 3. Intra-unit closure classification in resolve_clone_generator_subroutine_outputs
+    gen_src = (
+        "def gen1():\n"
+        "    a = 1; cb = lambda: a; yield a\n"
+        "    return a\n"
+        "def gen2():\n"
+        "    b = 1; cb = lambda: b; yield b\n"
+        "    return b\n"
+    )
+    gen_tree = ast.parse(gen_src)
+    g1_fn, g2_fn = gen_tree.body[0], gen_tree.body[1]
+    assert isinstance(g1_fn, ast.FunctionDef) and isinstance(g2_fn, ast.FunctionDef)
+    g1_first, g1_last = g1_fn.body[0], g1_fn.body[2]
+    g2_first, g2_last = g2_fn.body[0], g2_fn.body[2]
+    assert g1_last.end_col_offset is not None and g2_last.end_col_offset is not None
+    u1_gen: Dict[str, Any] = {
+        "name": "gen1:sub",
+        "kind": "sliding_window",
+        "start": g1_first.lineno,
+        "end": g1_last.end_lineno,
+        col_key: g1_first.col_offset,
+        "end_col": g1_last.end_col_offset,
+        "outputs": ["a"],
+    }
+    u2_gen: Dict[str, Any] = {
+        "name": "gen2:sub",
+        "kind": "sliding_window",
+        "start": g2_first.lineno,
+        "end": g2_last.end_lineno,
+        col_key: g2_first.col_offset,
+        "end_col": g2_last.end_col_offset,
+        "outputs": ["b"],
+    }
+    clear_dataflow_cache()
+    # Intra-unit lambda captures needed output 'a'/'b', so generator pair is rejected
+    res = resolve_clone_generator_subroutine_outputs(
+        u1_gen,
+        u2_gen,
+        {},
+        {},
+        gen_src,
+        gen_src,
+        tree1=gen_tree,
+        tree2=gen_tree,
+        return_details=True,
+    )
+    assert res.outputs is None
+    assert res.skip_reason == PairSkipReason.GENERATOR_CLOSURE_CONFLICT
+    # Negative control: unit starting AFTER the lambda (on `yield a`/`yield b`) has no intra-unit closure
+    u1_after = dict(u1_gen)
+    u2_after = dict(u2_gen)
+    u1_after[col_key] = g1_last.col_offset
+    u2_after[col_key] = g2_last.col_offset
+    u1_after["outputs"] = []
+    u2_after["outputs"] = []
+    res_after = resolve_clone_generator_subroutine_outputs(
+        u1_after,
+        u2_after,
+        {},
+        {},
+        gen_src,
+        gen_src,
+        tree1=gen_tree,
+        tree2=gen_tree,
+        return_details=True,
+    )
+    assert res_after.outputs == ([], [])
+
+@pytest.mark.parametrize(
+    ("case_src", "use_empty_module"),
+    [
+        pytest.param(
+            "def f(x):\n    y = x + 1\n    return y\n",
+            False,
+            id="bare_func_without_nested_closures",
+        ),
+        pytest.param(
+            "def f(x):\n    cb = lambda: x\n    return cb()\n",
+            False,
+            id="bare_func_with_nested_closure",
+        ),
+        pytest.param(
+            "",
+            True,
+            id="empty_module_with_empty_parent_map",
+        ),
+    ],
+)
+def test_bare_ast_scope_closures_observes_mutation_statelessly_and_caches_in_session(
+    case_src: str,
+    use_empty_module: bool,
+) -> None:
+    """Verifies standalone calls compute statelessly across AST mutations while AnalysisSession memoizes cleanly."""
+    clear_dataflow_cache()
+    if use_empty_module:
+        empty_mod = ast.Module(body=[], type_ignores=[])
+        with analysis_session() as sess:
+            assert _collect_scope_closures(empty_mod) == []
+            assert empty_mod in sess.get_bucket(_SessionBucket.CLOSURES)
+            assert _get_scope_parent_map(empty_mod) == {}
+            sess.clear()
+            assert empty_mod not in sess.get_bucket(_SessionBucket.CLOSURES)
+        return
+
+    mod = ast.parse(case_src)
+    fn_node = mod.body[0]
+    assert isinstance(fn_node, ast.FunctionDef)
+    with analysis_session() as sess:
+        before = _collect_scope_closures(fn_node)
+        assert fn_node in sess.get_bucket(_SessionBucket.CLOSURES)
+    # Mutating outside any active session is observed immediately without explicit eviction
+    fn_node.body.pop(0)
+    after = _collect_scope_closures(fn_node)
+    if "lambda" in case_src:
+        assert len(before) == 1
+        assert len(after) == 0
+    else:
+        assert after == []
+
+def test_scope_cache_exception_does_not_store_partial_session_entry() -> None:
+    """Verifies compute failures in _get_or_compute_scope_cached do not store partial entries in AnalysisSession."""
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel,protected-access
+        _make_trusted_scope_cache_key,
+    )
+
+    mod = ast.parse("def target(x):\n    return x + 1\n")
+    fn_node = mod.body[0]
+    assert isinstance(fn_node, ast.FunctionDef)
+    cache_key = _make_trusted_scope_cache_key(fn_node, "exception_guard")
+
+    with analysis_session() as sess:
+        def _failing_compute() -> Any:
+            raise RuntimeError("boom during scope computation")
+
+        with pytest.raises(RuntimeError, match="boom during scope computation"):
+            _get_or_compute_scope_cached(
+                _SessionBucket.CELL_INFO, cache_key, _failing_compute
+            )
+        assert cache_key not in sess.get_bucket(_SessionBucket.CELL_INFO)
+
+        committed = _get_or_compute_scope_cached(
+            _SessionBucket.CELL_INFO, cache_key, lambda: frozenset({"x"})
+        )
+        assert committed == frozenset({"x"})
+        assert cache_key in sess.get_bucket(_SessionBucket.CELL_INFO)

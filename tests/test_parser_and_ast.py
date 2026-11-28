@@ -956,8 +956,8 @@ def test_batch_43_ast_constructs_canonicalizers_and_branch_harvesting(tmp_path: 
         assert "match_proc:case_2" in m_clause_names
 
 
-def test_batch_45_idiom_canonicalizer_and_baseline_legacy(tmp_path: Path) -> None:
-    """Test Batch 45 enhancements: SetComp/DictComp/AsyncFor canonicalization, fatal/trace boilerplate, legacy baselines."""
+def test_idiom_canonicalizer_and_baseline_legacy(tmp_path: Path) -> None:
+    """Verifies SetComp/DictComp/AsyncFor canonicalization, fatal/trace boilerplate, and legacy baselines."""
     # 1. Boilerplate node checks for fatal and trace
     fatal_tree = ast.parse("logger.fatal('severe error')\nlogger.trace('tracing step')")
     for stmt in fatal_tree.body:
@@ -1057,8 +1057,8 @@ def test_batch_45_idiom_canonicalizer_and_baseline_legacy(tmp_path: Path) -> Non
     assert prune_res.retained_count == 0
 
 
-def test_batch_50_parser_and_baseline_deep_hardening(tmp_path: Path) -> None:
-    """Batch 50: Test AST canonicalization, scope visitor, decorator inspection, and baseline pruning."""
+def test_parser_canonicalization_scope_visitor_and_baseline_pruning(tmp_path: Path) -> None:
+    """Verifies AST canonicalization, scope visitor, decorator inspection, and baseline pruning."""
     # pylint: disable=import-outside-toplevel,protected-access
     from typing import Any
     from pydoppelgangerhunt.baseline import prune_baseline

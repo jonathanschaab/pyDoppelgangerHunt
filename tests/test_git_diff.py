@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -14,21 +13,10 @@ import pydoppelgangerhunt
 
 from pydoppelgangerhunt import (
     check_temporal_divergence,
-    compute_repository_dry_stats,
-    compute_unit_coverage,
     extract_unit_source_code,
     filter_clones_by_git_diff,
-    format_github_annotations,
-    format_json_report,
-    format_sarif_report,
-    generate_html_report,
-    generate_refactoring_patch,
     is_unit_in_modified_ranges,
     parse_git_diff_hunks,
-    scan_target,
-)
-from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
-    _build_whole_method_delegation,
 )
 
 
@@ -267,7 +255,8 @@ def test_defensive_unit_file_handling_in_diff_and_reporters(tmp_path: Path) -> N
 
 def test_single_line_delegation_with_type_annotations_and_none_bounds() -> None:
     """Verifies that single-line functions with type annotations preserve their signatures during delegation."""
-    from pydoppelgangerhunt.fixer import _build_whole_method_delegation, _find_sig_colon  # pylint: disable=protected-access
+    from pydoppelgangerhunt.fixer.patch import _build_whole_method_delegation  # pylint: disable=protected-access
+    from pydoppelgangerhunt.fixer.source import _find_sig_colon  # pylint: disable=protected-access
     from pydoppelgangerhunt.git_diff import check_temporal_divergence
     from pydoppelgangerhunt.reporters import format_github_annotations
 
@@ -312,8 +301,8 @@ def test_single_line_delegation_with_type_annotations_and_none_bounds() -> None:
     res = check_temporal_divergence(u_open, u_other)
     assert res is None or isinstance(res, dict)
 
-def test_batch_35_git_blame_dictionary_porcelain_parsing() -> None:
-    """Tests Batch 35: git blame porcelain parsing with out-of-order and repeated commit headers."""
+def test_git_blame_dictionary_porcelain_parsing() -> None:
+    """Verifies git blame porcelain parsing with out-of-order and repeated commit headers."""
     import unittest.mock as mock
     from pydoppelgangerhunt.git_diff import get_git_blame_info
 
@@ -348,8 +337,8 @@ def test_batch_35_git_blame_dictionary_porcelain_parsing() -> None:
         assert blame_2["timestamp"] == 1720000000
         assert blame_2["summary"] == "Bob commit"
 
-def test_batch_41_unified_path_normalization_and_html_escaping(tmp_path: Path) -> None:
-    """Verifies Batch 41 unified path normalization across reporters, diff, coverage, and HTML escaping."""
+def test_unified_path_normalization_and_html_escaping(tmp_path: Path) -> None:
+    """Verifies unified path normalization across reporters, diff, coverage, and HTML escaping."""
     from pydoppelgangerhunt.cli import _audit_clone_risk_warnings  # pylint: disable=protected-access
     from pydoppelgangerhunt.config import normalize_path_string
     from pydoppelgangerhunt.coverage import _read_xml_coverage  # pylint: disable=protected-access
@@ -438,7 +427,6 @@ def test_batch_41_unified_path_normalization_and_html_escaping(tmp_path: Path) -
 
     # 10. canonical_path_key and _normalize_exemption_endpoint
     import os
-    from pydoppelgangerhunt.config import canonical_path_key
     from pydoppelgangerhunt.matcher import _normalize_exemption_endpoint, scan_target
     from pydoppelgangerhunt.clustering import unit_key, _normalize_unit_file  # pylint: disable=protected-access
     from pydoppelgangerhunt.metrics import compute_repository_dry_stats

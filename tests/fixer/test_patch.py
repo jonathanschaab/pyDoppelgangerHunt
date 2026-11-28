@@ -1,4 +1,4 @@
-"""Unit tests for fixer refactoring patch generation, delegation calls, overlap collision, and git apply."""
+"""Unit tests for refactoring patch pipeline, overlap handling, rollback safety, and git apply."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import logging
 import shutil
 import subprocess
 import sys
-import textwrap
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from unittest import mock
@@ -20,28 +19,22 @@ from pydoppelgangerhunt import (
     check_units_overlap,
     extract_unit_source_code,
     generate_refactoring_patch,
-    refactor_module_units,
-    replace_unit_in_source,
     scan_target,
     synthesize_shared_helper_code,
 )
-from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
-    _build_whole_method_delegation,
+from pydoppelgangerhunt.fixer import (
     patch as patch_mod,
     resolve_closure_strictness_mode,
 )
-from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
+from pydoppelgangerhunt.fixer.source import (  # pylint: disable=protected-access
     _load_unit_file_text,
 )
 from pydoppelgangerhunt.fixer.depgraph import build_module_graph
+from tests.helpers import assert_valid_python
 
 requires_git = pytest.mark.skipif(
     shutil.which("git") is None, reason="git CLI not available"
 )
-
-
-from tests.helpers import assert_valid_python
-
 
 def test_audit_tests_parametrize_candidate_detection(tmp_path: Path) -> None:
     """Test detection of copy-pasted test functions as @pytest.mark.parametrize candidates."""
@@ -113,200 +106,6 @@ def test_comment_and_formatting_preservation(tmp_path: Path) -> None:
     assert "def _shared_calculate_tax" in patch
     assert "# Clone Pair" in patch
 
-def test_inter_block_overlap_collision_detection_and_reverse_offset_refactoring(tmp_path: Path) -> None:
-    """Verifies overlap collision detection, maximal subset filtering, and reverse-order refactoring."""
-    from pydoppelgangerhunt.fixer import (  # pylint: disable=import-outside-toplevel
-        check_units_overlap,
-        filter_overlapping_clone_units,
-        refactor_module_units,
-    )
-
-    u_outer = {"file": "mod.py", "start": 10, "end": 30, "name": "outer_block"}
-    u_inner = {"file": "mod.py", "start": 15, "end": 25, "name": "inner_block"}
-    u_disjoint = {"file": "mod.py", "start": 40, "end": 50, "name": "disjoint_block"}
-    u_other_file = {"file": "other.py", "start": 10, "end": 30, "name": "other_outer"}
-
-    # 1. Test check_units_overlap
-    assert check_units_overlap(u_outer, u_inner) is True
-    assert check_units_overlap(u_inner, u_outer) is True
-    assert check_units_overlap(u_outer, u_disjoint) is False
-    assert check_units_overlap(u_outer, u_other_file) is False
-
-    # 2. Test filter_overlapping_clone_units
-    # Should prioritize u_outer (21 lines) over u_inner (11 lines), while keeping u_disjoint
-    filtered = filter_overlapping_clone_units([u_inner, u_outer, u_disjoint])
-    assert len(filtered) == 2
-    names = [u["name"] for u in filtered]
-    assert "outer_block" in names
-    assert "disjoint_block" in names
-    assert "inner_block" not in names
-
-    # Empty list edge case
-    assert filter_overlapping_clone_units([]) == []
-
-    # 3. Test refactor_module_units overlap collision exception
-    source_sample = (
-        "line 1\nline 2\nline 3\nline 4\nline 5\n"
-        "line 6\nline 7\nline 8\nline 9\nline 10\n"
-    )
-    rep_col1 = ({"file": "test.py", "start": 2, "end": 5, "name": "c1"}, "NEW_C1\n")
-    rep_col2 = ({"file": "test.py", "start": 4, "end": 7, "name": "c2"}, "NEW_C2\n")
-
-    with pytest.raises(ValueError, match="Overlapping unit collision detected"):
-        refactor_module_units(source_sample, [rep_col1, rep_col2])
-
-    # 4. Test refactor_module_units reverse line order application (no offset drift)
-    # Block A: lines 2-4 (replaced with 1 line)
-    # Block B: lines 7-9 (replaced with 1 line)
-    rep_a = ({"file": "test.py", "start": 2, "end": 4, "name": "block_a"}, "REPLACED_A\n")
-    rep_b = ({"file": "test.py", "start": 7, "end": 9, "name": "block_b"}, "REPLACED_B\n")
-
-    # Pass in forward order: refactor_module_units should internally sort reverse
-    refactored = refactor_module_units(source_sample, [rep_a, rep_b])
-    expected_lines = [
-        "line 1\n",
-        "REPLACED_A\n",
-        "line 5\n",
-        "line 6\n",
-        "REPLACED_B\n",
-        "line 10\n",
-    ]
-    assert refactored == "".join(expected_lines)
-
-    # Empty replacements edge case
-    assert refactor_module_units(source_sample, []) == source_sample
-
-    # 5. Test generate_refactoring_patch with overlapping clone units in the same file
-    f_multi = tmp_path / "multi_clone.py"
-    f_multi.write_text(
-        "def first_task(x: int) -> int:\n"
-        "    a = x * 10\n"
-        "    b = a + 5\n"
-        "    return b\n"
-        "\n"
-        "def second_task(x: int) -> int:\n"
-        "    a = x * 10\n"
-        "    b = a + 5\n"
-        "    return b\n",
-        encoding="utf-8",
-    )
-    u_t1 = {"file": str(f_multi), "start": 1, "end": 4, "name": "first_task"}
-    u_t2 = {"file": str(f_multi), "start": 6, "end": 9, "name": "second_task"}
-
-    # Non-overlapping clones in the same file are both safely refactored in reverse order
-    patch = generate_refactoring_patch([(0.95, u_t1, u_t2)], repo_root=str(tmp_path), replace_clones=True)
-    assert "def _shared_first_task_second_task" in patch
-    assert "_shared_first_task_second_task(x)" in patch
-
-def test_replace_unit_in_source_subline_and_token_slicing() -> None:
-    """Verifies sub-line and token-range replacement preserving surrounding code and pragmas."""
-    from pydoppelgangerhunt import replace_unit_in_source  # pylint: disable=import-outside-toplevel
-
-    # 1. Statement sharing a line with prefix code and trailing pragma
-    code1 = "x = 1; y = (a + b)  # type: ignore[operator]\n"
-    unit_subline = {
-        "file": "sub.py",
-        "start": 1,
-        "end": 1,
-        "start_col": 7,
-        "end_col": 18,
-        "name": "y_assign",
-    }
-    replaced1 = replace_unit_in_source(code1, unit_subline, "y = helper(a, b)")
-    assert replaced1 == "x = 1; y = helper(a, b)  # type: ignore[operator]\n"
-
-    # 2. Multi-line unit with boundary pragma preservation
-    code2 = (
-        "def run_job():\n"
-        "    val = compute_step()\n"
-        "    return val  # type: ignore[no-any-return]\n"
-    )
-    unit_whole = {"file": "job.py", "start": 2, "end": 3, "name": "run_job_body"}
-    replaced2 = replace_unit_in_source(code2, unit_whole, "    return _shared_compute_step()")
-    assert "return _shared_compute_step()  # type: ignore[no-any-return]\n" in replaced2
-
-    # 3. Whole-line with preserve_boundary_pragmas=False
-    replaced3 = replace_unit_in_source(
-        code2, unit_whole, "    return _shared_compute_step()", preserve_boundary_pragmas=False
-    )
-    assert "return _shared_compute_step()\n" in replaced3
-    assert "# type: ignore" not in replaced3
-
-def test_replace_unit_in_source_harvested_block_keeps_indentation(tmp_path: Path) -> None:
-    """Verifies harvested indented multiline blocks are replaced as whole lines."""
-    from pydoppelgangerhunt import replace_unit_in_source  # pylint: disable=import-outside-toplevel
-    from pydoppelgangerhunt.parser import harvest_file_units  # pylint: disable=import-outside-toplevel
-
-    code = (
-        "def run(value: int) -> int:\n"
-        "    if value > 0:\n"
-        "        result = value + 1\n"
-        "        return result\n"
-        "    fallback = 0\n"
-        "    return fallback\n"
-    )
-    src = tmp_path / "sample.py"
-    src.write_text(code, encoding="utf-8")
-
-    units = harvest_file_units(str(src), str(tmp_path), min_lines=2, min_tokens=3)
-    block_unit = next(unit for unit in units if unit.get("kind") == "compound_block")
-
-    replaced = replace_unit_in_source(code, block_unit, "    helper_result = shared(value)\n    return helper_result\n")
-
-    assert replaced == (
-        "def run(value: int) -> int:\n"
-        "    helper_result = shared(value)\n"
-        "    return helper_result\n"
-        "    fallback = 0\n"
-        "    return fallback\n"
-    )
-
-def test_generate_refactoring_patch_same_class_whole_methods(tmp_path: Path) -> None:
-    """Verifies that refactoring whole methods in the same class preserves headers and delegates."""
-    f = tmp_path / "bank.py"
-    code = (
-        "class BankAccount:\n"
-        "    def calc_interest_a(self, principal: float) -> float:\n"
-        "        rate = 0.05\n"
-        "        return principal * rate\n"
-        "\n"
-        "    def calc_interest_b(self, principal: float) -> float:\n"
-        "        rate = 0.05\n"
-        "        return principal * rate\n"
-    )
-    f.write_text(code, encoding="utf-8")
-
-    u1 = {
-        "file": str(f),
-        "start": 2,
-        "end": 4,
-        "name": "calc_interest_a",
-        "kind": "function",
-        "enclosing_class": "BankAccount",
-    }
-    u2 = {
-        "file": str(f),
-        "start": 6,
-        "end": 8,
-        "name": "calc_interest_b",
-        "kind": "function",
-        "enclosing_class": "BankAccount",
-    }
-
-    patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
-    assert patch
-    # Private helper should be inserted inside BankAccount
-    assert "+    def _shared_calc_interest_a_calc_interest_b(self, principal: float) -> float:" in patch
-    # Signatures preserved and bodies delegate via self._shared_helper
-    assert "+        return self._shared_calc_interest_a_calc_interest_b(principal)" in patch
-    assert "-        rate = 0.05" in patch
-
-    # Check replace_clones=False inserting helper inside class
-    patch_preview = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=False)
-    assert patch_preview
-    assert "+    def _shared_calc_interest_a_calc_interest_b(self, principal: float) -> float:" in patch_preview
-    assert "-        rate = 0.05" not in patch_preview
-
 def test_generate_refactoring_patch_same_class_compound_blocks(tmp_path: Path) -> None:
     """Verifies refactoring compound blocks within class methods invokes self._shared_helper."""
     f = tmp_path / "processor.py"
@@ -350,119 +149,6 @@ def test_generate_refactoring_patch_same_class_compound_blocks(tmp_path: Path) -
     # Invocation via self._shared_helper omitting self from args
     assert "self._shared_process_one_process_two(" in patch
 
-def test_generate_refactoring_patch_cross_class_receiver_injection(tmp_path: Path) -> None:
-    """Verifies cross-class clones extract to module-level helper with explicit receiver injection."""
-    f = tmp_path / "workers.py"
-    code = (
-        "class WorkerA:\n"
-        "    def work(self, speed: int) -> int:\n"
-        "        return speed * 10\n"
-        "\n"
-        "class WorkerB:\n"
-        "    def work(self, speed: int) -> int:\n"
-        "        return speed * 10\n"
-    )
-    f.write_text(code, encoding="utf-8")
-
-    u1 = {
-        "file": str(f),
-        "start": 2,
-        "end": 3,
-        "name": "work",
-        "kind": "function",
-        "enclosing_class": "WorkerA",
-    }
-    u2 = {
-        "file": str(f),
-        "start": 6,
-        "end": 7,
-        "name": "work",
-        "kind": "function",
-        "enclosing_class": "WorkerB",
-    }
-
-    patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
-    assert patch
-    # Module-level helper with self: Any
-    assert "+def _shared_work(self: Any, speed: int) -> int:" in patch
-    # Call site delegates with self passed explicitly
-    assert "+        return _shared_work(self, speed)" in patch
-
-def test_build_whole_method_delegation_sync_and_async_generators() -> None:
-    """Verifies whole-method delegation syntax for sync and async generators."""
-    src = (
-        "class Streamer:\n"
-        "    def gen(self, count: int):\n"
-        "        \"\"\"Docstring.\"\"\"\n"
-        "        for i in range(count):\n"
-        "            yield i\n"
-    )
-    unit = {"name": "gen", "start": 2, "end": 5}
-    sync_del = _build_whole_method_delegation(
-        src,
-        unit,
-        call_prefix="self.",
-        helper_name="_shared_gen",
-        args_str="count",
-        has_yield=True,
-        is_async=False,
-        has_return=False,
-    )
-    assert "yield from self._shared_gen(count)" in sync_del
-
-    sync_del_ret = _build_whole_method_delegation(
-        src,
-        unit,
-        call_prefix="self.",
-        helper_name="_shared_gen",
-        args_str="count",
-        has_yield=True,
-        is_async=False,
-        has_return=True,
-    )
-    assert "return (yield from self._shared_gen(count))" in sync_del_ret
-
-    async_src = (
-        "class AsyncStreamer:\n"
-        "    async def stream(self, count: int):\n"
-        "        for i in range(count):\n"
-        "            yield i\n"
-    )
-    async_unit = {"name": "stream", "start": 2, "end": 4}
-    async_del = _build_whole_method_delegation(
-        async_src,
-        async_unit,
-        call_prefix="self.",
-        helper_name="_shared_stream",
-        args_str="count",
-        has_yield=True,
-        is_async=True,
-    )
-    assert "async for _item in self._shared_stream(count):\n            yield _item" in async_del
-
-def test_two_space_async_generator_delegation(tmp_path: Path) -> None:
-    """Verifies that 2-space indented files use 2-space step for async generator delegation."""
-    code = (
-        "async def gen1(src):\n"
-        "  async for item in src:\n"
-        "    yield item\n"
-        "\n"
-        "async def gen2(src):\n"
-        "  async for item in src:\n"
-        "    yield item\n"
-    )
-    f = tmp_path / "two_gen.py"
-    f.write_text(code, encoding="utf-8")
-    u1 = {"file": str(f), "start": 2, "end": 3, "name": "gen1:asyncfor", "kind": "compound_block"}
-    u2 = {"file": str(f), "start": 6, "end": 7, "name": "gen2:asyncfor", "kind": "compound_block"}
-    patch = generate_refactoring_patch(
-        [(0.95, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-    assert patch
-    assert "+  async for _item in _shared_gen1_gen2(src):\n+    yield _item\n" in patch
-
 def test_generate_refactoring_patch_does_not_mutate_unit_is_static(tmp_path: Path) -> None:
     """Verifies that generate_refactoring_patch does not mutate caller unit dicts with is_static."""
     code = (
@@ -487,35 +173,6 @@ def test_generate_refactoring_patch_does_not_mutate_unit_is_static(tmp_path: Pat
         replace_clones=True,
     )
     assert "is_static" not in u_inst
-
-def test_generate_refactoring_patch_cross_file_receiver_difference(tmp_path: Path) -> None:
-    """Verifies that cross-file pairs with differing receiver kinds decline replacement if receiver is referenced."""
-    code1 = (
-        "class ServiceA:\n"
-        "    def run(self, x: int) -> int:\n"
-        "        y = x\n"
-        "        return self.factor + y\n"
-    )
-    code2 = (
-        "class ServiceB:\n"
-        "    @classmethod\n"
-        "    def run(cls, x: int) -> int:\n"
-        "        y = x\n"
-        "        return cls.factor + y\n"
-    )
-    f1 = tmp_path / "srv_a.py"
-    f2 = tmp_path / "srv_b.py"
-    f1.write_text(code1, encoding="utf-8")
-    f2.write_text(code2, encoding="utf-8")
-    u1 = {"file": str(f1), "start": 2, "end": 4, "name": "run", "kind": "function", "enclosing_class": "ServiceA", "receiver_kind": "instance"}
-    u2 = {"file": str(f2), "start": 3, "end": 5, "name": "run", "kind": "function", "enclosing_class": "ServiceB", "receiver_kind": "class"}
-
-    patch = generate_refactoring_patch(
-        [(0.95, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-    assert patch == ""
 
 def test_generate_refactoring_patch_slash_normalization(tmp_path: Path) -> None:
     """Verifies that differing path slash formats normalize to the same file during patch generation."""
@@ -547,62 +204,6 @@ def test_generate_refactoring_patch_slash_normalization(tmp_path: Path) -> None:
     # Both units must be replaced in the single file and delegate to the helper
     assert patch.count("+        return self._shared_worker_one_worker_two(x)") == 2
 
-def test_backslash_relative_path_normalization_on_unit(tmp_path: Path) -> None:
-    """Verifies that units carrying Windows-style backslashes resolve correctly across platforms."""
-    pkg_dir = tmp_path / "pkg"
-    pkg_dir.mkdir()
-    f = pkg_dir / "service.py"
-    f.write_text("def run_a(x: int) -> int:\n    return x + 10\n\ndef run_b(x: int) -> int:\n    return x + 10\n", encoding="utf-8")
-
-    u1 = {"file": "pkg\\service.py", "start": 1, "end": 2, "name": "run_a", "kind": "function"}
-    u2 = {"file": "pkg/service.py", "start": 4, "end": 5, "name": "run_b", "kind": "function"}
-
-    extracted = extract_unit_source_code(u1, repo_root=str(tmp_path))
-    assert len(extracted) == 2
-    assert "def run_a" in extracted[0]
-
-    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
-    assert "--- a/pkg/service.py" in patch
-    assert "+++ b/pkg/service.py" in patch
-
-def test_cross_class_clone_call_site_receiver_arguments(tmp_path: Path) -> None:
-    """Verifies that cross-class method clones preserve receiver arguments at both call sites."""
-    code = (
-        "class WorkerA:\n"
-        "    def execute(self, payload: str) -> str:\n"
-        "        return payload.strip().lower()\n"
-        "\n"
-        "class WorkerB:\n"
-        "    def run_task(self, payload: str) -> str:\n"
-        "        return payload.strip().lower()\n"
-    )
-    f = tmp_path / "workers.py"
-    f.write_text(code, encoding="utf-8")
-
-    u1 = {"file": "workers.py", "start": 2, "end": 3, "name": "execute", "kind": "function"}
-    u2 = {"file": "workers.py", "start": 6, "end": 7, "name": "run_task", "kind": "function"}
-
-    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
-    assert "def _shared_execute_run_task(self: Any, payload: str)" in patch
-    assert "+        return _shared_execute_run_task(self, payload)" in patch
-    # Verify WorkerB also passes self, not just WorkerA
-    count_self_call = patch.count("_shared_execute_run_task(self, payload)")
-    assert count_self_call == 2
-
-def test_standalone_comprehension_replacement_preserves_indentation() -> None:
-    """Verifies that an expression unit occupying its own line retains its leading indentation."""
-    source = "def foo():\n    [x for x in data]\n"
-    unit = {
-        "kind": "comprehension",
-        "start": 2,
-        "end": 2,
-        "start_col": 4,
-        "end_col": 21,
-    }
-    rep = "_shared(data)"
-    result = replace_unit_in_source(source, unit, rep)
-    assert result == "def foo():\n    _shared(data)\n"
-
 def test_check_units_overlap_same_line_column_bounded() -> None:
     """Verifies that distinct non-overlapping expressions on the same line are not marked as overlapping."""
     u1 = {
@@ -629,27 +230,6 @@ def test_check_units_overlap_same_line_column_bounded() -> None:
         "end_col": 20,
     }
     assert check_units_overlap(u1, u_overlap) is True
-
-def test_refactor_module_units_same_line_column_order() -> None:
-    """Verifies that refactor_module_units applies same-line replacements from right to left."""
-    source = "val = [a for a in b] + [c for c in d]\n"
-    u1 = {
-        "file": "test.py",
-        "start": 1,
-        "end": 1,
-        "start_col": 6,
-        "end_col": 20,
-    }
-    u2 = {
-        "file": "test.py",
-        "start": 1,
-        "end": 1,
-        "start_col": 23,
-        "end_col": 37,
-    }
-    replacements = [(u1, "helper(b)"), (u2, "helper(d)")]
-    refactored = refactor_module_units(source, replacements)
-    assert refactored == "val = helper(b) + helper(d)\n"
 
 def test_generate_refactoring_patch_mixed_static_instance_does_not_mark_static(tmp_path: Path) -> None:
     """Verifies that a mixed static/instance clone pair does not evaluate to is_static=True."""
@@ -728,33 +308,6 @@ def test_extracted_helper_unconditional_walrus_no_redundant_init(tmp_path: Path)
     assert patch
     assert "res = None" not in patch
 
-def test_build_whole_method_delegation_single_line_function() -> None:
-    """Verifies that _build_whole_method_delegation cleanly handles single-line functions without IndentationError."""
-    code = "def add(x: int, y: int) -> int: return x + y\n"
-    unit = {"file": "t.py", "start": 1, "end": 1, "name": "add", "kind": "function"}
-    res = _build_whole_method_delegation(code, unit, "", "_shared_add", "x, y")
-    assert "def add(x: int, y: int) -> int:\n" in res
-    assert "return _shared_add(x, y)" in res
-    assert_valid_python(res)
-    parsed = ast.parse(res)
-    assert len(parsed.body) == 1
-    assert isinstance(parsed.body[0], ast.FunctionDef)
-
-def test_build_whole_method_delegation_decorated_single_line() -> None:
-    """Verifies that _build_whole_method_delegation retains decorators on single-line functions."""
-    code = "@decorator\ndef compute(x: int) -> int: return x * 2\n"
-    unit = {"file": "t.py", "start": 1, "end": 2, "name": "compute", "kind": "function"}
-    res = _build_whole_method_delegation(code, unit, "", "_shared_compute", "x")
-    assert "@decorator\n" in res
-    assert "def compute(x: int) -> int:\n" in res
-    assert "return _shared_compute(x)" in res
-    assert_valid_python(res)
-    parsed = ast.parse(res)
-    assert len(parsed.body) == 1
-    fn_def = parsed.body[0]
-    assert isinstance(fn_def, ast.FunctionDef)
-    assert len(fn_def.decorator_list) == 1
-
 def test_refactoring_patch_global_and_nonlocal_not_assigned_at_call_site(tmp_path: Path) -> None:
     """Verifies that generate_refactoring_patch does not generate call-site assignments for globals and declines nonlocals."""
     code_glob = (
@@ -801,77 +354,6 @@ def test_refactoring_patch_global_and_nonlocal_not_assigned_at_call_site(tmp_pat
         replace_clones=True,
     )
     assert patch_nl == ""
-
-def test_batch_34_local_node_traversal_and_delegation_hardening(tmp_path: Path) -> None:
-    """Tests Batch 34: _iter_local_nodes isolation and delegation tie-breaking."""
-    from pydoppelgangerhunt.parser import harvest_file_units
-    from pydoppelgangerhunt.fixer import _build_whole_method_delegation
-
-    code = (
-        "class Handler:\n"
-        "    def handle(self, req):\n"
-        "        def validate(data):\n"
-        "            if not data:\n"
-        "                a = 1\n"
-        "                b = 2\n"
-        "                c = 3\n"
-        "                d = 4\n"
-        "                e = 5\n"
-        "                return False\n"
-        "            return True\n"
-        "        return validate(req)\n"
-    )
-    src_file = tmp_path / "handler.py"
-    src_file.write_text(code, encoding="utf-8")
-
-    units_with_closures = harvest_file_units(
-        str(src_file),
-        repo_root=str(tmp_path),
-        min_lines=4,
-        min_tokens=5,
-        harvest_closures=True,
-    )
-    names = [u["name"] for u in units_with_closures]
-    assert "handle:If" not in names
-    assert "Handler.handle:If" not in names
-    assert any("validate:If" in name for name in names)
-
-    validate_if = next(u for u in units_with_closures if "validate:If" in u["name"])
-    assert validate_if.get("receiver_kind") is None
-    assert validate_if.get("is_static") is False
-
-    clause_units = harvest_file_units(
-        str(src_file),
-        repo_root=str(tmp_path),
-        min_lines=4,
-        min_tokens=5,
-        clause_level=True,
-        harvest_closures=True,
-    )
-    c_names = [u["name"] for u in clause_units]
-    assert "handle:if_branch" not in c_names
-
-    delegation_code = (
-        "class A:\n"
-        "    def method(self):\n"
-        "        return 42\n"
-    )
-    u_delegation = {
-        "file": str(src_file),
-        "start": 2,
-        "end": 3,
-        "name": "method",
-        "kind": "function",
-    }
-    del_res = _build_whole_method_delegation(
-        delegation_code,
-        u_delegation,
-        call_prefix="self.",
-        helper_name="_shared_method",
-        args_str="",
-    )
-    assert "def method(self):" in del_res
-    assert "return self._shared_method()" in del_res
 
 def test_generate_refactoring_patch_multi_clone_same_file_git_apply(tmp_path: Path) -> None:
     """Verifies that multiple clone pairs in the same file generate a single unified diff that applies cleanly via git apply."""
@@ -941,104 +423,6 @@ def test_generate_refactoring_patch_multi_clone_same_file_git_apply(tmp_path: Pa
     assert run_proc.returncode == 0
     assert run_proc.stdout.strip() == "7 7 11 11"
 
-def test_generate_refactoring_patch_cross_module_with_import_and_execution(tmp_path: Path) -> None:
-    """Verifies that cross-module clone refactoring injects the import into file 2 and both run."""
-    import subprocess  # pylint: disable=import-outside-toplevel
-
-    pkg_dir = tmp_path / "service_pkg"
-    pkg_dir.mkdir()
-    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
-
-    src_a = (
-        "def compute_alpha(x: int) -> int:\n"
-        "    step1 = x * 10\n"
-        "    step2 = step1 + 7\n"
-        "    return step2\n"
-    )
-    src_b = (
-        "def compute_beta(v: int) -> int:\n"
-        "    step1 = v * 10\n"
-        "    step2 = step1 + 7\n"
-        "    return step2\n"
-    )
-    f_a = pkg_dir / "srv_a.py"
-    f_b = pkg_dir / "srv_b.py"
-    f_a.write_text(src_a, encoding="utf-8")
-    f_b.write_text(src_b, encoding="utf-8")
-
-    u_a = {"name": "compute_alpha", "file": "service_pkg/srv_a.py", "start": 1, "end": 4, "kind": "function"}
-    u_b = {"name": "compute_beta", "file": "service_pkg/srv_b.py", "start": 1, "end": 4, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u_a, u_b)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="host",
-    )
-
-    # 1. Diff includes both files
-    assert "--- a/service_pkg/srv_a.py" in patch
-    assert "--- a/service_pkg/srv_b.py" in patch
-    # 2. File 2 imports helper from file 1
-    assert "from service_pkg.srv_a import _shared_compute_alpha_compute_beta" in patch
-
-    # 3. Verify git apply and execution
-    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
-    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
-    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
-
-    apply_proc = subprocess.run(
-        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True
-    )
-    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
-
-    run_proc = subprocess.run(
-        ["python", "-c", "from service_pkg.srv_a import compute_alpha; from service_pkg.srv_b import compute_beta; print(compute_alpha(5), compute_beta(5))"],
-        cwd=str(tmp_path),
-        capture_output=True,
-        text=True,
-    )
-    assert run_proc.returncode == 0
-    assert run_proc.stdout.strip() == "57 57"
-
-def test_generate_refactoring_patch_cross_module_circular_import_safety(tmp_path: Path) -> None:
-    """Verifies that circular module imports are detected and prevented during cross-module patch generation."""
-    pkg_dir = tmp_path / "cyclic_pkg"
-    pkg_dir.mkdir()
-    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
-
-    src_a = (
-        "import cyclic_pkg.mod_b\n\n"
-        "def work_a(x: int) -> int:\n"
-        "    y = x + 1\n"
-        "    return y * 2\n"
-    )
-    src_b = (
-        "def work_b(x: int) -> int:\n"
-        "    y = x + 1\n"
-        "    return y * 2\n"
-    )
-    f_a = pkg_dir / "mod_a.py"
-    f_b = pkg_dir / "mod_b.py"
-    f_a.write_text(src_a, encoding="utf-8")
-    f_b.write_text(src_b, encoding="utf-8")
-
-    u_a = {"name": "work_a", "file": "cyclic_pkg/mod_a.py", "start": 3, "end": 5, "kind": "function"}
-    u_b = {"name": "work_b", "file": "cyclic_pkg/mod_b.py", "start": 1, "end": 3, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u_a, u_b)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="host",
-    )
-
-    # File 2 is NOT refactored with an unsafe circular import
-    assert "--- a/cyclic_pkg/mod_b.py" not in patch
-    assert "Circular import or unresolvable module path" in patch
-
 def test_generate_refactoring_patch_overlapping_units_filtered(tmp_path: Path) -> None:
     """Verifies that overlapping candidate units are filtered without crashing ValueError."""
     src = (
@@ -1060,68 +444,6 @@ def test_generate_refactoring_patch_overlapping_units_filtered(tmp_path: Path) -
         replace_clones=True,
     )
     assert "def outer(x: int) -> int:" in patch
-
-def test_init_method_delegation_suppresses_return(tmp_path: Path) -> None:
-    """Verifies that __init__ method refactoring never emits return in delegation calls."""
-    import subprocess  # pylint: disable=import-outside-toplevel
-
-    src = (
-        "class ModelA:\n"
-        "    def __init__(self, val: int) -> None:\n"
-        "        self.val = val * 10\n"
-        "        self.active = True\n"
-        "\n"
-        "class ModelB:\n"
-        "    def __init__(self, val: int) -> None:\n"
-        "        self.val = val * 10\n"
-        "        self.active = True\n"
-    )
-    f = tmp_path / "models.py"
-    f.write_text(src, encoding="utf-8")
-
-    u1 = {"name": "__init__", "file": "models.py", "start": 2, "end": 4, "kind": "function", "enclosing_class": "ModelA"}
-    u2 = {"name": "__init__", "file": "models.py", "start": 7, "end": 9, "kind": "function", "enclosing_class": "ModelB"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-    lines = [
-        line for line in patch.splitlines()
-        if line.startswith("+") and not line.startswith("+++")
-    ]
-    init_delegations = [line for line in lines if "_shared_init" in line]
-    assert len(init_delegations) >= 2
-    for line in init_delegations:
-        assert "return " not in line
-
-    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
-    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
-    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
-
-    apply_proc = subprocess.run(
-        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
-    )
-    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
-
-    run_proc = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "from models import ModelA, ModelB; "
-            "a = ModelA(5); b = ModelB(7); "
-            "print(a.val, a.active, b.val, b.active)",
-        ],
-        cwd=str(tmp_path),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert run_proc.returncode == 0
-    assert run_proc.stdout.strip() == "50 True 70 True"
 
 def test_multi_class_method_helper_line_adjustment(tmp_path: Path) -> None:
     """Verifies that line shifts from earlier method refactorings do not corrupt helper insertion in later classes."""
@@ -1192,39 +514,6 @@ def test_multi_class_method_helper_line_adjustment(tmp_path: Path) -> None:
     assert run_proc.returncode == 0
     assert run_proc.stdout.strip() == "11 22"
 
-def test_cross_module_helper_name_collision_deduplication(tmp_path: Path) -> None:
-    """Verifies that if File 2 already defines the candidate helper name, an indexed suffix is generated."""
-    pkg = tmp_path / "coll_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = (
-        "def handle_data(x: int) -> int:\n"
-        "    res = x * 2 + 5\n"
-        "    return res\n"
-    )
-    src2 = (
-        "_shared_handle_data_process_data = 'existing_symbol'\n"
-        "\n"
-        "def process_data(x: int) -> int:\n"
-        "    res = x * 2 + 5\n"
-        "    return res\n"
-    )
-    (pkg / "f1.py").write_text(src1, encoding="utf-8")
-    (pkg / "f2.py").write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "handle_data", "file": "coll_pkg/f1.py", "start": 1, "end": 3, "kind": "function"}
-    u2 = {"name": "process_data", "file": "coll_pkg/f2.py", "start": 3, "end": 5, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="host",
-    )
-    assert "_shared_handle_data_process_data_2" in patch
-    assert "from coll_pkg.f1 import _shared_handle_data_process_data_2" in patch
-
 def test_super_call_rejected_for_module_binding(tmp_path: Path) -> None:
     """Verifies that methods containing super() are rejected when effective binding is module."""
     src = (
@@ -1266,67 +555,6 @@ def test_super_call_rejected_for_module_binding(tmp_path: Path) -> None:
     )
     assert patch_module == ""
 
-def test_super_call_accepted_for_same_class_method_binding(tmp_path: Path) -> None:
-    """Verifies that methods containing super() within the same class generate a valid class helper method."""
-    import subprocess  # pylint: disable=import-outside-toplevel
-
-    src = (
-        "class BaseHandler:\n"
-        "    def perform(self, x: int) -> int:\n"
-        "        return x * 10\n"
-        "\n"
-        "class CustomHandler(BaseHandler):\n"
-        "    def handle_primary(self, x: int) -> int:\n"
-        "        base_val = super().perform(x)\n"
-        "        return base_val + 5\n"
-        "\n"
-        "    def handle_secondary(self, x: int) -> int:\n"
-        "        base_val = super().perform(x)\n"
-        "        return base_val + 5\n"
-    )
-    f = tmp_path / "handlers.py"
-    f.write_text(src, encoding="utf-8")
-
-    u1 = {"name": "handle_primary", "file": "handlers.py", "start": 6, "end": 8, "kind": "function", "enclosing_class": "CustomHandler"}
-    u2 = {"name": "handle_secondary", "file": "handlers.py", "start": 10, "end": 12, "kind": "function", "enclosing_class": "CustomHandler"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        method_binding="method",
-        replace_clones=True,
-    )
-    assert patch != ""
-    assert "def _shared_handle_primary" in patch
-    assert "super().perform(x)" in patch
-
-    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
-    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
-    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
-
-    apply_proc = subprocess.run(
-        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
-    )
-    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
-
-    run_proc = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "from handlers import CustomHandler; "
-            "h = CustomHandler(); "
-            "print(h.handle_primary(3), h.handle_secondary(7))",
-        ],
-        cwd=str(tmp_path),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert run_proc.returncode == 0, f"run failed: {run_proc.stderr}"
-    assert run_proc.stdout.strip() == "35 75"
-
 def test_cross_module_global_rejected(tmp_path: Path) -> None:
     """Verifies that clone pairs using global variables across different files are rejected."""
     pkg = tmp_path / "state_pkg"
@@ -1361,48 +589,6 @@ def test_cross_module_global_rejected(tmp_path: Path) -> None:
         replace_clones=True,
     )
     assert patch == ""
-
-def test_init_colon_notation_no_return_delegation(tmp_path: Path) -> None:
-    """Verifies that __init__ methods with colon-prefixed names delegate without return statements."""
-    src = (
-        "class ConfigRecord:\n"
-        "    def __init__(self, key: str) -> None:\n"
-        "        self.key = key\n"
-        "        self.active = True\n"
-        "\n"
-        "class DataRecord:\n"
-        "    def __init__(self, key: str) -> None:\n"
-        "        self.key = key\n"
-        "        self.active = True\n"
-    )
-    f = tmp_path / "records.py"
-    f.write_text(src, encoding="utf-8")
-
-    u1 = {
-        "name": "ConfigRecord:__init__",
-        "file": "records.py",
-        "start": 2,
-        "end": 4,
-        "kind": "function",
-        "enclosing_class": "ConfigRecord",
-    }
-    u2 = {
-        "name": "DataRecord:__init__",
-        "file": "records.py",
-        "start": 7,
-        "end": 9,
-        "kind": "function",
-        "enclosing_class": "DataRecord",
-    }
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-    assert patch != ""
-    assert "return _shared" not in patch
-    assert "_shared_ConfigRecord_DataRecord(self, key)" in patch
 
 def test_partially_overlapping_inputs_subprocess_execution(tmp_path: Path) -> None:
     """Verifies runtime correctness of refactored Type-2 clones with partially overlapping parameters."""
@@ -1559,79 +745,6 @@ def test_batch_83_generator_subunit_terminal_return_syntax() -> None:
     parsed = ast.parse(f"def wrapper():\n    {call_code}\n")
     assert isinstance(parsed, ast.Module)
 
-
-def test_generate_refactoring_patch_custom_receiver_paired_with_standalone(tmp_path: Path) -> None:
-    """Verifies that generate_refactoring_patch supports replacing clones between a custom receiver method and a function."""
-    src1 = (
-        "class Runner:\n"
-        "    def execute(this, val: int) -> int:\n"
-        "        return val * 2\n"
-    )
-    src2 = (
-        "def execute_standalone(val: int) -> int:\n"
-        "    return val * 2\n"
-    )
-    f1 = tmp_path / "a.py"
-    f2 = tmp_path / "b.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"file": "a.py", "start": 2, "end": 3, "name": "execute"}
-    u2 = {"file": "b.py", "start": 1, "end": 2, "name": "execute_standalone"}
-    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
-    assert "--- a/a.py" in patch
-    assert "--- a/b.py" in patch
-    assert "_shared_execute_execute_standalone" in patch
-
-
-def test_generate_refactoring_patch_custom_receiver_different_attrs_rejected(tmp_path: Path) -> None:
-    """Verifies that methods accessing different attributes on custom receivers are not falsely merged."""
-    src1 = (
-        "class A:\n"
-        "    def get_val(this) -> int:\n"
-        "        return this.alpha\n"
-    )
-    src2 = (
-        "class B:\n"
-        "    def get_val(this) -> int:\n"
-        "        return this.beta\n"
-    )
-    f1 = tmp_path / "a.py"
-    f2 = tmp_path / "b.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"file": "a.py", "start": 2, "end": 3, "name": "get_val"}
-    u2 = {"file": "b.py", "start": 2, "end": 3, "name": "get_val"}
-    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
-    assert patch == ""
-
-
-def test_generate_refactoring_patch_cross_receiver_attrs_matching(tmp_path: Path) -> None:
-    """Verifies that methods accessing the same attribute under different receiver names (self vs this) are merged."""
-    src1 = (
-        "class A:\n"
-        "    def get_val(self) -> int:\n"
-        "        return self.total\n"
-    )
-    src2 = (
-        "class B:\n"
-        "    def get_val(this) -> int:\n"
-        "        return this.total\n"
-    )
-    f1 = tmp_path / "a.py"
-    f2 = tmp_path / "b.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"file": "a.py", "start": 2, "end": 3, "name": "get_val"}
-    u2 = {"file": "b.py", "start": 2, "end": 3, "name": "get_val"}
-    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
-    assert "--- a/a.py" in patch
-    assert "--- a/b.py" in patch
-    assert "_shared_get_val" in patch
-
-
 def test_generate_refactoring_patch_permuted_outputs_alignment(tmp_path: Path) -> None:
     """Verifies that when clone 2 assigns output variables in permuted order relative to
     clone 1, patch generation fails closed by default to prevent variable swapping."""
@@ -1698,7 +811,6 @@ def test_generate_refactoring_patch_permuted_outputs_alignment(tmp_path: Path) -
         [(1.0, u3, u4)], repo_root=str(tmp_path), replace_clones=True
     )
     assert patch_conflicting == ""
-
 
 def test_generate_refactoring_patch_cross_module_auto_creates_common_module(tmp_path: Path) -> None:
     """Verifies that auto cross-module strategy synthesizes _common.py and decouples siblings."""
@@ -1774,7 +886,6 @@ def test_generate_refactoring_patch_cross_module_auto_creates_common_module(tmp_
     assert run_proc.returncode == 0
     assert run_proc.stdout.strip() == "57 57"
 
-
 def test_generate_refactoring_patch_cross_module_auto_preserves_existing_common_module(tmp_path: Path) -> None:
     """Verifies that auto strategy cleanly appends to an already-existing _common.py without overwriting."""
     pkg_dir = tmp_path / "service_pkg"
@@ -1843,141 +954,6 @@ def test_generate_refactoring_patch_cross_module_auto_preserves_existing_common_
     assert run_proc.returncode == 0
     assert run_proc.stdout.strip() == "preserved 31 31"
 
-
-def test_generate_refactoring_patch_cross_module_auto_prevents_circular_import(tmp_path: Path) -> None:
-    """Verifies that synthesizing _common.py eliminates sibling circular dependencies even when imports exist."""
-    pkg_dir = tmp_path / "cyclic_pkg"
-    pkg_dir.mkdir()
-    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
-
-    src_a = (
-        "import cyclic_pkg.mod_b\n\n"
-        "def work_a(x: int) -> int:\n"
-        "    y = x + 1\n"
-        "    return y * 2\n"
-    )
-    src_b = (
-        "def work_b(x: int) -> int:\n"
-        "    y = x + 1\n"
-        "    return y * 2\n"
-    )
-    (pkg_dir / "mod_a.py").write_text(src_a, encoding="utf-8")
-    (pkg_dir / "mod_b.py").write_text(src_b, encoding="utf-8")
-
-    u_a = {"name": "work_a", "file": "cyclic_pkg/mod_a.py", "start": 3, "end": 5, "kind": "function"}
-    u_b = {"name": "work_b", "file": "cyclic_pkg/mod_b.py", "start": 1, "end": 3, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u_a, u_b)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="auto",
-    )
-
-    # In auto mode, _common.py is synthesized and neither sibling imports the other for the helper
-    assert "--- a/cyclic_pkg/mod_a.py" in patch
-    assert "--- a/cyclic_pkg/mod_b.py" in patch
-    assert "from cyclic_pkg._common import _shared_work_a_work_b" in patch
-
-    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
-    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
-    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
-
-    apply_proc = subprocess.run(
-        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
-    )
-    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
-
-    run_proc = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import cyclic_pkg.mod_a; import cyclic_pkg.mod_b; "
-            "print(cyclic_pkg.mod_a.work_a(5), cyclic_pkg.mod_b.work_b(5))",
-        ],
-        cwd=str(tmp_path),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert run_proc.returncode == 0
-    assert run_proc.stdout.strip() == "12 12"
-
-
-@pytest.mark.parametrize("reverse_order", [False, True])
-def test_generate_refactoring_patch_cross_module_when_one_file_is_already_shared_module(
-    tmp_path: Path, reverse_order: bool
-) -> None:
-    """Verifies consolidating when either duplicate unit is already located in the shared module."""
-    pkg_dir = tmp_path / "shared_pkg"
-    pkg_dir.mkdir()
-    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
-
-    src_worker = (
-        "def compute_task(x: int) -> int:\n"
-        "    r = x * 4 + 3\n"
-        "    return r\n"
-    )
-    src_common = (
-        "def helper_seed() -> int:\n"
-        "    return 1\n"
-        "\n"
-        "def compute_common(x: int) -> int:\n"
-        "    r = x * 4 + 3\n"
-        "    return r\n"
-    )
-    (pkg_dir / "worker.py").write_text(src_worker, encoding="utf-8")
-    (pkg_dir / "_common.py").write_text(src_common, encoding="utf-8")
-
-    u_worker = {"name": "compute_task", "file": "shared_pkg/worker.py", "start": 1, "end": 3, "kind": "function"}
-    u_common = {"name": "compute_common", "file": "shared_pkg/_common.py", "start": 4, "end": 6, "kind": "function"}
-
-    pair = (1.0, u_common, u_worker) if reverse_order else (1.0, u_worker, u_common)
-
-    patch = generate_refactoring_patch(
-        [pair],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="auto",
-    )
-
-    helper_name = "_shared_compute_common_compute_task" if reverse_order else "_shared_compute_task_compute_common"
-    # worker.py imports from shared_pkg._common
-    assert "--- a/shared_pkg/worker.py" in patch
-    assert f"from shared_pkg._common import {helper_name}" in patch
-    # _common.py defines the helper
-    assert "--- a/shared_pkg/_common.py" in patch
-    assert f"def {helper_name}" in patch
-
-    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
-    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
-    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
-
-    apply_proc = subprocess.run(
-        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
-    )
-    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
-
-    run_proc = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import shared_pkg.worker; import shared_pkg._common; "
-            "print(shared_pkg.worker.compute_task(7), shared_pkg._common.compute_common(7))",
-        ],
-        cwd=str(tmp_path),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert run_proc.returncode == 0
-    assert run_proc.stdout.strip() == "31 31"
-
-
 def test_generate_refactoring_patch_cross_module_host_strategy_success(tmp_path: Path) -> None:
     """Verifies cross-module clone consolidation when cross_file_strategy='host_module' with no cycle."""
     pkg_dir = tmp_path / "host_pkg"
@@ -2042,7 +1018,6 @@ def test_generate_refactoring_patch_cross_module_host_strategy_success(tmp_path:
     assert run_proc.returncode == 0
     assert run_proc.stdout.strip() == "13 13"
 
-
 def test_generate_refactoring_patch_cross_module_host_strategy_circular_detection(
     tmp_path: Path,
 ) -> None:
@@ -2090,7 +1065,6 @@ def test_generate_refactoring_patch_cross_module_host_strategy_circular_detectio
     assert "--- a/cycle_pkg/caller.py" not in patch
     assert "from cycle_pkg.host import" not in patch
 
-
 def test_generate_refactoring_patch_cross_module_missing_caller_file(tmp_path: Path) -> None:
     """Verifies that missing caller file gracefully records refactoring commentary without crash."""
     pkg_dir = tmp_path / "single_pkg"
@@ -2115,7 +1089,6 @@ def test_generate_refactoring_patch_cross_module_missing_caller_file(tmp_path: P
 
     assert "--- a/single_pkg/file1.py" in patch
     assert "Complete refactoring by importing the helper into single_pkg/nonexistent.py" in patch
-
 
 def test_generate_refactoring_patch_rejects_out_of_root_caller_path(
     tmp_path: Path,
@@ -2164,7 +1137,6 @@ def test_generate_refactoring_patch_rejects_out_of_root_caller_path(
     extracted = extract_unit_source_code(u2_outside, repo_root=str(repo_dir))
     assert not any("CONFIDENTIAL_TOKEN" in line for line in extracted)
     assert extracted == ["# Source for safe_worker lines 1-2\n"]
-
 
 def test_generate_refactoring_patch_rejects_symlink_caller_path(
     tmp_path: Path,
@@ -2219,336 +1191,6 @@ def test_generate_refactoring_patch_rejects_symlink_caller_path(
     assert not any("OUTSIDE_SYM_DATA" in line for line in extracted)
     assert extracted == ["# Source for process_item lines 1-2\n"]
 
-
-def test_generate_refactoring_patch_shared_module_helper_name_collision_avoidance(
-    tmp_path: Path,
-) -> None:
-    """Verifies that two distinct clone pairs sharing the same base name do not collide in _common.py."""
-    pkg_dir = tmp_path / "collision_pkg"
-    pkg_dir.mkdir()
-    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
-
-    src_a = (
-        "def compute_val(x: int) -> int:\n"
-        "    return x * 10\n"
-        "\n"
-        "def calculate_val(x: int) -> int:\n"
-        "    return x + 99\n"
-    )
-    src_b = (
-        "def compute_val(y: int) -> int:\n"
-        "    return y * 10\n"
-        "\n"
-        "def calculate_val(y: int) -> int:\n"
-        "    return y + 99\n"
-    )
-    (pkg_dir / "mod_a.py").write_text(src_a, encoding="utf-8")
-    (pkg_dir / "mod_b.py").write_text(src_b, encoding="utf-8")
-
-    u_a1 = {"name": "compute_val", "file": "collision_pkg/mod_a.py", "start": 1, "end": 2, "kind": "function"}
-    u_b1 = {"name": "compute_val", "file": "collision_pkg/mod_b.py", "start": 1, "end": 2, "kind": "function"}
-
-    u_a2 = {"name": "calculate_val", "file": "collision_pkg/mod_a.py", "start": 4, "end": 5, "kind": "function"}
-    u_b2 = {"name": "calculate_val", "file": "collision_pkg/mod_b.py", "start": 4, "end": 5, "kind": "function"}
-
-    # Pre-existing _common.py that already contains _shared_compute_val
-    src_existing_common = (
-        "def _shared_compute_val(x: int) -> int:\n"
-        "    return x * 999\n"
-    )
-    (pkg_dir / "_common.py").write_text(src_existing_common, encoding="utf-8")
-
-    patch = generate_refactoring_patch(
-        [(1.0, u_a1, u_b1), (1.0, u_a2, u_b2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="auto",
-    )
-
-    # Pre-existing _shared_compute_val was in _common.py, so helper for u_a1/u_b1 gets _shared_compute_val_2
-    assert "def _shared_compute_val_2" in patch
-    assert "def _shared_calculate_val" in patch
-    assert "from collision_pkg._common import _shared_compute_val_2" in patch
-
-
-def test_generate_refactoring_patch_auto_detects_existing_shared_module_cycle(
-    tmp_path: Path,
-) -> None:
-    """Verifies that auto strategy detects when existing _common.py already imports caller and avoids cycle."""
-    pkg_dir = tmp_path / "precycle_pkg"
-    pkg_dir.mkdir()
-    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
-
-    # _common.py already imports mod_a
-    src_common = (
-        "import precycle_pkg.mod_a\n\n"
-        "def existing_seed() -> int:\n"
-        "    return 1\n"
-    )
-    src_a = (
-        "def run_task(x: int) -> int:\n"
-        "    return x * 5\n"
-    )
-    src_b = (
-        "def run_other(x: int) -> int:\n"
-        "    return x * 5\n"
-    )
-    (pkg_dir / "_common.py").write_text(src_common, encoding="utf-8")
-    (pkg_dir / "mod_a.py").write_text(src_a, encoding="utf-8")
-    (pkg_dir / "mod_b.py").write_text(src_b, encoding="utf-8")
-
-    u_a = {"name": "run_task", "file": "precycle_pkg/mod_a.py", "start": 1, "end": 2, "kind": "function"}
-    u_b = {"name": "run_other", "file": "precycle_pkg/mod_b.py", "start": 1, "end": 2, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u_a, u_b)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="auto",
-    )
-
-    # Circular import detected for mod_a -> _common -> mod_a
-    assert (
-        "Circular import detected "
-        "(cycle: precycle_pkg.mod_a -> precycle_pkg._common -> precycle_pkg.mod_a)"
-    ) in patch
-    # mod_a must NOT be patched with a circular import
-    assert "--- a/precycle_pkg/mod_a.py" not in patch
-    # mod_b (which has no cycle) safely imports from _common
-    assert "--- a/precycle_pkg/mod_b.py" in patch
-    assert "from precycle_pkg._common import _shared_run_task_run_other" in patch
-
-
-def test_generate_refactoring_patch_lazy_depgraph(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Verifies that build_module_graph is evaluated lazily only when needed."""
-    mock_build = mock.MagicMock()
-    monkeypatch.setattr(patch_mod, "build_module_graph", mock_build)
-
-    f = tmp_path / "single.py"
-    f.write_text("def a(): return 1\ndef b(): return 1\n", encoding="utf-8")
-    u1 = {"name": "a", "file": str(f), "start": 1, "end": 1, "kind": "function"}
-    u2 = {"name": "b", "file": str(f), "start": 2, "end": 2, "kind": "function"}
-
-    # Intra-file patch generation does not consult or build the graph
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=False,
-    )
-    assert "def _shared_a_b" in patch
-    mock_build.assert_not_called()
-
-
-def test_evolving_depgraph_detects_multi_pair_cycles(tmp_path: Path) -> None:
-    """Verifies that accepted cross-module dependencies update the evolving graph, catching multi-pair cycles."""
-    pkg = tmp_path / "cycle_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    (pkg / "mod_a.py").write_text(
-        "def a1(x: int) -> int:\n    return x + 1\ndef a2(y: int) -> int:\n    return y * 2\n",
-        encoding="utf-8",
-    )
-    (pkg / "mod_b.py").write_text(
-        "def b1(x: int) -> int:\n    return x + 1\ndef b2(z: int) -> int:\n    return z * 3\n",
-        encoding="utf-8",
-    )
-    (pkg / "mod_c.py").write_text(
-        "def c1(z: int) -> int:\n    return z * 3\ndef c2(y: int) -> int:\n    return y * 2\n",
-        encoding="utf-8",
-    )
-
-    u_a1 = {"name": "a1", "file": "cycle_pkg/mod_a.py", "start": 1, "end": 2, "kind": "function"}
-    u_b1 = {"name": "b1", "file": "cycle_pkg/mod_b.py", "start": 1, "end": 2, "kind": "function"}
-    u_b2 = {"name": "b2", "file": "cycle_pkg/mod_b.py", "start": 3, "end": 4, "kind": "function"}
-    u_c1 = {"name": "c1", "file": "cycle_pkg/mod_c.py", "start": 1, "end": 2, "kind": "function"}
-    u_c2 = {"name": "c2", "file": "cycle_pkg/mod_c.py", "start": 3, "end": 4, "kind": "function"}
-    u_a2 = {"name": "a2", "file": "cycle_pkg/mod_a.py", "start": 3, "end": 4, "kind": "function"}
-
-    # Pair 1: a1(host) <-> b1(caller) -> b imports a (b -> a)
-    # Pair 2: b2(host) <-> c1(caller) -> c imports b (c -> b)
-    # Pair 3: c2(host) <-> a2(caller) -> a imports c (a -> c), which closes a -> c -> b -> a cycle!
-    clones = [
-        (1.0, u_a1, u_b1),
-        (1.0, u_b2, u_c1),
-        (1.0, u_c2, u_a2),
-    ]
-
-    patch = generate_refactoring_patch(
-        clones,
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="host_module",
-    )
-
-    # Pair 1 & Pair 2 succeed and are wired
-    assert "from cycle_pkg.mod_a import _shared_a1_b1" in patch
-    assert "from cycle_pkg.mod_b import _shared_b2_c1" in patch
-
-    # Pair 3 is detected as closing a cycle: cycle_pkg.mod_a -> cycle_pkg.mod_c -> cycle_pkg.mod_b -> cycle_pkg.mod_a
-    assert "Circular import or unresolvable module path" in patch
-    assert "cycle_pkg.mod_a -> cycle_pkg.mod_c -> cycle_pkg.mod_b -> cycle_pkg.mod_a" in patch
-    # mod_a must NOT import from mod_c
-    assert "from cycle_pkg.mod_c import" not in patch
-
-
-def test_shared_module_computes_required_imports_for_host(tmp_path: Path) -> None:
-    """Verifies that shared modules receive typing and source dependencies even if already imported in f1."""
-    pkg = tmp_path / "imports_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src_f1 = (
-        "from typing import List\n"
-        "\n"
-        "def calc_roots(vals: List[float]) -> float:\n"
-        "    import math\n"
-        "    return math.sqrt(sum(vals))\n"
-    )
-    src_f2 = (
-        "from typing import List\n"
-        "\n"
-        "def compute_roots(items: List[float]) -> float:\n"
-        "    import math\n"
-        "    return math.sqrt(sum(items))\n"
-    )
-    (pkg / "f1.py").write_text(src_f1, encoding="utf-8")
-    (pkg / "f2.py").write_text(src_f2, encoding="utf-8")
-
-    u1 = {"name": "calc_roots", "file": "imports_pkg/f1.py", "start": 3, "end": 5, "kind": "function"}
-    u2 = {"name": "compute_roots", "file": "imports_pkg/f2.py", "start": 3, "end": 5, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    # Verify that the synthesized _common.py patch contains typing imports and preserves local math import
-    assert "diff --git a/imports_pkg/_common.py b/imports_pkg/_common.py" in patch
-    assert "+from typing import List" in patch
-    assert "+    import math" in patch
-    assert "\n+import math\n" not in patch
-
-
-def test_unreadable_existing_shared_module_skips_gracefully(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Verifies that an existing shared module that fails to read does not emit new-file patch."""
-    pkg = tmp_path / "unread_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    (pkg / "f1.py").write_text("def run_a(x):\n    return x * 2\n", encoding="utf-8")
-    (pkg / "f2.py").write_text("def run_b(x):\n    return x * 2\n", encoding="utf-8")
-    shared_file = pkg / "_common.py"
-    shared_file.write_text("# existing unreadable\n", encoding="utf-8")
-
-    orig_read_text = Path.read_text
-
-    def mock_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
-        if self.resolve() == shared_file.resolve():
-            raise OSError("Permission denied: unreadable")
-        return orig_read_text(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "read_text", mock_read_text)
-
-    u1 = {"name": "run_a", "file": "unread_pkg/f1.py", "start": 1, "end": 2, "kind": "function"}
-    u2 = {"name": "run_b", "file": "unread_pkg/f2.py", "start": 1, "end": 2, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    # Must NOT emit a new-file patch for _common.py
-    assert "new file mode 100644" not in patch
-    assert "--- /dev/null" not in patch
-    # Must emit advisory notice about existing unreadable file
-    expected_note = (
-        "shared module file unread_pkg/_common.py exists but could not be read; skipping extraction."
-    )
-    assert expected_note in patch
-
-
-def test_relative_imports_preserved_and_translated_in_shared_module(tmp_path: Path) -> None:
-    """Verifies that relative imports in clone files are translated to canonical imports in _common.py."""
-    pkg = tmp_path / "rel_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    (pkg / "helpers.py").write_text("class CustomType:\n    pass\n", encoding="utf-8")
-
-    src_f1 = (
-        "from .helpers import CustomType\n"
-        "\n"
-        "def compute_val(v: CustomType) -> int:\n"
-        "    return 42\n"
-    )
-    src_f2 = (
-        "from .helpers import CustomType\n"
-        "\n"
-        "def compute_other(v: CustomType) -> int:\n"
-        "    return 42\n"
-    )
-    (pkg / "f1.py").write_text(src_f1, encoding="utf-8")
-    (pkg / "f2.py").write_text(src_f2, encoding="utf-8")
-
-    u1 = {"name": "compute_val", "file": "rel_pkg/f1.py", "start": 3, "end": 4, "kind": "function"}
-    u2 = {"name": "compute_other", "file": "rel_pkg/f2.py", "start": 3, "end": 4, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    # _common.py should receive translated canonical import: from rel_pkg.helpers import CustomType
-    assert "diff --git a/rel_pkg/_common.py b/rel_pkg/_common.py" in patch
-    assert "+from rel_pkg.helpers import CustomType" in patch
-
-
-def test_shared_module_host_imports_cycle_detection(tmp_path: Path) -> None:
-    """Verifies that when _common.py gains dependencies on a caller module, cycle is detected and prevented."""
-    pkg = tmp_path / "host_cycle_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src_f1 = (
-        "class HelperDep:\n"
-        "    pass\n"
-        "\n"
-        "def clone_a(x: HelperDep) -> int:\n"
-        "    return 42\n"
-    )
-    src_f2 = (
-        "from host_cycle_pkg.f1 import HelperDep\n"
-        "\n"
-        "def clone_b(x: HelperDep) -> int:\n"
-        "    return 42\n"
-    )
-    (pkg / "f1.py").write_text(src_f1, encoding="utf-8")
-    (pkg / "f2.py").write_text(src_f2, encoding="utf-8")
-
-    u1 = {"name": "clone_a", "file": "host_cycle_pkg/f1.py", "start": 4, "end": 5, "kind": "function"}
-    u2 = {"name": "clone_b", "file": "host_cycle_pkg/f2.py", "start": 3, "end": 4, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    # Because helper uses HelperDep from host_cycle_pkg.f1, _common.py imports host_cycle_pkg.f1.
-    # Therefore, f1 importing _common.py would form f1 -> _common -> f1 cycle!
-    assert "Circular import detected" in patch
-    assert "host_cycle_pkg.f1 -> host_cycle_pkg._common -> host_cycle_pkg.f1" in patch
-
-
 def test_host_module_no_ghost_edge_when_replace_clones_is_false(tmp_path: Path) -> None:
     """Verifies that replace_clones=False does not insert phantom edges into the dependency graph."""
     pkg = tmp_path / "ghost_pkg"
@@ -2572,113 +1214,6 @@ def test_host_module_no_ghost_edge_when_replace_clones_is_false(tmp_path: Path) 
     )
     assert "from ghost_pkg.mod_a import" not in patch_dry
     assert "Complete refactoring by importing the helper into ghost_pkg/mod_b.py" in patch_dry
-
-
-def test_future_annotations_propagation_in_shared_module(tmp_path: Path) -> None:
-    """Verifies that from __future__ import annotations is carried over to synthesized shared module."""
-    pkg = tmp_path / "future_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src_f1 = (
-        "from __future__ import annotations\n"
-        "from typing import List\n"
-        "\n"
-        "def process_models(items: List[str] | None) -> int:\n"
-        "    return len(items) if items else 0\n"
-    )
-    src_f2 = (
-        "from __future__ import annotations\n"
-        "from typing import List\n"
-        "\n"
-        "def handle_models(items: List[str] | None) -> int:\n"
-        "    return len(items) if items else 0\n"
-    )
-    (pkg / "f1.py").write_text(src_f1, encoding="utf-8")
-    (pkg / "f2.py").write_text(src_f2, encoding="utf-8")
-
-    u1 = {"name": "process_models", "file": "future_pkg/f1.py", "start": 4, "end": 5, "kind": "function"}
-    u2 = {"name": "handle_models", "file": "future_pkg/f2.py", "start": 4, "end": 5, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "diff --git a/future_pkg/_common.py b/future_pkg/_common.py" in patch
-    assert "+from __future__ import annotations" in patch
-    # Verify from __future__ import annotations comes before other imports in the diff
-    future_idx = patch.find("+from __future__ import annotations")
-    typing_idx = patch.find("+from typing import List")
-    assert future_idx != -1
-    assert typing_idx != -1
-    assert future_idx < typing_idx
-
-
-def test_shared_module_dry_run_no_ghost_edge_or_caller_import(tmp_path: Path) -> None:
-    """Verifies that replace_clones=False with shared_module does not emit caller imports or ghost edges."""
-    pkg = tmp_path / "dry_shared_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src_a = "def compute_a(x: int) -> int:\n    return x * 10 + 1\n"
-    src_b = "def compute_b(x: int) -> int:\n    return x * 10 + 1\n"
-    (pkg / "mod_a.py").write_text(src_a, encoding="utf-8")
-    (pkg / "mod_b.py").write_text(src_b, encoding="utf-8")
-
-    u_a = {"name": "compute_a", "file": "dry_shared_pkg/mod_a.py", "start": 1, "end": 2, "kind": "function"}
-    u_b = {"name": "compute_b", "file": "dry_shared_pkg/mod_b.py", "start": 1, "end": 2, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u_a, u_b)],
-        repo_root=str(tmp_path),
-        replace_clones=False,
-        cross_file_strategy="shared_module",
-    )
-
-    # _common.py is synthesized with the helper
-    assert "diff --git a/dry_shared_pkg/_common.py b/dry_shared_pkg/_common.py" in patch
-    assert "+def _shared_compute_a_compute_b(x: int) -> int:" in patch
-
-    # Callers receive the proposed import from _common
-    assert "+from dry_shared_pkg._common import _shared_compute_a_compute_b" in patch
-    # Function bodies are NOT replaced because replace_clones=False
-    assert "return _shared_compute_a_compute_b" not in patch
-    # Callers receive advisory comments explaining where helper was extracted
-    assert "Complete refactoring by replacing the clone with a call in dry_shared_pkg/mod_a.py" in patch
-    assert "Complete refactoring by replacing the clone with a call in dry_shared_pkg/mod_b.py" in patch
-
-
-def test_shared_module_existing_directory_skipped(tmp_path: Path) -> None:
-    """Verifies that when the target shared module path is an existing directory, extraction skips gracefully."""
-    pkg = tmp_path / "dir_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    # Create a directory named _common.py
-    dir_conflict = pkg / "_common.py"
-    dir_conflict.mkdir()
-
-    src_a = "def run_a(x: int) -> int:\n    return x + 5\n"
-    src_b = "def run_b(x: int) -> int:\n    return x + 5\n"
-    (pkg / "mod_a.py").write_text(src_a, encoding="utf-8")
-    (pkg / "mod_b.py").write_text(src_b, encoding="utf-8")
-
-    u_a = {"name": "run_a", "file": "dir_pkg/mod_a.py", "start": 1, "end": 2, "kind": "function"}
-    u_b = {"name": "run_b", "file": "dir_pkg/mod_b.py", "start": 1, "end": 2, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u_a, u_b)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "is an existing directory; skipping extraction" in patch
-    assert "new file mode 100644" not in patch
-
 
 def test_auto_strategy_falls_back_to_host_when_separate_packages(tmp_path: Path) -> None:
     """Verifies that auto strategy uses host_module instead of polluting repo root when files share no common package."""
@@ -2710,137 +1245,6 @@ def test_auto_strategy_falls_back_to_host_when_separate_packages(tmp_path: Path)
     assert "--- a/pkg_b/srv.py" in patch
     assert "from pkg_a.srv import _shared_process_handle" in patch
 
-
-def test_host_module_detects_cycle_from_synthesized_host_imports(tmp_path: Path) -> None:
-    """Verifies that host_module detects cycle when host gains an import pointing back to caller."""
-    pkg = tmp_path / "host_cycle_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    # mod_b has a helper function used by the clone in mod_b
-    src_b = (
-        "def helper_b(x: int) -> int:\n"
-        "    return x + 1\n"
-        "\n"
-        "def compute_b(x: int) -> int:\n"
-        "    y = helper_b(x)\n"
-        "    return y * 2\n"
-    )
-    src_a = (
-        "def helper_b(x: int) -> int:\n"
-        "    return x + 1\n"
-        "\n"
-        "def compute_a(x: int) -> int:\n"
-        "    y = helper_b(x)\n"
-        "    return y * 2\n"
-    )
-    (pkg / "mod_a.py").write_text(src_a, encoding="utf-8")
-    (pkg / "mod_b.py").write_text(src_b, encoding="utf-8")
-
-    u_a = {"name": "compute_a", "file": "host_cycle_pkg/mod_a.py", "start": 4, "end": 6, "kind": "function"}
-    u_b = {"name": "compute_b", "file": "host_cycle_pkg/mod_b.py", "start": 4, "end": 6, "kind": "function"}
-
-    # Pre-wire mod_a to import mod_b so mod_a -> mod_b
-    src_a_with_import = (
-        "from host_cycle_pkg.mod_b import helper_b\n"
-        "\n"
-        "def compute_a(x: int) -> int:\n"
-        "    y = helper_b(x)\n"
-        "    return y * 2\n"
-    )
-    (pkg / "mod_a.py").write_text(src_a_with_import, encoding="utf-8")
-    u_a["start"] = 3
-    u_a["end"] = 5
-
-    # If mod_b were to import mod_a, cycle mod_b -> mod_a -> mod_b would form
-    patch = generate_refactoring_patch(
-        [(1.0, u_a, u_b)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="host_module",
-    )
-
-    assert "Circular import detected" in patch or "Circular import or unresolvable module path" in patch
-    assert "from host_cycle_pkg.mod_a import _shared_compute_a_compute_b" not in patch
-
-
-def test_host_module_ignores_type_checking_guarded_direct_import(tmp_path: Path) -> None:
-    """Verifies that TYPE_CHECKING-only imports do not block safe host-module extraction."""
-    pkg_dir = tmp_path / "guard_pkg"
-    pkg_dir.mkdir()
-    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
-
-    src_host = (
-        "from typing import TYPE_CHECKING\n\n"
-        "if TYPE_CHECKING:\n"
-        "    import guard_pkg.caller\n\n"
-        "def compute_host(x: int) -> int:\n"
-        "    return x * 2 + 5\n"
-    )
-    src_caller = (
-        "def compute_caller(x: int) -> int:\n"
-        "    return x * 2 + 5\n"
-    )
-    (pkg_dir / "host.py").write_text(src_host, encoding="utf-8")
-    (pkg_dir / "caller.py").write_text(src_caller, encoding="utf-8")
-
-    u_host = {"name": "compute_host", "file": "guard_pkg/host.py", "start": 6, "end": 7, "kind": "function"}
-    u_caller = {"name": "compute_caller", "file": "guard_pkg/caller.py", "start": 1, "end": 2, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u_host, u_caller)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="host_module",
-    )
-
-    assert "Circular import or unresolvable module path" not in patch
-    assert "from guard_pkg.host import _shared_compute_host_compute_caller" in patch
-
-
-def test_shared_module_translates_local_relative_imports(tmp_path: Path) -> None:
-    """Verifies that relative function-local imports in clones are translated to canonical absolute paths."""
-    pkg = tmp_path / "local_rel_pkg"
-    sub1 = pkg / "sub1"
-    sub2 = pkg / "sub2"
-    sub1.mkdir(parents=True)
-    sub2.mkdir(parents=True)
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    (sub1 / "__init__.py").write_text("", encoding="utf-8")
-    (sub2 / "__init__.py").write_text("", encoding="utf-8")
-
-    (pkg / "helpers.py").write_text("def transform(x: int) -> int:\n    return x + 42\n", encoding="utf-8")
-
-    src_1 = (
-        "def compute_1(x: int) -> int:\n"
-        "    from ..helpers import transform\n"
-        "    return transform(x)\n"
-    )
-    src_2 = (
-        "def compute_2(x: int) -> int:\n"
-        "    from ..helpers import transform\n"
-        "    return transform(x)\n"
-    )
-    (sub1 / "mod1.py").write_text(src_1, encoding="utf-8")
-    (sub2 / "mod2.py").write_text(src_2, encoding="utf-8")
-
-    u1 = {"name": "compute_1", "file": "local_rel_pkg/sub1/mod1.py", "start": 1, "end": 3, "kind": "function"}
-    u2 = {"name": "compute_2", "file": "local_rel_pkg/sub2/mod2.py", "start": 1, "end": 3, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    # In local_rel_pkg/_common.py, the import should be canonicalized to from local_rel_pkg.helpers import transform
-    assert "from local_rel_pkg.helpers import transform" in patch
-    # Should NOT have verbatim 'from ..helpers import transform' added in the shared module
-    assert "+from ..helpers import transform" not in patch
-    assert "+    from ..helpers import transform" not in patch
-
-
 def test_register_plan_dependencies_init_package_context(tmp_path: Path) -> None:
     """Verifies that _register_plan_dependencies_in_graph correctly identifies __init__.py as package context."""
     from pydoppelgangerhunt.fixer.patch import _register_plan_dependencies_in_graph  # pylint: disable=import-outside-toplevel
@@ -2860,387 +1264,6 @@ def test_register_plan_dependencies_init_package_context(tmp_path: Path) -> None
 
     # dg should have edge my_package -> my_package.deps
     assert "my_package.deps" in dg.get_dependencies("my_package")
-
-
-def test_shared_module_translates_local_relative_imports_package_init(tmp_path: Path) -> None:
-    """Verifies that relative function-local imports in pkg/__init__.py are translated with package context."""
-    pkg = tmp_path / "pkg_init_test"
-    pkg.mkdir()
-    (pkg / "deps.py").write_text("def helper(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
-
-    src_init = (
-        "def compute_init(x: int) -> int:\n"
-        "    from .deps import helper\n"
-        "    return helper(x)\n"
-    )
-    src_mod = (
-        "def compute_mod(x: int) -> int:\n"
-        "    from .deps import helper\n"
-        "    return helper(x)\n"
-    )
-    (pkg / "__init__.py").write_text(src_init, encoding="utf-8")
-    (pkg / "mod.py").write_text(src_mod, encoding="utf-8")
-
-    u1 = {"name": "compute_init", "file": "pkg_init_test/__init__.py", "start": 1, "end": 3, "kind": "function"}
-    u2 = {"name": "compute_mod", "file": "pkg_init_test/mod.py", "start": 1, "end": 3, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    # In pkg_init_test/_common.py, the import should be translated to from pkg_init_test.deps import helper
-    assert "from pkg_init_test.deps import helper" in patch
-    # Should NOT have resolved to from deps import helper (which would be missing pkg_init_test.)
-    assert "+from deps import helper" not in patch
-    assert "+    from deps import helper" not in patch
-
-
-def test_existing_shared_module_gains_future_annotations_from_source(tmp_path: Path) -> None:
-    """Verifies that an existing shared module gains future annotations when clone source has them."""
-    pkg = tmp_path / "future_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    # Pre-existing _common.py without future annotations
-    (pkg / "_common.py").write_text("def existing_helper() -> None:\n    pass\n", encoding="utf-8")
-
-    src1 = (
-        "from __future__ import annotations\n"
-        "from dep_pkg import Later\n\n"
-        "def run_calc(x: Later) -> Later:\n"
-        "    return x\n"
-    )
-    src2 = (
-        "from __future__ import annotations\n"
-        "from dep_pkg import Later\n\n"
-        "def run_calc2(x: Later) -> Later:\n"
-        "    return x\n"
-    )
-    (pkg / "mod1.py").write_text(src1, encoding="utf-8")
-    (pkg / "mod2.py").write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "run_calc", "file": "future_pkg/mod1.py", "start": 4, "end": 5, "kind": "function"}
-    u2 = {"name": "run_calc2", "file": "future_pkg/mod2.py", "start": 4, "end": 5, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    # _common.py should receive from __future__ import annotations
-    assert "+from __future__ import annotations" in patch
-
-
-def test_canonicalize_helper_preserves_comments_and_pragmas() -> None:
-    """Verifies that canonicalizing relative imports preserves inline comments, pragmas, and formatting."""
-    from pydoppelgangerhunt.fixer.patch import _canonicalize_helper_relative_imports  # pylint: disable=import-outside-toplevel
-
-    helper = (
-        "def helper_func(x: int) -> int:\n"
-        "    # Important internal logic comment\n"
-        "    from .utils import convert  # type: ignore[import-untyped]\n"
-        "    # Another inline remark\n"
-        "    return convert(x)  # noqa: E501\n"
-    )
-    canonicalized = _canonicalize_helper_relative_imports(helper, [("my_pkg.sub.mod", False)])
-    assert "from my_pkg.sub.utils import convert  # type: ignore[import-untyped]" in canonicalized
-    assert "# Important internal logic comment" in canonicalized
-    assert "# Another inline remark" in canonicalized
-    assert "# noqa: E501" in canonicalized
-
-
-def test_collect_host_missing_imports_preserves_aliased_typing(tmp_path: Path) -> None:
-    """Verifies that aliased typing imports (e.g. from typing import List as MyList) are preserved."""
-    pkg = tmp_path / "alias_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = (
-        "from typing import List as MyList\n\n"
-        "def process(items: MyList[int]) -> int:\n"
-        "    return len(items)\n"
-    )
-    src2 = (
-        "from typing import List as MyList\n\n"
-        "def process2(items: MyList[int]) -> int:\n"
-        "    return len(items)\n"
-    )
-    (pkg / "mod1.py").write_text(src1, encoding="utf-8")
-    (pkg / "mod2.py").write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "process", "file": "alias_pkg/mod1.py", "start": 3, "end": 4, "kind": "function"}
-    u2 = {"name": "process2", "file": "alias_pkg/mod2.py", "start": 3, "end": 4, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    # In _common.py, the aliased typing import should be present
-    assert "from typing import List as MyList" in patch
-
-
-def test_generate_patch_relative_repo_root_no_path_doubling(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Verifies that passing a relative repo_root does not duplicate path components."""
-    monkeypatch.chdir(tmp_path)
-    rel_root = Path("sub_proj")
-    pkg = rel_root / "my_pkg"
-    pkg.mkdir(parents=True)
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src = "def util(a: int) -> int:\n    return a * 2\n"
-    (pkg / "a.py").write_text(src, encoding="utf-8")
-    (pkg / "b.py").write_text(src, encoding="utf-8")
-
-    u1 = {"name": "util", "file": str(pkg / "a.py"), "start": 1, "end": 2, "kind": "function"}
-    u2 = {"name": "util", "file": str(pkg / "b.py"), "start": 1, "end": 2, "kind": "function"}
-
-    # Pass genuinely relative repo_root
-    rel_repo_root = "sub_proj"
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=rel_repo_root,
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "sub_proj/sub_proj" not in patch.replace("\\", "/")
-    assert "my_pkg/_common.py" in patch.replace("\\", "/")
-
-
-def test_generate_patch_conflicting_import_symbols_skips_extraction(tmp_path: Path) -> None:
-    """Verifies that clones binding the same symbol to different modules skip extraction."""
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    sub1 = pkg / "sub1"
-    sub1.mkdir()
-    (sub1 / "__init__.py").write_text("", encoding="utf-8")
-    (sub1 / "helpers.py").write_text("class CustomType:\n    pass\n", encoding="utf-8")
-
-    sub2 = pkg / "sub2"
-    sub2.mkdir()
-    (sub2 / "__init__.py").write_text("", encoding="utf-8")
-    (sub2 / "helpers.py").write_text("class CustomType:\n    pass\n", encoding="utf-8")
-
-    src1 = (
-        "from .helpers import CustomType\n\n"
-        "def compute(item: CustomType) -> int:\n"
-        "    return len(item)\n"
-    )
-    src2 = (
-        "from .helpers import CustomType\n\n"
-        "def compute(item: CustomType) -> int:\n"
-        "    return len(item)\n"
-    )
-    f1 = sub1 / "worker.py"
-    f2 = sub2 / "worker.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "compute", "file": str(f1), "start": 3, "end": 4, "kind": "function"}
-    u2 = {"name": "compute", "file": str(f2), "start": 3, "end": 4, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "conflicting imported symbol 'CustomType'" in patch
-    assert "skipping extraction" in patch
-    assert "_common.py" not in patch
-
-
-def test_generate_patch_skips_guarded_imports_in_shared_module(tmp_path: Path) -> None:
-    """Verifies that imports inside conditional or guarded blocks are not emitted into shared modules."""
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = (
-        "from typing import List\n"
-        "if True:\n"
-        "    from typing_extensions import Buffer\n\n"
-        "def run_job(x: List[int]) -> int:\n"
-        "    return len(x)\n"
-    )
-    src2 = (
-        "from typing import List\n"
-        "try:\n"
-        "    import optional_dep\n"
-        "except ImportError:\n"
-        "    pass\n\n"
-        "def run_job(x: List[int]) -> int:\n"
-        "    return len(x)\n"
-    )
-    f1 = pkg / "a.py"
-    f2 = pkg / "b.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "run_job", "file": str(f1), "start": 5, "end": 6, "kind": "function"}
-    u2 = {"name": "run_job", "file": str(f2), "start": 7, "end": 8, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    common_section = patch.split("diff --git a/pkg/_common.py")[-1]
-    assert "from typing import List" in common_section
-    assert "Buffer" not in common_section
-    assert "optional_dep" not in common_section
-
-
-def test_generate_patch_wildcard_import_unresolved_symbol(tmp_path: Path) -> None:
-    """Verifies that an unresolved symbol in a helper where source used wildcard import skips extraction."""
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = (
-        "from math import *\n\n"
-        "def calc(x: CustomType) -> float:\n"
-        "    return float(len(str(x)))\n"
-    )
-    src2 = (
-        "from math import *\n\n"
-        "def calc(x: CustomType) -> float:\n"
-        "    return float(len(str(x)))\n"
-    )
-    f1 = pkg / "m1.py"
-    f2 = pkg / "m2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "calc", "file": str(f1), "start": 3, "end": 4, "kind": "function"}
-    u2 = {"name": "calc", "file": str(f2), "start": 3, "end": 4, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "potentially relies on wildcard import" in patch
-    assert "skipping extraction" in patch
-
-
-def test_cross_file_wildcard_with_explicit_import_rejected(tmp_path: Path) -> None:
-    """Verifies that cross-file extraction is rejected when one clone uses wildcard and another has explicit import."""
-    pkg = tmp_path / "pkg_wildcard_mixed"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = (
-        "from dep_a import *\n\n"
-        "def process(x: TransformType) -> int:\n"
-        "    return 42\n"
-    )
-    src2 = (
-        "from dep_b import TransformType\n\n"
-        "def process(x: TransformType) -> int:\n"
-        "    return 42\n"
-    )
-    f1 = pkg / "m1.py"
-    f2 = pkg / "m2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "process", "file": str(f1), "start": 3, "end": 4, "kind": "function"}
-    u2 = {"name": "process", "file": str(f2), "start": 3, "end": 4, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "potentially relies on wildcard import" in patch
-    assert "skipping extraction" in patch
-    assert "from dep_b import TransformType" not in patch
-
-
-def test_same_file_wildcard_import_allowed(tmp_path: Path) -> None:
-    """Verifies that same-file clones sharing a module-level wildcard import are extracted."""
-    pkg = tmp_path / "pkg_same_file_wildcard"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src = (
-        "from math import *\n\n"
-        "def run_a(x: int) -> float:\n"
-        "    return float(x) * 2.0\n\n"
-        "def run_b(x: int) -> float:\n"
-        "    return float(x) * 2.0\n"
-    )
-    f = pkg / "mod.py"
-    f.write_text(src, encoding="utf-8")
-
-    u1 = {"name": "run_a", "file": str(f), "start": 3, "end": 4, "kind": "function"}
-    u2 = {"name": "run_b", "file": str(f), "start": 6, "end": 7, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-
-    assert "potentially relies on wildcard import" not in patch
-    assert "def _shared_run_a" in patch
-
-
-def test_shared_module_rejects_unresolved_nonbuiltin_dependency(tmp_path: Path) -> None:
-    """Verifies that a helper referencing an unimported module-local type rejects shared module extraction."""
-    pkg = tmp_path / "pkg_unresolved"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = (
-        "class LocalDep:\n"
-        "    pass\n\n"
-        "def compute_1(x: LocalDep) -> int:\n"
-        "    return 42\n"
-    )
-    src2 = (
-        "class LocalDep:\n"
-        "    pass\n\n"
-        "def compute_2(x: LocalDep) -> int:\n"
-        "    return 42\n"
-    )
-    f1 = pkg / "m1.py"
-    f2 = pkg / "m2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "compute_1", "file": str(f1), "start": 4, "end": 5, "kind": "function"}
-    u2 = {"name": "compute_2", "file": str(f2), "start": 4, "end": 5, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "unresolved symbol 'LocalDep' in shared module" in patch
-    assert "skipping extraction" in patch
-
 
 def test_host_module_rejects_unresolved_nonbuiltin_dependency(tmp_path: Path) -> None:
     """Verifies that a helper referencing a type only defined in clone 2 file rejects host module extraction."""
@@ -3275,512 +1298,6 @@ def test_host_module_rejects_unresolved_nonbuiltin_dependency(tmp_path: Path) ->
 
     assert "unresolved symbol 'DepOnlyInTwo' in host module" in patch
     assert "skipping extraction" in patch
-
-
-def test_shared_module_rejects_conflicting_local_imports(tmp_path: Path) -> None:
-    """Verifies that clones with conflicting local imports for the same symbol are rejected."""
-    pkg = tmp_path / "pkg_conflicting_locals"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = (
-        "def calc_1(x: float) -> float:\n"
-        "    from math import sin as f\n"
-        "    return f(x)\n"
-    )
-    src2 = (
-        "def calc_2(x: float) -> float:\n"
-        "    from cmath import sin as f\n"
-        "    return f(x).real\n"
-    )
-    f1 = pkg / "m1.py"
-    f2 = pkg / "m2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "calc_1", "file": str(f1), "start": 1, "end": 3, "kind": "function"}
-    u2 = {"name": "calc_2", "file": str(f2), "start": 1, "end": 3, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "conflicting local import symbol 'f' across clone sources" in patch
-    assert "skipping extraction" in patch
-
-
-def test_host_module_detects_conflicting_imported_symbol_with_host(tmp_path: Path) -> None:
-    """Verifies that extraction is skipped if host module already imports the symbol from another package."""
-    pkg = tmp_path / "pkg_host_conflict"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = (
-        "from pkg_a import transform\n\n"
-        "def run_1(x: int) -> int:\n"
-        "    from pkg_b import transform\n"
-        "    return transform(x)\n"
-    )
-    src2 = (
-        "def run_2(x: int) -> int:\n"
-        "    from pkg_b import transform\n"
-        "    return transform(x)\n"
-    )
-    f1 = pkg / "m1.py"
-    f2 = pkg / "m2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "run_1", "file": str(f1), "start": 3, "end": 5, "kind": "function"}
-    u2 = {"name": "run_2", "file": str(f2), "start": 1, "end": 3, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="host",
-    )
-
-    assert "conflicting imported symbol 'transform' across clone sources" in patch
-    assert "skipping extraction" in patch
-
-
-def test_canonicalize_helper_relative_imports_with_nonstandard_whitespace() -> None:
-    """Verifies that relative imports with irregular whitespace are parsed and canonicalized."""
-    from pydoppelgangerhunt.fixer.patch import _canonicalize_helper_relative_imports  # pylint: disable=import-outside-toplevel
-
-    code = (
-        "def helper(x: int) -> int:\n"
-        "    from   .helpers   import   transform\n"
-        "    return transform(x)\n"
-    )
-    res = _canonicalize_helper_relative_imports(code, [("my_pkg.mod", False)])
-    assert "from my_pkg.helpers import transform" in res
-    assert "from   ." not in res
-
-
-def test_shared_module_rejects_conflicting_local_relative_imports(tmp_path: Path) -> None:
-    """Verifies that clones in different subpackages using conflicting relative imports are rejected."""
-    pkg = tmp_path / "conflict_rel_pkg"
-    sub1 = pkg / "sub1"
-    sub2 = pkg / "sub2"
-    sub1.mkdir(parents=True)
-    sub2.mkdir(parents=True)
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    (sub1 / "__init__.py").write_text("", encoding="utf-8")
-    (sub2 / "__init__.py").write_text("", encoding="utf-8")
-
-    (sub1 / "helpers.py").write_text("def transform(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
-    (sub2 / "helpers.py").write_text("def transform(x: int) -> int:\n    return x + 2\n", encoding="utf-8")
-
-    src_1 = (
-        "def compute_1(x: int) -> int:\n"
-        "    from .helpers import transform\n"
-        "    return transform(x)\n"
-    )
-    src_2 = (
-        "def compute_2(x: int) -> int:\n"
-        "    from .helpers import transform\n"
-        "    return transform(x)\n"
-    )
-    (sub1 / "mod1.py").write_text(src_1, encoding="utf-8")
-    (sub2 / "mod2.py").write_text(src_2, encoding="utf-8")
-
-    u1 = {"name": "compute_1", "file": "conflict_rel_pkg/sub1/mod1.py", "start": 1, "end": 3, "kind": "function"}
-    u2 = {"name": "compute_2", "file": "conflict_rel_pkg/sub2/mod2.py", "start": 1, "end": 3, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert (
-        "conflicting relative import in helper across clone sources" in patch
-        or "conflicting local import symbol 'transform' across clone sources" in patch
-    )
-    assert "from conflict_rel_pkg.sub1.helpers import transform" not in patch
-
-
-def test_same_file_conflicting_local_imports_skips_without_corrupting_plan(tmp_path: Path) -> None:
-    """Verifies same-file clones with conflicting local imports skip extraction cleanly without dirtying plan."""
-    f = tmp_path / "same_file_mod.py"
-    f.write_text(
-        "def foo(x: int) -> int:\n"
-        "    from math import sqrt as f\n"
-        "    return f(x)\n\n"
-        "def bar(x: int) -> int:\n"
-        "    from cmath import sqrt as f\n"
-        "    return f(x).real\n",
-        encoding="utf-8",
-    )
-    u1 = {"name": "foo", "file": str(f), "start": 1, "end": 3, "kind": "function"}
-    u2 = {"name": "bar", "file": str(f), "start": 5, "end": 7, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-
-    assert "conflicting local import symbol 'f' across clone sources" in patch
-    assert "skipping extraction" in patch
-    assert "_shared_foo_bar" not in patch
-
-
-def test_local_imports_not_hoisted_to_module_scope(tmp_path: Path) -> None:
-    """Verifies that lazy/guarded local imports stay inside the helper body and are not hoisted to module scope."""
-    pkg = tmp_path / "lazy_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = (
-        "def do_calc1(x: int) -> int:\n"
-        "    import math\n"
-        "    return math.isqrt(x)\n"
-    )
-    src2 = (
-        "def do_calc2(x: int) -> int:\n"
-        "    import math\n"
-        "    return math.isqrt(x)\n"
-    )
-    f1 = pkg / "m1.py"
-    f2 = pkg / "m2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "do_calc1", "file": str(f1), "start": 1, "end": 3, "kind": "function"}
-    u2 = {"name": "do_calc2", "file": str(f2), "start": 1, "end": 3, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "diff --git a/lazy_pkg/_common.py b/lazy_pkg/_common.py" in patch
-    assert "+    import math" in patch
-    assert "\n+import math\n" not in patch
-
-
-def test_host_existing_relative_imports_canonicalized_without_false_conflict(tmp_path: Path) -> None:
-    """Verifies that existing relative imports in host module match canonicalized clone imports without conflict."""
-    pkg = tmp_path / "rel_host_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    (pkg / "helpers.py").write_text("class CustomType:\n    pass\n", encoding="utf-8")
-
-    host_src = (
-        "from .helpers import CustomType\n\n"
-        "def run_host(val: CustomType) -> CustomType:\n"
-        "    return val\n"
-    )
-    caller_src = (
-        "from rel_host_pkg.helpers import CustomType\n\n"
-        "def run_caller(val: CustomType) -> CustomType:\n"
-        "    return val\n"
-    )
-
-    f_host = pkg / "host_mod.py"
-    f_caller = pkg / "caller_mod.py"
-    f_host.write_text(host_src, encoding="utf-8")
-    f_caller.write_text(caller_src, encoding="utf-8")
-
-    u1 = {"name": "run_host", "file": str(f_host), "start": 3, "end": 4, "kind": "function"}
-    u2 = {"name": "run_caller", "file": str(f_caller), "start": 3, "end": 4, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="host",
-    )
-
-    assert "conflicting imported symbol" not in patch
-    assert "skipping extraction" not in patch
-    assert "from rel_host_pkg.host_mod import _shared_run_host_run_caller" in patch
-
-
-def test_shared_module_resolution_failure_adds_advisory_comment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Verifies that if resolve_shared_module_file raises ValueError, patch adds skip advisory comment."""
-    pkg = tmp_path / "unsafe_shared_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = "def fn1(x: int) -> int:\n    return x + 1\n"
-    src2 = "def fn2(x: int) -> int:\n    return x + 1\n"
-    f1 = pkg / "m1.py"
-    f2 = pkg / "m2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "fn1", "file": str(f1), "start": 1, "end": 2, "kind": "function"}
-    u2 = {"name": "fn2", "file": str(f2), "start": 1, "end": 2, "kind": "function"}
-
-    from pydoppelgangerhunt.fixer import patch as patch_mod  # pylint: disable=import-outside-toplevel
-
-    def mock_resolve_shared(*args: Any, **kwargs: Any) -> Path:
-        raise ValueError("Shared module path resolves outside common package directory")
-
-    monkeypatch.setattr(patch_mod, "resolve_shared_module_file", mock_resolve_shared)
-
-    patch = patch_mod.generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "Shared module path resolves outside common package directory" in patch
-    assert "skipping extraction" in patch
-    assert "_common.py" not in patch
-
-
-def test_shared_module_resolution_filesystem_error_adds_advisory_comment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Verifies that if resolve_shared_module_file raises OSError or RuntimeError, patch adds skip advisory comment."""
-    pkg = tmp_path / "oserr_shared_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = "def fn1(x: int) -> int:\n    return x + 1\n"
-    src2 = "def fn2(x: int) -> int:\n    return x + 1\n"
-    f1 = pkg / "m1.py"
-    f2 = pkg / "m2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "fn1", "file": str(f1), "start": 1, "end": 2, "kind": "function"}
-    u2 = {"name": "fn2", "file": str(f2), "start": 1, "end": 2, "kind": "function"}
-
-    from pydoppelgangerhunt.fixer import patch as patch_mod  # pylint: disable=import-outside-toplevel
-
-    def mock_resolve_oserror(*args: Any, **kwargs: Any) -> Path:
-        raise OSError("Permission denied: cannot access directory")
-
-    monkeypatch.setattr(patch_mod, "resolve_shared_module_file", mock_resolve_oserror)
-
-    patch_os = patch_mod.generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "Permission denied: cannot access directory" in patch_os
-    assert "skipping extraction" in patch_os
-    assert "_common.py" not in patch_os
-
-    def mock_resolve_runtime_err(*args: Any, **kwargs: Any) -> Path:
-        raise RuntimeError("Symlink loop detected")
-
-    monkeypatch.setattr(patch_mod, "resolve_shared_module_file", mock_resolve_runtime_err)
-
-    patch_rt = patch_mod.generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "Symlink loop detected" in patch_rt
-    assert "skipping extraction" in patch_rt
-    assert "_common.py" not in patch_rt
-
-
-def test_clone_sources_conflicting_definition_and_import_rejected(tmp_path: Path) -> None:
-    """Verifies that if one clone imports a symbol while another defines it locally, extraction is rejected."""
-    pkg = tmp_path / "conflict_def_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = (
-        "from dep import CustomType\n\n"
-        "def calc1(x: CustomType) -> int:\n"
-        "    return 42\n"
-    )
-    src2 = (
-        "class CustomType:\n"
-        "    pass\n\n"
-        "def calc2(x: CustomType) -> int:\n"
-        "    return 42\n"
-    )
-    f1 = pkg / "m1.py"
-    f2 = pkg / "m2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "calc1", "file": str(f1), "start": 3, "end": 4, "kind": "function"}
-    u2 = {"name": "calc2", "file": str(f2), "start": 4, "end": 5, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "conflicting imported symbol 'CustomType' across clone sources" in patch
-    assert "skipping extraction" in patch
-
-
-def test_clone_sources_inconsistent_binding_missing_import_rejected(tmp_path: Path) -> None:
-    """Verifies that if one clone imports a symbol while another has no binding for it, extraction is rejected."""
-    pkg = tmp_path / "inconsistent_bind_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = (
-        "from dep import CustomType\n\n"
-        "def calc1(x: CustomType) -> int:\n"
-        "    return 42\n"
-    )
-    src2 = (
-        "def calc2(x: CustomType) -> int:\n"
-        "    return 42\n"
-    )
-    f1 = pkg / "m1.py"
-    f2 = pkg / "m2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "calc1", "file": str(f1), "start": 3, "end": 4, "kind": "function"}
-    u2 = {"name": "calc2", "file": str(f2), "start": 1, "end": 2, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "conflicting imported symbol 'CustomType' across clone sources" in patch
-    assert "skipping extraction" in patch
-
-
-def test_helper_retains_module_import_when_local_import_not_selected(tmp_path: Path) -> None:
-    """Verifies that module-level import is hoisted when clone 2 had local import not present in clone 1 helper."""
-    pkg = tmp_path / "retained_local_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = (
-        "from math import sqrt\n\n"
-        "def calc1(x: int) -> float:\n"
-        "    return sqrt(x)\n"
-    )
-    src2 = (
-        "def calc2(x: int) -> float:\n"
-        "    from math import sqrt\n"
-        "    return sqrt(x)\n"
-    )
-    f1 = pkg / "m1.py"
-    f2 = pkg / "m2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "calc1", "file": str(f1), "start": 3, "end": 4, "kind": "function"}
-    u2 = {"name": "calc2", "file": str(f2), "start": 1, "end": 3, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=False,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "from math import sqrt" in patch
-    assert "skipping extraction" not in patch
-    assert "diff --git a/retained_local_pkg/_common.py b/retained_local_pkg/_common.py" in patch
-
-
-def test_nested_function_parameters_do_not_shadow_outer_helper_imports(tmp_path: Path) -> None:
-    """Verifies that nested function parameters in helper do not prevent module-level imports from hoisting."""
-    pkg = tmp_path / "nested_shadow_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = (
-        "from math import sqrt as transform\n\n"
-        "def runner1(x: int) -> float:\n"
-        "    res = transform(x)\n"
-        "    def inner(transform: int) -> int:\n"
-        "        return transform + 1\n"
-        "    return res + inner(1)\n"
-    )
-    src2 = (
-        "from math import sqrt as transform\n\n"
-        "def runner2(x: int) -> float:\n"
-        "    res = transform(x)\n"
-        "    def inner(transform: int) -> int:\n"
-        "        return transform + 1\n"
-        "    return res + inner(1)\n"
-    )
-    f1 = pkg / "m1.py"
-    f2 = pkg / "m2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "runner1", "file": str(f1), "start": 3, "end": 7, "kind": "function"}
-    u2 = {"name": "runner2", "file": str(f2), "start": 3, "end": 7, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "from math import sqrt as transform" in patch
-    assert "skipping extraction" not in patch
-
-
-def test_symlink_shared_module_target_rejected_with_advisory_comment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Verifies that if target shared module is a symlink, extraction is skipped with advisory comment."""
-    pkg = tmp_path / "sym_target_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = "def f1(x: int) -> int:\n    return x + 1\n"
-    src2 = "def f2(x: int) -> int:\n    return x + 1\n"
-    f1 = pkg / "m1.py"
-    f2 = pkg / "m2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "f1", "file": str(f1), "start": 1, "end": 2, "kind": "function"}
-    u2 = {"name": "f2", "file": str(f2), "start": 1, "end": 2, "kind": "function"}
-
-    orig_is_symlink = Path.is_symlink
-
-    def mock_is_symlink(self: Path) -> bool:
-        if self.name == "_common.py":
-            return True
-        return orig_is_symlink(self)
-
-    monkeypatch.setattr(Path, "is_symlink", mock_is_symlink)
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "is an existing symlink" in patch
-    assert "skipping extraction" in patch
-    assert "diff --git" not in patch
-
 
 def test_generate_refactoring_patch_when_target_is_package_directory(tmp_path: Path) -> None:
     """Verifies that when repo_root is a package directory, imports retain enclosing package context."""
@@ -3833,55 +1350,6 @@ def test_generate_refactoring_patch_when_target_is_package_directory(tmp_path: P
     assert apply_res.returncode == 0
     assert (sub_pkg / "_common.py").is_file()
     assert "_shared_calc_one_calc_two" in (sub_pkg / "_common.py").read_text(encoding="utf-8")
-
-
-def test_generate_refactoring_patch_with_package_root_depgraph_preserves_cycle_detection(
-    tmp_path: Path,
-) -> None:
-    """Verifies externally built depgraphs from package roots use the same module namespace."""
-    from pydoppelgangerhunt.fixer.depgraph import build_module_graph  # pylint: disable=import-outside-toplevel
-
-    project_root = tmp_path / "project"
-    project_root.mkdir()
-    top_pkg = project_root / "my_package"
-    top_pkg.mkdir()
-    (top_pkg / "__init__.py").write_text("", encoding="utf-8")
-    (top_pkg / "caller.py").write_text(
-        "def compute_c(x: int) -> int:\n"
-        "    return x + 10\n",
-        encoding="utf-8",
-    )
-    (top_pkg / "mid.py").write_text(
-        "import my_package.caller\n\n"
-        "def compute_m(x: int) -> int:\n"
-        "    return my_package.caller.compute_c(x)\n",
-        encoding="utf-8",
-    )
-    (top_pkg / "host.py").write_text(
-        "import my_package.mid\n\n"
-        "def compute_h(x: int) -> int:\n"
-        "    return x + 10\n",
-        encoding="utf-8",
-    )
-
-    depgraph = build_module_graph(top_pkg)
-    u_host = {"name": "compute_h", "file": "host.py", "start": 3, "end": 4, "kind": "function"}
-    u_caller = {"name": "compute_c", "file": "caller.py", "start": 1, "end": 2, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u_host, u_caller)],
-        repo_root=str(top_pkg),
-        replace_clones=True,
-        cross_file_strategy="host_module",
-        depgraph=depgraph,
-    )
-
-    assert (
-        "Circular import or unresolvable module path "
-        "(cycle: my_package.caller -> my_package.host -> my_package.mid -> my_package.caller)"
-    ) in patch
-    assert "from my_package.host import _shared_compute_h_compute_c" not in patch
-
 
 def test_generate_refactoring_patch_src_layout_uses_project_root_patch_paths(
     tmp_path: Path,
@@ -3959,7 +1427,6 @@ def test_generate_refactoring_patch_src_layout_uses_project_root_patch_paths(
     assert apply_res.returncode == 0
     assert (sub_pkg / "_common.py").is_file()
 
-
 def test_generate_refactoring_patch_file_repo_root_uses_project_root_patch_paths(
     tmp_path: Path,
 ) -> None:
@@ -4033,7 +1500,6 @@ def test_generate_refactoring_patch_file_repo_root_uses_project_root_patch_paths
     assert apply_res.returncode == 0
     assert (top_pkg / "_common.py").is_file()
 
-
 def test_generate_refactoring_patch_strategy_normalization(tmp_path: Path) -> None:
     """Verifies that strategy arguments handle whitespace, casing, and unknown fallback gracefully."""
     f1 = tmp_path / "a.py"
@@ -4052,89 +1518,6 @@ def test_generate_refactoring_patch_strategy_normalization(tmp_path: Path) -> No
     )
     assert "--- a/a.py" in patch
     assert "+++ b/a.py" in patch
-
-
-def test_collect_host_missing_imports_handles_shadowed_builtins(tmp_path: Path) -> None:
-    """Verifies that shadowed builtins are hoisted when consistent or rejected when conflicting."""
-    pkg = tmp_path / "shadow_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    # Consistent shadowing: both modules import a custom `len`
-    src1_consistent = (
-        "from custom_utils import len\n\n"
-        "def count_items1(items: list) -> int:\n"
-        "    return len(items) + 1\n"
-    )
-    src2_consistent = (
-        "from custom_utils import len\n\n"
-        "def count_items2(items: list) -> int:\n"
-        "    return len(items) + 1\n"
-    )
-    f1 = pkg / "c1.py"
-    f2 = pkg / "c2.py"
-    f1.write_text(src1_consistent, encoding="utf-8")
-    f2.write_text(src2_consistent, encoding="utf-8")
-
-    u1 = {"name": "count_items1", "file": str(f1), "start": 3, "end": 4, "kind": "function"}
-    u2 = {"name": "count_items2", "file": str(f2), "start": 3, "end": 4, "kind": "function"}
-
-    patch_consistent = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "from custom_utils import len" in patch_consistent
-    assert "from shadow_pkg._common import _shared_count_items1_count_items2" in patch_consistent
-
-    # Inconsistent shadowing: one clone imports custom `len`, the other uses builtin `len`
-    src2_inconsistent = (
-        "def count_items2(items: list) -> int:\n"
-        "    return len(items) + 1\n"
-    )
-    f2.write_text(src2_inconsistent, encoding="utf-8")
-    u2_inconsistent = {"name": "count_items2", "file": str(f2), "start": 1, "end": 2, "kind": "function"}
-
-    patch_inconsistent = generate_refactoring_patch(
-        [(1.0, u1, u2_inconsistent)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "conflicting imported symbol 'len'" in patch_inconsistent
-    assert "skipping extraction" in patch_inconsistent
-
-
-def test_generate_refactoring_patch_cross_file_strategy_skip(tmp_path: Path) -> None:
-    """Verifies that cross_file_strategy='skip' bypasses cross-file clones while allowing same-file clones."""
-    f1 = tmp_path / "mod1.py"
-    f2 = tmp_path / "mod2.py"
-    f1.write_text("def a():\n    return 1\ndef b():\n    return 1\n", encoding="utf-8")
-    f2.write_text("def c():\n    return 1\n", encoding="utf-8")
-
-    u_a = {"name": "a", "file": "mod1.py", "start": 1, "end": 2, "kind": "function"}
-    u_b = {"name": "b", "file": "mod1.py", "start": 3, "end": 4, "kind": "function"}
-    u_c = {"name": "c", "file": "mod2.py", "start": 1, "end": 2, "kind": "function"}
-
-    # Pure cross-file pair with skip should produce no patch
-    patch_cross = generate_refactoring_patch(
-        [(1.0, u_a, u_c)],
-        repo_root=str(tmp_path),
-        cross_file_strategy="skip",
-    )
-    assert patch_cross == ""
-
-    # Same-file pair should still be extracted even when cross_file_strategy='skip'
-    patch_same = generate_refactoring_patch(
-        [(1.0, u_a, u_b)],
-        repo_root=str(tmp_path),
-        cross_file_strategy="skip",
-    )
-    assert "def _shared_a_b" in patch_same
-
 
 def test_generate_refactoring_patch_nested_subdirectory_without_init(tmp_path: Path) -> None:
     """Verifies scanning a nested directory inside a package produces fully-qualified import paths."""
@@ -4166,237 +1549,6 @@ def test_generate_refactoring_patch_nested_subdirectory_without_init(tmp_path: P
     assert "--- a/my_pkg/tools/b.py" in patch
     assert "+++ b/my_pkg/tools/b.py" in patch
     assert "+++ b/my_pkg/tools/_common.py" in patch
-
-
-def test_nested_imports_do_not_suppress_outer_helper_imports(tmp_path: Path) -> None:
-    """Verifies that imports in nested functions/classes do not suppress outer helper imports."""
-    # pylint: disable=protected-access
-    code = (
-        "def helper(x: int) -> int:\n"
-        "    res = transform(x)\n"
-        "    def inner(y: int) -> int:\n"
-        "        from inner_pkg import transform\n"
-        "        return transform(y)\n"
-        "    return res + inner(x)\n"
-    )
-    tree = ast.parse(code)
-    free_names, defined_names, local_imports = patch_mod._extract_helper_symbols(tree)
-    assert "transform" in free_names
-    assert "transform" not in local_imports
-    assert "helper" in defined_names
-    assert "x" in defined_names
-    assert "inner" in defined_names
-    assert "y" not in defined_names
-
-    # End-to-end patch generation test:
-    # Outer helper uses `transform`, while inner function locally imports a different `transform`.
-    # Ensure `from mymod import transform` is hoisted to the shared module header.
-    pkg = tmp_path / "nested_import_pkg"
-    pkg.mkdir(parents=True)
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = (
-        "from mymod import transform\n\n"
-        "def run_step1(x: int) -> int:\n"
-        "    res = transform(x)\n"
-        "    def inner(y: int) -> int:\n"
-        "        from inner_pkg import transform\n"
-        "        return transform(y)\n"
-        "    return res + inner(x)\n"
-    )
-    src2 = (
-        "from mymod import transform\n\n"
-        "def run_step2(x: int) -> int:\n"
-        "    res = transform(x)\n"
-        "    def inner(y: int) -> int:\n"
-        "        from inner_pkg import transform\n"
-        "        return transform(y)\n"
-        "    return res + inner(x)\n"
-    )
-    f1 = pkg / "s1.py"
-    f2 = pkg / "s2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "run_step1", "file": str(f1), "start": 3, "end": 8, "kind": "function"}
-    u2 = {"name": "run_step2", "file": str(f2), "start": 3, "end": 8, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "from mymod import transform" in patch
-    assert "from nested_import_pkg._common import _shared_run_step1_run_step2" in patch
-
-
-def test_type_checking_guarded_import_does_not_suppress_runtime_helper_typing(
-    tmp_path: Path,
-) -> None:
-    """Verifies that imports under 'if TYPE_CHECKING:' do not suppress runtime helper typing imports."""
-    pkg = tmp_path / "type_check_pkg"
-    pkg.mkdir(parents=True)
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    # Existing _common.py contains guarded TYPE_CHECKING import
-    common_file = pkg / "_common.py"
-    common_file.write_text(
-        "from typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    from typing import List\n",
-        encoding="utf-8",
-    )
-
-    src1 = (
-        "def compute_items1(vals: List[int]) -> int:\n"
-        "    return sum(vals)\n"
-    )
-    src2 = (
-        "def compute_items2(vals: List[int]) -> int:\n"
-        "    return sum(vals)\n"
-    )
-    f1 = pkg / "c1.py"
-    f2 = pkg / "c2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "compute_items1", "file": str(f1), "start": 1, "end": 2, "kind": "function"}
-    u2 = {"name": "compute_items2", "file": str(f2), "start": 1, "end": 2, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    # _common.py patch MUST contain unconditional 'from typing import List'
-    assert "+from typing import List" in patch
-
-
-def test_cross_file_host_local_definition_conflict_rejected(
-    tmp_path: Path,
-) -> None:
-    """Verifies that cross-file extraction into host module is rejected when callers define conflicting local dependencies."""
-    # pylint: disable=protected-access
-    pkg = tmp_path / "host_conflict_pkg"
-    pkg.mkdir(parents=True)
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src_host = (
-        "class LocalService:\n"
-        "    pass\n\n"
-        "def process_service1(svc: LocalService) -> int:\n"
-        "    return 42\n"
-    )
-    src_caller = (
-        "class LocalService:\n"
-        "    pass\n\n"
-        "def process_service2(svc: LocalService) -> int:\n"
-        "    return 42\n"
-    )
-    f_host = pkg / "host_mod.py"
-    f_caller = pkg / "caller_mod.py"
-    f_host.write_text(src_host, encoding="utf-8")
-    f_caller.write_text(src_caller, encoding="utf-8")
-
-    u_host = {"name": "process_service1", "file": str(f_host), "start": 4, "end": 5, "kind": "function"}
-    u_caller = {"name": "process_service2", "file": str(f_caller), "start": 4, "end": 5, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u_host, u_caller)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="host",
-    )
-
-    assert "conflicting local definition 'LocalService' across clone sources" in patch
-    # Extraction must be safely skipped, no helper inserted
-    assert "_shared_process_service1_process_service2" not in patch
-
-    # Direct collector verification for conflicting and unresolved symbols
-    host_plan = patch_mod._FilePatchPlan(file_path=f_host, rel_path="host_mod.py", orig_text=src_host)
-    helper_code = "def _shared(svc: LocalService) -> int:\n    return 42\n"
-    with pytest.raises(ValueError, match="conflicting local definition 'LocalService'"):
-        patch_mod._collect_host_missing_imports(
-            host_plan=host_plan,
-            helper_code=helper_code,
-            scope={},
-            source_texts=[(src_host, "host_mod", False), (src_caller, "caller_mod", False)],
-            host_mod="host_mod",
-        )
-
-    with pytest.raises(ValueError, match="unresolved symbol 'LocalService' in caller module"):
-        patch_mod._collect_host_missing_imports(
-            host_plan=host_plan,
-            helper_code=helper_code,
-            scope={},
-            source_texts=[(src_host, "host_mod", False), ("# no defs\n", "caller_mod", False)],
-            host_mod="host_mod",
-        )
-
-
-def test_host_local_definition_omits_self_import_when_caller_imports_from_host(
-    tmp_path: Path,
-) -> None:
-    """Verifies that when a caller imports a dependency from host, host omits self-imports of its own local definition."""
-    # pylint: disable=protected-access
-    pkg = tmp_path / "self_import_pkg"
-    pkg.mkdir(parents=True)
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    host_src = (
-        "class LocalDep:\n"
-        "    pass\n\n"
-        "def process_item1(item: LocalDep) -> int:\n"
-        "    return 42\n"
-    )
-    caller_src = (
-        "from self_import_pkg.host_mod import LocalDep\n\n"
-        "def process_item2(item: LocalDep) -> int:\n"
-        "    return 42\n"
-    )
-    f_host = pkg / "host_mod.py"
-    f_caller = pkg / "caller_mod.py"
-    f_host.write_text(host_src, encoding="utf-8")
-    f_caller.write_text(caller_src, encoding="utf-8")
-
-    # 1. Direct collector check
-    host_plan = patch_mod._FilePatchPlan(file_path=f_host, rel_path="self_import_pkg/host_mod.py", orig_text=host_src)
-    helper_code = "def _shared_process_item1_process_item2(item: LocalDep) -> int:\n    return 42\n"
-    imports = patch_mod._collect_host_missing_imports(
-        host_plan=host_plan,
-        helper_code=helper_code,
-        scope={},
-        source_texts=[
-            (host_src, "self_import_pkg.host_mod", False),
-            (caller_src, "self_import_pkg.caller_mod", False),
-        ],
-        host_mod="self_import_pkg.host_mod",
-    )
-    # Must NOT contain self-import from self_import_pkg.host_mod
-    assert not any("self_import_pkg.host_mod" in imp for imp in imports)
-    assert not any("LocalDep" in imp for imp in imports)
-
-    # 2. End-to-end patch generation check
-    u1 = {"name": "process_item1", "file": str(f_host), "start": 4, "end": 5, "kind": "function"}
-    u2 = {"name": "process_item2", "file": str(f_caller), "start": 3, "end": 4, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="host",
-    )
-
-    # Host module diff must NOT contain a self-import
-    assert "+from self_import_pkg.host_mod import LocalDep" not in patch
-    assert "+import self_import_pkg.host_mod" not in patch
-    # Host module must receive the extracted helper
-    assert "def _shared_process_item1_process_item2(item: LocalDep) -> int:" in patch
-    # Caller module must import the extracted helper from host
-    assert "from self_import_pkg.host_mod import _shared_process_item1_process_item2" in patch
-
 
 def test_clone_differing_local_builtin_binding_rejected(tmp_path: Path) -> None:
     """Verifies that extraction is rejected when one clone uses a builtin while another binds the name locally."""
@@ -4432,7 +1584,6 @@ def test_clone_differing_local_builtin_binding_rejected(tmp_path: Path) -> None:
     assert "conflicting imported symbol 'len' across clone sources" in patch
     assert "skipping extraction" in patch
 
-
 def test_clone_differing_local_builtin_binding_rejected_same_file(tmp_path: Path) -> None:
     """Verifies that same-file clones where one uses a builtin and another shadows it locally are rejected."""
     f = tmp_path / "same_file_shadow.py"
@@ -4456,43 +1607,6 @@ def test_clone_differing_local_builtin_binding_rejected_same_file(tmp_path: Path
 
     assert "conflicting imported symbol 'len' across clone sources" in patch
     assert "skipping extraction" in patch
-
-
-def test_clones_with_matching_local_imports_hoisted_to_shared_module(tmp_path: Path) -> None:
-    """Verifies that when helper lacks a local import, an agreed local import from clones is safely hoisted."""
-    pkg = tmp_path / "shared_local_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = (
-        "from math import isqrt\n\n"
-        "def compute_1(x: int) -> int:\n"
-        "    return isqrt(x)\n"
-    )
-    src2 = (
-        "def compute_2(x: int) -> int:\n"
-        "    from math import isqrt\n"
-        "    return isqrt(x)\n"
-    )
-    f1 = pkg / "m1.py"
-    f2 = pkg / "m2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"name": "compute_1", "file": str(f1), "start": 3, "end": 4, "kind": "function"}
-    u2 = {"name": "compute_2", "file": str(f2), "start": 1, "end": 3, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=False,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "diff --git a/shared_local_pkg/_common.py b/shared_local_pkg/_common.py" in patch
-    assert "+from math import isqrt" in patch
-    assert "def _shared_compute_1_compute_2(x: int) -> int:" in patch
-
 
 def test_extract_helper_symbols_scope_resolution() -> None:
     """Verifies that _extract_helper_symbols accurately identifies free, defined, and local names."""
@@ -4552,7 +1666,6 @@ def my_helper(param1: ExternalType, default_arg=ExternalDefault) -> ReturnType:
         assert "KwSym" in p_free
         assert "_shared_fn" in p_def
 
-
 @pytest.mark.skipif(sys.version_info < (3, 10), reason="Pattern matching requires Python 3.10+")
 def test_extract_helper_symbols_pattern_matching() -> None:
     """Verifies that match-case pattern bindings are recognized as local bindings on Python 3.10+."""
@@ -4571,117 +1684,6 @@ def match_helper(external_val: Any) -> Any:
     assert "head" not in free
     assert "tail" not in free
     assert "match_helper" in defined
-
-
-def test_shared_module_rejects_subsequent_pair_creating_cycle_with_earlier_caller(
-    tmp_path: Path,
-) -> None:
-    """Verifies that a subsequent clone pair cannot inject dependencies into a shared module
-
-    that create a circular dependency with an earlier pair's caller.
-    """
-    root = tmp_path / "repo"
-    pkg = root / "pkg"
-    pkg.mkdir(parents=True)
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    # caller_a defines CustomType and has clone 1
-    src_a = (
-        "class CustomType:\n"
-        "    pass\n\n"
-        "def clone_one_a(x: int) -> int:\n"
-        "    a = x + 1\n"
-        "    b = a + 2\n"
-        "    return b\n"
-    )
-    # caller_b has clone 1
-    src_b = (
-        "def clone_one_b(x: int) -> int:\n"
-        "    a = x + 1\n"
-        "    b = a + 2\n"
-        "    return b\n"
-    )
-    # caller_c imports CustomType from caller_a and has clone 2
-    src_c = (
-        "from pkg.caller_a import CustomType\n\n"
-        "def clone_two_c(item: CustomType) -> int:\n"
-        "    a = 10\n"
-        "    b = a + 20\n"
-        "    return b\n"
-    )
-    # caller_d imports CustomType from caller_a and has clone 2
-    src_d = (
-        "from pkg.caller_a import CustomType\n\n"
-        "def clone_two_d(item: CustomType) -> int:\n"
-        "    a = 10\n"
-        "    b = a + 20\n"
-        "    return b\n"
-    )
-
-    fa = pkg / "caller_a.py"
-    fb = pkg / "caller_b.py"
-    fc = pkg / "caller_c.py"
-    fd = pkg / "caller_d.py"
-    fa.write_text(src_a, encoding="utf-8")
-    fb.write_text(src_b, encoding="utf-8")
-    fc.write_text(src_c, encoding="utf-8")
-    fd.write_text(src_d, encoding="utf-8")
-
-    u1a = {"name": "clone_one_a", "file": str(fa), "start": 4, "end": 7, "kind": "function"}
-    u1b = {"name": "clone_one_b", "file": str(fb), "start": 1, "end": 4, "kind": "function"}
-    u2c = {"name": "clone_two_c", "file": str(fc), "start": 3, "end": 6, "kind": "function"}
-    u2d = {"name": "clone_two_d", "file": str(fd), "start": 3, "end": 6, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1a, u1b), (1.0, u2c, u2d)],
-        repo_root=str(root),
-        cross_file_strategy="shared_module",
-        replace_clones=True,
-    )
-
-    assert patch is not None
-    # Pair 1 succeeded in creating _common.py
-    assert "pkg/_common.py" in patch
-    # Pair 1 callers were patched
-    assert "pkg/caller_a.py" in patch
-    assert "pkg/caller_b.py" in patch
-
-    # _common.py must NOT import caller_a (which would cause a cycle)
-    assert "+from pkg.caller_a import" not in patch
-
-    # Pair 2 was rejected due to circular dependency
-    assert "rejected due to circular dependency" in patch
-
-
-def test_cross_module_shared_module_directory_collision_rejected(tmp_path: Path) -> None:
-    """Verifies that if the shared module path is an existing directory, extraction is safely skipped."""
-    pkg = tmp_path / "pkg_dir_collision"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src1 = "def fn1(x: int) -> int:\n    return x + 10\n"
-    src2 = "def fn2(x: int) -> int:\n    return x + 10\n"
-    f1 = pkg / "m1.py"
-    f2 = pkg / "m2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    # Create directory at _common.py
-    (pkg / "_common.py").mkdir()
-
-    u1 = {"name": "fn1", "file": str(f1), "start": 1, "end": 2, "kind": "function"}
-    u2 = {"name": "fn2", "file": str(f2), "start": 1, "end": 2, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        cross_file_strategy="shared_module",
-        replace_clones=True,
-    )
-
-    assert "existing directory" in patch
-    assert "skipping extraction" in patch
-
 
 def test_generate_refactoring_patch_rejects_internal_symlink_clone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -4732,7 +1734,6 @@ def test_generate_refactoring_patch_rejects_internal_symlink_clone(
     assert "real.py" not in patch_inverted
     assert patch_inverted == ""
 
-
 def test_generate_refactoring_patch_rejects_absolute_path_outside_repo_root(
     tmp_path: Path,
 ) -> None:
@@ -4761,7 +1762,6 @@ def test_generate_refactoring_patch_rejects_absolute_path_outside_repo_root(
     assert "outside.py" not in patch
     assert "inside.py" not in patch
 
-
 def test_resolve_safe_clone_file_path_filesystem_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4786,45 +1786,6 @@ def test_resolve_safe_clone_file_path_filesystem_error(
     res = _resolve_safe_clone_file_path("target.py", [repo])
     assert res is None
 
-
-def test_scope_nested_import_not_recorded_in_local_imports(tmp_path: Path) -> None:
-    """Verifies that imports within nested functions are not recorded in unit local_imports."""
-    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
-        analyze_unit_variable_scope,
-    )
-
-    code = (
-        "def outer(x: int) -> int:\n"
-        "    def inner(y: int) -> int:\n"
-        "        from inner_pkg import helper\n"
-        "        return helper(y)\n"
-        "    return inner(x)\n"
-    )
-    f = tmp_path / "test_nested.py"
-    f.write_text(code, encoding="utf-8")
-    unit = {"file": "test_nested.py", "start": 1, "end": 5, "kind": "function", "name": "outer"}
-    scope_info = analyze_unit_variable_scope(unit, repo_root=str(tmp_path))
-    assert "from inner_pkg import helper" not in scope_info["local_imports"]
-
-
-def test_resolve_safe_clone_file_path_does_not_fallback_relative_path_to_patch_root(
-    tmp_path: Path,
-) -> None:
-    """Verifies that relative clone paths are only resolved against the scan root, not patch_root."""
-    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
-        _resolve_safe_clone_file_path,
-    )
-
-    project = tmp_path / "project"
-    tools = project / "pkg" / "tools"
-    tools.mkdir(parents=True)
-    other = project / "pkg" / "other.py"
-    other.write_text("x = 1\n", encoding="utf-8")
-
-    res = _resolve_safe_clone_file_path("pkg/other.py", (tools, project))
-    assert res is None
-
-
 def test_resolve_safe_clone_file_path_rejects_sentinel_file_on_disk(
     tmp_path: Path,
 ) -> None:
@@ -4842,7 +1803,6 @@ def test_resolve_safe_clone_file_path_rejects_sentinel_file_on_disk(
 
     res = _resolve_safe_clone_file_path("../outside.py", [repo])
     assert res is None
-
 
 def test_host_module_cycle_detection_skips_finalization_transactionally(
     tmp_path: Path,
@@ -4878,7 +1838,6 @@ def test_host_module_cycle_detection_skips_finalization_transactionally(
     assert "--- a/cyc_pkg/host.py" not in patch
     assert "Circular import or unresolvable module path" in patch
 
-
 def test_helper_requires_future_annotations_vararg_and_kwarg() -> None:
     """Verifies that *args and **kwargs annotations with PEP 604 unions trigger future annotations."""
     code_var = "def helper(*items: int | str) -> None:\n    pass\n"
@@ -4889,7 +1848,6 @@ def test_helper_requires_future_annotations_vararg_and_kwarg() -> None:
 
     code_none = "def helper(*items: int, **kwargs: str) -> None:\n    pass\n"
     assert patch_mod._helper_requires_future_annotations(code_none) is False
-
 
 def test_extract_module_defined_names_compound_blocks() -> None:
     """Verifies that classes, functions, and variables in top-level if/try/with are discovered."""
@@ -4915,274 +1873,9 @@ def test_extract_module_defined_names_compound_blocks() -> None:
     assert "nested_var" not in defs
     assert "NestedClass" not in defs
 
-
-def test_extract_module_import_statements_compound_blocks() -> None:
-    """Verifies that runtime imports inside top-level try/except and if blocks are extracted."""
-    src = (
-        "try:\n"
-        "    import ujson as json\n"
-        "except ImportError:\n"
-        "    import json\n"
-        "if True:\n"
-        "    from math import sqrt\n"
-    )
-    stmts, wildcards = patch_mod._extract_module_import_statements(src)
-    assert "json" in stmts
-    assert "sqrt" in stmts
-    assert not wildcards
-
-
-def test_shared_module_strategy_skips_when_host_is_clone_and_cycle_detected(
-    tmp_path: Path,
-) -> None:
-    """Verifies that shared_module strategy targeting a clone file skips transactionally on cycle."""
-    pkg = tmp_path / "shared_host_cycle"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    src_f1 = (
-        "import shared_host_cycle.f2\n\n"
-        "def compute_1(x: int) -> int:\n"
-        "    return x * 10\n"
-    )
-    src_f2 = (
-        "def compute_2(x: int) -> int:\n"
-        "    return x * 10\n"
-    )
-    (pkg / "f1.py").write_text(src_f1, encoding="utf-8")
-    (pkg / "f2.py").write_text(src_f2, encoding="utf-8")
-
-    u1 = {"name": "compute_1", "file": "shared_host_cycle/f1.py", "start": 3, "end": 4, "kind": "function"}
-    u2 = {"name": "compute_2", "file": "shared_host_cycle/f2.py", "start": 1, "end": 2, "kind": "function"}
-
-    # Set shared_module_name to f1.py so host_plan is f1_plan
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-        shared_module_name="f1.py",
-    )
-
-    assert "--- a/shared_host_cycle/f1.py" not in patch
-    assert "--- a/shared_host_cycle/f2.py" not in patch
-    assert "Circular import or unresolvable module path" in patch
-
-
-def test_shared_module_strategy_skips_when_all_callers_form_cycles(
-    tmp_path: Path,
-) -> None:
-    """Verifies that if all callers form cycles with _common.py, extraction is transactionally skipped."""
-    pkg = tmp_path / "all_cycle_pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-
-    # Create existing _common.py that already imports both mod_a and mod_b
-    (pkg / "_common.py").write_text(
-        "import all_cycle_pkg.mod_a\nimport all_cycle_pkg.mod_b\n", encoding="utf-8"
-    )
-    src_a = "def process_a(x: int) -> int:\n    return x + 5\n"
-    src_b = "def process_b(x: int) -> int:\n    return x + 5\n"
-    (pkg / "mod_a.py").write_text(src_a, encoding="utf-8")
-    (pkg / "mod_b.py").write_text(src_b, encoding="utf-8")
-
-    u_a = {"name": "process_a", "file": "all_cycle_pkg/mod_a.py", "start": 1, "end": 2, "kind": "function"}
-    u_b = {"name": "process_b", "file": "all_cycle_pkg/mod_b.py", "start": 1, "end": 2, "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u_a, u_b)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "--- a/all_cycle_pkg/mod_a.py" not in patch
-    assert "--- a/all_cycle_pkg/mod_b.py" not in patch
-    assert "rejected due to circular dependency" in patch
-
-
-def test_generate_refactoring_patch_init_and_submodule_shared_module(
-    tmp_path: Path,
-) -> None:
-    """Verifies that clones between __init__.py and a submodule can share a module without false cycle."""
-    pkg = tmp_path / "init_sub_pkg"
-    pkg.mkdir()
-    src_init = (
-        "def common_calc(val: int) -> int:\n"
-        "    res = val * 2 + 1\n"
-        "    return res\n"
-    )
-    src_worker = (
-        "def run_worker_calc(val: int) -> int:\n"
-        "    res = val * 2 + 1\n"
-        "    return res\n"
-    )
-    (pkg / "__init__.py").write_text(src_init, encoding="utf-8")
-    (pkg / "worker.py").write_text(src_worker, encoding="utf-8")
-
-    u1 = {
-        "name": "common_calc",
-        "file": "init_sub_pkg/__init__.py",
-        "start": 1,
-        "end": 3,
-        "kind": "function",
-    }
-    u2 = {
-        "name": "run_worker_calc",
-        "file": "init_sub_pkg/worker.py",
-        "start": 1,
-        "end": 3,
-        "kind": "function",
-    }
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="shared_module",
-    )
-
-    assert "diff --git a/init_sub_pkg/_common.py b/init_sub_pkg/_common.py" in patch
-    assert "--- a/init_sub_pkg/__init__.py" in patch
-    assert "--- a/init_sub_pkg/worker.py" in patch
-    assert "Circular import" not in patch
-
-
-def test_collect_host_missing_imports_substring_safety() -> None:
-    """Verifies that substring matches in comments or longer import names do not suppress required imports."""
-    host_code = (
-        "# Note: do not import os directly\n"
-        "import os_helper\n\n"
-        "def existing_fn():\n"
-        "    return os_helper.run()\n"
-    )
-    host_plan = patch_mod._FilePatchPlan(
-        file_path=Path("app/main.py"),
-        rel_path="app/main.py",
-        orig_text=host_code,
-    )
-    helper_code = "def helper_fn():\n    return os.path.exists('foo')\n"
-    scope = {"module": "app.main"}
-    source_code = "import os\ndef orig_fn():\n    return os.path.exists('foo')\n"
-
-    missing = patch_mod._collect_host_missing_imports(
-        host_plan=host_plan,
-        helper_code=helper_code,
-        scope=scope,
-        source_texts=[source_code],
-    )
-    assert "import os" in missing
-
-
 def test_has_future_annotations_value_error_handling() -> None:
     """Verifies that _has_future_annotations gracefully handles source strings triggering ValueError."""
     assert patch_mod._has_future_annotations("def foo():\n    pass\x00") is False
-
-
-def test_extract_module_import_statements_final_binding_and_rebound_conflicts() -> None:
-    """Verifies that later top-level imports override earlier bindings and flag conflicts."""
-    src = (
-        "from dep_a import transform\n"
-        "from dep_b import transform\n"
-        "import os\n"
-        "import os\n"
-    )
-    res = patch_mod._extract_module_import_statements(src)
-    assert res.stmts["transform"] == "from dep_b import transform"
-    assert "transform" in res.rebound_conflicts
-    assert "transform" in res.unconditional_names
-    assert res.stmts["os"] == "import os"
-    assert "os" not in res.rebound_conflicts
-    assert "os" in res.unconditional_names
-
-
-def test_collect_host_missing_imports_rejects_rebound_conflicts() -> None:
-    """Verifies that clone extraction fails when referencing a rebound conflicting symbol."""
-    source_code = (
-        "from dep_a import transform\n"
-        "from dep_b import transform\n\n"
-        "def compute(x: int) -> int:\n"
-        "    return transform(x)\n"
-    )
-    host_plan = patch_mod._FilePatchPlan(
-        file_path=Path("common.py"),
-        rel_path="common.py",
-        orig_text="",
-        is_new_file=True,
-    )
-    helper_code = "def helper_fn(x: int) -> int:\n    return transform(x)\n"
-    scope = {"module": "source_mod"}
-
-    with pytest.raises(
-        ValueError,
-        match="conflicting imported symbol 'transform' rebound within source module",
-    ):
-        patch_mod._collect_host_missing_imports(
-            host_plan=host_plan,
-            helper_code=helper_code,
-            scope=scope,
-            source_texts=[(source_code, "source_mod", False)],
-        )
-
-
-def test_collect_host_missing_imports_rejects_cross_file_guarded_imports() -> None:
-    """Verifies that cross-file extraction rejects symbols relying on runtime fallback imports."""
-    source_code = (
-        "try:\n"
-        "    from fast_dep import transform\n"
-        "except ImportError:\n"
-        "    from fallback_dep import transform\n\n"
-        "def compute(x: int) -> int:\n"
-        "    return transform(x)\n"
-    )
-    host_plan = patch_mod._FilePatchPlan(
-        file_path=Path("pkg/_common.py"),
-        rel_path="pkg/_common.py",
-        orig_text="",
-        is_new_file=True,
-    )
-    helper_code = "def helper_fn(x: int) -> int:\n    return transform(x)\n"
-    scope = {"module": "pkg.worker"}
-
-    with pytest.raises(
-        ValueError,
-        match="symbol 'transform' relies on runtime-guarded import in source module",
-    ):
-        patch_mod._collect_host_missing_imports(
-            host_plan=host_plan,
-            helper_code=helper_code,
-            scope=scope,
-            source_texts=[(source_code, "pkg.worker", False)],
-        )
-
-
-def test_collect_host_missing_imports_same_file_preserves_guarded_imports() -> None:
-    """Verifies that same-file host refactoring does not hoist guarded imports unconditionally."""
-    source_code = (
-        "try:\n"
-        "    import ujson as json\n"
-        "except ImportError:\n"
-        "    import json\n\n"
-        "def f1(d):\n"
-        "    return json.dumps(d)\n"
-    )
-    host_plan = patch_mod._FilePatchPlan(
-        file_path=Path("pkg/worker.py"),
-        rel_path="pkg/worker.py",
-        orig_text=source_code,
-        is_new_file=False,
-    )
-    helper_code = "def helper_fn(d):\n    return json.dumps(d)\n"
-    scope = {"module": "pkg.worker"}
-
-    missing = patch_mod._collect_host_missing_imports(
-        host_plan=host_plan,
-        helper_code=helper_code,
-        scope=scope,
-        source_texts=[(source_code, "pkg.worker", False)],
-    )
-    assert not any("json" in s for s in missing)
-
 
 def test_extract_module_defined_names_ignores_non_store_contexts() -> None:
     """Verifies that attribute and subscript assignment targets do not register load-context names as defined."""
@@ -5206,51 +1899,6 @@ def test_extract_module_defined_names_ignores_non_store_contexts() -> None:
     assert "c" in defined
     assert "item" in defined
     assert "f" in defined
-
-
-def test_extract_module_defined_names_augassign_and_walrus() -> None:
-    """Verifies that AugAssign store targets and module-level walrus expressions are extracted as defined."""
-    src = (
-        "total = 0\n"
-        "total += 10\n"
-        "state.count += 5\n"
-        "if (module_val := get_config()):\n"
-        "    pass\n"
-        "def helper_fn():\n"
-        "    if (nested_val := 99):\n"
-        "        pass\n"
-    )
-    defined = patch_mod._extract_module_defined_names(src)
-    assert "total" in defined
-    assert "module_val" in defined
-    assert "state" not in defined
-    assert "count" not in defined
-    assert "nested_val" not in defined
-
-
-def test_collect_host_missing_imports_rejects_import_rebound_by_definition(tmp_path: Path) -> None:
-    """Verifies that attempting cross-file extraction of a symbol rebound by local definition is rejected."""
-    plan = patch_mod._FilePatchPlan(
-        file_path=tmp_path / "mod_target.py",
-        rel_path="mod_target.py",
-        orig_text="",
-        is_new_file=True,
-    )
-    source_code = (
-        "from dep_lib import process\n"
-        "def process(x: int) -> int:\n"
-        "    return x + 10\n"
-    )
-    helper_code = "def _shared(x: int) -> int:\n    return process(x)\n"
-
-    with pytest.raises(ValueError, match="conflicting imported symbol 'process' rebound by local definition"):
-        patch_mod._collect_host_missing_imports(
-            host_plan=plan,
-            helper_code=helper_code,
-            scope={"local_imports": []},
-            source_texts=[(source_code, "pkg.worker", False)],
-        )
-
 
 def test_generate_refactoring_patch_subdirectory_scan_detects_project_cycle(tmp_path: Path) -> None:
     """Verifies that scanning a non-package subdirectory detects circular imports through project-level modules."""
@@ -5308,7 +1956,6 @@ def test_generate_refactoring_patch_subdirectory_scan_detects_project_cycle(tmp_
     assert "from script_a import" not in patch
     assert "from tools.script_a import" not in patch
 
-
 def test_extract_defined_symbols_comprehensive_constructs() -> None:
     """Verifies symbol extraction correctly discovers while loops, match mapping rest, and type aliases."""
     while_code = "while active:\n    x = 10\n"
@@ -5330,7 +1977,6 @@ def test_extract_defined_symbols_comprehensive_constructs() -> None:
         alias_names = patch_mod._extract_module_defined_names(alias_code)
         assert "CustomInt" in alias_names
 
-
 def test_extract_helper_symbols_nested_walrus_isolation() -> None:
     """Verifies walrus assignments inside nested functions do not leak into helper defined names."""
     code = (
@@ -5345,39 +1991,6 @@ def test_extract_helper_symbols_nested_walrus_isolation() -> None:
     _, defined, _ = patch_mod._extract_helper_symbols(tree.body[0])
     assert "outer" in defined or "inner" in defined
     assert "inner_walrus" not in defined
-
-
-def test_generate_refactoring_patch_does_not_mutate_caller_depgraph(
-    tmp_path: Path,
-) -> None:
-    """Verifies generate_refactoring_patch works on a copy of depgraph and does not mutate caller's graph."""
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    mod_a = pkg / "mod_a.py"
-    mod_b = pkg / "mod_b.py"
-
-    mod_a.write_text("import pkg.mod_b\ndef func_a(): return 123\n", encoding="utf-8")
-    mod_b.write_text("def func_b(): return 123\n", encoding="utf-8")
-
-    u1 = {"name": "func_a", "file": str(mod_a), "start": 2, "end": 2, "kind": "function"}
-    u2 = {"name": "func_b", "file": str(mod_b), "start": 1, "end": 1, "kind": "function"}
-
-    depgraph = build_module_graph(tmp_path)
-    snapshot_adj = {k: set(v) for k, v in depgraph.adjacency.items()}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        cross_file_strategy="host_module",
-        depgraph=depgraph,
-    )
-
-    assert "Circular import or unresolvable module path" in patch
-    # Verify caller's depgraph adjacency remains identical
-    assert depgraph.adjacency == snapshot_adj
-
 
 def test_generate_refactoring_patch_deduplicates_standalone_advisory_comments(
     tmp_path: Path,
@@ -5406,7 +2019,6 @@ def test_generate_refactoring_patch_deduplicates_standalone_advisory_comments(
     # Standalone comment should only appear once in patch output
     assert patch.count("# Note: Cross-module clone pair; helper extraction") == 1
 
-
 def test_helper_lambda_parameter_scoping_does_not_abort_extraction(tmp_path: Path) -> None:
     """Verifies that lambda parameters are properly scoped and not treated as unresolved symbols."""
     pkg = tmp_path / "lambda_pkg"
@@ -5429,298 +2041,9 @@ def test_helper_lambda_parameter_scoping_does_not_abort_extraction(tmp_path: Pat
     assert "unresolved symbol 'x'" not in patch
     assert "_common.py" in patch
 
-
-def test_canonicalize_helper_relative_imports_semicolon_separated() -> None:
-    """Verifies that multiple relative imports on the same line are both canonicalized."""
-    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
-        _canonicalize_helper_relative_imports,
-    )
-
-    code = "from .a import x; from .b import y\n"
-    canon = _canonicalize_helper_relative_imports(code, [("pkg.mod", False)])
-    assert "from pkg.a import x" in canon
-    assert "from pkg.b import y" in canon
-
-
-def test_format_patch_relative_path_nested_directories(tmp_path: Path) -> None:
-    """Verifies that _format_patch_relative_path does not strip nested directory components."""
-    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
-        _format_patch_relative_path,
-    )
-
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    rel_target = Path("sub/nested/file.py")
-    res = _format_patch_relative_path(rel_target, repo)
-    assert res == "sub/nested/file.py"
-
-
-def test_col_offset_to_char_offset_ascii_and_multibyte() -> None:
-    """Verifies that col_offset_to_char_offset translates UTF-8 byte offsets to character indices."""
-    from pydoppelgangerhunt.fixer import col_offset_to_char_offset
-
-    # Edge cases
-    assert col_offset_to_char_offset("", None) == 0
-    assert col_offset_to_char_offset("abc", 0) == 0
-    assert col_offset_to_char_offset("abc", -5) == 0
-    assert col_offset_to_char_offset("abc", 100) == 3
-
-    # ASCII line: byte offset equals character index
-    ascii_line = "alpha = beta + gamma\n"
-    assert col_offset_to_char_offset(ascii_line, 8) == 8
-    assert col_offset_to_char_offset(ascii_line, 15) == 15
-
-    # Multi-byte line with emojis (4 bytes each in UTF-8, 1 char in str)
-    # "msg = '🚀🚀' + str(val)\n"
-    # len("msg = '") = 7 bytes / 7 chars
-    # '🚀🚀' = 8 bytes / 2 chars
-    # "' + str(" = 8 bytes / 8 chars
-    # Total byte offset of 'val' = 7 + 8 + 8 = 23 bytes
-    # Total char index of 'val' = 7 + 2 + 8 = 17 chars
-    emoji_line = "msg = '\U0001F680\U0001F680' + str(val)\n"
-    assert col_offset_to_char_offset(emoji_line, 23) == 17
-    assert emoji_line[17:20] == "val"
-
-    # Multi-byte line with Chinese characters (3 bytes each in UTF-8, 1 char in str)
-    # "title = '中文测试' + name\n"
-    # len("title = '") = 9 bytes / 9 chars
-    # '中文测试' = 12 bytes / 4 chars
-    # "' + " = 4 bytes / 4 chars
-    # Total byte offset of 'name' = 9 + 12 + 4 = 25 bytes
-    # Total char index of 'name' = 9 + 4 + 4 = 17 chars
-    cjk_line = "title = '中文测试' + name\n"
-    assert col_offset_to_char_offset(cjk_line, 25) == 17
-    assert cjk_line[17:21] == "name"
-
-
-def test_compute_unit_byte_and_char_offsets() -> None:
-    """Verifies that compute_unit_byte_offsets and compute_unit_char_offsets compute exact spans."""
-    from pydoppelgangerhunt.fixer import (
-        compute_unit_byte_offsets,
-        compute_unit_char_offsets,
-    )
-
-    source = (
-        "def compute(data):\n"
-        "    msg = '\U0001F680' + str([x for x in data])\n"
-        "    return msg\n"
-    )
-    # Unit for the list comprehension on line 2
-    # In UTF-8: line 2 starts at byte 19 ("def compute(data):\n" is 19 bytes)
-    # On line 2: "    msg = '\U0001F680' + str(" is 4 + 7 + 4 + 8 = 23 bytes
-    # [x for x in data] is 17 bytes -> end col 40
-    tree = ast.parse(source)
-    comp_node = next(n for n in ast.walk(tree) if isinstance(n, ast.ListComp))
-
-    unit = {
-        "file": "test.py",
-        "start": comp_node.lineno,
-        "end": comp_node.end_lineno,
-        "start_col": comp_node.col_offset,
-        "end_col": comp_node.end_col_offset,
-        "kind": "comprehension",
-    }
-
-    char_span = compute_unit_char_offsets(source, unit)
-    byte_span = compute_unit_byte_offsets(source, unit)
-
-    # Character slice must match AST source segment
-    assert source[char_span[0]:char_span[1]] == "[x for x in data]"
-    # Byte slice in UTF-8 bytes must match
-    source_bytes = source.encode("utf-8")
-    assert source_bytes[byte_span[0]:byte_span[1]] == b"[x for x in data]"
-
-
-def test_compute_unit_replacement_span_pragmas_and_whole_line() -> None:
-    """Verifies that compute_unit_replacement_span correctly formats replacements and retains boundary pragmas."""
-    from pydoppelgangerhunt.fixer import compute_unit_replacement_span
-
-    # 1. Whole-line function replacement ensures trailing newline
-    source = "def foo():\n    return 1\n\ndef bar():\n    return 2\n"
-    u_foo = {"file": "test.py", "start": 1, "end": 2, "kind": "function"}
-    s_c, e_c, rep = compute_unit_replacement_span(source, u_foo, "def foo():\n    return 42")
-    assert rep.endswith("\n")
-    assert source[s_c:e_c] == "def foo():\n    return 1\n"
-
-    # 2. Boundary pragma on line is retained
-    source_pragma = "def calc():\n    val = 10  # type: ignore\n    return val\n"
-    u_stmt = {"file": "test.py", "start": 2, "end": 2, "kind": "statement"}
-    s_c2, e_c2, rep2 = compute_unit_replacement_span(
-        source_pragma, u_stmt, "    val = compute_shared()", preserve_boundary_pragmas=True
-    )
-    assert "# type: ignore" in rep2
-    assert source_pragma[s_c2:e_c2] == "    val = 10  # type: ignore\n"
-
-
-def test_refactor_module_units_descending_offset_shuffled_order() -> None:
-    """Verifies that refactor_module_units sorts replacements by descending offset regardless of input order."""
-    from pydoppelgangerhunt.fixer import refactor_module_units
-
-    source = (
-        "def first():\n"
-        "    return 1\n"
-        "\n"
-        "def second():\n"
-        "    return 2\n"
-        "\n"
-        "def third():\n"
-        "    return 3\n"
-    )
-    u1 = {"file": "t.py", "start": 1, "end": 2, "name": "first"}
-    u2 = {"file": "t.py", "start": 4, "end": 5, "name": "second"}
-    u3 = {"file": "t.py", "start": 7, "end": 8, "name": "third"}
-
-    r1 = (u1, "def first():\n    return 10\n")
-    r2 = (u2, "def second():\n    return 20\n")
-    r3 = (u3, "def third():\n    return 30\n")
-
-    # Pass in shuffled order [r2, r1, r3]
-    result = refactor_module_units(source, [r2, r1, r3])
-    expected = (
-        "def first():\n"
-        "    return 10\n"
-        "\n"
-        "def second():\n"
-        "    return 20\n"
-        "\n"
-        "def third():\n"
-        "    return 30\n"
-    )
-    assert result == expected
-    assert_valid_python(result)
-
-
-def test_refactor_module_units_same_line_multiline_expansion_no_drift() -> None:
-    """Verifies that a downstream multi-line replacement on the same line preserves upstream coordinates."""
-    from pydoppelgangerhunt.fixer import refactor_module_units
-
-    source = "val = [a for a in b] + [c for c in d]\n"
-    u1 = {
-        "file": "test.py",
-        "start": 1,
-        "end": 1,
-        "start_col": 6,
-        "end_col": 20,
-        "kind": "comprehension",
-    }
-    u2 = {
-        "file": "test.py",
-        "start": 1,
-        "end": 1,
-        "start_col": 23,
-        "end_col": 37,
-        "kind": "comprehension",
-    }
-    # Downstream replacement is multi-line with indentation
-    rep2 = "helper(\n    d,\n    extra=True,\n)"
-    rep1 = "helper(b)"
-
-    # Pass in forward order: [u1, u2]
-    refactored = refactor_module_units(source, [(u1, rep1), (u2, rep2)])
-    expected = (
-        "val = helper(b) + helper(\n"
-        "    d,\n"
-        "    extra=True,\n"
-        ")\n"
-    )
-    assert refactored == expected
-    assert_valid_python(refactored)
-
-
-def test_refactor_module_units_touching_line_boundaries_no_drift() -> None:
-    """Verifies that units touching line boundaries are refactored without line truncation or coordinate drift."""
-    from pydoppelgangerhunt.fixer import refactor_module_units
-
-    source = (
-        "# calculation\n"
-        "res = (\n"
-        "    compute_a(items) +\n"
-        "    compute_b(items)\n"
-        ")\n"
-    )
-    # Unit 1 is compute_a(items) on line 3, cols 4..20
-    # Unit 2 is compute_b(items) on line 4, cols 4..20
-    u1 = {
-        "file": "test.py",
-        "start": 3,
-        "end": 3,
-        "start_col": 4,
-        "end_col": 20,
-        "kind": "complex_expr",
-    }
-    u2 = {
-        "file": "test.py",
-        "start": 4,
-        "end": 4,
-        "start_col": 4,
-        "end_col": 20,
-        "kind": "complex_expr",
-    }
-    rep1 = "shared_a(\n        items,\n        mode='fast',\n    )"
-    rep2 = "shared_b(\n        items,\n        mode='slow',\n    )"
-
-    refactored = refactor_module_units(source, [(u1, rep1), (u2, rep2)])
-    expected = (
-        "# calculation\n"
-        "res = (\n"
-        "    shared_a(\n"
-        "        items,\n"
-        "        mode='fast',\n"
-        "    ) +\n"
-        "    shared_b(\n"
-        "        items,\n"
-        "        mode='slow',\n"
-        "    )\n"
-        ")\n"
-    )
-    assert refactored == expected
-    assert_valid_python(refactored)
-
-
-def test_refactor_module_units_unicode_multibyte_source_code() -> None:
-    """Verifies that source code containing multi-byte UTF-8 emojis and symbols refactors cleanly."""
-    from pydoppelgangerhunt.fixer import refactor_module_units
-
-    source = (
-        "# Banner: \U0001F680 Space Rocket Launch \U0001F680\n"
-        "title = 'Rocket: \U0001F680' + str([x for x in telemetry])\n"
-        "notes = 'Details: \U0001F31F' + str([y for y in status])\n"
-    )
-    tree = ast.parse(source)
-    comps = [n for n in ast.walk(tree) if isinstance(n, ast.ListComp)]
-    comps.sort(key=lambda n: n.lineno)
-
-    u1 = {
-        "file": "rocket.py",
-        "start": comps[0].lineno,
-        "end": comps[0].end_lineno,
-        "start_col": comps[0].col_offset,
-        "end_col": comps[0].end_col_offset,
-        "kind": "comprehension",
-    }
-    u2 = {
-        "file": "rocket.py",
-        "start": comps[1].lineno,
-        "end": comps[1].end_lineno,
-        "start_col": comps[1].col_offset,
-        "end_col": comps[1].end_col_offset,
-        "kind": "comprehension",
-    }
-
-    rep1 = "process_telemetry(telemetry)"
-    rep2 = "process_status(status)"
-
-    refactored = refactor_module_units(source, [(u1, rep1), (u2, rep2)])
-    assert "process_telemetry(telemetry)" in refactored
-    assert "process_status(status)" in refactored
-    assert "\U0001F680" in refactored
-    assert "\U0001F31F" in refactored
-    assert_valid_python(refactored)
-
-
 def test_adjust_line_for_replacements_exact_parity() -> None:
     """Verifies that _adjust_line_for_replacements produces exact line numbers matching refactor_module_units."""
-    from pydoppelgangerhunt.fixer.patch import _adjust_line_for_replacements
+    from pydoppelgangerhunt.fixer._patch_delegation import _adjust_line_for_replacements
     from pydoppelgangerhunt.fixer import refactor_module_units
 
     orig_text = (
@@ -5762,7 +2085,6 @@ def test_adjust_line_for_replacements_exact_parity() -> None:
     refactored_con = refactor_module_units(orig_text, [r_con])
     ref_con_lines = refactored_con.splitlines(keepends=True)
     assert ref_con_lines[adjusted_con - 1] == "line 8\n"
-
 
 def test_generate_refactoring_patch_same_file_multiple_methods_and_helpers(tmp_path: Path) -> None:
     """Verifies that generate_refactoring_patch coordinates reverse-order replacements and method helper insertion."""
@@ -5820,18 +2142,15 @@ def test_generate_refactoring_patch_same_file_multiple_methods_and_helpers(tmp_p
     assert "self._shared_" in patch
     assert "-        cleaned = [x.strip() for x in data if x]" in patch
 
-
 def test_edge_case_robustness_non_dict_and_invalid_units() -> None:
     """Verifies that non-dict or malformed units raise descriptive errors rather than silently defaulting."""
     from pydoppelgangerhunt.fixer import (
         check_units_overlap,
-        compute_unit_byte_offsets,
         compute_unit_char_offsets,
         compute_unit_replacement_span,
         compute_unit_spans,
-        refactor_module_units,
     )
-    from pydoppelgangerhunt.fixer.patch import _adjust_line_for_replacements
+    from pydoppelgangerhunt.fixer._patch_delegation import _adjust_line_for_replacements
     from pydoppelgangerhunt.fixer.source import _compute_unit_spans
 
     # Non-dict units raise TypeError
@@ -5866,7 +2185,6 @@ def test_edge_case_robustness_non_dict_and_invalid_units() -> None:
     assert adj == 1
     with pytest.raises(TypeError, match="Unit must be a dictionary"):
         _adjust_line_for_replacements(2, [(None, "rep")], "line 1\n")  # type: ignore[arg-type,list-item]
-
 
 def test_edge_case_robustness_columns_and_empty_inputs() -> None:
     """Verifies handling of invalid column types, inverted column offsets, and empty inputs."""
@@ -5906,93 +2224,6 @@ def test_edge_case_robustness_columns_and_empty_inputs() -> None:
     del_unit = {"file": "a.py", "start": 1, "end": 1}
     assert refactor_module_units("remove this\nkeep this\n", [(del_unit, "")]) == "keep this\n"
 
-
-def test_column_bounded_replacement_preserves_suffix_and_pragma() -> None:
-    """Verifies that column-bounded replacements preserve trailing code and place boundary pragmas at line end."""
-    from pydoppelgangerhunt.fixer import (
-        compute_unit_replacement_span,
-        replace_unit_in_source,
-        resolve_unit_replacement,
-    )
-
-    # Case 1: Mid-line expression followed by binary operation and trailing type ignore
-    source1 = "result = expensive_call() + other_expression  # type: ignore\n"
-    u_call = {"file": "test_mod.py", "start": 1, "end": 1, "start_col": 9, "end_col": 25, "kind": "complex_expr"}
-    refactored1 = replace_unit_in_source(source1, u_call, "shared_call()")
-    assert refactored1 == "result = shared_call() + other_expression  # type: ignore\n"
-    assert_valid_python(refactored1)
-
-    # Case 2: compute_unit_replacement_span with boundary pragma attached to unit on line with trailing code
-    source2 = "val = calculate() + offset  # type: ignore\n"
-    u_calc = {"file": "test_mod.py", "start": 1, "end": 1, "start_col": 6, "end_col": 17, "kind": "complex_expr"}
-    s_c, e_c, final_rep = compute_unit_replacement_span(source2, u_calc, "new_calc()", preserve_boundary_pragmas=True)
-    assembled = source2[:s_c] + final_rep + source2[e_c:]
-    assert assembled == "val = new_calc() + offset  # type: ignore\n"
-    assert_valid_python(assembled)
-
-    # Case 3: Trailing code without terminal newline at EOF
-    source3 = "out = compute_val() + 10  # noqa"
-    u_comp = {"file": "test_mod.py", "start": 1, "end": 1, "start_col": 6, "end_col": 19, "kind": "complex_expr"}
-    refactored3 = replace_unit_in_source(source3, u_comp, "fast_val()")
-    assert refactored3 == "out = fast_val() + 10  # noqa"
-    assert_valid_python(refactored3)
-
-    # Case 4: Attached boundary pragma (# type: ignore) on multi-line unit with different pragma in suffix (# noqa)
-    source4 = "res = calculate(  # type: ignore\n    data\n)  # noqa: E501\n"
-    u_multi = {"file": "test_mod.py", "start": 1, "end": 3, "start_col": 6, "end_col": 1, "kind": "complex_expr"}
-    item4 = resolve_unit_replacement(source4, u_multi, "fast_calc(data)", preserve_boundary_pragmas=True)
-    assert item4.consumes_line_suffix is True
-    refactored4 = replace_unit_in_source(source4, u_multi, "fast_calc(data)", preserve_boundary_pragmas=True)
-    assert refactored4 == "res = fast_calc(data)  # noqa: E501  # type: ignore\n"
-    assert_valid_python(refactored4)
-
-    # Case 5: Attached boundary pragma on multi-line unit with regular comment in suffix
-    source5 = "res = calculate(  # type: ignore\n    data\n)  # compute offset\n"
-    item5 = resolve_unit_replacement(source5, u_multi, "fast_calc(data)", preserve_boundary_pragmas=True)
-    assert item5.consumes_line_suffix is True
-    refactored5 = replace_unit_in_source(source5, u_multi, "fast_calc(data)", preserve_boundary_pragmas=True)
-    assert refactored5 == "res = fast_calc(data)  # compute offset  # type: ignore\n"
-    assert_valid_python(refactored5)
-
-
-def test_refactor_module_units_same_line_emoji_prefix_replacement() -> None:
-    """Verifies that AST byte offsets are translated to character offsets when replacing code units preceded by emojis."""
-    from pydoppelgangerhunt.fixer import refactor_module_units
-
-    # Single emoji before list comprehension on the same line
-    emoji_source = "prefix = '🚀'; value = [x for x in data]\n"
-    tree1 = ast.parse(emoji_source)
-    comp_node = next(n for n in ast.walk(tree1) if isinstance(n, ast.ListComp))
-    assert comp_node.col_offset == 25  # In UTF-8 bytes ('🚀' is 4 bytes vs 1 char)
-    u_comp = {
-        "file": "emoji_mod.py",
-        "start": comp_node.lineno,
-        "end": comp_node.end_lineno,
-        "start_col": comp_node.col_offset,
-        "end_col": comp_node.end_col_offset,
-        "kind": "comprehension",
-    }
-    refactored_emoji = refactor_module_units(emoji_source, [(u_comp, "helper(data)")])
-    assert refactored_emoji == "prefix = '🚀'; value = helper(data)\n"
-    assert_valid_python(refactored_emoji)
-
-    # Multiple multi-byte characters and trailing statements
-    multi_emoji_source = "tag = '🎉✨🔥'; items = [i * 2 for i in raw_items]; done = True\n"
-    tree2 = ast.parse(multi_emoji_source)
-    comp_node2 = next(n for n in ast.walk(tree2) if isinstance(n, ast.ListComp))
-    u_comp2 = {
-        "file": "emoji_mod.py",
-        "start": comp_node2.lineno,
-        "end": comp_node2.end_lineno,
-        "start_col": comp_node2.col_offset,
-        "end_col": comp_node2.end_col_offset,
-        "kind": "comprehension",
-    }
-    refactored_multi = refactor_module_units(multi_emoji_source, [(u_comp2, "transform(raw_items)")])
-    assert refactored_multi == "tag = '🎉✨🔥'; items = transform(raw_items); done = True\n"
-    assert_valid_python(refactored_multi)
-
-
 def test_dual_tier_overlap_conservative_missing_column_rejection() -> None:
     """Verifies intentional dual-tier overlap behavior: conservative whole-line rejection vs exact byte collision."""
     from pydoppelgangerhunt.fixer import check_units_overlap, refactor_module_units
@@ -6022,7 +2253,6 @@ def test_dual_tier_overlap_conservative_missing_column_rejection() -> None:
     with pytest.raises(ValueError, match="Overlapping unit collision detected"):
         refactor_module_units(src_expand, [(unit_calc, "new_y"), (unit_tail, "new_tail")])
 
-
 def test_check_units_overlap_multiline_end_boundary_single_line() -> None:
     """Verifies column-aware overlap detection when a single-line unit shares a multi-line unit's end line."""
     from pydoppelgangerhunt.fixer import check_units_overlap, refactor_module_units
@@ -6050,7 +2280,6 @@ def test_check_units_overlap_multiline_end_boundary_single_line() -> None:
     assert not check_units_overlap(unit_m, unit_s)
     refactored = refactor_module_units(src_code, [(unit_m, "fast_res"), (unit_s, "offset")])
     assert "fast_res + offset\n" in refactored
-
 
 def test_check_units_overlap_multiline_start_boundary_single_line() -> None:
     """Verifies column-aware overlap detection when a single-line unit shares a multi-line unit's start line."""
@@ -6087,23 +2316,6 @@ def test_check_units_overlap_multiline_start_boundary_single_line() -> None:
     assert check_units_overlap(u_multi, u_single_overlap)
     assert check_units_overlap(u_single_overlap, u_multi)
 
-
-def test_col_offset_to_char_offset_clamps_malformed_utf8_offset() -> None:
-    """Verifies that col_offset_to_char_offset clamps to the nearest valid character boundary when offset lands mid-sequence."""
-    from pydoppelgangerhunt.fixer import col_offset_to_char_offset
-
-    line = "header = '\U0001F680'; data = 42\n"
-    # '\U0001F680' begins at byte 10 and ends at byte 14 (UTF-8 bytes: 10, 11, 12, 13)
-    # Byte offset 10 points to the emoji character (char index 10)
-    assert col_offset_to_char_offset(line, 10) == 10
-    # Byte offsets 11, 12, 13 land in the middle of '\U0001F680' and clamp to char index 10
-    assert col_offset_to_char_offset(line, 11) == 10
-    assert col_offset_to_char_offset(line, 12) == 10
-    assert col_offset_to_char_offset(line, 13) == 10
-    # Byte offset 14 points past the emoji (char index 11)
-    assert col_offset_to_char_offset(line, 14) == 11
-
-
 def test_unit_span_namedtuple_and_compute_unit_spans() -> None:
     """Verifies that UnitSpan carries character/byte bounds and line/col metadata without recomputation."""
     from pydoppelgangerhunt.fixer import UnitSpan, compute_unit_spans, compute_unit_replacement_span
@@ -6135,10 +2347,9 @@ def test_unit_span_namedtuple_and_compute_unit_spans() -> None:
     assert e_c == 39
     assert rep == "helper(items)"
 
-
 def test_adjust_line_for_replacements_additive_deltas() -> None:
     """Verifies that _compute_replacement_line_deltas and _adjust_line_for_replacements compute exact line shifts."""
-    from pydoppelgangerhunt.fixer.patch import (
+    from pydoppelgangerhunt.fixer._patch_delegation import (
         _adjust_line_for_replacements,
         _compute_replacement_line_deltas,
     )
@@ -6177,7 +2388,6 @@ def test_adjust_line_for_replacements_additive_deltas() -> None:
     assert ref_lines[adj4 - 1] == "line 4\n"
     assert ref_lines[adj7 - 1] == "line 7\n"
 
-
 def test_check_units_overlap_malformed_inputs_raise_errors() -> None:
     """Verifies that check_units_overlap raises descriptive errors rather than silently returning False on invalid units."""
     from pydoppelgangerhunt.fixer import check_units_overlap
@@ -6202,108 +2412,9 @@ def test_check_units_overlap_malformed_inputs_raise_errors() -> None:
     with pytest.raises(ValueError, match="Malformed unit: invalid column offset"):
         check_units_overlap(u_valid, {"file": "mod.py", "start": 1, "end": 5, "end_col": "invalid"})
 
-
-def test_multi_unit_expansion_with_boundary_pragma_line_suffix_extension() -> None:
-    """Verifies multi-unit replacements where both units expand and one has a trailing boundary pragma."""
-    from pydoppelgangerhunt.fixer import (
-        ReplacementItem,
-        refactor_module_units,
-        resolve_unit_replacement,
-    )
-
-    source_text = (
-        "x = 1  # type: ignore\n"
-        "y = [1, 2, 3] ; extra = 10\n"
-        "z = [4, 5, 6]\n"
-        "out = None\n"
-    )
-    # Unit 1: spans lines 1 to 2, ending at column 13 on line 2 (cols 0-13)
-    u1 = {
-        "file": "calc.py",
-        "name": "u1",
-        "start": 1,
-        "end": 2,
-        "start_col": 0,
-        "end_col": 13,
-        "kind": "complex_expr",
-    }
-    # Unit 2: 'z = [4, 5, 6]' on line 3 (cols 0-13)
-    u2 = {
-        "file": "calc.py",
-        "name": "u2",
-        "start": 3,
-        "end": 3,
-        "start_col": 0,
-        "end_col": 13,
-        "kind": "comprehension",
-    }
-
-    rep1 = "x = 1\ny = (\n    1,\n    2,\n    3,\n)"
-    rep2 = "z = (\n    4,\n    5,\n    6,\n)"
-
-    # Test resolve_unit_replacement directly
-    item1 = resolve_unit_replacement(source_text, u1, rep1, preserve_boundary_pragmas=True)
-    assert isinstance(item1, ReplacementItem)
-    assert item1.consumes_line_suffix is True
-    line1_len = len("x = 1  # type: ignore\n")
-    line2_len = len("y = [1, 2, 3] ; extra = 10\n")
-    assert item1.end_char == line1_len + line2_len
-    assert "# type: ignore" in item1.final_rep
-    assert "; extra = 10" in item1.final_rep
-
-    # Test refactor_module_units applying both multi-line expansions
-    reps = [(u1, rep1), (u2, rep2)]
-    refactored = refactor_module_units(source_text, reps)
-
-    assert "y = (\n    1,\n    2,\n    3,\n) ; extra = 10  # type: ignore\n" in refactored
-    assert "z = (\n    4,\n    5,\n    6,\n)" in refactored
-    assert "out = None\n" in refactored
-
-
-def test_col_offset_to_char_offset_utf8_multibyte_clamping_and_exact_boundary() -> None:
-    """Verifies that col_offset_to_char_offset accurately handles multi-byte UTF-8 boundaries and clamps."""
-    from pydoppelgangerhunt.fixer import (
-        col_offset_to_char_offset,
-        compute_unit_spans,
-    )
-
-    # Greek characters: each 'α', 'β', 'γ' is 2 UTF-8 bytes.
-    # Total bytes: 2 ('α') + 2 ('β') + 2 ('γ') + 1 ('\n') = 7 bytes.
-    line = "αβγ\n"
-    assert line.encode("utf-8") == b"\xce\xb1\xce\xb2\xce\xb3\n"
-
-    # Landing exactly at byte 0: char 0 ("")
-    assert col_offset_to_char_offset(line, 0) == 0
-    # Landing exactly at byte 2 (end of 'α'): char 1 ("α")
-    assert col_offset_to_char_offset(line, 2) == 1
-    # Landing at byte 3 (middle of 'β' byte sequence): clamped safely to preceding valid char boundary (char 1)
-    assert col_offset_to_char_offset(line, 3) == 1
-    # Landing exactly at byte 4 (end of 'β'): char 2 ("αβ")
-    assert col_offset_to_char_offset(line, 4) == 2
-    # Landing at byte 5 (middle of 'γ'): clamped safely to preceding char boundary (char 2)
-    assert col_offset_to_char_offset(line, 5) == 2
-    # Landing exactly at byte 6 (end of 'γ'): char 3 ("αβγ")
-    assert col_offset_to_char_offset(line, 6) == 3
-
-    # Test through compute_unit_spans with exact and clamped column bounds
-    u_exact = {"file": "greek.py", "start": 1, "end": 1, "start_col": 0, "end_col": 4, "kind": "complex_expr"}
-    span_exact = compute_unit_spans(line, u_exact)
-    assert span_exact.start_char == 0
-    assert span_exact.end_char == 2
-    assert span_exact.start_byte == 0
-    assert span_exact.end_byte == 4
-
-    u_clamped = {"file": "greek.py", "start": 1, "end": 1, "start_col": 0, "end_col": 3, "kind": "complex_expr"}
-    span_clamped = compute_unit_spans(line, u_clamped)
-    assert span_clamped.start_char == 0
-    assert span_clamped.end_char == 1
-    assert span_clamped.start_byte == 0
-    assert span_clamped.end_byte == 3
-
-
 def test_adjust_line_for_replacements_boundary_coincidence() -> None:
     """Verifies that _adjust_line_for_replacements does not shift a target line when a unit ends on that target line."""
-    from pydoppelgangerhunt.fixer.patch import _adjust_line_for_replacements
+    from pydoppelgangerhunt.fixer._patch_delegation import _adjust_line_for_replacements
 
     orig_text = (
         "line 1\n"
@@ -6334,7 +2445,6 @@ def test_adjust_line_for_replacements_boundary_coincidence() -> None:
     # Target line 6: downstream of both u1 and u2 (3 < 6 and 5 < 6).
     # Both deltas apply: -2 + 1 = -1. Result is 6 + (-1) = 5.
     assert _adjust_line_for_replacements(6, reps, orig_text) == 5
-
 
 def test_check_units_overlap_multiline_inverted_column_bounds() -> None:
     """Verifies that check_units_overlap handles boundary column disjointness and interior overlaps."""
@@ -6397,7 +2507,6 @@ def test_check_units_overlap_multiline_inverted_column_bounds() -> None:
     u_line1 = {"file": "mod.py", "start": 1, "end": 1, "start_col": 5, "end_col": 15}
     assert check_units_overlap(u_zero_line1, u_line1) is True
 
-
 def test_unit_desc_strict_validation_and_parsing() -> None:
     """Verifies that _unit_desc in refactor_module_units strictly raises TypeError and ValueError."""
     from pydoppelgangerhunt.fixer import refactor_module_units
@@ -6416,7 +2525,6 @@ def test_unit_desc_strict_validation_and_parsing() -> None:
     with pytest.raises(ValueError, match="Overlapping unit collision detected between 'fn1' \\(1-2\\) and 'fn2' \\(1-2\\)"):
         refactor_module_units("x = 1\ny = 2\n", [(u1, "x = 10\n"), (u2, "y = 20\n")])
 
-
 def test_is_valid_unit_coordinates_scenarios() -> None:
     """Verifies that is_valid_unit_coordinates, parse_unit_coord, and compute_line_offsets validate and extract coordinates."""
     from pydoppelgangerhunt.fixer.patch import (
@@ -6424,10 +2532,10 @@ def test_is_valid_unit_coordinates_scenarios() -> None:
         is_valid_unit_coordinates as is_valid_pub,
         parse_unit_coord as parse_unit_coord_pub,
     )
+    from pydoppelgangerhunt.fixer._unit_schema import _parse_unit_coord
     from pydoppelgangerhunt.fixer.source import (
         _compute_line_offsets,
         _is_valid_unit_coordinates,
-        _parse_unit_coord,
         compute_line_offsets,
         is_valid_unit_coordinates,
         parse_unit_coord,
@@ -6494,7 +2602,6 @@ def test_is_valid_unit_coordinates_scenarios() -> None:
         assert pdgh_fixer.compute_line_offsets(lines_input) == (exp_c, exp_b)
         assert pdgh.compute_line_offsets(lines_input) == (exp_c, exp_b)
 
-
 def test_compute_replacement_line_deltas_raises_on_overlapping_units() -> None:
     """Verifies that _compute_replacement_line_deltas raises ValueError on overlapping units."""
     from pydoppelgangerhunt.fixer.patch import _compute_replacement_line_deltas
@@ -6509,35 +2616,29 @@ def test_compute_replacement_line_deltas_raises_on_overlapping_units() -> None:
     ):
         _compute_replacement_line_deltas([(u1, "# rep 1\n"), (u2, "# rep 2\n")], orig_text)
 
-
-def test_generate_refactoring_patch_skips_malformed_clone_pair_without_aborting_batch(
+def test_generate_refactoring_patch_rejects_malformed_unit_schema_at_entry(
     tmp_path: Path,
 ) -> None:
-    """Verifies that a malformed clone pair in a batch does not abort valid clone pair refactoring."""
+    """Verifies generate_refactoring_patch fails fast on invalid unit schemas before processing valid pairs."""
     f1 = tmp_path / "mod1.py"
     f2 = tmp_path / "mod2.py"
     f1.write_text("def run_a(val: int) -> int:\n    return val * 2\n", encoding="utf-8")
     f2.write_text("def run_b(val: int) -> int:\n    return val * 2\n", encoding="utf-8")
 
-    # Pair 1: Malformed coordinates that would fail coordinate parsing
+    # Pair 1: Malformed coordinates rejected by entry-point schema validation
     bad_u1 = {"file": str(f1), "name": "run_a", "start": "not_an_int", "end": 2}
     bad_u2 = {"file": str(f2), "name": "run_b", "start": 1, "end": 2}
 
-    # Pair 2: Fully valid clone pair
+    # Pair 2: Valid clone pair in the same batch
     good_u1 = {"file": str(f1), "name": "run_a", "start": 1, "end": 2, "kind": "function"}
     good_u2 = {"file": str(f2), "name": "run_b", "start": 1, "end": 2, "kind": "function"}
 
-    patch = generate_refactoring_patch(
-        [(0.9, bad_u1, bad_u2), (1.0, good_u1, good_u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-
-    # Valid pair should have successfully generated patch despite bad pair in batch
-    assert "--- a/mod1.py" in patch
-    assert "--- a/mod2.py" in patch
-    assert "_shared_run_a_run_b" in patch
-
+    with pytest.raises(ValueError, match="start"):
+        generate_refactoring_patch(
+            [(0.9, bad_u1, bad_u2), (1.0, good_u1, good_u2)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+        )
 
 def test_generate_refactoring_patch_skips_syntax_error_pair_without_aborting_batch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -6579,7 +2680,6 @@ def test_generate_refactoring_patch_skips_syntax_error_pair_without_aborting_bat
     assert "--- a/mod_valid2.py" in patch
     assert "_shared_process_a_process_b" in patch
 
-
 def test_compute_unit_spans_unpadded_line_length_and_no_double_newline() -> None:
     """Verifies that compute_unit_spans does not leave stray double newlines on statement replacements."""
     from pydoppelgangerhunt.fixer import compute_unit_spans, refactor_module_units
@@ -6612,105 +2712,6 @@ def test_compute_unit_spans_unpadded_line_length_and_no_double_newline() -> None
     span_mid = compute_unit_spans(src_mid, unit_mid)
     assert span_mid.is_column_bounded is True
 
-
-def test_col_offset_to_char_offset_ascii_fast_path_equivalence() -> None:
-    """Verifies that the ASCII fast-path in col_offset_to_char_offset matches UTF-8 decoding."""
-    from pydoppelgangerhunt.fixer import col_offset_to_char_offset
-
-    line = "def calculate_total(price, tax):"
-    assert line.isascii() is True
-
-    for c in [-5, 0, 3, 10, len(line), len(line) + 10]:
-        assert col_offset_to_char_offset(line, c) == max(0, min(len(line), c))
-
-
-def test_delegate_unit_in_plan_tier2_collision_raises_and_rolls_back(tmp_path: Path) -> None:
-    """Verifies that physical byte-span collisions in _delegate_unit_in_plan trigger transactional rollback."""
-    from pydoppelgangerhunt.fixer import UnitCollisionError
-    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _delegate_unit_in_plan
-
-    f1 = tmp_path / "mod1.py"
-    f2 = tmp_path / "mod2.py"
-    f1.write_text("def a():\n    v = 1\n    return v\n", encoding="utf-8")
-    f2.write_text("def b():\n    v = 1\n    return v\n", encoding="utf-8")
-
-    u1 = {"file": str(f1), "name": "a", "start": 2, "end": 3, "kind": "function"}
-    u2 = {"file": str(f2), "name": "b", "start": 2, "end": 3, "kind": "function"}
-
-    # Valid clone pair works cleanly via batch patch generation
-    patch = generate_refactoring_patch(
-        [(0.95, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-    assert "_shared_a_b" in patch
-
-    # Verify direct _delegate_unit_in_plan collision detection and transactional rollback
-    plan = _FilePatchPlan(
-        file_path=f1,
-        rel_path="mod1.py",
-        orig_text=f1.read_text(encoding="utf-8"),
-        is_new_file=False,
-    )
-    # First unit delegation succeeds
-    _delegate_unit_in_plan(
-        u1,
-        plan,
-        helper_name="_shared_a_b",
-        inputs=[],
-        outputs=["v"],
-        scope={"is_async": False, "has_yield": False},
-        target_inputs=None,
-        target_outputs=None,
-        await_prefix="",
-    )
-    assert len(plan.replacements) == 1
-    assert len(plan.claimed_units) == 1
-
-    # Colliding unit overlapping with u1 triggers UnitCollisionError
-    u_colliding = {"file": str(f1), "name": "inner", "start": 2, "end": 2, "kind": "statement"}
-    with pytest.raises(UnitCollisionError):
-        _delegate_unit_in_plan(
-            u_colliding,
-            plan,
-            helper_name="_shared_inner",
-            inputs=[],
-            outputs=["v"],
-            scope={"is_async": False, "has_yield": False},
-            target_inputs=None,
-            target_outputs=None,
-            await_prefix="",
-        )
-
-    # Local transactional rollback: plan state is restored to pre-collision state
-    assert len(plan.replacements) == 1
-    assert plan.replacements[0][0] == u1
-    assert len(plan.claimed_units) == 1
-    assert plan.claimed_units[0] == u1
-
-
-def test_render_file_patch_plan_tier2_collision_fallback() -> None:
-    """Verifies that _render_file_patch_plan safely recovers and filters when replacements collide."""
-    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _render_file_patch_plan
-
-    plan = _FilePatchPlan(
-        file_path=Path("test.py"),
-        rel_path="test.py",
-        orig_text="a = 1\nb = 2\nc = 3\n",
-        is_new_file=False,
-    )
-    u1 = {"file": "test.py", "start": 1, "end": 2}
-    u2 = {"file": "test.py", "start": 2, "end": 3}  # Collides physically on line 2
-    plan.replacements.append((u1, "# replaced 1\n"))
-    plan.replacements.append((u2, "# replaced 2\n"))
-
-    # _render_file_patch_plan should not raise ValueError; it should filter the collision and render a valid patch
-    diff = _render_file_patch_plan(plan, replace_clones=True)
-    assert "--- a/test.py" in diff
-    assert "# replaced 1" in diff
-    assert "# replaced 2" not in diff
-
-
 def test_render_file_patch_plan_omits_unit_with_missing_or_invalid_end() -> None:
     """Verifies that _render_file_patch_plan fails closed and omits units whose end
     coordinate is omitted or inverted."""
@@ -6730,7 +2731,6 @@ def test_render_file_patch_plan_omits_unit_with_missing_or_invalid_end() -> None
     diff = _render_file_patch_plan(plan, replace_clones=True)
     assert "# replaced line 1" not in diff
     assert "# replaced line 3" not in diff
-
 
 def test_render_file_patch_plan_mixed_valid_and_colon_invalid_units() -> None:
     """Verifies that _render_file_patch_plan safely filters valid units and ignores
@@ -6753,8 +2753,6 @@ def test_render_file_patch_plan_mixed_valid_and_colon_invalid_units() -> None:
     assert "+a = 99" in diff
     assert "b = 100" not in diff
 
-
-
 def test_generate_refactoring_patch_no_state_leakage_on_skipped_pair(tmp_path: Path) -> None:
     """Verifies that helper names and comments are not leaked when clone extraction is skipped."""
     f1 = tmp_path / "m1.py"
@@ -6774,31 +2772,6 @@ def test_generate_refactoring_patch_no_state_leakage_on_skipped_pair(tmp_path: P
     )
     # Patch should contain circular dependency rejection notice
     assert "Circular import or unresolvable module path" in patch
-
-
-def test_package_reexport_col_offset_to_char_offset() -> None:
-    """Verifies that col_offset_to_char_offset is exported in the root pydoppelgangerhunt package."""
-    import pydoppelgangerhunt
-
-    assert hasattr(pydoppelgangerhunt, "col_offset_to_char_offset")
-    assert "col_offset_to_char_offset" in pydoppelgangerhunt.__all__
-    assert callable(pydoppelgangerhunt.col_offset_to_char_offset)
-
-
-def test_unit_collision_error_hierarchy_and_render_fallback() -> None:
-    """Verifies that UnitCollisionError subclasses ValueError and is raised on collisions."""
-    from pydoppelgangerhunt.fixer import UnitCollisionError, refactor_module_units
-
-    assert issubclass(UnitCollisionError, ValueError)
-
-    collision_u1 = {"file": "collision_target.py", "name": "block_alpha", "start": 1, "end": 2}
-    collision_u2 = {"file": "collision_target.py", "name": "block_beta", "start": 1, "end": 2}
-
-    with pytest.raises(UnitCollisionError) as exc_info:
-        refactor_module_units("x = 1\ny = 2\n", [(collision_u1, "x = 10\n"), (collision_u2, "y = 20\n")])
-    assert "Overlapping unit collision detected" in str(exc_info.value)
-    assert isinstance(exc_info.value, ValueError)
-
 
 def test_generate_refactoring_patch_rolls_back_partial_mutations_on_deep_failure(
     tmp_path: Path,
@@ -6840,7 +2813,7 @@ def test_generate_refactoring_patch_rolls_back_partial_mutations_on_deep_failure
         return original_delegation_builder(*args, **kwargs)
 
     with mock_patch(
-        "pydoppelgangerhunt.fixer.patch._build_unit_delegation_call",
+        "pydoppelgangerhunt.fixer._patch_delegation._build_unit_delegation_call",
         side_effect=mocked_delegation_builder,
     ):
         patch_result = generate_refactoring_patch(
@@ -6860,7 +2833,6 @@ def test_generate_refactoring_patch_rolls_back_partial_mutations_on_deep_failure
     assert "--- a/rollback_mod_a.py" in patch_result
     assert "--- a/rollback_mod_b.py" in patch_result
 
-
 def test_compute_unit_spans_whitespace_parity_with_form_feed() -> None:
     """Verifies that compute_unit_spans correctly classifies whitespace with form-feeds (\\f)."""
     from pydoppelgangerhunt.fixer import compute_unit_spans
@@ -6877,43 +2849,6 @@ def test_compute_unit_spans_whitespace_parity_with_form_feed() -> None:
     unit_sub_expr = {"file": "ff_test.py", "start": 2, "end": 2, "start_col": 11, "end_col": 17}
     span_sub = compute_unit_spans(source_code_prefix, unit_sub_expr)
     assert span_sub.is_column_bounded
-
-
-def test_package_reexport_unit_collision_error() -> None:
-    """Verifies that UnitCollisionError is re-exported in root and fixer packages."""
-    import pydoppelgangerhunt as pdgh
-    import pydoppelgangerhunt.fixer as pdgh_fixer
-
-    assert hasattr(pdgh, "UnitCollisionError")
-    assert "UnitCollisionError" in pdgh.__all__
-    assert issubclass(pdgh.UnitCollisionError, ValueError)
-
-    assert hasattr(pdgh_fixer, "UnitCollisionError")
-    assert "UnitCollisionError" in pdgh_fixer.__all__
-    assert issubclass(pdgh_fixer.UnitCollisionError, ValueError)
-
-
-def test_refactor_module_units_inverted_line_range_is_noop() -> None:
-    """Verifies that inverted line ranges (start > end) fail closed with ValueError
-    in mutation APIs."""
-    from pydoppelgangerhunt.fixer import refactor_module_units, replace_unit_in_source
-
-    original_code = "line1\nline2\nline3\n"
-    inverted_unit = {"file": "sample.py", "name": "bad_inv", "start": 5, "end": 2}
-
-    # refactor_module_units fails closed with ValueError
-    with pytest.raises(ValueError, match="invalid coordinates for refactoring"):
-        refactor_module_units(original_code, [(inverted_unit, "INVERTED_REPLACEMENT\n")])
-
-    # replace_unit_in_source fails closed with ValueError
-    with pytest.raises(ValueError, match="invalid coordinates for replacement"):
-        replace_unit_in_source(original_code, inverted_unit, "INVERTED_REPLACEMENT\n")
-
-    # Out of bounds start line
-    oob_unit = {"file": "sample.py", "name": "bad_oob", "start": 99, "end": 100}
-    result_oob = refactor_module_units(original_code, [(oob_unit, "OOB_REPLACEMENT\n")])
-    assert result_oob == original_code
-
 
 def test_column_bounded_replacement_no_double_newline_on_clean_line_end() -> None:
     """Verifies that column-bounded replacements on clean line ends do not produce duplicate double newlines."""
@@ -6948,7 +2883,6 @@ def test_column_bounded_replacement_no_double_newline_on_clean_line_end() -> Non
     )
     assert_valid_python(repaired_code)
 
-
 def test_check_units_overlap_inverted_line_ranges_are_disjoint() -> None:
     """Verifies that check_units_overlap treats inverted line ranges (start > end) as empty and disjoint."""
     from pydoppelgangerhunt.fixer import check_units_overlap
@@ -6961,63 +2895,6 @@ def test_check_units_overlap_inverted_line_ranges_are_disjoint() -> None:
     assert check_units_overlap(inv_u1, valid_unit) is False
     assert check_units_overlap(valid_unit, inv_u1) is False
     assert check_units_overlap(inv_u1, inv_u2) is False
-
-
-def test_refactor_module_units_tier2_sweep_catches_nested_and_adjacent_collisions() -> None:
-    """Verifies that O(N log N) Tier 2 physical sweep catches nested intervals and collisions."""
-    from pydoppelgangerhunt.fixer import UnitCollisionError, refactor_module_units
-
-    text = "alpha = 1\nbeta = 2\ngamma = 3\n"
-    # c_wide covers lines 1-3, c_inner covers line 2 (nested within c_wide)
-    c_wide = {"file": "f.py", "name": "wide", "start": 1, "end": 3}
-    c_inner = {"file": "f.py", "name": "inner", "start": 2, "end": 2}
-
-    with pytest.raises(UnitCollisionError) as err:
-        refactor_module_units(text, [(c_wide, "# wide\n"), (c_inner, "# inner\n")])
-    assert "Overlapping unit collision detected" in str(err.value)
-
-
-def test_compute_replacement_line_deltas_sweep_catches_nested_interval_collision() -> None:
-    """Verifies that _compute_replacement_line_deltas catches nested intervals via max_end_item sweep."""
-    from pydoppelgangerhunt.fixer import UnitCollisionError
-    from pydoppelgangerhunt.fixer.patch import _compute_replacement_line_deltas
-
-    text = "line_one = 1\nline_two = 2\nline_three = 3\n"
-    c_wide = {"file": "f.py", "name": "wide", "start": 1, "end": 3}
-    c_inner = {"file": "f.py", "name": "inner", "start": 2, "end": 2}
-
-    with pytest.raises(UnitCollisionError) as err:
-        _compute_replacement_line_deltas([(c_wide, "# wide\n"), (c_inner, "# inner\n")], text)
-    assert "Overlapping unit collision detected in line delta computation" in str(err.value)
-
-
-def test_col_offset_to_char_offset_surrogate_code_points() -> None:
-    """Verifies that col_offset_to_char_offset and compute_unit_spans handle lone surrogates without error."""
-    from pydoppelgangerhunt.fixer import col_offset_to_char_offset
-    from pydoppelgangerhunt.fixer.source import compute_unit_spans
-
-    # Lone surrogate character (U+D800) encoded in UTF-8 as 3 bytes (0xED 0xA0 0x80)
-    surrogate_line = "val = '\ud800'"
-    # Offset 0..7: 'val = \'' (7 ASCII characters, bytes 0..7)
-    assert col_offset_to_char_offset(surrogate_line, 6) == 6
-    assert col_offset_to_char_offset(surrogate_line, 7) == 7
-    # Offset 8 & 9: mid-sequence bytes within the 3-byte surrogate; clamps back to 7
-    assert col_offset_to_char_offset(surrogate_line, 8) == 7
-    assert col_offset_to_char_offset(surrogate_line, 9) == 7
-    # Offset 10: boundary after surrogate character (character index 8)
-    assert col_offset_to_char_offset(surrogate_line, 10) == 8
-    # Offset 11: boundary after closing quote (character index 9)
-    assert col_offset_to_char_offset(surrogate_line, 11) == 9
-
-    # compute_unit_spans with surrogate code points
-    source_with_surrogate = "val = '\ud800'\nprint(val)\n"
-    unit = {"file": "surrogate.py", "start": 1, "end": 1, "start_col": 0, "end_col": 10}
-    span = compute_unit_spans(source_with_surrogate, unit)
-    assert span.start_char == 0
-    assert span.start_byte == 0
-    assert span.end_char > 0
-    assert span.end_byte > 0
-
 
 def test_resolve_unit_replacement_crlf_line_endings_no_dangling_carriage_return() -> None:
     """Verifies that CRLF line endings (\r\n) do not produce orphaned \r carriage returns."""
@@ -7070,22 +2947,6 @@ def test_resolve_unit_replacement_crlf_line_endings_no_dangling_carriage_return(
     assert whole_rep_item.final_rep.endswith("\r\n")
     assert "# type: ignore" in whole_rep_item.final_rep
 
-
-def test_refactor_module_units_missing_file_key_defaults_to_module() -> None:
-    """Verifies that refactor_module_units defaults missing 'file' keys to <module> for Tier 1 validation."""
-    from pydoppelgangerhunt.fixer import UnitCollisionError, refactor_module_units
-
-    code = "x = 1\ny = 2\nz = 3\n"
-    # Units without 'file' keys that overlap in line ranges
-    u1 = {"name": "u1", "start": 1, "end": 2}
-    u2 = {"name": "u2", "start": 2, "end": 3}
-
-    with pytest.raises(UnitCollisionError) as exc_info:
-        refactor_module_units(code, [(u1, "rep1\n"), (u2, "rep2\n")])
-    assert "<module>" in str(exc_info.value)
-    assert "Overlapping unit collision detected" in str(exc_info.value)
-
-
 def test_column_bounded_replacement_clean_line_end_no_duplicate_newline() -> None:
     """Verifies that a column-bounded expression at clean line-end without pragmas does not duplicate newlines."""
     from pydoppelgangerhunt.fixer import refactor_module_units, resolve_unit_replacement
@@ -7107,30 +2968,6 @@ def test_column_bounded_replacement_clean_line_end_no_duplicate_newline() -> Non
     result = refactor_module_units(code, [(unit, "helper(data)\n")])
     assert result == "val = helper(data)\nprint(val)\n"
 
-
-def test_tier2_sweep_zero_width_slice_collision() -> None:
-    """Verifies that _intervals_overlap and Tier 2 sweep detect collisions with zero-width slices."""
-    from pydoppelgangerhunt.fixer.patch import _intervals_overlap
-
-    # Zero-width point strictly inside active interval [10, 20)
-    assert _intervals_overlap(10, 20, 15, 15) is True
-    assert _intervals_overlap(15, 15, 10, 20) is True
-
-    # Zero-width point touching interval boundaries exactly does not collide
-    assert _intervals_overlap(10, 20, 10, 10) is False
-    assert _intervals_overlap(10, 20, 20, 20) is False
-    assert _intervals_overlap(10, 10, 10, 20) is False
-    assert _intervals_overlap(20, 20, 10, 20) is False
-
-    # Zero-width points at the exact same offset collide
-    assert _intervals_overlap(10, 10, 10, 10) is True
-    assert _intervals_overlap(10, 10, 15, 15) is False
-
-    # Disjoint intervals
-    assert _intervals_overlap(10, 20, 25, 25) is False
-    assert _intervals_overlap(10, 20, 5, 5) is False
-
-
 def test_compute_unit_spans_deprecation_warning() -> None:
     """Verifies that _compute_unit_spans emits a runtime DeprecationWarning with stacklevel=2."""
     from pydoppelgangerhunt.fixer.source import _compute_unit_spans
@@ -7141,7 +2978,6 @@ def test_compute_unit_spans_deprecation_warning() -> None:
         result = _compute_unit_spans(code, unit)
 
     assert result == ((0, 28), (0, 28), False)
-
 
 def test_generate_refactoring_patch_unexpected_exception_keyerror_rollback(
     tmp_path: Path,
@@ -7201,7 +3037,6 @@ def test_generate_refactoring_patch_unexpected_exception_keyerror_rollback(
     assert "Unexpected failure processing clone pair" in warning_records[0].message
     assert warning_records[0].exc_info is not None
 
-
 def test_generate_refactoring_patch_programming_bugs_fail_loudly(
     tmp_path: Path,
 ) -> None:
@@ -7236,7 +3071,6 @@ def test_generate_refactoring_patch_programming_bugs_fail_loudly(
     ):
         with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
             generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path))
-
 
 def test_plan_snapshot_typed_dict_and_restore(tmp_path: Path) -> None:
     """Verifies that _FilePatchPlan.snapshot() conforms to _PlanSnapshot and restores state cleanly."""
@@ -7273,7 +3107,6 @@ def test_plan_snapshot_typed_dict_and_restore(tmp_path: Path) -> None:
     assert "_shared_x" in plan.used_helper_names
     assert len(plan.claimed_units) == 1
 
-
 def test_compute_unit_spans_start_col_exceeds_line_length_clamping() -> None:
     """Verifies that start_col > len(line_bytes) safely clamps to the line length boundary."""
     from pydoppelgangerhunt.fixer import compute_unit_spans
@@ -7297,33 +3130,6 @@ def test_compute_unit_spans_start_col_exceeds_line_length_clamping() -> None:
     assert span_unicode.end_byte == len(code_unicode.encode("utf-8"))
     assert span_unicode.start_char == len(code_unicode)
     assert span_unicode.end_char == len(code_unicode)
-
-
-def test_refactor_module_units_dry_run_validation() -> None:
-    """Verifies that refactor_module_units with dry_run=True validates collisions without mutating source."""
-    from pydoppelgangerhunt.fixer import UnitCollisionError, refactor_module_units
-
-    code = "def f1():\n    return 1\n\ndef f2():\n    return 2\n"
-    u1 = {"file": "sample.py", "start": 1, "end": 2}
-    u2 = {"file": "sample.py", "start": 4, "end": 5}
-
-    # Dry run with valid non-overlapping replacements returns original source_text unchanged
-    res = refactor_module_units(
-        code,
-        [(u1, "def f1_new():\n    return 10\n"), (u2, "def f2_new():\n    return 20\n")],
-        dry_run=True,
-    )
-    assert res == code
-
-    # Dry run with colliding replacements still raises UnitCollisionError
-    u_collide = {"file": "sample.py", "start": 2, "end": 4}
-    with pytest.raises(UnitCollisionError):
-        refactor_module_units(
-            code,
-            [(u1, "def f1_new():\n    return 10\n"), (u_collide, "pass\n")],
-            dry_run=True,
-        )
-
 
 def test_apply_line_deltas_edge_cases() -> None:
     """Verifies that _apply_line_deltas handles boundary conditions and non-integer inputs."""
@@ -7351,7 +3157,6 @@ def test_apply_line_deltas_edge_cases() -> None:
     # Target line 15: after 3, 7, and 12 (+2 - 1 + 4 = +5)
     assert _apply_line_deltas(15, deltas) == 20
 
-
 def test_split_source_lines_physical_newlines_and_form_feed() -> None:
     """Verifies that split_source_lines splits strictly on physical newlines and preserves form-feed characters."""
     import io
@@ -7374,25 +3179,6 @@ def test_split_source_lines_physical_newlines_and_form_feed() -> None:
     # Parity with io.StringIO readlines
     for s in ["", "a", "a\n", "a\r\nb\nc", "def fn():\n\x0c    pass\n"]:
         assert split_source_lines(s) == io.StringIO(s, newline="").readlines()
-
-
-def test_refactor_module_units_form_feed_line_replacement() -> None:
-    """Verifies that refactor_module_units replaces whole statements with form-feed indentation cleanly."""
-    from pydoppelgangerhunt.fixer import refactor_module_units
-
-    source_with_ff = "def fn():\n\x0c    x = 10\n    return x\n"
-    unit_stmt = {"file": "ff_test.py", "start": 2, "end": 2, "start_col": 5, "end_col": 11}
-    # Whole-statement replacement must replace the entire line including \f, not just \f
-    res = refactor_module_units(source_with_ff, [(unit_stmt, "    x = 20\n")])
-    assert res == "def fn():\n    x = 20\n    return x\n"
-
-    # Sub-expression replacement inside a form-feed line
-    source_ff_expr = "def fn():\n\x0c    flag = x = 10\n    return x\n"
-    # Column offset 12 is 'x = 10' (\f is 1 byte, 4 spaces is 4 bytes, 'flag = ' is 7 bytes: 1+4+7=12)
-    unit_sub = {"file": "ff_test.py", "start": 2, "end": 2, "start_col": 12, "end_col": 18}
-    res_sub = refactor_module_units(source_ff_expr, [(unit_sub, "y = 99")])
-    assert res_sub == "def fn():\n\x0c    flag = y = 99\n    return x\n"
-
 
 def test_empty_source_buffer_replacement_is_noop() -> None:
     """Verifies that replacements targeting an empty source buffer return empty string without inserting text."""
@@ -7421,7 +3207,6 @@ def test_empty_source_buffer_replacement_is_noop() -> None:
     # refactor_module_units
     assert refactor_module_units("", [(unit, "x = 1\n")]) == ""
 
-
 def test_package_reexport_split_source_lines() -> None:
     """Verifies that split_source_lines is re-exported from package root and fixer subpackages."""
     import pydoppelgangerhunt as pdgh
@@ -7434,7 +3219,6 @@ def test_package_reexport_split_source_lines() -> None:
     assert hasattr(pdgh_fixer, "split_source_lines")
     assert "split_source_lines" in pdgh_fixer.__all__
     assert callable(pdgh_fixer.split_source_lines)
-
 
 def test_compute_unit_spans_non_positive_line_clamping() -> None:
     """Verifies that compute_unit_spans clamps non-positive line numbers to line 1 matching check_units_overlap."""
@@ -7471,7 +3255,6 @@ def test_compute_unit_spans_non_positive_line_clamping() -> None:
     assert span_inv.end_line == 1
     assert span_inv.start_char == span_inv.end_char == len(src)
 
-
 def test_render_file_patch_plan_preserves_crlf_in_helpers() -> None:
     """Verifies that _render_file_patch_plan uses CRLF line endings when splicing helpers into CRLF files."""
     from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _render_file_patch_plan
@@ -7494,7 +3277,6 @@ def test_render_file_patch_plan_preserves_crlf_in_helpers() -> None:
     for line in diff.splitlines(keepends=True):
         if line.startswith("+") and not line.startswith("+++"):
             assert line.endswith("\r\n"), f"Expected CRLF line ending in hunk line: {line!r}"
-
 
 def test_split_source_lines_finditer_avoid_intermediate_allocation() -> None:
     """Verifies that split_source_lines with finditer produces identical results across all line ending types."""
@@ -7522,7 +3304,6 @@ def test_split_source_lines_finditer_avoid_intermediate_allocation() -> None:
         assert result == expected, f"Mismatch on {case!r}: {result!r} != {expected!r}"
         assert all(isinstance(ln, str) and ln for ln in result)
 
-
 def test_count_physical_newlines_and_detect_line_ending() -> None:
     """Verifies physical newline counting and line ending detection across LF, CRLF, and lone CR."""
     from pydoppelgangerhunt.fixer import count_physical_newlines, detect_line_ending
@@ -7544,7 +3325,6 @@ def test_count_physical_newlines_and_detect_line_ending() -> None:
     assert detect_line_ending("x = 1", "y = 2\r\n") == "\r\n"
     assert detect_line_ending("x = 1", "y = 2\r") == "\r"
 
-
 def test_compute_replacement_line_deltas_lone_cr_source() -> None:
     """Verifies that _compute_replacement_line_deltas accurately computes line delta for lone-CR sources."""
     from pydoppelgangerhunt.fixer.patch import _compute_replacement_line_deltas
@@ -7555,7 +3335,6 @@ def test_compute_replacement_line_deltas_lone_cr_source() -> None:
     u = {"file": "cr_test.py", "start": 1, "end": 2}
     deltas = _compute_replacement_line_deltas([(u, "def foo():\r")], src_cr)
     assert deltas == [(2, -1)]
-
 
 def test_resolve_unit_replacement_lone_cr_source() -> None:
     """Verifies that resolve_unit_replacement and replace_unit_in_source preserve lone-CR line terminators."""
@@ -7575,7 +3354,6 @@ def test_resolve_unit_replacement_lone_cr_source() -> None:
     res_line = replace_unit_in_source(src_cr_line, unit_line, "x = 10")
     assert res_line == "x = 10\ry = 2\r"
     assert "\n" not in res_line
-
 
 def test_render_file_patch_plan_lone_cr_helpers() -> None:
     """Verifies that _render_file_patch_plan preserves lone-CR line terminators when splicing helpers."""
@@ -7599,7 +3377,6 @@ def test_render_file_patch_plan_lone_cr_helpers() -> None:
             assert line.endswith("\r"), f"Expected lone-CR line ending in hunk line: {line!r}"
             assert not line.endswith("\r\n"), f"Did not expect CRLF in CR hunk line: {line!r}"
 
-
 def test_package_reexport_newline_helpers() -> None:
     """Verifies that count_physical_newlines and detect_line_ending are re-exported from package roots."""
     import pydoppelgangerhunt as pdgh
@@ -7612,7 +3389,6 @@ def test_package_reexport_newline_helpers() -> None:
         assert hasattr(pdgh_fixer, name)
         assert name in pdgh_fixer.__all__
         assert callable(getattr(pdgh_fixer, name))
-
 
 def test_detect_line_ending_sample_boundary_and_straddle() -> None:
     """Verifies that detect_line_ending handles boundary-straddling CRLF and expanded sample buffers."""
@@ -7629,25 +3405,6 @@ def test_detect_line_ending_sample_boundary_and_straddle() -> None:
     # Case 3: Lone CR at char 4095 followed by non-\n
     text_4096_cr = "a" * 4095 + "\r" + "b = 2"
     assert detect_line_ending(text_4096_cr) == "\r"
-
-
-def test_refactor_module_units_zero_width_insertion_collision() -> None:
-    """Verifies that refactor_module_units detects collisions between distinct zero-width insertions."""
-    from pydoppelgangerhunt.fixer import UnitCollisionError, refactor_module_units
-
-    code = "x = 1\ny = 2\n"
-    # Two zero-width units at the exact same line and column offset collide in Tier 2
-    u1 = {"file": "sample.py", "start": 1, "end": 1, "start_col": 2, "end_col": 2}
-    u2 = {"file": "sample.py", "start": 1, "end": 1, "start_col": 2, "end_col": 2}
-
-    with pytest.raises(UnitCollisionError, match="Overlapping unit collision detected"):
-        refactor_module_units(code, [(u1, "# ins1 "), (u2, "# ins2 ")])
-
-    # Two zero-width units at distinct column offsets succeed without collision
-    u3 = {"file": "sample.py", "start": 1, "end": 1, "start_col": 4, "end_col": 4}
-    res = refactor_module_units(code, [(u1, "#1 "), (u3, "#2 ")])
-    assert res == "x #1 = #2 1\ny = 2\n"
-
 
 def test_detect_line_ending_true_majority_vote_resilience() -> None:
     """Verifies that detect_line_ending performs a true majority vote across all lines and resists stray terminators."""
@@ -7680,7 +3437,6 @@ def test_detect_line_ending_true_majority_vote_resilience() -> None:
     assert detect_line_ending("a\r\nb\r") == "\r\n"
     assert detect_line_ending("a\r\nb\nc\r") == "\n"
 
-
 def test_resolve_unit_replacement_form_feed_in_final_rep() -> None:
     """Verifies that resolve_unit_replacement uses physical line splitting for final_rep containing form feeds."""
     from pydoppelgangerhunt.fixer import resolve_unit_replacement
@@ -7690,25 +3446,6 @@ def test_resolve_unit_replacement_form_feed_in_final_rep() -> None:
     rep_with_ff = "\x0cx = 2\x0c"
     item = resolve_unit_replacement(source, unit, rep_with_ff, preserve_boundary_pragmas=True)
     assert item.final_rep == "\x0cx = 2\x0c  # type: ignore\n"
-
-
-def test_refactor_module_units_boundary_touching_zero_width_insertion_order() -> None:
-    """Verifies deterministic application order for zero-width insertions touching replacement boundaries."""
-    from pydoppelgangerhunt.fixer import refactor_module_units
-
-    code = "abcdefghij\n"
-    u_rep = {"file": "test.py", "start": 1, "end": 1, "start_col": 2, "end_col": 5}
-
-    # Zero-width insertion at start boundary [2, 2) is applied before replacement text [2, 5)
-    u_ins_start = {"file": "test.py", "start": 1, "end": 1, "start_col": 2, "end_col": 2}
-    res_start = refactor_module_units(code, [(u_rep, "XYZ"), (u_ins_start, "INS_")])
-    assert res_start == "abINS_XYZfghij\n"
-
-    # Zero-width insertion at end boundary [5, 5) is applied after replacement text [2, 5)
-    u_ins_end = {"file": "test.py", "start": 1, "end": 1, "start_col": 5, "end_col": 5}
-    res_end = refactor_module_units(code, [(u_rep, "XYZ"), (u_ins_end, "_INS")])
-    assert res_end == "abXYZ_INSfghij\n"
-
 
 def test_render_file_patch_plan_form_feed_in_helpers() -> None:
     """Verifies that _render_file_patch_plan preserves form feeds in method and module helpers."""
@@ -7737,66 +3474,6 @@ def test_render_file_patch_plan_form_feed_in_helpers() -> None:
     diff_new = _render_file_patch_plan(new_plan, replace_clones=True)
     assert "+def new_helper():\x0c    return 3" in diff_new
 
-
-def test_resolve_unit_replacement_last_line_offset_indexing() -> None:
-    """Verifies resolve_unit_replacement on the last line uses offset arrays without string re-encoding."""
-    from pydoppelgangerhunt.fixer import resolve_unit_replacement
-    from pydoppelgangerhunt.fixer.source import _compute_line_offsets, split_source_lines
-
-    # Case 1: Clean line end with replacement ending in newline
-    code1 = "x = 1\ny = 2 + 3\n"
-    lines1 = split_source_lines(code1)
-    char_offs1, byte_offs1 = _compute_line_offsets(lines1)
-    unit1 = {"file": "test.py", "start": 2, "end": 2, "start_col": 4, "end_col": 9}
-    item1 = resolve_unit_replacement(
-        code1,
-        unit1,
-        "42\n",
-        preserve_boundary_pragmas=True,
-        lines=lines1,
-        line_char_offsets=char_offs1,
-        line_byte_offsets=byte_offs1,
-    )
-    assert item1.consumes_line_suffix is True
-    assert item1.end_char == char_offs1[2]
-    assert item1.end_byte == byte_offs1[2]
-    assert item1.final_rep == "42\n"
-
-    # Case 2: Unclean suffix with missing pragmas appending to line end
-    code2 = "a = 1  # type: ignore\ny = (2 + 3) * 5\n"
-    lines2 = split_source_lines(code2)
-    char_offs2, byte_offs2 = _compute_line_offsets(lines2)
-    unit2 = {"file": "test.py", "start": 1, "end": 2, "start_col": 0, "end_col": 11}
-    item2 = resolve_unit_replacement(
-        code2,
-        unit2,
-        "res = 42",
-        preserve_boundary_pragmas=True,
-        lines=lines2,
-        line_char_offsets=char_offs2,
-        line_byte_offsets=byte_offs2,
-    )
-    assert item2.consumes_line_suffix is True
-    assert item2.end_char == char_offs2[2]
-    assert item2.end_byte == byte_offs2[2]
-    assert item2.final_rep == "res = 42 * 5  # type: ignore\n"
-
-
-def test_canonicalize_helper_relative_imports_form_feed_and_crlf() -> None:
-    """Verifies that _canonicalize_helper_relative_imports preserves form feeds and line endings."""
-    from pydoppelgangerhunt.fixer.patch import _canonicalize_helper_relative_imports
-
-    helper_code = "\x0cdef foo():\r\n    from .bar import baz\r\n    x = 1\x0c + 2\r\n    return baz()\r\n"
-    res = _canonicalize_helper_relative_imports(
-        helper_code,
-        [("pkg.sub", False)],
-    )
-    assert "\x0c" in res
-    assert "from pkg.bar import baz" in res
-    assert "\r\n" in res
-    assert "x = 1\x0c + 2" in res
-
-
 def test_detect_line_ending_iterable_and_mixed_arguments() -> None:
     """Verifies that detect_line_ending accepts iterables, generators, sequences, and None values."""
     from pydoppelgangerhunt.fixer import detect_line_ending
@@ -7815,7 +3492,6 @@ def test_detect_line_ending_iterable_and_mixed_arguments() -> None:
     assert detect_line_ending() == "\n"
     assert detect_line_ending([]) == "\n"
     assert detect_line_ending(None) == "\n"
-
 
 def test_intervals_overlap_public_helper() -> None:
     """Verifies intervals_overlap on disjoint, overlapping, touching, and zero-width intervals."""
@@ -7840,7 +3516,6 @@ def test_intervals_overlap_public_helper() -> None:
     # Two zero-width intervals
     assert intervals_overlap(5, 5, 5, 5) is True
     assert intervals_overlap(5, 5, 6, 6) is False
-
 
 def test_validate_module_unit_replacements_and_tier_toggles() -> None:
     """Verifies validate_module_unit_replacements and tier1/tier2 toggles in refactor_module_units."""
@@ -7872,65 +3547,6 @@ def test_validate_module_unit_replacements_and_tier_toggles() -> None:
     )
     assert "x = 10" in res
 
-
-def test_delegate_unit_in_plan_incremental_scaling_and_collision() -> None:
-    """Verifies incremental O(K) collision checking and snapshot rollback in _FilePatchPlan."""
-    from pydoppelgangerhunt.fixer.patch import (
-        UnitCollisionError,
-        _FilePatchPlan,
-        _delegate_unit_in_plan,
-    )
-
-    code = "def foo():\n    a = 1\n    b = 2\n    return a + b\n"
-    plan = _FilePatchPlan(
-        file_path=Path("test.py"),
-        rel_path="test.py",
-        orig_text=code,
-    )
-
-    u1 = {"file": "test.py", "start": 2, "end": 2, "start_col": 4, "end_col": 9}
-    _delegate_unit_in_plan(
-        unit=u1,
-        plan=plan,
-        helper_name="_h1",
-        inputs=[],
-        outputs=["a"],
-        scope={},
-        target_inputs=None,
-        target_outputs=None,
-        await_prefix="",
-    )
-    assert len(plan.replacements) == 1
-    assert len(plan.replacement_items) == 1
-
-    # Snapshot state
-    snap = plan.snapshot()
-
-    # Attempt colliding unit
-    u_collide = {"file": "test.py", "start": 2, "end": 2, "start_col": 4, "end_col": 9}
-    with pytest.raises(UnitCollisionError):
-        _delegate_unit_in_plan(
-            unit=u_collide,
-            plan=plan,
-            helper_name="_h2",
-            inputs=[],
-            outputs=["a"],
-            scope={},
-            target_inputs=None,
-            target_outputs=None,
-            await_prefix="",
-        )
-
-    # Verify plan was not mutated by failed delegation
-    assert len(plan.replacements) == 1
-    assert len(plan.replacement_items) == 1
-
-    # Restore snapshot and verify parity
-    plan.restore(snap)
-    assert len(plan.replacements) == 1
-    assert len(plan.replacement_items) == 1
-
-
 def test_extract_unit_body_lines_and_synthesis_form_feed(tmp_path: Path) -> None:
     """Verifies that _extract_unit_body_lines and synthesize_shared_helper_code preserve form feeds."""
     from pydoppelgangerhunt.fixer.source import _extract_unit_body_lines
@@ -7956,7 +3572,6 @@ def test_extract_unit_body_lines_and_synthesis_form_feed(tmp_path: Path) -> None
     h_code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert "\x0c" in h_code
 
-
 def test_negative_column_clamping_in_check_units_overlap() -> None:
     """Verifies that negative column offsets clamp to 0 and do not produce erroneous collisions."""
     # Negative start column clamps to 0: [0, 5) and [5, 10) touch but do not overlap
@@ -7971,38 +3586,6 @@ def test_negative_column_clamping_in_check_units_overlap() -> None:
     # Both negative clamp to 0: [0, 0) is empty zero-width, so no collision
     u_neg_zero = {"file": "mod.py", "start": 1, "end": 1, "start_col": -10, "end_col": -2}
     assert check_units_overlap(u_neg_zero, u_pos) is False
-
-
-def test_dual_tier_rejection_and_pragma_expanded_catch() -> None:
-    """Verifies both Tier 1 coordinate rejection and Tier 2 pragma-expanded collision catch."""
-    from pydoppelgangerhunt.fixer.patch import UnitCollisionError
-
-    # 1. Tier 1 Semantic Overlap Rejection
-    u_t1_a = {"name": "fn1", "file": "mod.py", "start": 1, "end": 2}
-    u_t1_b = {"name": "fn2", "file": "mod.py", "start": 2, "end": 3}
-    assert check_units_overlap(u_t1_a, u_t1_b) is True
-    with pytest.raises(UnitCollisionError, match="Overlapping unit collision detected"):
-        refactor_module_units("x = 1\ny = 2\nz = 3\n", [(u_t1_a, "pass\n"), (u_t1_b, "pass\n")], tier1=True, tier2=False)
-
-    # 2. Tier 2 Catch of Pragma-Expanded Collision
-    src = "a = 1  # type: ignore\nb = 2\n"
-    # u1: line 1, col 0..5 (statement part). Because line 1 has a trailing pragma,
-    # resolve_unit_replacement expands it to whole line [0, line_bytes[1]) to preserve pragma.
-    u_p1 = {"name": "u1", "file": "mod.py", "start": 1, "end": 1, "start_col": 0, "end_col": 5}
-    # u2: line 1, col 7..21 (pointing into trailing comment/token on same line).
-    u_p2 = {"name": "u2", "file": "mod.py", "start": 1, "end": 1, "start_col": 7, "end_col": 21, "kind": "complex_expr"}
-
-    # In Tier 1, column intervals [0, 5) and [7, 21) do not overlap
-    assert check_units_overlap(u_p1, u_p2) is False
-
-    # Tier 1 alone allows it without error
-    out = refactor_module_units(src, [(u_p1, "a = 10\n"), (u_p2, "comment")], tier1=True, tier2=False)
-    assert out is not None
-
-    # Tier 2 catches the physical interval collision caused by pragma whole-line expansion
-    with pytest.raises(UnitCollisionError, match="Overlapping unit collision detected between 'u1' \\(1-1\\) and 'u2' \\(1-1\\)"):
-        refactor_module_units(src, [(u_p1, "a = 10\n"), (u_p2, "comment")], tier1=True, tier2=True)
-
 
 def test_reporters_precompiled_physical_line_regex_notebook_cells(tmp_path: Path) -> None:
     """Verifies that extract_unit_source_code uses _PHYSICAL_LINE_RE and preserves form feeds."""
@@ -8022,7 +3605,6 @@ def test_reporters_precompiled_physical_line_regex_notebook_cells(tmp_path: Path
     lines = extract_unit_source_code(unit, repo_root=str(tmp_path))
     assert lines == ["val = 1\n", "\x0cres = val + 2\n"]
     assert "\x0c" in lines[1]
-
 
 @requires_git
 def test_generate_refactoring_patch_sync_generator_with_outputs_and_return(tmp_path: Path) -> None:
@@ -8108,7 +3690,6 @@ def test_generate_refactoring_patch_sync_generator_with_outputs_and_return(tmp_p
     assert after_proc.returncode == 0, f"Refactored execution failed: {after_proc.stderr}"
     assert after_proc.stdout == before_proc.stdout
 
-
 @requires_git
 def test_generate_refactoring_patch_sync_generator_renamed_downstream_outputs(tmp_path: Path) -> None:
     """Verifies that generator clones with distinct renamed outputs map outputs 1-to-1 without returning unassigned variables."""
@@ -8193,7 +3774,6 @@ def test_generate_refactoring_patch_sync_generator_renamed_downstream_outputs(tm
     assert after_proc.returncode == 0, f"Refactored execution failed: {after_proc.stderr}"
     assert after_proc.stdout == before_proc.stdout
 
-
 def test_generate_refactoring_patch_sync_generator_unequal_output_counts_rejected(tmp_path: Path) -> None:
     """Verifies that generator clones with unequal output counts and un-counterparted needed outputs are rejected."""
     src1 = (
@@ -8224,72 +3804,6 @@ def test_generate_refactoring_patch_sync_generator_unequal_output_counts_rejecte
 
     patch = generate_refactoring_patch([(0.90, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
     assert patch == ""
-
-
-def test_generate_refactoring_patch_async_generator_try_cleanup_rejected(tmp_path: Path) -> None:
-    """Verifies that clone pairs of async generators with cleanup blocks are rejected."""
-    src1 = (
-        "async def agen1(items: list[int]):\n"
-        "    try:\n"
-        "        for x in items:\n"
-        "            yield x\n"
-        "    finally:\n"
-        "        pass\n"
-    )
-    src2 = (
-        "async def agen2(items: list[int]):\n"
-        "    try:\n"
-        "        for x in items:\n"
-        "            yield x\n"
-        "    finally:\n"
-        "        pass\n"
-    )
-    f1 = tmp_path / "as1.py"
-    f2 = tmp_path / "as2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    assert_valid_python(src1)
-    assert_valid_python(src2)
-
-    u1 = {"file": str(f1), "start": 1, "end": 6, "name": "agen1", "kind": "function"}
-    u2 = {"file": str(f2), "start": 1, "end": 6, "name": "agen2", "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert patch == ""
-
-
-def test_generate_refactoring_patch_async_generator_with_bare_return_accepted(tmp_path: Path) -> None:
-    """Verifies that clone pairs of async generators with bare return statements are accepted and refactored."""
-    src1 = (
-        "async def agen1(items: list[int]):\n"
-        "    for x in items:\n"
-        "        if x < 0:\n"
-        "            return\n"
-        "        yield x\n"
-    )
-    src2 = (
-        "async def agen2(items: list[int]):\n"
-        "    for x in items:\n"
-        "        if x < 0:\n"
-        "            return\n"
-        "        yield x\n"
-    )
-    f1 = tmp_path / "as1.py"
-    f2 = tmp_path / "as2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"file": str(f1), "start": 1, "end": 5, "name": "agen1", "kind": "function"}
-    u2 = {"file": str(f2), "start": 1, "end": 5, "name": "agen2", "kind": "function"}
-
-    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
-    assert patch != ""
-    assert "async def _shared_agen1_agen2" in patch
-    assert "-> AsyncIterator[" in patch
-
 
 @requires_git
 def test_generate_refactoring_patch_sync_generator_classdef_downstream_execution(tmp_path: Path) -> None:
@@ -8374,50 +3888,6 @@ def test_generate_refactoring_patch_sync_generator_classdef_downstream_execution
     assert after_proc.returncode == 0, f"Refactored execution failed: {after_proc.stderr}"
     assert after_proc.stdout == before_proc.stdout
 
-
-def test_generate_refactoring_patch_async_generator_with_downstream_outputs_rejected(
-    tmp_path: Path,
-) -> None:
-    """Verifies that async generator clones requiring downstream outputs are rejected."""
-    src1 = (
-        "async def af1(items: list[int]):\n"
-        "    total = 0\n"
-        "    for x in items:\n"
-        "        total += x\n"
-        "        yield x\n"
-        "    print(total)\n"
-    )
-    src2 = (
-        "async def af2(items: list[int]):\n"
-        "    count = 0\n"
-        "    for x in items:\n"
-        "        count += x\n"
-        "        yield x\n"
-        "    print(count)\n"
-    )
-    f1 = tmp_path / "ag_out1.py"
-    f2 = tmp_path / "ag_out2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    assert_valid_python(src1)
-    assert_valid_python(src2)
-
-    u1 = {
-        "file": str(f1), "start": 2, "end": 5,
-        "name": "af1:for", "kind": "compound_block", "is_async": True,
-    }
-    u2 = {
-        "file": str(f2), "start": 2, "end": 5,
-        "name": "af2:for", "kind": "compound_block", "is_async": True,
-    }
-
-    patch = generate_refactoring_patch(
-        [(0.90, u1, u2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert patch == ""
-
-
 @requires_git
 def test_generate_refactoring_patch_sync_generator_closure_capture(tmp_path: Path) -> None:
     """Verifies that closure captures downstream retain captured variables in generator return."""
@@ -8501,84 +3971,6 @@ def test_generate_refactoring_patch_sync_generator_closure_capture(tmp_path: Pat
     assert after_proc.returncode == 0, f"Refactored execution failed: {after_proc.stderr}"
     assert after_proc.stdout == before_proc.stdout
 
-
-def test_generate_refactoring_patch_mixed_async_sync_rejected(tmp_path: Path) -> None:
-    """Verifies that pairing an async function or generator with a sync counterpart is rejected in synthesis and patch."""
-    src1 = (
-        "async def compute1(items: list[int]):\n"
-        "    total = 0\n"
-        "    for x in items:\n"
-        "        total += x\n"
-        "    return total\n"
-    )
-    src2 = (
-        "def compute2(items: list[int]):\n"
-        "    total = 0\n"
-        "    for x in items:\n"
-        "        total += x\n"
-        "    return total\n"
-    )
-    f1 = tmp_path / "as1.py"
-    f2 = tmp_path / "as2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"file": str(f1), "start": 1, "end": 5, "name": "compute1", "kind": "function", "is_async": True}
-    u2 = {"file": str(f2), "start": 1, "end": 5, "name": "compute2", "kind": "function", "is_async": False}
-
-    # 1. Direct synthesis check: verify synthesis rejects mixed async parity
-    mixed_helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
-    assert mixed_helper == ""
-
-    # 2. Control check: matching sync parity synthesizes cleanly
-    sync_helper = synthesize_shared_helper_code(u2, u2, repo_root=str(tmp_path))
-    assert sync_helper != ""
-    assert "def _shared_compute2" in sync_helper
-
-    # 3. Patch generation check: verify patch generation rejects mixed async parity
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert patch == ""
-
-    # 4. Mixed async generator vs sync generator: verify rejection
-    src_ag = (
-        "async def ag1(items: list[int]):\n"
-        "    for x in items:\n"
-        "        yield x\n"
-    )
-    src_sg = (
-        "def sg2(items: list[int]):\n"
-        "    for x in items:\n"
-        "        yield x\n"
-    )
-    f_ag = tmp_path / "ag.py"
-    f_sg = tmp_path / "sg.py"
-    f_ag.write_text(src_ag, encoding="utf-8")
-    f_sg.write_text(src_sg, encoding="utf-8")
-    u_ag = {
-        "file": str(f_ag),
-        "start": 1,
-        "end": 3,
-        "name": "ag1",
-        "kind": "function",
-        "is_async": True,
-    }
-    u_sg = {
-        "file": str(f_sg),
-        "start": 1,
-        "end": 3,
-        "name": "sg2",
-        "kind": "function",
-        "is_async": False,
-    }
-
-    assert synthesize_shared_helper_code(u_ag, u_sg, repo_root=str(tmp_path)) == ""
-    assert generate_refactoring_patch(
-        [(1.0, u_ag, u_sg)], repo_root=str(tmp_path), replace_clones=True
-    ) == ""
-
-
 def test_generate_refactoring_patch_symmetric_global_filtering(tmp_path: Path) -> None:
     """Verifies generate_refactoring_patch filters globals/nonlocals from u1/u2 outputs."""
     code = (
@@ -8621,7 +4013,6 @@ def test_generate_refactoring_patch_symmetric_global_filtering(tmp_path: Path) -
     assert "return local_var" in patch
     assert "return local_var, global_var" not in patch
 
-
 def test_generate_refactoring_patch_sync_generator_indefinite_loop_var_rejected(
     tmp_path: Path,
 ) -> None:
@@ -8658,7 +4049,6 @@ def test_generate_refactoring_patch_sync_generator_indefinite_loop_var_rejected(
         [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
     )
     assert patch == ""
-
 
 @requires_git
 def test_generate_refactoring_patch_sync_generator_with_union_yield_type(
@@ -8756,43 +4146,6 @@ def test_generate_refactoring_patch_sync_generator_with_union_yield_type(
     assert after_proc.returncode == 0, f"Refactored execution failed: {after_proc.stderr}"
     assert after_proc.stdout == before_proc.stdout
 
-
-def test_generate_refactoring_patch_mismatched_subroutine_kinds_rejected(
-    tmp_path: Path,
-) -> None:
-    """Verifies that clone pairs where one unit is a block and the other is a
-    whole function are rejected."""
-    src1 = (
-        "def f1(items: list[int]):\n"
-        "    total = 0\n"
-        "    for x in items:\n"
-        "        total += x\n"
-        "        yield x\n"
-        "    return total\n"
-    )
-    src2 = (
-        "def f2(items: list[int]):\n"
-        "    total = 0\n"
-        "    for x in items:\n"
-        "        total += x\n"
-        "        yield x\n"
-        "    return total\n"
-    )
-    f1 = tmp_path / "m1.py"
-    f2 = tmp_path / "m2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    # u1 is a compound block ("f1:for"), u2 is a whole function ("f2")
-    u1 = {"file": str(f1), "start": 2, "end": 5, "name": "f1:for", "kind": "compound_block"}
-    u2 = {"file": str(f2), "start": 1, "end": 6, "name": "f2", "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert patch == ""
-
-
 def test_generate_refactoring_patch_non_generator_mismatched_kinds_rejected(
     tmp_path: Path,
 ) -> None:
@@ -8824,7 +4177,6 @@ def test_generate_refactoring_patch_non_generator_mismatched_kinds_rejected(
         [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
     )
     assert patch == ""
-
 
 def test_generate_refactoring_patch_closure_strictness_knob(tmp_path: Path) -> None:
     """Verifies closure_strictness knob controls pre-unit closure isolation in patch generation."""
@@ -8871,72 +4223,28 @@ def test_generate_refactoring_patch_closure_strictness_knob(tmp_path: Path) -> N
     assert patch_lenient != ""
     assert "yield from" in patch_lenient
 
-    # 3. Direct boolean flag skip_pre_unit_closures=True
-    patch_bool = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-        skip_pre_unit_closures=True,
-    )
-    assert patch_bool != ""
-
-
 @pytest.mark.parametrize(
-    ("mode_arg", "skip_flag", "expected"),
+    ("mode_arg", "default_mode", "expected"),
     [
-        ("lenient", None, ("lenient", True)),
-        ("strict", None, ("strict", False)),
-        ("fast", None, ("lenient", True)),
-        ("skip", None, ("lenient", True)),
-        ("fail_closed", None, ("strict", False)),
-        (None, True, ("lenient", True)),
-        (None, False, ("strict", False)),
-        ("strict", True, ("strict", False)),
-        ("lenient", False, ("lenient", True)),
-        ("unknown_mode", True, ("lenient", True)),
-        ("unknown_mode", False, ("strict", False)),
+        ("lenient", "strict", "lenient"),
+        ("strict", "strict", "strict"),
+        ("pedantic", "strict", "pedantic"),
+        (None, "strict", "strict"),
+        (None, "pedantic", "pedantic"),
+        ("fast", "strict", "strict"),
+        ("skip", "strict", "strict"),
+        ("fail_closed", "strict", "strict"),
+        ("unknown_mode", "pedantic", "pedantic"),
+        ("unknown_mode", "strict", "strict"),
     ],
 )
 def test_resolve_closure_strictness_mode_aliases(
     mode_arg: Optional[str],
-    skip_flag: Optional[bool],
-    expected: Tuple[str, bool],
+    default_mode: str,
+    expected: str,
 ) -> None:
-    """Verifies resolve_closure_strictness_mode maps all aliases and honors precedence."""
-    assert resolve_closure_strictness_mode(
-        mode_arg,
-        skip_pre_unit_closures=skip_flag if skip_flag is not None else False,
-    ) == expected
-
-
-def test_generate_refactoring_patch_subroutine_unpaired_outputs_rejected(tmp_path: Path) -> None:
-    """Verifies that non-generator subroutines with unpaired outputs fail closed safely."""
-    f1 = tmp_path / "f1.py"
-    f2 = tmp_path / "f2.py"
-    f1.write_text("def run1():\n    a = 1\n    return a\n", encoding="utf-8")
-    f2.write_text("def run2():\n    b = 1\n    c = 2\n    return b + c\n", encoding="utf-8")
-
-    u1 = {
-        "file": str(f1),
-        "start": 2,
-        "end": 2,
-        "name": "run1:block",
-        "kind": "compound_block",
-        "outputs": ["a", "a"],
-    }
-    u2 = {
-        "file": str(f2),
-        "start": 2,
-        "end": 3,
-        "name": "run2:block",
-        "kind": "compound_block",
-        "outputs": ["b", "c"],
-    }
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert patch == ""
-
+    """Verifies resolve_closure_strictness_mode maps canonical modes and falls back to default on unknown values."""
+    assert resolve_closure_strictness_mode(mode_arg, default=default_mode) == expected
 
 def test_generate_refactoring_patch_replace_clones_false_emits_helper_with_differing_outputs(
     tmp_path: Path,
@@ -8982,86 +4290,6 @@ def test_generate_refactoring_patch_replace_clones_false_emits_helper_with_diffe
     )
     assert "def _shared_run1_run2" in patch_preview
 
-
-def test_generator_subroutine_enclosing_try_finally_read_rejected(tmp_path: Path) -> None:
-    """Verifies that generator subroutine extraction is rejected when the unit is lexically
-    inside a try block whose finally reads a needed output, guarding against abnormal exit loss."""
-    src1 = (
-        "def g1(items):\n"
-        "    try:\n"
-        "        total = 0\n"
-        "        for x in items:\n"
-        "            yield x\n"
-        "            total += x\n"
-        "    finally:\n"
-        "        print(total)\n"
-    )
-    src2 = (
-        "def g2(items):\n"
-        "    try:\n"
-        "        total = 0\n"
-        "        for y in items:\n"
-        "            yield y\n"
-        "            total += y\n"
-        "    finally:\n"
-        "        print(total)\n"
-    )
-    f1 = tmp_path / "g1.py"
-    f2 = tmp_path / "g2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"file": str(f1), "start": 3, "end": 6, "name": "g1:block", "kind": "compound_block"}
-    u2 = {"file": str(f2), "start": 3, "end": 6, "name": "g2:block", "kind": "compound_block"}
-
-    # Should be rejected because total is needed and read in enclosing try cleanup
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert patch == ""
-
-
-def test_generator_subroutine_enclosing_try_swallowing_handler_post_try_read_rejected(
-    tmp_path: Path,
-) -> None:
-    """Verifies that generator subroutine extraction is rejected when the unit is lexically
-    inside a try block whose handler can fall through and a needed output is read post-try."""
-    src1 = (
-        "def g1(items):\n"
-        "    try:\n"
-        "        total = 0\n"
-        "        for x in items:\n"
-        "            yield x\n"
-        "            total += x\n"
-        "    except GeneratorExit:\n"
-        "        pass\n"
-        "    print(total)\n"
-    )
-    src2 = (
-        "def g2(items):\n"
-        "    try:\n"
-        "        total = 0\n"
-        "        for y in items:\n"
-        "            yield y\n"
-        "            total += y\n"
-        "    except GeneratorExit:\n"
-        "        pass\n"
-        "    print(total)\n"
-    )
-    f1 = tmp_path / "g1_swallow.py"
-    f2 = tmp_path / "g2_swallow.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"file": str(f1), "start": 3, "end": 6, "name": "g1:block", "kind": "compound_block"}
-    u2 = {"file": str(f2), "start": 3, "end": 6, "name": "g2:block", "kind": "compound_block"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert patch == ""
-
-
 def test_pre_unit_generator_expression_lazy_read_captured(tmp_path: Path) -> None:
     """Verifies that pre-unit lazy generator expressions capturing unit variables fail closed."""
     src1 = (
@@ -9104,7 +4332,6 @@ def test_pre_unit_generator_expression_lazy_read_captured(tmp_path: Path) -> Non
         closure_strictness="lenient",
     )
     assert patch_lenient != ""
-
 
 def test_pre_unit_class_generator_expression_lazy_read_captured(tmp_path: Path) -> None:
     """Verifies that pre-unit class-body generator expressions capturing unit
@@ -9151,8 +4378,6 @@ def test_pre_unit_class_generator_expression_lazy_read_captured(tmp_path: Path) 
     )
     assert patch_lenient != ""
 
-
-
 def test_load_unit_file_text_truncated_at_start_line_fails_closed() -> None:
     """Verifies that _load_unit_file_text returns None when source_lines has ambiguous length."""
     unit = {
@@ -9167,44 +4392,6 @@ def test_load_unit_file_text_truncated_at_start_line_fails_closed() -> None:
     # When explicitly marked not sliced, it returns the content
     unit_full = dict(unit, source_lines_is_sliced=False)
     assert _load_unit_file_text(unit_full) == "x = 1\ny = 2\nz = 3\n"
-
-
-def test_generate_refactoring_patch_skips_mismatched_subroutine_kinds(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Verifies that clone pairs with mismatched subroutine kinds immediately skip."""
-    import logging  # pylint: disable=import-outside-toplevel
-
-    f1 = tmp_path / "mod1.py"
-    f2 = tmp_path / "mod2.py"
-    f1.write_text("def fn():\n    x = 42\n    y = x + 1\n", encoding="utf-8")
-    f2.write_text("def fn2():\n    x = 42\n    y = x + 1\n", encoding="utf-8")
-
-    # u1 is a function (not a subroutine), u2 is a subroutine compound_block
-    u1 = {"file": str(f1), "start": 1, "end": 3, "name": "fn", "kind": "function"}
-    u2 = {"file": str(f2), "start": 2, "end": 3, "name": "fn2:sub", "kind": "compound_block"}
-
-    with caplog.at_level(logging.DEBUG, logger="pydoppelgangerhunt.fixer.patch"):
-        with mock.patch(
-            "pydoppelgangerhunt.fixer.patch.synthesize_shared_helper_code"
-        ) as mock_synth, mock.patch(
-            "pydoppelgangerhunt.fixer.patch.inspect_single_unit_scope"
-        ) as mock_scope:
-            patch = generate_refactoring_patch(
-                [(1.0, u1, u2)],
-                repo_root=str(tmp_path),
-                replace_clones=True,
-            )
-            assert patch == ""
-            # Early exit: hoisted check prevents running scope analysis or synthesis
-            mock_synth.assert_not_called()
-            mock_scope.assert_not_called()
-
-    assert any(
-        "mismatched subroutine kinds (is_sub1=False, is_sub2=True)" in r.message
-        for r in caplog.records
-    )
-
 
 def test_render_file_patch_plan_path_normalization_span_matching() -> None:
     """Verifies that _render_file_patch_plan normalizes file paths when cross-checking
@@ -9232,7 +4419,6 @@ def test_render_file_patch_plan_path_normalization_span_matching() -> None:
         diff = _render_file_patch_plan(plan, replace_clones=True)
         assert "+a = 99" in diff
 
-
 def test_render_file_patch_plan_non_standard_unit_span_defensive_recovery() -> None:
     """Verifies that _render_file_patch_plan defends against non-standard or malformed
     retained candidate dicts without raising ValueError."""
@@ -9257,7 +4443,6 @@ def test_render_file_patch_plan_non_standard_unit_span_defensive_recovery() -> N
     ):
         diff = _render_file_patch_plan(plan, replace_clones=True)
         assert isinstance(diff, str)
-
 
 def test_generate_refactoring_patch_unreadable_second_file_skips_pair(
     tmp_path: Path,
@@ -9288,121 +4473,6 @@ def test_generate_refactoring_patch_unreadable_second_file_skips_pair(
     # Patch must be empty (pair skipped without refactoring u1)
     assert patch == ""
 
-
-def test_replace_unit_and_refactor_missing_coordinates_raise_value_error() -> None:
-    """Verifies that missing 'start' or 'end' line coordinates raise ValueError in
-    replace_unit_in_source and refactor_module_units."""
-    code = "x = 1\ny = 2\n"
-    # Missing end
-    with pytest.raises(ValueError, match="missing required 'end' line coordinate"):
-        replace_unit_in_source(code, {"start": 1}, "x = 10\n")
-
-    with pytest.raises(ValueError, match="missing required 'end' line coordinate"):
-        refactor_module_units(code, [({"start": 1}, "x = 10\n")])
-
-    # Missing start
-    with pytest.raises(ValueError, match="missing required 'start' line coordinate"):
-        replace_unit_in_source(code, {"end": 1}, "x = 10\n")
-
-    with pytest.raises(ValueError, match="missing required 'start' line coordinate"):
-        refactor_module_units(code, [({"end": 1}, "x = 10\n")])
-
-
-def test_validate_helper_compilation_indented_method_with_imports() -> None:
-    """Verifies that _validate_helper_compilation accepts an indented method helper
-    combined with unindented imports without raising IndentationError."""
-    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
-        _validate_helper_compilation,
-    )
-
-    combined_helper = (
-        "from typing import Tuple\n\n\n"
-        "    def _shared_calc(self, x: int) -> Tuple[int, int]:\n"
-        "        return x, x * 2\n"
-    )
-    assert _validate_helper_compilation(combined_helper) is True
-
-    # Truly invalid syntax should return False
-    assert _validate_helper_compilation("def invalid syntax (:") is False
-
-
-def test_validate_helper_compilation_indented_method_with_multiline_string_at_col_0() -> None:
-    """Verifies that _validate_helper_compilation and assert_valid_python accept an indented
-    method helper containing a triple-quoted multiline string with lines at column 0."""
-    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
-        _validate_helper_compilation,
-    )
-
-    helper_code = (
-        "    def _format_message(self, tag: str) -> str:\n"
-        '        template = """header:\n'
-        "col_0_line\n"
-        'footer"""\n'
-        "        return f'{tag}: {template}'\n"
-    )
-    assert _validate_helper_compilation(helper_code) is True
-    assert_valid_python(helper_code)
-
-    combined_helper = (
-        "from typing import Optional\n\n\n"
-        "    def _format_message(self, tag: str) -> Optional[str]:\n"
-        '        template = """header:\n'
-        "col_0_line\n"
-        'footer"""\n'
-        "        return f'{tag}: {template}'\n"
-    )
-    assert _validate_helper_compilation(combined_helper) is True
-    assert_valid_python(combined_helper)
-
-
-def test_same_file_delegation_preserves_renamed_inputs_and_outputs_on_clone_2(
-    tmp_path: Path,
-) -> None:
-    """Verifies that same-file subroutine delegation uses clone 2's renamed inputs
-    and outputs instead of incorrectly copying clone 1's variable names."""
-    f = tmp_path / "calc.py"
-    code = (
-        "def compute_alpha(items):\n"
-        "    total = 0\n"
-        "    for x in items:\n"
-        "        total += x\n"
-        "    return total\n"
-        "\n"
-        "def compute_beta(data):\n"
-        "    count = 0\n"
-        "    for y in data:\n"
-        "        count += y\n"
-        "    return count\n"
-    )
-    f.write_text(code, encoding="utf-8")
-    u1 = {
-        "file": str(f),
-        "start": 3,
-        "end": 4,
-        "name": "compute_alpha:for",
-        "kind": "compound_block",
-        "inputs": ["items", "total"],
-        "outputs": ["total"],
-    }
-    u2 = {
-        "file": str(f),
-        "start": 9,
-        "end": 10,
-        "name": "compute_beta:for",
-        "kind": "compound_block",
-        "inputs": ["data", "count"],
-        "outputs": ["count"],
-    }
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert patch != ""
-    # Clone 1 delegates using total and items
-    assert "+    total = _shared" in patch
-    # Clone 2 must delegate using count and data, NOT total and items
-    assert "+    count = _shared" in patch
-
-
 def test_record_skip_comment_same_file_plan_no_duplicate(tmp_path: Path) -> None:
     """Verifies that _record_skip_comment does not duplicate comments when f1 and f2
     alias the same file patch plan."""
@@ -9418,7 +4488,6 @@ def test_record_skip_comment_same_file_plan_no_duplicate(tmp_path: Path) -> None
     assert plan.comments == ["# skip notice\n"]
     assert skip_reasons["test_skip"] == 1
 
-
 def test_unit_start_module_scope_helper() -> None:
     """Verifies that _unit_start extracts and clamps unit start line coordinates."""
     from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
@@ -9429,44 +4498,6 @@ def test_unit_start_module_scope_helper() -> None:
     assert _unit_start({"start": 0}) == 1
     assert _unit_start({"start": -5}) == 1
     assert _unit_start({}) == 1
-
-
-def test_pragma_no_refactor_harvested_but_skipped_in_patch(tmp_path: Path) -> None:
-    """Verifies that units with # pragma: no-refactor are harvested for clone reporting
-    but skipped during patch generation."""
-    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch
-    from pydoppelgangerhunt.parser import harvest_file_units
-
-    code1 = (
-        "def compute_first(a, b):\n"
-        "    # pragma: no-refactor\n"
-        "    res = a * 2 + b * 3\n"
-        "    return res\n"
-    )
-    code2 = (
-        "def compute_second(a, b):\n"
-        "    res = a * 2 + b * 3\n"
-        "    return res\n"
-    )
-    p1 = tmp_path / "mod1.py"
-    p2 = tmp_path / "mod2.py"
-    p1.write_text(code1, encoding="utf-8")
-    p2.write_text(code2, encoding="utf-8")
-
-    units1 = harvest_file_units(str(p1), str(tmp_path), min_lines=3, min_tokens=5)
-    assert len(units1) > 0, "Pragma: no-refactor must not suppress unit harvesting"
-
-    units2 = harvest_file_units(str(p2), str(tmp_path), min_lines=3, min_tokens=5)
-    assert len(units2) > 0
-
-    u1 = dict(units1[0], file=str(p1.relative_to(tmp_path)))
-    u2 = dict(units2[0], file=str(p2.relative_to(tmp_path)))
-    clones = [(1.0, u1, u2)]
-
-    patch = generate_refactoring_patch(clones, repo_root=str(tmp_path), replace_clones=True)
-    assert "# Note: Clone pair" in patch
-    assert "inline '# pragma: no-refactor' present" in patch
-
 
 def test_validate_module_unit_replacements_strict_parameter() -> None:
     """Verifies that validate_module_unit_replacements respects the strict parameter."""
@@ -9482,386 +4513,6 @@ def test_validate_module_unit_replacements_strict_parameter() -> None:
 
     with pytest.raises(ValueError):
         validate_module_unit_replacements(code, replacements, strict=True)
-
-
-def test_validate_helper_compilation_multiline_imports() -> None:
-    """Verifies that multiline parenthesized imports compile cleanly in helper validation."""
-    from pydoppelgangerhunt.fixer.patch import _validate_helper_compilation
-    from tests.helpers import assert_valid_python
-
-    helper_code = (
-        "from os import (\n"
-        "    path,\n"
-        ")\n\n\n"
-        "def _shared_helper(a: int) -> int:\n"
-        "    return a + 1\n"
-    )
-    assert _validate_helper_compilation(helper_code) is True
-    assert_valid_python(helper_code)
-
-
-def test_complex_expr_whole_line_preserves_assignment_target_apply_and_run(
-    tmp_path: Path,
-) -> None:
-    """Verifies that whole-line complex_expr clones preserve assignment targets at call sites
-    and execute correctly after applying the refactoring patch."""
-    import importlib.util
-    import subprocess
-    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch
-
-    f = tmp_path / "calc_pair.py"
-    code = (
-        "def get_pair(x: int, y: int):\n"
-        "    return x + 1, y * 2\n"
-        "\n"
-        "def worker1(x: int, y: int):\n"
-        "    a, b = get_pair(x, y)\n"
-        "    return a + b\n"
-        "\n"
-        "def worker2(x: int, y: int):\n"
-        "    c, d = get_pair(x, y)\n"
-        "    return c + d\n"
-    )
-    f.write_text(code, encoding="utf-8")
-    u1 = {
-        "file": "calc_pair.py",
-        "start": 5,
-        "end": 5,
-        "name": "worker1:assign",
-        "kind": "complex_expr",
-    }
-    u2 = {
-        "file": "calc_pair.py",
-        "start": 9,
-        "end": 9,
-        "name": "worker2:assign",
-        "kind": "complex_expr",
-    }
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert patch != ""
-    assert "(a, b) = _shared_" in patch
-    assert "(c, d) = _shared_" in patch
-
-    # Initialize temporary git repository and apply the patch
-    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=str(tmp_path),
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Tester"],
-        cwd=str(tmp_path),
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True
-    )
-    proc = subprocess.run(
-        ["git", "apply"],
-        input=patch.encode("utf-8"),
-        cwd=str(tmp_path),
-        check=True,
-        capture_output=True,
-    )
-    assert proc.returncode == 0
-
-    # Load and execute the refactored module to verify runtime semantics
-    spec = importlib.util.spec_from_file_location("calc_pair_patched", str(f))
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    assert mod.worker1(10, 20) == 51
-    assert mod.worker2(10, 20) == 51
-
-
-def test_pragma_no_refactor_in_string_literal_does_not_suppress_refactoring(
-    tmp_path: Path,
-) -> None:
-    """Verifies that '# pragma: no-refactor' appearing inside a string literal
-    does not suppress clone refactoring."""
-    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch
-
-    code1 = (
-        "def emit_message1(val):\n"
-        "    msg = '# pragma: no-refactor'\n"
-        "    return f'{msg}: {val}'\n"
-    )
-    code2 = (
-        "def emit_message2(val):\n"
-        "    msg = '# pragma: no-refactor'\n"
-        "    return f'{msg}: {val}'\n"
-    )
-    p1 = tmp_path / "msg1.py"
-    p2 = tmp_path / "msg2.py"
-    p1.write_text(code1, encoding="utf-8")
-    p2.write_text(code2, encoding="utf-8")
-
-    u1 = {"file": "msg1.py", "start": 1, "end": 3, "name": "emit_message1", "kind": "function"}
-    u2 = {"file": "msg2.py", "start": 1, "end": 3, "name": "emit_message2", "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert patch != ""
-    assert "pragma: no-refactor' present" not in patch
-    assert "def _shared_emit_message1_emit_message2" in patch
-
-
-def test_pragma_no_refactor_on_preceding_statement_does_not_suppress_unit(
-    tmp_path: Path,
-) -> None:
-    """Verifies that a trailing pragma on a preceding statement does not suppress an
-    unrelated subsequent unit."""
-    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch
-
-    code1 = (
-        "x = 1  # pragma: no-refactor\n"
-        "def compute_logic1(a, b):\n"
-        "    return a * 2 + b * 3\n"
-    )
-    code2 = (
-        "x = 1  # pragma: no-refactor\n"
-        "def compute_logic2(a, b):\n"
-        "    return a * 2 + b * 3\n"
-    )
-    p1 = tmp_path / "logic1.py"
-    p2 = tmp_path / "logic2.py"
-    p1.write_text(code1, encoding="utf-8")
-    p2.write_text(code2, encoding="utf-8")
-
-    u1 = {"file": "logic1.py", "start": 2, "end": 3, "name": "compute_logic1", "kind": "function"}
-    u2 = {"file": "logic2.py", "start": 2, "end": 3, "name": "compute_logic2", "kind": "function"}
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert patch != ""
-    assert "pragma: no-refactor' present" not in patch
-    assert "def _shared_compute_logic1_compute_logic2" in patch
-
-
-def test_complex_expr_indented_multiline_assignment_dedents_cleanly(
-    tmp_path: Path,
-) -> None:
-    """Verifies that indented multi-line assignments in complex_expr units
-    are cleanly dedented without IndentationError when extracting targets."""
-    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch
-
-    f = tmp_path / "mod_indent.py"
-    code = (
-        "def compute_total(a: int, b: int):\n"
-        "    total = (\n"
-        "        a + b\n"
-        "    )\n"
-        "    return total\n"
-        "\n"
-        "def compute_sum(x: int, y: int):\n"
-        "    total = (\n"
-        "        x + y\n"
-        "    )\n"
-        "    return total\n"
-    )
-    f.write_text(code, encoding="utf-8")
-    u1 = {
-        "file": "mod_indent.py",
-        "start": 2,
-        "end": 4,
-        "name": "compute_total:assign",
-        "kind": "complex_expr",
-    }
-    u2 = {
-        "file": "mod_indent.py",
-        "start": 8,
-        "end": 10,
-        "name": "compute_sum:assign",
-        "kind": "complex_expr",
-    }
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert patch != ""
-    assert "total = _shared_" in patch
-
-
-def test_refactor_module_units_honors_offset_aliases() -> None:
-    """Verifies that refactor_module_units respects start_col_offset and end_col_offset
-    aliases when start_col and end_col are absent, preserving same-line neighbours."""
-    from pydoppelgangerhunt.fixer import refactor_module_units
-
-    src = "x = 1; y = 2; z = 3\n"
-    # Unit replacing only 'y = 2' using alias keys
-    unit = {
-        "file": "test.py",
-        "start": 1,
-        "end": 1,
-        "start_col_offset": 7,
-        "end_col_offset": 12,
-    }
-    result = refactor_module_units(src, [(unit, "y = 20")])
-    assert result == "x = 1; y = 20; z = 3\n"
-
-
-def test_generate_refactoring_patch_whole_line_return_complex_expr(tmp_path: Path) -> None:
-    """Verifies that whole-line complex_expr for Return statements retains the return keyword
-    in call site delegation rather than emitting a bare helper call."""
-    code1 = (
-        "def get_val_1(x: int, y: int) -> int:\n"
-        "    return compute_val(x, y)\n"
-    )
-    code2 = (
-        "def get_val_2(x: int, y: int) -> int:\n"
-        "    return compute_val(x, y)\n"
-    )
-    f1 = tmp_path / "ret1.py"
-    f2 = tmp_path / "ret2.py"
-    f1.write_text(code1, encoding="utf-8")
-    f2.write_text(code2, encoding="utf-8")
-    u1 = {
-        "file": "ret1.py",
-        "start": 2,
-        "end": 2,
-        "name": "get_val_1:ret",
-        "kind": "complex_expr",
-    }
-    u2 = {
-        "file": "ret2.py",
-        "start": 2,
-        "end": 2,
-        "name": "get_val_2:ret",
-        "kind": "complex_expr",
-    }
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert patch != ""
-    assert "return _shared_get_val_1_get_val_2(compute_val, x, y)" in patch
-
-
-def test_complex_expr_multiline_boundary_pragma_preserved(tmp_path: Path) -> None:
-    """Verifies that boundary pragmas attached to whole-line multi-line complex_expr
-    units are preserved via compute_unit_replacement_span."""
-    f = tmp_path / "mod_pragma.py"
-    code = (
-        "def compute_total(a: int, b: int):\n"
-        "    total: int = (  # type: ignore[assignment]\n"
-        "        a + b\n"
-        "    )\n"
-        "    return total\n"
-        "\n"
-        "def compute_sum(x: int, y: int):\n"
-        "    total: int = (  # type: ignore[assignment]\n"
-        "        x + y\n"
-        "    )\n"
-        "    return total\n"
-    )
-    f.write_text(code, encoding="utf-8")
-    u1 = {
-        "file": "mod_pragma.py",
-        "start": 2,
-        "end": 4,
-        "name": "compute_total:assign",
-        "kind": "complex_expr",
-    }
-    u2 = {
-        "file": "mod_pragma.py",
-        "start": 8,
-        "end": 10,
-        "name": "compute_sum:assign",
-        "kind": "complex_expr",
-    }
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert patch != ""
-    assert "# type: ignore[assignment]" in patch
-
-
-def test_build_unit_delegation_call_complex_expr_boundary_pragma_preserved() -> None:
-    """Verifies that _build_unit_delegation_call preserves boundary pragmas on
-    whole-line complex_expr units."""
-    from pydoppelgangerhunt.fixer.patch import _build_unit_delegation_call
-
-    code = (
-        "def run(a: int, b: int):\n"
-        "    res = (  # noqa: E501\n"
-        "        a + b\n"
-        "    )\n"
-        "    return res\n"
-    )
-    lines = code.splitlines(keepends=True)
-    unit = {
-        "file": "test.py",
-        "start": 2,
-        "end": 4,
-        "kind": "complex_expr",
-    }
-    call = _build_unit_delegation_call(
-        unit,
-        code,
-        lines,
-        effective_binding="function",
-        helper_name="_shared_add",
-        inputs=["a", "b"],
-        outputs=["res"],
-        scope={"kind": "function"},
-    )
-    assert "# noqa: E501" in call
-    assert "res = _shared_add(a, b)" in call
-
-
-def test_infer_helper_return_type_generator_send_type_strict_strategy() -> None:
-    """Verifies that type_merge_strategy='strict' causes generator send type to
-    fall back to 'object' instead of 'Any' when has_yield_assignment is True."""
-    from pydoppelgangerhunt.fixer.synthesis import _infer_helper_return_type
-
-    scope_with_assign = {
-        "has_yield": True,
-        "has_yield_assignment": True,
-        "yield_expr_names": [("yield", ":literal:int")],
-    }
-    # Default fallback_any should return Any
-    ret_default = _infer_helper_return_type(
-        "Any",
-        [],
-        set(),
-        scope_with_assign,
-        {},
-        {},
-        type_merge_strategy="fallback_any",
-    )
-    assert "Generator[int, Any, None]" in ret_default
-
-    # Strict strategy should return object
-    ret_strict = _infer_helper_return_type(
-        "Any",
-        [],
-        set(),
-        scope_with_assign,
-        {},
-        {},
-        type_merge_strategy="strict",
-    )
-    assert "Generator[int, object, None]" in ret_strict
-
-    # Async generator with strict strategy
-    ret_async_strict = _infer_helper_return_type(
-        "Any",
-        [],
-        set(),
-        scope_with_assign,
-        {},
-        {},
-        type_merge_strategy="strict",
-        is_async=True,
-    )
-    assert "AsyncGenerator[int, object]" in ret_async_strict
-
 
 def test_render_file_patch_plan_exact_key_disambiguates_same_line_units() -> None:
     """Verifies that _render_file_patch_plan disambiguates same-line units using exact keys
@@ -9918,253 +4569,6 @@ def test_render_file_patch_plan_exact_key_disambiguates_same_line_units() -> Non
     assert "outer_replacement()" in patch
     assert "inner_replacement()" not in patch
 
-
-def test_whole_line_complex_expr_unmapped_statement_fails_closed(tmp_path: Path) -> None:
-    """Verifies that whole-line complex_expr with unmapped statements (assert, del, raise)
-    fails closed rather than emitting a bare helper call that drops statement semantics."""
-    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
-        _build_unit_delegation_call,
-        generate_refactoring_patch,
-    )
-
-    code = (
-        "def check(x):\n"
-        "    assert validate(x)\n"
-        "    return x\n"
-    )
-    lines = code.splitlines(keepends=True)
-    unit_assert = {
-        "file": "test.py",
-        "start": 2,
-        "end": 2,
-        "name": "check",
-        "kind": "complex_expr",
-    }
-    # Direct check of _build_unit_delegation_call returning ""
-    rep = _build_unit_delegation_call(
-        unit_assert,
-        code,
-        lines,
-        effective_binding="module",
-        helper_name="_shared_validate",
-        inputs=["x"],
-        outputs=[],
-        scope={"inputs": ["x"], "outputs": []},
-    )
-    assert rep == ""
-
-    # Check that generate_refactoring_patch rolls back cleanly and does not emit bare call
-    f1 = tmp_path / "mod1.py"
-    f2 = tmp_path / "mod2.py"
-    f1.write_text(code, encoding="utf-8")
-    f2.write_text(code, encoding="utf-8")
-    u1 = {
-        "file": "mod1.py",
-        "start": 2,
-        "end": 2,
-        "name": "check",
-        "kind": "complex_expr",
-        "inputs": ["x"],
-        "outputs": [],
-    }
-    u2 = {
-        "file": "mod2.py",
-        "start": 2,
-        "end": 2,
-        "name": "check",
-        "kind": "complex_expr",
-        "inputs": ["x"],
-        "outputs": [],
-    }
-    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
-    # The patch must NOT replace 'assert validate(x)' with a bare '_shared_validate(x)'
-    assert "-    assert validate(x)" not in patch
-
-
-def test_complex_expr_augassign_delegation_prunes_unused_target(tmp_path: Path) -> None:
-    """Verifies that whole-line complex_expr with AugAssign generates a delegation call
-    that prunes the unreferenced target from call arguments."""
-    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
-        _build_unit_delegation_call,
-        generate_refactoring_patch,
-    )
-
-    code1 = (
-        "def run_one(total, a, b):\n"
-        "    total += a + b\n"
-    )
-    code2 = (
-        "def run_two(counter, a, b):\n"
-        "    counter += a + b\n"
-    )
-    lines1 = code1.splitlines(keepends=True)
-    u1 = {
-        "file": "mod1.py",
-        "start": 2,
-        "end": 2,
-        "name": "run_one",
-        "kind": "complex_expr",
-        "inputs": ["total", "a", "b"],
-        "outputs": [],
-    }
-    # Direct test of _build_unit_delegation_call:
-    rep = _build_unit_delegation_call(
-        u1,
-        code1,
-        lines1,
-        effective_binding="module",
-        helper_name="_shared_add",
-        inputs=["a", "b"],
-        outputs=[],
-        scope={"inputs": ["total", "a", "b"], "outputs": []},
-        target_inputs=["total", "a", "b"],
-    )
-    assert "total += _shared_add(a, b)" in rep
-    assert "_shared_add(total" not in rep
-
-    # Full patch generation test
-    f1 = tmp_path / "mod1.py"
-    f2 = tmp_path / "mod2.py"
-    f1.write_text(code1, encoding="utf-8")
-    f2.write_text(code2, encoding="utf-8")
-    u2 = {
-        "file": "mod2.py",
-        "start": 2,
-        "end": 2,
-        "name": "run_two",
-        "kind": "complex_expr",
-        "inputs": ["counter", "a", "b"],
-        "outputs": [],
-    }
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert "+    total += _shared_run_one_run_two(a, b)" in patch
-    assert "+    counter += _shared_run_one_run_two(a, b)" in patch
-
-
-def test_complex_expr_augassign_target_pruning_different_param_orders(tmp_path: Path) -> None:
-    """Verifies that whole-line complex_expr AugAssign units with different parameter
-    orderings do not swap arguments at call sites."""
-    code1 = (
-        "def run_one(total, a, b):\n"
-        "    total += a - b\n"
-        "    return total\n"
-    )
-    code2 = (
-        "def run_two(a, b, counter):\n"
-        "    counter += a - b\n"
-        "    return counter\n"
-    )
-    f1 = tmp_path / "mod1.py"
-    f2 = tmp_path / "mod2.py"
-    f1.write_text(code1, encoding="utf-8")
-    f2.write_text(code2, encoding="utf-8")
-
-    u1 = {
-        "file": "mod1.py",
-        "start": 2,
-        "end": 2,
-        "name": "run_one",
-        "kind": "complex_expr",
-        "inputs": ["total", "a", "b"],
-        "outputs": [],
-    }
-    u2 = {
-        "file": "mod2.py",
-        "start": 2,
-        "end": 2,
-        "name": "run_two",
-        "kind": "complex_expr",
-        "inputs": ["a", "b", "counter"],
-        "outputs": [],
-    }
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert "+    counter += _shared_run_one_run_two(a, b)" in patch
-    assert "(b, a)" not in patch
-
-
-def test_complex_expr_augassign_asymmetric_rhs_not_pruned(tmp_path: Path) -> None:
-    """Verifies that if one unit references its AugAssign target on RHS while the other
-    does not, neither has its parameter pruned to prevent arity mismatch."""
-    code1 = (
-        "def f1(total, a, b):\n"
-        "    total += a + b\n"
-    )
-    code2 = (
-        "def f2(counter, a, b):\n"
-        "    counter += counter + a + b\n"
-    )
-    f1 = tmp_path / "m1.py"
-    f2 = tmp_path / "m2.py"
-    f1.write_text(code1, encoding="utf-8")
-    f2.write_text(code2, encoding="utf-8")
-
-    u1 = {"file": "m1.py", "start": 2, "end": 2, "name": "f1", "kind": "complex_expr"}
-    u2 = {"file": "m2.py", "start": 2, "end": 2, "name": "f2", "kind": "complex_expr"}
-    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
-    if helper:
-        assert "total: Any" in helper or "counter: Any" in helper
-
-
-def test_build_unit_delegation_call_asymmetric_rhs_equal_arity() -> None:
-    """Verifies that _build_unit_delegation_call does not prune target when
-    len(effective_targets) == len(inputs), preventing arity mismatch."""
-    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=protected-access
-        _build_unit_delegation_call,
-    )
-
-    unit = {
-        "kind": "complex_expr",
-        "start": 1,
-        "end": 1,
-    }
-    orig_lines = ["total += a + a\n"]
-    call_str = _build_unit_delegation_call(
-        unit,
-        "total += a + a\n",
-        orig_lines,
-        effective_binding="module",
-        helper_name="_shared_helper",
-        inputs=["total", "a"],
-        outputs=[],
-        scope={"inputs": ["total", "a"]},
-        target_inputs=["total", "a"],
-        await_prefix="",
-    )
-    assert "_shared_helper(total, a)" in call_str
-
-
-def test_build_unit_delegation_call_cross_clone_name_collision_no_overprune() -> None:
-    """Verifies that _build_unit_delegation_call does not mutate inputs when target
-    name matches a remaining input variable."""
-    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=protected-access
-        _build_unit_delegation_call,
-    )
-
-    unit = {
-        "kind": "complex_expr",
-        "start": 1,
-        "end": 1,
-    }
-    orig_lines = ["a += b + c\n"]
-    call_str = _build_unit_delegation_call(
-        unit,
-        "a += b + c\n",
-        orig_lines,
-        effective_binding="module",
-        helper_name="_shared_helper",
-        inputs=["a", "b", "c"],
-        outputs=[],
-        scope={"inputs": ["a", "b", "c"]},
-        target_inputs=["a", "b", "c"],
-        await_prefix="",
-    )
-    assert "_shared_helper(a, b, c)" in call_str
-
-
 def test_file_patch_plan_parsed_tree_uses_get_or_parse_tree(tmp_path: Path) -> None:
     """Verifies _FilePatchPlan.parsed_tree delegates to _get_or_parse_tree."""
     from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=protected-access
@@ -10180,134 +4584,7 @@ def test_file_patch_plan_parsed_tree_uses_get_or_parse_tree(tmp_path: Path) -> N
     assert tree1 is not None
     key = (plan.content_digest, len(text))
     assert key in _parsed_tree_cache
-    assert _parsed_tree_cache[key] is tree1
-
-
-def test_augassign_target_pruning_cross_variable_collision(tmp_path: Path) -> None:
-    """Verifies that when an AugAssign target matches an active input in the partner clone,
-    both unreferenced targets are pruned and call-site arguments preserve positional order."""
-    src1 = (
-        "def func1(a, b, c):\n"
-        "    a += b - c\n"
-        "    return a\n"
-    )
-    src2 = (
-        "def func2(total, a, b):\n"
-        "    total += a - b\n"
-        "    return total\n"
-    )
-    f1 = tmp_path / "mod1.py"
-    f2 = tmp_path / "mod2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"file": "mod1.py", "start": 2, "end": 2, "name": "u1", "kind": "complex_expr"}
-    u2 = {"file": "mod2.py", "start": 2, "end": 2, "name": "u2", "kind": "complex_expr"}
-
-    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
-    assert "def _shared_u1_u2(b: Any, c: Any) -> Any:" in helper
-    assert "return b - c" in helper
-
-    patch = generate_refactoring_patch(
-        [(0.95, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-    assert "def _shared_u1_u2(b: Any, c: Any) -> Any:" in patch
-    assert "+    a += _shared_u1_u2(b, c)" in patch
-    assert "+    total += _shared_u1_u2(a, b)" in patch
-    assert "_shared_u1_u2(a, b, total)" not in patch
-    assert "_shared_u1_u2(b, a)" not in patch
-
-
-def test_subline_complex_expr_not_treated_as_augassign_target(tmp_path: Path) -> None:
-    """Verifies that subline complex_expr units with column offsets do not extract line's target."""
-    src = (
-        "def run(a, b):\n"
-        "    total += compute(a, b)\n"
-        "    return total\n"
-    )
-    f = tmp_path / "subline_mod.py"
-    f.write_text(src, encoding="utf-8")
-
-    u1 = {
-        "file": "subline_mod.py",
-        "start": 2,
-        "end": 2,
-        "start_col": 13,
-        "end_col": 26,
-        "name": "u1",
-        "kind": "complex_expr",
-    }
-    u2 = dict(u1)
-    u2["name"] = "u2"
-
-    helper_code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
-    assert "total" not in helper_code
-
-
-def test_augassign_target_pruning_same_name_across_clones(tmp_path: Path) -> None:
-    """Verifies that when both clones use the same unreferenced AugAssign target name,
-    the target is pruned from both inputs and inputs2 without desynchronization."""
-    src1 = (
-        "def func1(total: int, a: int, b: int) -> int:\n"
-        "    total += a - b\n"
-        "    return total\n"
-    )
-    src2 = (
-        "def func2(total: int, a: int, b: int) -> int:\n"
-        "    total += a - b\n"
-        "    return total\n"
-    )
-    f1 = tmp_path / "same_aug1.py"
-    f2 = tmp_path / "same_aug2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"file": "same_aug1.py", "start": 2, "end": 2, "name": "u1", "kind": "complex_expr"}
-    u2 = {"file": "same_aug2.py", "start": 2, "end": 2, "name": "u2", "kind": "complex_expr"}
-
-    helper_code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
-    assert "def _shared_u1_u2(a: Any, b: Any) -> Any:" in helper_code
-    assert "total" not in helper_code
-
-    patch = generate_refactoring_patch(
-        [(0.95, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-    assert "def _shared_u1_u2(a: Any, b: Any) -> Any:" in patch
-    assert "+    total += _shared_u1_u2(a, b)" in patch
-
-
-def test_whole_line_complex_expr_semicolon_multiple_statements_fails_closed(
-    tmp_path: Path,
-) -> None:
-    """Verifies that whole-line complex_expr units containing semicolon-separated statements
-    fail closed rather than silently dropping trailing statements."""
-    src = (
-        "def run(a: int, b: int) -> int:\n"
-        "    x = a + b; side_effect()\n"
-        "    return x\n"
-    )
-    f1 = tmp_path / "semi1.py"
-    f2 = tmp_path / "semi2.py"
-    f1.write_text(src, encoding="utf-8")
-    f2.write_text(src, encoding="utf-8")
-
-    u1 = {"file": "semi1.py", "start": 2, "end": 2, "name": "u1", "kind": "complex_expr"}
-    u2 = {"file": "semi2.py", "start": 2, "end": 2, "name": "u2", "kind": "complex_expr"}
-
-    assert synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path)) == ""
-    assert (
-        generate_refactoring_patch(
-            [(0.95, u1, u2)],
-            repo_root=str(tmp_path),
-            replace_clones=True,
-        )
-        == ""
-    )
-
+    assert _parsed_tree_cache[key][0] is tree1
 
 def test_synthesize_shared_helper_code_unmapped_stmt_fails_closed(
     tmp_path: Path,
@@ -10331,398 +4608,6 @@ def test_synthesize_shared_helper_code_unmapped_stmt_fails_closed(
     u_ann1 = {"file": "unmapped1.py", "start": 3, "end": 3, "name": "u1", "kind": "complex_expr"}
     u_ann2 = {"file": "unmapped2.py", "start": 3, "end": 3, "name": "u2", "kind": "complex_expr"}
     assert synthesize_shared_helper_code(u_ann1, u_ann2, repo_root=str(tmp_path)) == ""
-
-
-def test_whole_line_comprehension_preserves_assignment_target_and_indentation(
-    tmp_path: Path,
-) -> None:
-    """Verifies that whole-line comprehension units preserve their assignment target,
-    leading indentation, and trailing newline when replaced at call sites."""
-    src1 = (
-        "def f1(items: list[int]) -> list[int]:\n"
-        "    res = [x * 2 for x in items if x > 0]\n"
-        "    return res\n"
-    )
-    src2 = (
-        "def f2(items: list[int]) -> list[int]:\n"
-        "    out = [x * 2 for x in items if x > 0]\n"
-        "    return out\n"
-    )
-    f1 = tmp_path / "comp_whole1.py"
-    f2 = tmp_path / "comp_whole2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {
-        "file": "comp_whole1.py",
-        "start": 2,
-        "end": 2,
-        "name": "u1",
-        "kind": "comprehension",
-    }
-    u2 = {
-        "file": "comp_whole2.py",
-        "start": 2,
-        "end": 2,
-        "name": "u2",
-        "kind": "comprehension",
-    }
-
-    patch = generate_refactoring_patch(
-        [(0.95, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-    assert "def _shared_u1_u2(items: Any) -> Any:" in patch
-    assert "+    return [x * 2 for x in items if x > 0]" in patch
-    assert "+    res = _shared_u1_u2(items)" in patch
-    assert "+    out = _shared_u1_u2(items)" in patch
-
-
-def test_whole_line_comprehension_and_complex_expr_subscript_attribute_lhs_pruned(
-    tmp_path: Path,
-) -> None:
-    """Verifies that whole-line comprehension and complex_expr units with subscript or
-    attribute assignment targets prune LHS-only load identifiers and receiver attributes."""
-    src1 = (
-        "def update_slot(arr: list[list[int]], i: int, items: list[int]) -> None:\n"
-        "    arr[i] = [x * 2 for x in items if x > 0]\n"
-    )
-    src2 = (
-        "def compute_list(items: list[int]) -> list[int]:\n"
-        "    res = [x * 2 for x in items if x > 0]\n"
-        "    return res\n"
-    )
-    f1 = tmp_path / "lhs_sub1.py"
-    f2 = tmp_path / "lhs_sub2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"file": "lhs_sub1.py", "start": 2, "end": 2, "name": "u1", "kind": "comprehension"}
-    u2 = {"file": "lhs_sub2.py", "start": 2, "end": 2, "name": "u2", "kind": "comprehension"}
-
-    patch = generate_refactoring_patch(
-        [(0.95, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-    assert "def _shared_u1_u2(items: Any) -> Any:" in patch
-    assert "+    arr[i] = _shared_u1_u2(items)" in patch
-    assert "+    res = _shared_u1_u2(items)" in patch
-
-    # Also test self.cache[k] = compute(a, b) paired with res = compute(a, b)
-    src_attr1 = (
-        "class Worker:\n"
-        "    def store(self, k: str, a: int, b: int) -> None:\n"
-        "        self.cache[k] = (a + b) * (a - b)\n"
-    )
-    src_attr2 = (
-        "class Worker2:\n"
-        "    def calc(self, a: int, b: int) -> int:\n"
-        "        res = (a + b) * (a - b)\n"
-        "        return res\n"
-    )
-    fa1 = tmp_path / "lhs_attr1.py"
-    fa2 = tmp_path / "lhs_attr2.py"
-    fa1.write_text(src_attr1, encoding="utf-8")
-    fa2.write_text(src_attr2, encoding="utf-8")
-
-    ua1 = {"file": "lhs_attr1.py", "start": 3, "end": 3, "name": "u1", "kind": "complex_expr"}
-    ua2 = {"file": "lhs_attr2.py", "start": 3, "end": 3, "name": "u2", "kind": "complex_expr"}
-
-    patch_attr = generate_refactoring_patch(
-        [(0.95, ua1, ua2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-    assert "def _shared_u1_u2(a: Any, b: Any) -> Any:" in patch_attr
-    assert "+        self.cache[k] = _shared_u1_u2(a, b)" in patch_attr
-    assert "+        res = _shared_u1_u2(a, b)" in patch_attr
-
-
-def test_unit_has_no_refactor_pragma_fallback_inline_and_multiline_leading(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Verifies that _unit_has_no_refactor_pragma fallback detects inline trailing
-    # pragma: no-refactor comments and multi-line contiguous leading comment blocks."""
-    from pydoppelgangerhunt.fixer import patch as patch_mod
-    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=protected-access
-        _unit_has_no_refactor_pragma,
-    )
-
-    def _raise_runtime_error(*_args: Any, **_kwargs: Any) -> Any:
-        raise RuntimeError("simulated tokenizer failure")
-
-    monkeypatch.setattr(patch_mod, "extract_unit_comments_and_pragmas", _raise_runtime_error)
-
-    # 1. Inline trailing comment on header line
-    lines_inline = [
-        "def foo():  # pragma: no-refactor\n",
-        "    return 42\n",
-    ]
-    u_inline = {"start": 1, "end": 2}
-    assert _unit_has_no_refactor_pragma(u_inline, lines_inline) is True
-
-    # 2. Multi-line contiguous leading comment block above unit
-    lines_multiline = [
-        "# pragma: no-refactor\n",
-        "# Intentional duplicate implementation\n",
-        "def bar():\n",
-        "    return 99\n",
-    ]
-    u_multiline = {"start": 3, "end": 4}
-    assert _unit_has_no_refactor_pragma(u_multiline, lines_multiline) is True
-
-
-def test_whole_line_complex_expr_lhs_receiver_pruned_across_method_and_function(
-    tmp_path: Path,
-) -> None:
-    """Verifies that when self appears only on the LHS of an instance method's whole-line
-    complex_expr, receiver binding flags are recomputed so it pairs cleanly with a
-    top-level function or staticmethod."""
-    src_method = (
-        "class Worker:\n"
-        "    def store(self, k: str, a: int, b: int) -> None:\n"
-        "        self.cache[k] = (a + b) * (a - b)\n"
-    )
-    src_func = (
-        "def standalone_calc(a: int, b: int) -> int:\n"
-        "    res = (a + b) * (a - b)\n"
-        "    return res\n"
-    )
-    f1 = tmp_path / "rec_method.py"
-    f2 = tmp_path / "rec_func.py"
-    f1.write_text(src_method, encoding="utf-8")
-    f2.write_text(src_func, encoding="utf-8")
-
-    u1 = {"file": "rec_method.py", "start": 3, "end": 3, "name": "u1", "kind": "complex_expr"}
-    u2 = {"file": "rec_func.py", "start": 2, "end": 2, "name": "u2", "kind": "complex_expr"}
-
-    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
-    assert "def _shared_u1_u2(a: Any, b: Any) -> Any:" in helper
-
-    patch = generate_refactoring_patch(
-        [(0.95, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-    assert "def _shared_u1_u2(a: Any, b: Any) -> Any:" in patch
-    assert "+        self.cache[k] = _shared_u1_u2(a, b)" in patch
-    assert "+    res = _shared_u1_u2(a, b)" in patch
-
-
-def test_asymmetric_augassign_vs_assign_whole_line_complex_expr_refactored(
-    tmp_path: Path,
-) -> None:
-    """Verifies that a whole-line complex_expr with AugAssign (total += a + b) paired
-    with a regular Assign (res = a + b) prunes the unreferenced AugAssign target and
-    refactors both call sites."""
-    src1 = (
-        "def accumulate(total: int, a: int, b: int) -> int:\n"
-        "    total += (a + b) * 2\n"
-        "    return total\n"
-    )
-    src2 = (
-        "def compute_once(a: int, b: int) -> int:\n"
-        "    res = (a + b) * 2\n"
-        "    return res\n"
-    )
-    f1 = tmp_path / "asym_aug1.py"
-    f2 = tmp_path / "asym_aug2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"file": "asym_aug1.py", "start": 2, "end": 2, "name": "u1", "kind": "complex_expr"}
-    u2 = {"file": "asym_aug2.py", "start": 2, "end": 2, "name": "u2", "kind": "complex_expr"}
-
-    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
-    assert "def _shared_u1_u2(a: Any, b: Any) -> Any:" in helper
-
-    patch = generate_refactoring_patch(
-        [(0.95, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-    assert "def _shared_u1_u2(a: Any, b: Any) -> Any:" in patch
-    assert "+    total += _shared_u1_u2(a, b)" in patch
-    assert "+    res = _shared_u1_u2(a, b)" in patch
-
-
-def test_custom_classmethod_receiver_preserved_after_lhs_pruning() -> None:
-    """Verifies that _prune_unreferenced_lhs_scope preserves class binding for a
-    @classmethod with a custom receiver name (e.g., klass) when LHS loads are pruned."""
-    from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope
-    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access
-        _prune_unreferenced_lhs_scope,
-    )
-
-    lines = ["registry[idx] = klass.create(a, b)"]
-    unit = {
-        "name": "build_entry",
-        "kind": "complex_expr",
-        "start": 1,
-        "end": 1,
-        "receiver_param": "klass",
-        "receiver_kind": "class",
-        "source_text": lines[0],
-    }
-    scope = inspect_single_unit_scope(unit)
-    _prune_unreferenced_lhs_scope(unit, scope, lines)
-
-    assert "registry" not in scope["inputs"]
-    assert "idx" not in scope["inputs"]
-    assert "klass" in scope["inputs"]
-    assert scope["has_class_binding"] is True
-    assert scope["has_instance_binding"] is False
-    assert scope["has_receiver_access"] is True
-    assert scope["binding_kind"] == "class"
-
-
-def test_whole_line_comprehension_distinct_lhs_attrs_with_shared_rhs_attr(
-    tmp_path: Path,
-) -> None:
-    """Verifies that two methods assigning to distinct LHS attributes (self.res1 vs self.res2)
-    while reading a shared attribute on the RHS (self.factor) prune the LHS attribute writes
-    and refactor cleanly."""
-    src = (
-        "class Processor:\n"
-        "    def __init__(self, factor: int) -> None:\n"
-        "        self.factor = factor\n"
-        "        self.res1 = []\n"
-        "        self.res2 = []\n"
-        "\n"
-        "    def run_first(self, items: list) -> None:\n"
-        "        self.res1 = [x * self.factor + 1 for x in items if x > 0]\n"
-        "\n"
-        "    def run_second(self, items: list) -> None:\n"
-        "        self.res2 = [x * self.factor + 1 for x in items if x > 0]\n"
-    )
-    f = tmp_path / "proc.py"
-    f.write_text(src, encoding="utf-8")
-
-    u1 = {
-        "file": "proc.py",
-        "start": 8,
-        "end": 8,
-        "name": "Processor.run_first:<comp>",
-        "kind": "comprehension",
-        "enclosing_class": "Processor",
-        "receiver_param": "self",
-    }
-    u2 = {
-        "file": "proc.py",
-        "start": 11,
-        "end": 11,
-        "name": "Processor.run_second:<comp>",
-        "kind": "comprehension",
-        "enclosing_class": "Processor",
-        "receiver_param": "self",
-    }
-
-    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
-    assert "def _shared_" in helper
-    assert "return [x * self.factor + 1 for x in items if x > 0]" in helper
-
-    patch = generate_refactoring_patch(
-        [(0.98, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-    assert "+        self.res1 = _shared_run_first_run_second(self, items)" in patch
-    assert "+        self.res2 = _shared_run_first_run_second(self, items)" in patch
-
-
-def test_async_function_and_async_method_kinds_whole_body_delegation(
-    tmp_path: Path,
-) -> None:
-    """Verifies that units with kind='async_function' or kind='async_method' strip their
-    async def header during body extraction, synthesize a valid async def helper, and emit
-    whole-method delegation calls."""
-    src = (
-        "async def fetch_alpha(client, key: str) -> int:\n"
-        "    raw = await client.get(key)\n"
-        "    val = int(raw.strip())\n"
-        "    return val + 1\n"
-        "\n"
-        "async def fetch_beta(client, key: str) -> int:\n"
-        "    raw = await client.get(key)\n"
-        "    val = int(raw.strip())\n"
-        "    return val + 1\n"
-    )
-    f = tmp_path / "async_mod.py"
-    f.write_text(src, encoding="utf-8")
-
-    u1 = {
-        "file": "async_mod.py",
-        "start": 1,
-        "end": 4,
-        "name": "fetch_alpha",
-        "kind": "async_function",
-    }
-    u2 = {
-        "file": "async_mod.py",
-        "start": 6,
-        "end": 9,
-        "name": "fetch_beta",
-        "kind": "async_function",
-    }
-
-    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
-    assert helper.startswith("async def _shared_fetch_alpha_fetch_beta(")
-    assert helper.count("async def ") == 1
-
-    patch = generate_refactoring_patch(
-        [(1.0, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-    assert "+async def _shared_fetch_alpha_fetch_beta(" in patch
-    assert "+    return await _shared_fetch_alpha_fetch_beta(client, key)" in patch
-
-
-def test_lhs_and_augassign_pruning_ignores_bound_comprehension_target_on_rhs(
-    tmp_path: Path,
-) -> None:
-    """Verifies that _node_references_name ignores bound comprehension targets on the RHS
-    so LHS subscript indices (arr[x] = [x * 2 for x in items]) and AugAssign targets
-    (total += sum(total for total in items)) are properly pruned."""
-    src1 = (
-        "def fill_slot(arr: list, x: int, items: list) -> None:\n"
-        "    arr[x] = [x * 2 + 1 for x in items if x > 0]\n"
-    )
-    src2 = (
-        "def compute_list(items: list) -> list:\n"
-        "    res = [x * 2 + 1 for x in items if x > 0]\n"
-        "    return res\n"
-    )
-    f1 = tmp_path / "comp_lhs1.py"
-    f2 = tmp_path / "comp_lhs2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
-
-    u1 = {"file": "comp_lhs1.py", "start": 2, "end": 2, "name": "u1", "kind": "comprehension"}
-    u2 = {"file": "comp_lhs2.py", "start": 2, "end": 2, "name": "u2", "kind": "comprehension"}
-
-    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
-    assert "def _shared_u1_u2(items: Any) -> Any:" in helper
-
-    patch = generate_refactoring_patch(
-        [(0.98, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-    assert "+    arr[x] = _shared_u1_u2(items)" in patch
-    assert "+    res = _shared_u1_u2(items)" in patch
-
-    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access
-        _extract_augassign_unreferenced_target,
-    )
-
-    assert (
-        _extract_augassign_unreferenced_target(["total += sum(total for total in items)"])
-        == "total"
-    )
-
 
 def test_asymmetric_expr_kind_and_chained_assign_outputs_cleared(
     tmp_path: Path,
@@ -10802,318 +4687,395 @@ def test_asymmetric_expr_kind_and_chained_assign_outputs_cleared(
     assert "+    x = y = _shared_u1_u2(a, b)" in patch_kindless
     assert "+    z = _shared_u1_u2(a, b)" in patch_kindless
 
-
-def test_lhs_load_pruning_cross_clone_collision_and_arity_mismatch(
+def test_generate_refactoring_patch_transactional_rollback_multi_file_same_file_and_cycles(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verifies that whole-line complex_expr units whose LHS-only loads collide with the
-    partner clone's RHS inputs preserve positional argument order without permuting operands,
-    and fail closed when pruned RHS arities differ."""
-    src1 = (
-        "def store_one(arr, a, b, c):\n"
-        "    arr[a] = b - c\n"
+    """Verifies per-pair snapshot rollback leaves zero partial edits on multi-file, same-file, and cycle failures."""
+    # 1. Multi-file pair-2 exception after Pair 1 succeeded and Pair 2 started modifying files:
+    #    Pair 1 edits remain intact; Pair 2 edits and new module entries are completely rolled back.
+    a1 = tmp_path / "a1.py"
+    a2 = tmp_path / "a2.py"
+    b1 = tmp_path / "b1.py"
+    b2 = tmp_path / "b2.py"
+    pair1_fn = (
+        "def calc_one(x):\n"
+        "    t = x + 10\n"
+        "    return t * 2\n"
     )
-    src2 = (
-        "def store_two(arr, idx, a, b):\n"
-        "    arr[idx] = a - b\n"
+    pair2_fn = (
+        "def calc_two(y):\n"
+        "    t = y + 20\n"
+        "    return t * 3\n"
     )
-    f1 = tmp_path / "lhs_col1.py"
-    f2 = tmp_path / "lhs_col2.py"
-    f1.write_text(src1, encoding="utf-8")
-    f2.write_text(src2, encoding="utf-8")
+    a1.write_text(pair1_fn, encoding="utf-8")
+    a2.write_text(pair1_fn, encoding="utf-8")
+    b1.write_text(pair2_fn, encoding="utf-8")
+    b2.write_text(pair2_fn, encoding="utf-8")
 
-    u1 = {"file": "lhs_col1.py", "start": 2, "end": 2, "name": "u1", "kind": "complex_expr"}
-    u2 = {"file": "lhs_col2.py", "start": 2, "end": 2, "name": "u2", "kind": "complex_expr"}
+    p1_u1 = {"file": str(a1), "start": 1, "end": 3, "name": "calc_one", "kind": "function"}
+    p1_u2 = {"file": str(a2), "start": 1, "end": 3, "name": "calc_one", "kind": "function"}
+    p2_u1 = {"file": str(b1), "start": 1, "end": 3, "name": "calc_two", "kind": "function"}
+    p2_u2 = {"file": str(b2), "start": 1, "end": 3, "name": "calc_two", "kind": "function"}
 
-    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
-    assert "def _shared_u1_u2(b: Any, c: Any) -> Any:" in helper
-    patch = generate_refactoring_patch(
-        [(0.95, u1, u2)],
-        repo_root=str(tmp_path),
-        replace_clones=True,
-    )
-    assert "+    arr[a] = _shared_u1_u2(b, c)" in patch
-    assert "+    arr[idx] = _shared_u1_u2(a, b)" in patch
-    assert "_shared_u1_u2(b, a)" not in patch
+    import pydoppelgangerhunt.fixer._patch_delegation as patch_deleg_mod
 
-    # Asymmetric RHS arity after LHS pruning fails closed
-    src3 = (
-        "def store_three(arr, a, b):\n"
-        "    arr[a] = a + b + 1\n"
-    )
-    f3 = tmp_path / "lhs_col3.py"
-    f3.write_text(src3, encoding="utf-8")
-    u3 = {"file": "lhs_col3.py", "start": 2, "end": 2, "name": "u3", "kind": "complex_expr"}
-    u1_single = {
-        "file": "lhs_col1.py",
-        "start": 2,
-        "end": 2,
-        "name": "u1",
-        "kind": "complex_expr",
-    }
-    f1.write_text("def store_one(arr, a, b):\n    arr[a] = b + 1\n", encoding="utf-8")
-    assert synthesize_shared_helper_code(u1_single, u3, repo_root=str(tmp_path)) == ""
-    assert (
-        generate_refactoring_patch(
-            [(0.95, u1_single, u3)],
+    real_replace = patch_deleg_mod.resolve_unit_replacement
+    replace_calls = 0
+
+    def _fail_second_pair_second_edit(*args: Any, **kwargs: Any) -> Any:
+        nonlocal replace_calls
+        replace_calls += 1
+        # Fail after the 3rd replacement (middle of pair 2 after pair 2 touched its first file)
+        if replace_calls == 4:
+            raise RuntimeError("simulated mid-pair failure after first-file modification")
+        return real_replace(*args, **kwargs)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            patch_deleg_mod, "resolve_unit_replacement", _fail_second_pair_second_edit
+        )
+        patch_partial = generate_refactoring_patch(
+            [(0.99, p1_u1, p1_u2), (0.99, p2_u1, p2_u2)],
             repo_root=str(tmp_path),
             replace_clones=True,
         )
-        == ""
+    assert "calc_one" in patch_partial
+    assert "b1.py" not in patch_partial
+    assert "b2.py" not in patch_partial
+
+    # 2. Same-file clone pair failure after first replacement leaves empty patch
+    same_file = tmp_path / "same.py"
+    same_file.write_text(
+        "def left(x):\n    v = x + 1\n    return v * 2\n\n"
+        "def right(x):\n    v = x + 1\n    return v * 2\n",
+        encoding="utf-8",
     )
+    sf_u1 = {"file": str(same_file), "start": 1, "end": 3, "name": "left", "kind": "function"}
+    sf_u2 = {"file": str(same_file), "start": 5, "end": 7, "name": "right", "kind": "function"}
+    sf_calls = 0
 
+    def _fail_same_file_midway(*args: Any, **kwargs: Any) -> Any:
+        nonlocal sf_calls
+        sf_calls += 1
+        if sf_calls == 2:
+            raise RuntimeError("simulated same-file failure")
+        return real_replace(*args, **kwargs)
 
-def test_top_level_async_comprehension_and_nested_class_lambda_async_scoping() -> None:
-    """Verifies that top-level async comprehensions set unit['is_async'] = True in
-    _populate_unit_receiver_metadata and that _ScopeHierarchyVisitor resets async_stack
-    to False inside ClassDef and Lambda bodies nested inside async def."""
-    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=protected-access
-        _populate_unit_receiver_metadata,
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            patch_deleg_mod, "resolve_unit_replacement", _fail_same_file_midway
+        )
+        same_patch = generate_refactoring_patch(
+            [(0.99, sf_u1, sf_u2)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+        )
+    assert same_patch == ""
+
+    # 3. Circular import dependency across modules is rejected cleanly without mutating callers
+    cyc_a = tmp_path / "cyc_a.py"
+    cyc_b = tmp_path / "cyc_b.py"
+    cyc_a.write_text(
+        "import cyc_b\n\n"
+        "def f1(x):\n"
+        "    val = x + 1\n"
+        "    return val * 2\n",
+        encoding="utf-8",
     )
-    from pydoppelgangerhunt.parser import (  # pylint: disable=protected-access
-        _ScopeHierarchyVisitor,
+    cyc_b.write_text(
+        "def f2(x):\n"
+        "    val = x + 1\n"
+        "    return val * 2\n",
+        encoding="utf-8",
     )
-
-    top_src = "res = [await fetch(x) for x in items]\n"
-    u_top: dict[str, Any] = {
-        "start": 1,
-        "end": 1,
-        "kind": "comprehension",
-        "is_subroutine": True,
-    }
-    _populate_unit_receiver_metadata(u_top, source_text=top_src)
-    assert u_top["is_async"] is True
-
-    nested_src = (
-        "async def outer(items):\n"
-        "    class Inner:\n"
-        "        vals = [x for x in range(5)]\n"
-        "    fn = lambda seq=[await f(i) for i in items]: [y for y in seq]\n"
+    ca_u = {"file": str(cyc_a), "start": 3, "end": 5, "name": "f1", "kind": "function"}
+    cb_u = {"file": str(cyc_b), "start": 1, "end": 3, "name": "f2", "kind": "function"}
+    dg = build_module_graph(str(tmp_path))
+    cyc_patch = generate_refactoring_patch(
+        [(0.99, ca_u, cb_u)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="inline_first",
+        depgraph=dg,
     )
-    tree = ast.parse(nested_src)
-    scoper = _ScopeHierarchyVisitor()
-    scoper.visit(tree)
+    assert "cyc_b" in cyc_patch
+    assert "from cyc_a import" not in cyc_patch
+    assert "Circular import" in cyc_patch or "circular" in cyc_patch.lower()
 
-    outer_fn = tree.body[0]
-    inner_cls = outer_fn.body[0]  # type: ignore[attr-defined]
-    cls_comp = inner_cls.body[0].value
-    lam_node = outer_fn.body[1].value  # type: ignore[attr-defined]
-    lam_default_comp = lam_node.args.defaults[0]
-    lam_body_comp = lam_node.body
-
-    assert scoper.func_is_async[id(cls_comp)] is False
-    assert scoper.func_is_async[id(lam_default_comp)] is True
-    assert scoper.func_is_async[id(lam_body_comp)] is False
-
-
-def test_kindless_subline_expr_slicing_and_mixed_assign_return_alignment(
+def test_generate_refactoring_patch_uses_unit_source_code_when_second_unit_lacks_file_source(
     tmp_path: Path,
 ) -> None:
-    """Verifies that synthesize_shared_helper_code aligns expression kinds before slicing
-    sub-line token columns and unwraps ast.Return alongside ast.Assign in _strip_stmt_target_lines."""
-    # 1. Kind-less sub-line unit with start_col/end_col paired with explicit complex_expr unit
-    sub_src1 = "def f1(a, b, c):\n    out = (a + b) * (b + c)\n    return out\n"
-    sub_src2 = "def f2(a, b, c):\n    val = (a + b) * (b + c)\n    return val\n"
-    sf1 = tmp_path / "sub1.py"
-    sf2 = tmp_path / "sub2.py"
-    sf1.write_text(sub_src1, encoding="utf-8")
-    sf2.write_text(sub_src2, encoding="utf-8")
-    u_sub1 = {
-        "file": "sub1.py",
+    """Verifies preview patches synthesize from u2 source_code without placeholder comments when disk source is absent."""
+    mod_a = tmp_path / "mod_a.py"
+    mod_a.write_text(
+        "def compute_a(x, y):\n    val = (x * 2 + y)\n    return val\n",
+        encoding="utf-8",
+    )
+    line_text = "    val = (x * 2 + y)"
+    expr_start_col = line_text.index("x * 2 + y")
+    expr_end_col = expr_start_col + len("x * 2 + y")
+
+    u1 = {
+        "file": str(mod_a),
+        "name": "compute_a:expr",
         "start": 2,
         "end": 2,
-        "start_col": 10,
-        "end_col": 27,
-        "name": "s1",
-    }
-    u_sub2 = {
-        "file": "sub2.py",
-        "start": 2,
-        "end": 2,
-        "start_col": 10,
-        "end_col": 27,
-        "name": "s2",
+        "start_col": expr_start_col,
+        "end_col": expr_end_col,
         "kind": "complex_expr",
     }
-    sub_helper = synthesize_shared_helper_code(u_sub1, u_sub2, repo_root=str(tmp_path))
-    assert "return (a + b) * (b + c)" in sub_helper
-    assert "out =" not in sub_helper
-
-    # 2. Mixed whole-line Assign (res = <expr>) and Return (return <expr>) multiline complex_expr
-    mix_src1 = (
-        "def m1(a, b, c, d):\n"
-        "    res = (\n"
-        "        (a + b)\n"
-        "        * (c + d)\n"
-        "    )\n"
-        "    return res\n"
-    )
-    mix_src2 = (
-        "def m2(a, b, c, d):\n"
-        "    return (\n"
-        "        (a + b)\n"
-        "        * (c + d)\n"
-        "    )\n"
-    )
-    mf1 = tmp_path / "mix1.py"
-    mf2 = tmp_path / "mix2.py"
-    mf1.write_text(mix_src1, encoding="utf-8")
-    mf2.write_text(mix_src2, encoding="utf-8")
-    u_mix1 = {
-        "file": "mix1.py",
-        "start": 2,
-        "end": 5,
-        "name": "m1_expr",
-        "kind": "complex_expr",
-    }
-    u_mix2 = {
-        "file": "mix2.py",
-        "start": 2,
-        "end": 5,
-        "name": "m2_expr",
-        "kind": "complex_expr",
-    }
-    mix_helper = synthesize_shared_helper_code(u_mix1, u_mix2, repo_root=str(tmp_path))
-    assert "return (a + b) * (c + d)" in mix_helper
-    mix_patch = generate_refactoring_patch(
-        [(0.95, u_mix1, u_mix2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert "+    res = _shared_m1_expr_m2_expr(a, b, c, d)" in mix_patch
-    assert "+    return _shared_m1_expr_m2_expr(a, b, c, d)" in mix_patch
-
-
-def test_same_class_whole_line_expr_lhs_only_self_runtime_safety(
-    tmp_path: Path,
-) -> None:
-    """Verifies that same-class whole-line comprehension/complex_expr clones where self
-    is only referenced on the LHS do not emit mismatched receiver signatures."""
-    cls_src = (
-        "class Processor:\n"
-        "    def m1(self, items):\n"
-        "        self.res1 = [x * 2 for x in items]\n"
-        "        return self.res1\n"
-        "\n"
-        "    def m2(self, items):\n"
-        "        self.res2 = [x * 2 for x in items]\n"
-        "        return self.res2\n"
-    )
-    f_cls = tmp_path / "proc.py"
-    f_cls.write_text(cls_src, encoding="utf-8")
-    u1_c = {"file": "proc.py", "start": 3, "end": 3, "name": "m1_c"}
-    u2_c = {
-        "file": "proc.py",
+    u2_with_src = {
+        "file": str(tmp_path / "missing_mod_b.py"),
+        "name": "compute_b:expr",
         "start": 7,
         "end": 7,
-        "name": "m2_c",
-        "kind": "comprehension",
+        "start_col": 14,
+        "end_col": 23,
+        "kind": "complex_expr",
+        "allow_snippet_only": True,
+        "source_code": "x * 2 + y",
     }
-    patch_str = generate_refactoring_patch(
-        [(0.99, u1_c, u2_c)], repo_root=str(tmp_path), replace_clones=True
+    patch_out = generate_refactoring_patch(
+        [(0.99, u1, u2_with_src)],
+        repo_root=str(tmp_path),
+        replace_clones=False,
     )
-    assert "@staticmethod" not in patch_str
-    assert "+def _shared_m1_c_m2_c(items: Any) -> Any:" in patch_str
-    assert "+        self.res1 = _shared_m1_c_m2_c(items)" in patch_str
-    assert "+        self.res2 = _shared_m1_c_m2_c(items)" in patch_str
+    assert "# Source for " not in patch_out
+    assert "x * 2 + y" in patch_out
+    assert "+def " in patch_out
 
+    # Also verify whole-function u2 with source_code in default strict mode
+    u1_fn = {
+        "file": str(mod_a),
+        "name": "compute_a",
+        "start": 1,
+        "end": 3,
+        "kind": "function",
+    }
+    u2_fn_src = {
+        "file": str(tmp_path / "missing_mod_b.py"),
+        "name": "compute_b",
+        "start": 10,
+        "end": 12,
+        "kind": "function",
+        "source_code": "def compute_b(x, y):\n    val = (x * 2 + y)\n    return val\n",
+    }
+    fn_patch = generate_refactoring_patch(
+        [(0.99, u1_fn, u2_fn_src)],
+        repo_root=str(tmp_path),
+        replace_clones=False,
+    )
+    assert "# Source for " not in fn_patch
+    assert "x * 2 + y" in fn_patch
+    assert "+def " in fn_patch
 
-def test_whole_line_complex_expr_leading_comment_and_col0_multiline_string(
+    # Negative control: missing disk file and no source_code never emits placeholder helper lines
+    u1_missing = {
+        "file": str(tmp_path / "missing_mod_a.py"),
+        "name": "compute_a",
+        "start": 1,
+        "end": 2,
+        "kind": "function",
+    }
+    u2_missing = {
+        "file": str(tmp_path / "missing_mod_b.py"),
+        "name": "compute_b",
+        "start": 1,
+        "end": 2,
+        "kind": "function",
+    }
+    empty_patch = generate_refactoring_patch(
+        [(0.99, u1_missing, u2_missing)],
+        repo_root=str(tmp_path),
+        replace_clones=False,
+    )
+    assert empty_patch == ""
+    assert "# Source for " not in empty_patch
+
+@pytest.mark.parametrize(
+    ("exc_kind", "expect_diag_error", "expect_warning"),
+    [
+        pytest.param(
+            "type_error",
+            True,
+            True,
+            id="internal_type_error_triggers_diagnostic_error_and_warning",
+        ),
+        pytest.param(
+            "value_error",
+            True,
+            True,
+            id="internal_value_error_triggers_diagnostic_error_and_warning",
+        ),
+        pytest.param(
+            "syntax_error",
+            False,
+            False,
+            id="control_syntax_error_skips_at_debug",
+        ),
+        pytest.param(
+            "unit_collision",
+            False,
+            False,
+            id="control_unit_collision_error_skips_at_debug",
+        ),
+    ],
+)
+def test_generate_refactoring_patch_reports_internal_value_and_type_errors_as_diagnostic_errors(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    exc_kind: str,
+    expect_diag_error: bool,
+    expect_warning: bool,
 ) -> None:
-    """Verifies that whole-line complex_expr units starting with a comment and containing
-    a column-0 multiline string literal parse and refactor cleanly."""
+    """Verifies unexpected TypeError/ValueError invoke on_diagnostic_error and warn while SyntaxError/UnitCollisionError skip at DEBUG."""
+    import pydoppelgangerhunt.fixer.patch as patch_mod  # pylint: disable=import-outside-toplevel
+
+    exc_map: Dict[str, Exception] = {
+        "type_error": TypeError("internal synthesis type bug"),
+        "value_error": ValueError("internal synthesis value bug"),
+        "syntax_error": SyntaxError("unparseable snippet"),
+        "unit_collision": patch_mod.UnitCollisionError("unit overlap"),
+    }
     src = (
-        "def f1(cache, k, suffix):\n"
-        "    # leading comment 1\n"
-        "    cache[k] = (\n"
-        '        """header\n'
-        "col0_line\n"
-        '""" + suffix\n'
-        "    )\n"
-        "    return cache\n"
-        "\n"
-        "def f2(store, key, suffix):\n"
-        "    # leading comment 2\n"
-        "    store[key] = (\n"
-        '        """header\n'
-        "col0_line\n"
-        '""" + suffix\n'
-        "    )\n"
-        "    return store\n"
+        "def f1(a, b):\n    total = a + b\n    return total * 2\n\n"
+        "def f2(a, b):\n    total = a + b\n    return total * 2\n"
     )
-    p = tmp_path / "col0_expr.py"
-    p.write_text(src, encoding="utf-8")
-    u1 = {"file": "col0_expr.py", "start": 2, "end": 7, "name": "f1_expr", "kind": "complex_expr"}
-    u2 = {"file": "col0_expr.py", "start": 11, "end": 16, "name": "f2_expr", "kind": "complex_expr"}
-    patch_str = generate_refactoring_patch(
-        [(0.99, u1, u2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert "+def _shared_f1_expr_f2_expr(suffix: Any) -> Any:" in patch_str
-    assert "+    cache[k] = _shared_f1_expr_f2_expr(suffix)" in patch_str
-    assert "+    store[key] = _shared_f1_expr_f2_expr(suffix)" in patch_str
+    mod_file = tmp_path / "diag_err.py"
+    mod_file.write_text(src, encoding="utf-8")
+    u1 = {"file": str(mod_file), "name": "f1", "kind": "function", "start": 1, "end": 3}
+    u2 = {"file": str(mod_file), "name": "f2", "kind": "function", "start": 5, "end": 7}
 
+    def _boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise exc_map[exc_kind]
 
-def test_out_of_bounds_pragma_and_col0_multiline_string_subroutine_synthesis(
-    tmp_path: Path,
-) -> None:
-    """Verifies that _unit_has_no_refactor_pragma handles out-of-bounds u_start without
-    IndexError and that subroutine synthesis with column-0 multiline strings preserves
-    exact string literal content alongside synthesized preambles and returns."""
-    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
-        _unit_has_no_refactor_pragma,
-    )
+    monkeypatch.setattr(patch_mod, "analyze_unit_variable_scope", _boom)
 
-    pragma_lines = ["# pragma: no-refactor\n", "x = 1\n"]
-    assert (
-        _unit_has_no_refactor_pragma(
-            {"start": 50, "end": 55}, pragma_lines, "".join(pragma_lines)
+    diag_calls = 0
+
+    def _on_diag() -> None:
+        nonlocal diag_calls
+        diag_calls += 1
+
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt.fixer.patch"):
+        out = generate_refactoring_patch(
+            [(0.99, u1, u2)],
+            repo_root=str(tmp_path),
+            on_diagnostic_error=_on_diag,
         )
-        is False
+
+    assert out == ""
+    assert diag_calls == (1 if expect_diag_error else 0)
+    has_warn = any(
+        rec.levelno >= logging.WARNING
+        and "Unexpected failure processing clone pair" in rec.getMessage()
+        for rec in caplog.records
     )
-    dec_pragma_lines = [
-        "# pragma: no-refactor\n",
-        "@my_decorator(\n",
-        "    arg=True,\n",
-        ")\n",
-        "def compute(x):\n",
-        "    return x + 1\n",
+    assert has_warn is expect_warning
+
+@pytest.mark.parametrize(
+    ("mode", "allowlist", "skip_pair", "expected_marker"),
+    [
+        pytest.param(
+            "strict",
+            None,
+            True,
+            "CustomTx",
+            id="skipped_heuristic_pair_emits_no_summary_warning",
+        ),
+        pytest.param(
+            "pedantic",
+            ["*.atomic"],
+            True,
+            "*.atomic",
+            id="skipped_wildcard_pair_emits_no_summary_warning",
+        ),
+        pytest.param(
+            "strict",
+            None,
+            False,
+            "CustomTx",
+            id="control_committed_heuristic_pair_emits_summary_warning",
+        ),
+        pytest.param(
+            "pedantic",
+            ["*.atomic"],
+            False,
+            "*.atomic",
+            id="control_committed_wildcard_pair_emits_summary_warning",
+        ),
+    ],
+)
+def test_generate_refactoring_patch_skipped_pairs_do_not_emit_heuristic_or_wildcard_summary(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    mode: str,
+    allowlist: Optional[List[str]],
+    skip_pair: bool,
+    expected_marker: str,
+) -> None:
+    """Verifies skipped clone pairs do not pollute session-level heuristic or wildcard Summary warnings."""
+    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        clear_closure_warning_cache,
+    )
+
+    mgr_expr = "CustomTx()" if allowlist is None else "db.atomic()"
+    f1 = tmp_path / "m1.py"
+    f2 = tmp_path / "m2.py"
+    fn_a = (
+        f"def run_a(db, step):\n"
+        f"    with {mgr_expr}:\n"
+        f"        val = step()\n"
+        f"    cb = lambda: val\n"
+        f"    res = cb() + 1\n"
+        f"    return res\n"
+    )
+    fn_b = (
+        f"def run_b(db, step):\n"
+        f"    with {mgr_expr}:\n"
+        f"        val = step()\n"
+        f"    cb = lambda: val\n"
+        f"    res = cb() + 1\n"
+        f"    return res\n"
+    )
+    f1.write_text(fn_a, encoding="utf-8")
+    f2.write_text(fn_b, encoding="utf-8")
+    u1 = {
+        "file": str(f1),
+        "name": "run_a:block",
+        "kind": "sliding_window",
+        "start": 4,
+        "end": 5,
+    }
+    u2 = {
+        "file": str(f2),
+        "name": "run_b:block",
+        "kind": "sliding_window",
+        "start": 4,
+        "end": 5,
+    }
+
+    clear_closure_warning_cache()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt.config"):
+        patch_out = generate_refactoring_patch(
+            [(0.99, u1, u2)],
+            repo_root=str(tmp_path),
+            cross_file_strategy="skip" if skip_pair else "host_module",
+            closure_strictness=mode,
+            non_suppressing_ctx_managers=allowlist,
+        )
+
+    summary_warnings = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.levelno >= logging.WARNING and "Summary:" in rec.getMessage()
     ]
-    assert (
-        _unit_has_no_refactor_pragma(
-            {"start": 5, "end": 6}, dec_pragma_lines, "".join(dec_pragma_lines)
-        )
-        is True
-    )
-
-    src = (
-        "class Formatter:\n"
-        "    def build_a(self, flag: bool, suffix: str) -> str:\n"
-        "        if flag:\n"
-        "            tag = 'ON'\n"
-        '        banner = """header\n'
-        'col0_body_line"""\n'
-        "        res = f'{banner}:{tag}:{suffix}'\n"
-        "        return res\n"
-        "\n"
-        "    def build_b(self, flag: bool, suffix: str) -> str:\n"
-        "        if flag:\n"
-        "            tag = 'ON'\n"
-        '        banner = """header\n'
-        'col0_body_line"""\n'
-        "        res = f'{banner}:{tag}:{suffix}'\n"
-        "        return res\n"
-    )
-    f_sub = tmp_path / "fmt.py"
-    f_sub.write_text(src, encoding="utf-8")
-    u1 = {"file": "fmt.py", "start": 3, "end": 7, "name": "build_a_sub", "kind": "subroutine"}
-    u2 = {"file": "fmt.py", "start": 11, "end": 15, "name": "build_b_sub", "kind": "subroutine"}
-    helper_code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
-    assert "\ncol0_body_line\"\"\"\n" in helper_code
-    assert "    col0_body_line" not in helper_code
-    assert "        tag = None\n" in helper_code
-    assert "        return tag, banner, res\n" in helper_code
-    patch_str = generate_refactoring_patch(
-        [(0.99, u1, u2)], repo_root=str(tmp_path), replace_clones=True
-    )
-    assert "    col0_body_line" not in patch_str
-    assert "+        return tag, banner, res\n" in patch_str
-
+    if skip_pair:
+        assert patch_out == ""
+        assert not summary_warnings
+    else:
+        assert "def _shared_" in patch_out
+        assert any(expected_marker in msg for msg in summary_warnings), summary_warnings

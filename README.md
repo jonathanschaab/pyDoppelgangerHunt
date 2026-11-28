@@ -124,6 +124,9 @@ min_lines = 8
 min_tokens = 15
 cross_file_strategy = "auto"
 shared_module_name = "_common.py"
+# closure_strictness = "strict"  # "strict" (reporting default), "pedantic" (--patch default), or "lenient"
+# Prefer explicit dotted/bare names; use wildcards ("<module>.*.attr" or "*.attr") only as a last resort:
+non_suppressing_ctx_managers = []
 exclude = [
     "tests",
     "vendor",
@@ -133,6 +136,8 @@ exemptions = [
     ["module_a.py:func_1", "module_b.py:func_2"],
 ]
 ```
+
+Leaving `closure_strictness` unset (commented out) allows `--patch` (`generate_refactoring_patch`, for both `--replace-clones` / `replace_clones=True` and preview patches with `replace_clones=False`) to default automatically to `"pedantic"` while keeping reporting (`--suggest`, `--html`) on `"strict"`. Setting a canonical `closure_strictness` opts `--patch` / `generate_refactoring_patch` out of that automatic `"pedantic"` default. Unrecognized `closure_strictness` values in `pyproject.toml` raise `ValueError` (exiting with CLI status `2`).
 
 ### Cross-Module Deduplication Strategies
 
@@ -151,22 +156,37 @@ If any proposed cross-module extraction would introduce a circular import or unr
 
 ```python
 from pydoppelgangerhunt import (
+    AnalysisSession,
+    NormalizedCoordinates,
+    NormalizedSourceBuffer,
+    NormalizedUnit,
     ReplacementItem,
+    SCOPE_SCHEMA_VERSION,
+    SourceLinesOrigin,
     UnitCollisionError,
     UnitDict,
+    UnitSchema,
     UnitSpan,
+    analysis_session,
+    clear_dataflow_cache,
     compute_unit_byte_offsets,
     compute_unit_char_offsets,
     compute_unit_replacement_span,
     compute_unit_spans,
+    console_main,
     count_physical_newlines,
     detect_line_ending,
+    extract_unit_source_lines_with_state,
     generate_refactoring_patch,
+    heuristic_ctx_manager_session,
     intervals_overlap,
     is_subroutine_unit,
+    normalize_unit_boundary,
     refactor_module_units,
+    resolve_unit_source_buffer,
     split_source_lines,
     validate_module_unit_replacements,
+    validate_unit_schema,
 )
 ```
 
@@ -178,6 +198,8 @@ from pydoppelgangerhunt import (
 - **`count_physical_newlines(text)`**: Accurately counts physical line endings (`\r\n`, `\r`, `\n`) across mixed and legacy lone-CR formats.
 - **`detect_line_ending(*sources)`**: Detects predominant line ending format across source strings or iterables via majority vote (`\n`, `\r\n`, or `\r`), breaking ties in priority order (`\n` → `\r\n` → `\r`).
 - **`intervals_overlap(s1, e1, s2, e2)`**: Fast primitive returning `True` if two half-open intervals `[s1, e1)` and `[s2, e2)` intersect; `False` otherwise.
+- **`validate_unit_schema(unit, strict=False)`**: Validates a unit dictionary against `UnitSchema`, returning unrecognized keys (or raising `ValueError` under `strict=True`). Positionally consumed fields (`source_lines`, `inputs`, `outputs`, `precomputed_outputs`, `norm_tokens`, `calls`, list-valued `tokens`) must be ordered sequences—sets are rejected because they make helper parameter order and output pairing nondeterministic—while `non_suppressing_ctx_managers` and `shingles` also accept sets. `docstring_end` and `enclosing_class_start` are 1-based and reject `0`, aliased coordinates (`start`/`lineno`, `end`/`end_lineno`, `start_col`/`col_offset`/`start_col_offset`, `end_col`/`end_col_offset`) must agree, `"file"` accepts `str` or `os.PathLike` backed by `str`, `buffer_format` (when provided) must be `"python"` or `"nbformat"`, `closure_strictness` must be `"strict"`, `"pedantic"`, or `"lenient"`, and `non_suppressing_ctx_managers` rejects degenerate wildcards (`*`, `*.*`, or malformed `*` segments). **Schema validation is explicit**: only the high-level refactoring entrypoints (`generate_refactoring_patch`, `synthesize_shared_helper_code`, and `synthesize_refactoring_suggestion`) call `validate_unit_schema` automatically at entry; lower-level helpers (`inspect_single_unit_scope`, `extract_unit_source_lines_with_state`, `analyze_unit_variable_scope`, etc.) do not auto-validate external unit payloads unless callers invoke `validate_unit_schema` first.
+- **Notebook cell sources & in-memory anchors**: Code-cell `source` fragments are concatenated per nbformat before physical line splitting (line endings normalized to `\n`); cells whose `source` is missing or contains non-string fragments, and non-code cells, are skipped during harvesting and resolve to a `SourceLinesOrigin.PLACEHOLDER` (failing closed) in `extract_unit_source_lines_with_state`. Malformed `.ipynb#<fragment>` anchors (such as `#cell_0` or `#bad`) always fail closed to `PLACEHOLDER`, and in-memory buffers resolve under `source_lines > source_text > file_source` precedence with explicit format disambiguation via `UnitSchema["buffer_format"]` (`"python"` for extracted plain-Python cell source or `"nbformat"` for raw nbformat JSON, where any non-JSON, non-code, out-of-range, or malformed payload fails closed). When `buffer_format` is omitted, `file_source` buffers starting with `{` are parsed strictly as nbformat JSON, while `source_text`/`source_lines` buffers starting with `{` are parsed as nbformat JSON only when they decode cleanly to a JSON object containing `"cells"` or `"nbformat"` (valid Python dict literals such as `{"nbformat": 4, "data": x}` and non-JSON cell text pass through as plain Python unless `buffer_format="nbformat"` is set). Plain-Python in-memory buffers alongside a syntactically valid `#cell_N` anchor are treated as authoritative unsaved cell buffers and override disk `.ipynb` anchor lookup.
 - **`is_subroutine_unit(unit, source_text=None, tree=None)`**: Inspects unit metadata to
   determine if a clone unit represents an inner compound block, sliding window, or clause branch
   rather than an entire callable. Explicit `is_subroutine` boolean takes precedence; returns `True`
@@ -191,6 +213,7 @@ from pydoppelgangerhunt import (
 - **`extract_unit_source_code(unit, repo_root=None)`**: Extracts the source lines corresponding to a code unit from memory or disk. When an AST unit is missing an `end` line coordinate, it safely falls back to returning the single line at `start` rather than slicing to the end of the file.
 - **`refactor_module_units(source_text, replacements, lines=None, line_char_offsets=None, line_byte_offsets=None, dry_run=False, tier1=True, tier2=True, strict=True)`**: Applies multiple non-overlapping unit replacements in strict **reverse source order** (descending byte offsets) using single-pass buffer slicing, guaranteeing that downstream text expansions or contractions never invalidate upstream coordinates.
 - **`validate_module_unit_replacements(source_text, replacements, lines=None, line_char_offsets=None, line_byte_offsets=None, tier1=True, tier2=True, strict=True)`**: Non-mutating validation helper that verifies candidate replacements for collisions across Tier 1 (AST coordinate overlap) and Tier 2 (physical byte interval sweep) without modifying or allocating new source string buffers.
+- **`heuristic_ctx_manager_session(*, warn=None)`**: Context manager that isolates unproven context-manager heuristic diagnostics to the active `contextvars` execution context (propagating to worker threads via `contextvars.copy_context().run` without cross-session leakage) and emits a single consolidated summary on exit (`warn=None` defaults to `True` on outermost sessions and inherits the enclosing session's `warn` setting when nested; an explicit nested `warn=True` session with findings merges into and escalates an enclosing `warn=False` session's summary to `WARNING`).
 - **`generate_refactoring_patch(candidate_pairs, repo_root=..., replace_clones=..., ...)`**:
   Synthesizes a multi-file unified diff (`git apply` compatible) with dependency cycle detection
   and per-pair transactional snapshot rollback. For generator subroutines (within function or
@@ -236,10 +259,12 @@ except UnitCollisionError as exc:
 #### Performance & Algorithmic Bounds
 
 Refactoring executes in linear-logarithmic time with incremental validation:
-- **Incremental Collision Checking**: Delegation checks candidate units incrementally ($O(K)$ per unit against existing replacements and physical items), eliminating expensive $O(K \log K)$ buffer dry-runs per clone pair.
+- **Incremental Collision Checking**: Delegation checks candidate units incrementally (`O(K)` per unit against existing replacements and physical items), eliminating expensive `O(K log K)` buffer dry-runs per clone pair.
 - **Micro-Benchmark**: For modules with 100+ replacements and 10,000+ lines, dual-tier validation and single-pass descending buffer slicing executes in under 5 ms on modern hardware.
 
 ##### Precision & Soundness Trade-off: Closure Scanning
+
+> **Important (`strict` default caveat)**: Default `strict` mode uses a name-and-provenance heuristic for custom context managers and is **fail-open for neutrally named custom exception-suppressing context managers** (such as `Transaction()`, `Guard()`, or `SpanContext()`). To enforce sound fail-closed verification on every unproven context manager, run with `--closure-strictness pedantic` (or set `closure_strictness = "pedantic"` and list verified managers in `non_suppressing_ctx_managers = ["pkg.tx.atomic"]`).
 
 When extracting generator subroutine clones that assign variables, `pyDoppelgangerHunt` conducts
 a pre-unit AST walk within the enclosing scope to detect closures, lambdas, or nested classes
@@ -247,32 +272,152 @@ that capture candidate outputs prior to unit execution. Because such closures ma
 callback tables or event loops, strict mode treats these captured names as live to defend against
 escaping callbacks across lexical scopes.
 
-- **Memoization & Cache Invalidation**: Downstream liveness analysis caches AST traversal results
-  in a thread-safe LRU cache keyed by SHA-256 source digest (full 256-bit hash hex string),
-  unit line/column coordinates, candidate outputs, closure strictness (`skip_pre_unit_closures`),
-  and enclosing unit inputs (`unit_inputs`). Because cache keys depend solely on source content
-  digests and unit coordinates rather than file paths or unit names, cache entries are cleanly
-  shared across clones and files with identical content. To support concurrent patch generation
-  and avoid cache thrashing across multi-pair sessions, `clear_dataflow_cache()` is exposed
-  as a public API (exported from `pydoppelgangerhunt.fixer`) for callers to invoke at batch
-  boundaries. Long-running processes (such as IDE language servers, daemon file watchers, or
-  custom analysis pipelines invoking `collect_downstream_read_names` directly) should call
-  `clear_dataflow_cache()` periodically between scan runs or batch boundaries to release
-  memoized AST trees and parent node maps.
-- **Precision vs. Soundness Trade-off**: Pre-unit closure scanning can be configured via
-  `--closure-strictness {strict,lenient,fail_closed,fast,skip}` (or `--skip-pre-unit-closures`, or setting
-  `closure_strictness = "strict"|"lenient"` in `pyproject.toml`):
-  - `strict` (alias: `fail_closed`, default): Conservative defense mode that treats
-    pre-unit closures capturing candidate outputs as live escaping callbacks, guarding against
-    callbacks registered in event loops or tables.
-  - `lenient` (aliases: `fast`, `skip`): Precision-oriented mode that skips pre-unit closure
-    scanning, reducing false-positive pair rejections in codebases where pre-unit closures never
-    escape, at the cost of potential callback capture hazards for escaping closures.
+- **Memoization, `AnalysisSession`, & Cache Invalidation**: Process-global memoization is
+  restricted strictly to immutable SHA-256 source-text caches (`_parsed_tree_cache` and
+  `_downstream_reads_cache`, keyed by full 256-bit source digests, unit line/column coordinates,
+  candidate outputs, closure strictness, and enclosing unit inputs). All AST-keyed derived maps
+  (parent maps, statement line indexes, closure/loop/try-with/cell-info tables, and registered
+  tree source lines) live strictly inside a run-scoped `AnalysisSession` bound via
+  `contextvars.ContextVar` (publicly exported as `AnalysisSession` and `analysis_session()` from
+  `pydoppelgangerhunt` and `pydoppelgangerhunt.fixer`). Top-level entrypoints (`cli.main`,
+  `generate_refactoring_patch`, `generate_html_report`, `synthesize_refactoring_suggestion`,
+  `synthesize_shared_helper_code`, `inspect_single_unit_scope`, `analyze_unit_variable_scope`,
+  and `collect_downstream_read_names`) automatically enter `with analysis_session():` so repeated
+  lookups within a batch share cached maps and release every AST reference immediately when the
+  session exits. Standalone calls outside an explicit session compute statelessly, so caller-owned
+  `ast.AST` objects mutated between calls are observed immediately without manual eviction and
+  never poison the immutable source-hash cache. Callers running custom multi-call pipelines over
+  immutable ASTs can wrap their batch in `with analysis_session():` (and share sessions across
+  worker threads via `contextvars.copy_context().run`). Long-running processes (such as IDE
+  language servers or daemon file watchers) should call `clear_dataflow_cache()` at batch
+  boundaries to release memoized parsed ASTs and source-hash liveness entries.
+- **Precision vs. Soundness Trade-off**: Pre-unit closure and context-manager exception-suppression
+  analysis is configured via the single `closure_strictness` knob
+  (`--closure-strictness {strict,pedantic,lenient}`, or `closure_strictness = "strict"|"pedantic"|"lenient"`
+  and `non_suppressing_ctx_managers = [...]` in `pyproject.toml` or per-unit `UnitSchema` dicts;
+  applicable across text/`--suggest` reports, `--html` reports, and `--patch`). Precedence is uniform
+  across CLI and programmatic APIs: explicit caller `closure_strictness` overrides per-unit
+  `unit["closure_strictness"]`, which overrides the entrypoint default (`"pedantic"` for `--patch` /
+  `generate_refactoring_patch`, `"strict"` for reporting). Unrecognized `closure_strictness` values
+  in `pyproject.toml`, CLI flags, or per-unit `unit["closure_strictness"]` fields validated by
+  `validate_unit_schema` (invoked automatically by `generate_refactoring_patch` and
+  `synthesize_shared_helper_code`) raise `ValueError`, whereas passing an unrecognized string to the
+  `closure_strictness=` keyword parameter (in `resolve_closure_strictness_mode()`,
+  `generate_refactoring_patch()`, `synthesize_shared_helper_code()`, etc.) logs a deduplicated
+  warning and falls back to the unit's explicit mode or the entrypoint default:
+  - `strict` (default for reporting, `--suggest`, and `--html`): **Heuristic context-manager safety mode** with conservative closure-cell
+    analysis. Treats pre-unit closures capturing candidate outputs as live escaping callbacks and
+    enforces all closure-cell hazard checks. For `with` / `async with` blocks, calls to standard
+    library non-suppressing context-manager factories (`open(...)`, `builtins.open(...)`,
+    `__builtins__.open(...)`, `io.open`, `io.StringIO`, `io.BytesIO`, `io.TextIOWrapper`,
+    `io.BufferedReader`, `io.BufferedWriter`, `io.BufferedRandom`, `io.BufferedRWPair`,
+    `io.FileIO`, `tempfile.TemporaryDirectory`, `tempfile.NamedTemporaryFile`,
+    `tempfile.SpooledTemporaryFile`, `tempfile.TemporaryFile`,
+    `contextlib.nullcontext`, `contextlib.closing`, `contextlib.aclosing`, `contextlib.chdir`,
+    `contextlib.redirect_stdout`, `contextlib.redirect_stderr`, `warnings.catch_warnings`,
+    `threading.Lock`, `threading.RLock`, `threading.Condition`, `threading.Semaphore`,
+    `threading.BoundedSemaphore`, `asyncio.Lock`, `asyncio.Condition`, `asyncio.Semaphore`,
+    `asyncio.BoundedSemaphore`, `decimal.localcontext`, `unittest.mock.patch`, `mock.patch`,
+    `os.scandir`, `sqlite3.connect`, `zipfile.ZipFile`, `tarfile.TarFile`, `tarfile.open`,
+    `gzip.open`, `gzip.GzipFile`, `bz2.open`, `bz2.BZ2File`, `lzma.open`, `lzma.LZMAFile`,
+    `mmap.mmap`, `socket.socket`, `socket.create_connection`), local variables bound to instances
+    returned by those calls, and local classes with a strictly static class body whose
+    `__exit__`/`__aexit__` returns only `False`/`None` are proven non-suppressing (whereas bare
+    uncalled factory references such as `with open:` or `with contextlib.nullcontext:` and
+    `pathlib.Path(...)` are never treated as non-suppressing context managers). Unproven context
+    managers use a name-and-provenance heuristic:
+    managers are treated as non-suppressing unless their terminal identifier/callee attribute
+    matches—at `snake_case` or `CamelCase` token boundaries—one of the 41 case-insensitive
+    suppression-idiom stems (`suppress`, `raises`, `ignor`, `subtest`, `exitstack`,
+    `enter_context`, `enter_async_context`, `cancelscope`, `move_on_after`, `fail_after`, `catch`,
+    `swallow`, `silen`, `quiet`, `toler`, `best_effort`, `absorb`, `trap`, `fallback`, `noop`,
+    `no_op`, `shield`, `retry`, `attempt`, `skip`, `mute`, `muting`, `maybe`, `hush`, `discard`,
+    `forgiv`, `squelch`, `quench`, `mask`, `handl`, `safe`, `failsafe`, `rescue`, `recover`,
+    `allow`, `continue_on`, avoiding unrelated names such as `masked_array`,
+    `commute`, `Mutex`, `bootstrap`, or `tolerance_ctx`) or their root
+    receiver/class is proven suppressing via local/function/class `__exit__` provenance (intermediate
+    attribute names on receiver chains such as `self.retry_budget.acquire()` are not scanned).
+    **Note**: because this heuristic is name-based, `strict` mode is **fail-open for neutrally
+    named custom exception-suppressing context managers** (such as `Transaction()`, `Guard()`,
+    `SpanContext()`, `SessionScope()`, or `BatchContext()`). In units that read an enclosing
+    `global` variable, `strict` mode rejects arbitrary calls, `with`/`async with` blocks,
+    `import` statements, suspension points (`await`, `yield`, `yield from`, `async for`, and async comprehensions),
+    attribute/subscript/descriptor mutations, deletions, and external or `@=` augmented assignments,
+    while permitting C-level built-ins (`callable`, `id`, `ord`), dunder-invoking inspection/conversion
+    built-ins (`bin`, `bool`, `chr`, `hex`, `int`, `isinstance`, `issubclass`, `len`, `oct`, `range`),
+    implicit boolean truthiness, synchronous read-only AST expressions, and local primitive-initialized
+    accumulator augmented assignments (`total = 0; total += x`) under the heuristic that user dunders
+    (`__len__`, `__index__`, `__bool__`, `__radd__`, etc.) do not mutate module-level globals.
+    Whenever an unproven context manager is accepted via the name heuristic or a wildcard
+    allowlist pattern, `pyDoppelgangerHunt` logs a deduplicated `INFO` diagnostic and—for
+    accepted/committed pairs across `--suggest`, `--html`, and `--patch` (omitting rejected or
+    skipped pairs)—a session-scoped `WARNING` summary (or `INFO` when `warn=False` is passed
+    explicitly) to `stderr`/logging (never polluting `stdout` or `--output` report files, while
+    recording an advisory `# Note:` comment in `--suggest` / `--html` helper blocks and `--patch`
+    unified diffs); `--patch` / `generate_refactoring_patch` (both `replace_clones=False` and
+    `True`) defaults to `pedantic` unless `closure_strictness` is explicitly set.
+    In every mode, positive non-suppression proofs (local class bodies and pure-Python stdlib
+    managers such as `contextlib.nullcontext`) are withdrawn for the whole module when a finite
+    single-pass syntactic guard detects direct runtime exit-protocol patching (`Cls.__exit__ = ...`,
+    `del Cls.__aexit__`, `obj.__class__ = ...`, `Cls.__bases__ = ...`, direct
+    `setattr`/`delattr`/`__setattr__`/`__delattr__` targeting `__exit__`/`__aexit__`/`__class__`/`__bases__`
+    or a non-literal attribute name), direct `exec`/`eval` calls, or direct imported/stdlib module
+    factory rebinds (`contextlib.nullcontext = ...`, `builtins.open = ...`, `mylib.Guard = ...`).
+    Directly patched names are treated as suspicious (potentially suppressing) and override
+    `non_suppressing_ctx_managers` for those names, while unshadowed, non-explicitly-rebound
+    builtin `open(...)` and unpatched explicit `non_suppressing_ctx_managers` entries remain
+    trusted. **Static trust boundary**: indirect dynamic reflection (builtin aliasing such as
+    `f = setattr`, `sys.modules`/`importlib`/`vars()`/`globals()`/`dict` namespace mutations,
+    metaclasses, and out-of-module monkey-patching) is intentionally outside single-file static
+    AST analysis; use `closure_strictness = "pedantic"` (default for `--patch`) whenever unproven
+    context managers must fail closed.
+  - `pedantic` (default for `--patch` / `generate_refactoring_patch` when no explicit
+    `closure_strictness` is set): **Stricter static conservative mode**
+    that treats all unproven unknown `with` / `async with` context managers as potentially
+    exception-suppressing unless explicitly allowlisted via `--non-suppressing-ctx-managers` or
+    `non_suppressing_ctx_managers` (merged across global config and per-unit overrides), and inside
+    global-reading units rejects dunder-invoking built-in calls (`len`, `bool`, `chr`, `int`, `bin`,
+    `hex`, `oct`, `isinstance`, `issubclass`, `range`), all augmented assignments (`total += x`),
+    and unproven implicit-dunder AST operations (binary/unary operators, non-identity comparisons and
+    `in`/`not in` membership checks, attribute/`@property` and subscript reads, `for`/comprehension
+    iteration, sequence/mapping unpacking, f-string formatting, `set`/`dict` key hashing, `match`
+    class/value/mapping/sequence patterns on unproven subjects, non-builtin `raise`/`except`
+    handlers, and boolean truth-value evaluations) unless operands are syntactic literals, literal
+    containers, identity comparisons (`is` / `is not`), or unshadowed C-level built-ins (`callable`,
+    `id`, `ord`)—untyped variable operands fail closed in `pedantic` mode without speculative
+    local-variable type inference. Static analysis remains bounded by Python's dynamic runtime (e.g., runtime
+    frame introspection via `sys._getframe()`, metaclasses, or out-of-module monkeypatching of a
+    module's context-manager classes are not modeled). Prefer explicit dotted paths (e.g.,
+    `pkg.tx.atomic` or `unittest.mock.patch.object`, which match absolute imports only and do not
+    match relative imports such as `from ..pkg.tx import atomic`), relative imports (`.Name`
+    matching any relative import ending in `Name`, such as `from . import Name` or
+    `from .sub import Name`; use `.sub.Name` or `..sub.Name` to pin a specific relative module
+    path and dot depth), and bare names
+    (including locally defined classes); use wildcards (`<module>.*.attr` for resolvable receivers
+    or, as a last resort, `*.atomic` matching `<any_receiver>.atomic(...)`) sparingly, because
+    wildcard matches rely on attribute names alone without proving the receiver cannot suppress
+    exceptions (accepted wildcard matches record an advisory `# Note:` comment and session summary
+    warning). Bare `*`, `*.*`, Python keywords, and malformed wildcard patterns raise `ValueError`.
+  - `lenient`: Precision-oriented mode that skips pre-unit
+    closure liveness scanning for generator subroutines and relaxes speculative unreferenced-sibling
+    closure checks, while still enforcing checks for unbound captured cells at the extraction point,
+    externally mutated captured cells, intra-unit `nonlocal`/walrus mutator escapes, and sibling
+    closures explicitly referenced as unit inputs.
 
 #### Safety Model & Fail-Closed Refactoring Guarantees
 
 When synthesizing refactoring patches and shared helpers, `pyDoppelgangerHunt` enforces
 strict fail-closed safety invariants:
+- **Unavailable Source Placeholders & Host-Caller Preview Semantics**: Units lacking backing source
+  (including tree-only units without inline/file source) emit `"unavailable_source_placeholder"` and
+  `is_control_flow_safe = False`. Because `u1` always supplies the extracted helper AST, a
+  placeholder `u1` is unconditionally rejected across pair resolution, helper synthesis, and patch
+  generation (preventing placeholder comment lines from ever entering a helper); for `u2`,
+  subroutine extraction, `replace_clones=True`, explicit `source_text2` inputs, inline `u2`
+  source buffers, readable `u2` disk files, and invalid notebook anchors/buffers reject
+  placeholders, while whole-unit preview-only extraction (`replace_clones=False`, genuinely
+  missing caller file) intentionally synthesizes the helper from `u1`'s verified AST and records
+  a manual-import advisory comment.
 - **Lexical Scope Containment & Pre-Unit Closure Isolation (Generator Subroutines)**: For generator
   subroutines, any closures, lambdas, generator expressions, or nested class definitions preceding a
   candidate unit within the enclosing lexical scope that capture potential output variables are
@@ -293,7 +438,29 @@ strict fail-closed safety invariants:
   reads within the local module file. Because `yield` at module level is a Python `SyntaxError`,
   generator return propagation applies strictly to functions and methods. For non-generator
   module-level units, variables defined within the unit are module-level globals; ensure
-  module-level refactorings do not alter globals exported as public module API.
+  module-level refactorings do not alter globals exported as public module API. When a subroutine
+  inside an enclosing function reads a variable declared `global` in that enclosing scope, calls to
+  arbitrary functions, context-manager blocks (`with` / `async with`), import statements
+  (`import` / `from ... import`), coroutine/generator
+  suspension points (`await`, `yield`, `yield from`, `async for`), attribute/subscript
+  assignments (`obj.attr = ...`, `obj[k] = ...`), non-static class-body attributes (`class C: attr = descriptor`,
+  which can invoke `__set_name__` during class creation), external or non-primitive/`@=` augmented assignments
+  (`counter += 1`, `obj.attr += 1`, `obj[k] += 1`, `total @= x`), and deletions (`del`) are
+  rejected in both `strict` and `pedantic` modes as a `global_escape` hazard because they could
+  rebind or mutate the module-level global mid-execution. Local arithmetic/bitwise augmented assignments on variables
+  initialized inside the unit to a primitive constant (`total = 0; total += x`), implicit boolean truth-value tests,
+  and read-only AST protocol operations (binary/unary/comparison operators, subscript reads, attribute/`@property`
+  reads, synchronous `for`/comprehension iteration, unpacking, f-strings, and container literals) are permitted in
+  `strict` mode (under the heuristic assumption that user operands do not mutate module-level globals inside protocol
+  dunders such as `__radd__`, `__bool__`, `__getitem__`, `__getattr__`, `__iter__`, or `__format__`) and rejected in
+  `pedantic` mode unless operands are syntactic immutable literals, literal containers, identity comparisons
+  (`is` / `is not`), or unshadowed C-level built-ins (`callable`, `id`, `ord`); untyped local-variable operands fail
+  closed in `pedantic` mode. C-level built-ins that do not
+  invoke user-defined Python dunders (`callable`, `id`, `ord`) are permitted when unshadowed in both `strict` and
+  `pedantic` modes; dunder-invoking inspection/conversion built-ins (`bin`, `bool`, `chr`, `hex`, `int`, `isinstance`,
+  `issubclass`, `len`, `oct`, `range`) are permitted in `strict` mode under the heuristic assumption that user
+  types do not mutate module-level globals inside `__len__`/`__bool__`/`__int__`/`__index__`/
+  `__instancecheck__`/`__subclasscheck__`, and are rejected in `pedantic` mode.
 - **Dynamic Scope Reflection Limitations**: Downstream variable liveness analysis statically
   identifies dynamic local and global reads via `locals()`, `vars()`, `eval()`, `exec()`, `dir()`,
   and `globals()`. Dynamic reflection via runtime stack frame introspection (such as
@@ -332,8 +499,7 @@ with `--patch`, check verbose logs (`-v` or logging level `DEBUG`):
 - **Pre-Unit Closure Escapes**: If candidate outputs are captured by closures or callbacks defined
   prior to the unit, extraction fails closed to prevent the closure from observing stale local
   state after subroutine extraction. If you have verified that the pre-unit closure is never
-  invoked after the extracted unit executes, you can enable `--closure-strictness lenient`
-  (or `--skip-pre-unit-closures`).
+  invoked after the extracted unit executes, you can enable `--closure-strictness lenient`.
 - **Abnormal Exit Handlers**: If a generator subroutine is enclosed in a `try` block whose `finally`
   or `except` handlers read needed outputs, extraction is rejected to protect cleanup integrity.
 - **Indefinite Stores**: If an output variable in a generator subroutine lacks definite assignment
@@ -360,14 +526,14 @@ pydoppelgangerhunt --init
 | `--format` | `text\|json\|sarif` | Output report format (default: `text`) |
 | `--output`, `-o` | `PATH` | Output file path to save report |
 | `--html` | `PATH` | Write standalone interactive HTML dashboard report |
-| `--patch` | `PATH` | Write git-apply compatible unified patch file |
+| `--patch` | `PATH` | Write git-apply compatible unified patch file (defaults `--closure-strictness` to `pedantic` when unset) |
 | `--replace-clones` | Flag | Replace duplicate clone bodies with calls delegating to extracted helpers |
 | `--type-merge-strategy` | `fallback_any\|union` | Parameter typing strategy for helper synthesis (`fallback_any` or `union`) |
 | `--method-binding` | `auto\|method\|module` | Target helper binding strategy (`auto`, `method`, or `module`) |
 | `--cross-file-strategy` | `auto\|shared_module\|host_module\|skip` | Cross-module deduplication strategy (`auto`, `shared_module`, `host_module`, or `skip`; default: `auto`) |
 | `--shared-module-name` | `FILENAME` | Target filename for shared utility extractions (default: `_common.py`) |
-| `--skip-pre-unit-closures` | Flag | Skip pre-unit closure scan during subroutine extraction |
-| `--closure-strictness` | `strict\|lenient\|fail_closed\|fast\|skip` | Closure strictness mode (`strict` / `fail_closed` [soundness] or `lenient` / `fast` / `skip` [fewer rejections]; default: `strict`) |
+| `--closure-strictness` | `strict\|pedantic\|lenient` | Closure strictness mode (`strict` [heuristic `with`-suppression, default for reports/`--suggest`/`--html`], `pedantic` [all unproven `with`-managers treated as potentially suppressing, default for `--patch`], or `lenient` [relaxes speculative unreferenced-sibling closure checks while keeping unbound/mutated captured-cell, intra-unit `nonlocal`/walrus mutator, and referenced-sibling closure checks]) |
+| `--non-suppressing-ctx-managers` | `NAMES` | Context manager dotted paths, `.Name` relative imports, bare names, or (as a last resort) `<module>.*.attr` / `*.attr` wildcards proven not to suppress exceptions (comma-separated or repeatable) |
 | `--sort-by` | `similarity\|priority\|sloc` | Sort clone hits (default: `similarity`) |
 | `--priority` | Flag | Sort clones by Priority score: $\text{Sim} \times \text{SLOC} \times \text{Complexity}$ |
 | `--top` | `INT` | Truncate report to top $N$ clone pairs |
@@ -397,6 +563,10 @@ pydoppelgangerhunt --init
 | `--max-index-frequency` | `FLOAT` | Inverted index frequency threshold to prune ubiquitous shingles (default: `0.25`) |
 | `--workers` | `INT` | Number of worker processes for parallel AST harvesting |
 
+CLI exit codes: `0` when no clones (or only baselined clones) are found cleanly, `1` when clones are reported cleanly, `2` for invalid CLI or configuration usage (`argparse`), `3` when internal diagnostic errors occur without clones, and `4` when both clones and internal diagnostic errors occur.
+
+During CLI execution (`pydoppelgangerhunt` via `console_main()`), Python compiler `SyntaxWarning` and invalid-escape `DeprecationWarning` messages emitted while parsing user repositories are suppressed at process startup. Programmatic calls to `cli.main()` and direct library callers do not mutate process-global `warnings.filters` and retain standard Python warning behavior unless wrapped explicitly by the caller.
+
 ### Baseline Calibration & Massive Monorepo Deployments
 
 When running differential scans in CI pipelines (`--diff-only --baseline baseline.json`), `pyDoppelgangerHunt` reuses pre-computed corpus calibration metadata (shingle frequencies and corpus size) from the recorded baseline to provide fast, approximate IDF weighting and dynamic stop-shingle pruning bounds without having to recompute global repository frequency statistics from scratch. To guarantee that calibration never suppresses potentially valid clone candidates (preventing false negatives), candidate pruning is conservative when calibrated document frequencies are near the pruning cutoff.
@@ -412,12 +582,12 @@ All pull requests and releases are validated against 7 automated quality gates d
 
 | Gate | Target | Tool / Command | Invariant Threshold |
 | :--- | :--- | :--- | :--- |
-| **Gate 1** | Type Safety | `mypy` | 0 errors across 18 source files |
+| **Gate 1** | Type Safety & Py3.9 Syntax | `mypy` + `scripts/check_py39_compat.py` | 0 mypy errors & Python 3.9 grammar compatibility across all source and test files |
 | **Gate 2** | Code Quality | `pylint` | Strict **10.00 / 10.00** rating |
 | **Gate 3** | Packaging Hygiene | `deptry` | 0 unused, missing, or transitive dependencies |
 | **Gate 4** | AST Security | `bandit` | 0 security issues (`-ll`) |
 | **Gate 5** | Supply Chain | `pip-audit` | 0 known CVEs in virtual environment |
-| **Gate 6** | Unit Tests & Coverage | `pytest` + `pytest-cov` | 80 passed, **$\ge 85.0\%$ branch coverage** (85.92%) |
+| **Gate 6** | Unit Tests & Coverage | `pytest` + `pytest-cov` | 100% passing, **$\ge 85.0\%$ branch coverage** |
 | **Gate 7** | Clone Barrier | `pydoppelgangerhunt` | 0 clones across Tier 1 ($\ge 70\%$, 8 lines) and Tier 2 ($\ge 80\%$, 6 lines) |
 
 ### Executing Quality Gates Locally

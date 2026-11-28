@@ -11,26 +11,32 @@ import builtins
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from pydoppelgangerhunt.config import (
+    resolve_closure_strictness_mode,
+    should_warn_closure_event,
+)
+from pydoppelgangerhunt._ast_compat import is_try_or_trystar_node
+from pydoppelgangerhunt.fixer._df_cfg import _block_unconditionally_terminates
 from pydoppelgangerhunt.fixer._df_cache import (
     _MAX_DOWNSTREAM_CACHE_SIZE,
+    _SessionBucket,
     _build_downstream_cache_key,
     _coerce_string_frozenset,
     _downstream_cache_lock,
     _downstream_reads_cache,
-    _extract_first_unit_coord,
     _extract_unit_end_col,
+    _extract_unit_start_col,
     _get_or_compute_scope_cached,
     _get_or_parse_tree,
     _get_valid_unit_bounds,
     _parse_source_tree,
-    _resolve_unit_ast_end_col,
-    _scope_loops_cache,
-    _scope_try_with_cache,
     _store_lru_cache_entry,
-    _warned_lenient_closure,
+    analysis_session,
 )
+from pydoppelgangerhunt.fixer._df_span_index import _resolve_unit_ast_end_col
 from pydoppelgangerhunt.fixer._df_closures import (
     _collect_pre_unit_closures,
+    _extract_scope_escaping_bindings,
     _extract_scope_local_names,
     _extract_single_node_local_names,
 )
@@ -82,7 +88,7 @@ def _find_enclosing_loops(
         return loops
 
     cached_loops = _get_or_compute_scope_cached(
-        _scope_loops_cache, scope_node, _compute
+        _SessionBucket.LOOPS, scope_node, _compute
     )
     return [
         (l_start, l_end)
@@ -96,35 +102,16 @@ def _find_enclosing_loops(
     ]
 
 
-def _stmt_definitely_terminates(stmt: ast.stmt) -> bool:
+def _stmt_definitely_terminates(stmt: ast.stmt, *, _depth: int = 0) -> bool:
     """Checks whether an AST statement unconditionally exits execution."""
-    if isinstance(stmt, (ast.Return, ast.Raise)):
-        return True
-    if isinstance(stmt, ast.If):
-        return (
-            bool(stmt.orelse)
-            and _block_definitely_terminates(stmt.body)
-            and _block_definitely_terminates(stmt.orelse)
-        )
-    if isinstance(stmt, ast.Try):
-        if stmt.finalbody and _block_definitely_terminates(stmt.finalbody):
-            return True
-        if stmt.handlers and _block_definitely_terminates(stmt.body):
-            return all(_block_definitely_terminates(h.body) for h in stmt.handlers)
-    if type(stmt).__name__ == "TryStar":
-        finalbody = getattr(stmt, "finalbody", None)
-        if finalbody and _block_definitely_terminates(finalbody):
-            return True
-        handlers = getattr(stmt, "handlers", [])
-        body = getattr(stmt, "body", [])
-        if handlers and _block_definitely_terminates(body):
-            return all(_block_definitely_terminates(h.body) for h in handlers)
-    return False
+    return _block_unconditionally_terminates(
+        (stmt,), include_try=True, _depth=_depth
+    )
 
 
-def _block_definitely_terminates(stmts: Sequence[ast.stmt]) -> bool:
+def _block_definitely_terminates(stmts: Sequence[ast.stmt], *, _depth: int = 0) -> bool:
     """Checks whether any statement in a sequence unconditionally terminates execution."""
-    return any(_stmt_definitely_terminates(s) for s in stmts)
+    return _block_unconditionally_terminates(stmts, include_try=True, _depth=_depth)
 
 
 def _stmts_enclose_unit(stmts: Sequence[ast.stmt], u_start: int, u_end: int) -> bool:
@@ -172,14 +159,11 @@ def _get_scope_try_and_with_blocks(
         for node in ast.walk(scope_node):
             if node is scope_node:
                 continue
-            if (
-                isinstance(node, (ast.Try, ast.With, ast.AsyncWith))
-                or type(node).__name__ == "TryStar"
-            ):
+            if isinstance(node, (ast.With, ast.AsyncWith)) or is_try_or_trystar_node(node):
                 blocks.append(node)
         return blocks
 
-    return _get_or_compute_scope_cached(_scope_try_with_cache, scope_node, _compute)
+    return _get_or_compute_scope_cached(_SessionBucket.TRY_WITH, scope_node, _compute)
 
 
 def _execute_read_pass(
@@ -219,11 +203,24 @@ def _scope_reads_outputs_after_line(
     outputs: Set[str],
     end_col: Optional[int] = None,
     start_line: Optional[int] = None,
+    start_col: Optional[int] = None,
 ) -> bool:
     """Checks whether any statement in the scope loads outputs after the given line,
     including loop-carried reads if the statement sits inside an enclosing loop."""
+    output_set = (
+        outputs if isinstance(outputs, (set, frozenset)) else set(outputs)
+    )
     stmt_start = start_line if start_line is not None else line
     stmt_end = line
+    escaping_bindings = _extract_scope_escaping_bindings(
+        scope_node,
+        stmt_start,
+        stmt_end,
+        u_start_col=start_col,
+        u_end_col=end_col,
+    )
+    if not output_set.isdisjoint(escaping_bindings):
+        return True
     enclosing_loops = _find_enclosing_loops(scope_node, stmt_start, stmt_end)
     is_module = isinstance(scope_node, ast.Module)
 
@@ -233,12 +230,12 @@ def _scope_reads_outputs_after_line(
         stmt_end,
         stmt_end,
         end_col,
-        outputs,
+        output_set,
         enclosing_loops,
         _VisitorPassMode.AFTER_UNIT,
         is_module,
     )
-    if not outputs.isdisjoint(after_reads):
+    if not output_set.isdisjoint(after_reads):
         return True
 
     if enclosing_loops:
@@ -246,7 +243,7 @@ def _scope_reads_outputs_after_line(
             stmt_start,
             stmt_end,
             end_col,
-            candidates=outputs,
+            candidates=output_set,
             enclosing_loops=enclosing_loops,
             pass_mode=_VisitorPassMode.LOOP_CARRIED,
             is_module_scope=is_module,
@@ -256,7 +253,7 @@ def _scope_reads_outputs_after_line(
         )
         for stmt in _extract_scope_stmts(scope_node):
             loop_visitor.visit(stmt)
-        if not outputs.isdisjoint(loop_visitor.loaded):
+        if not output_set.isdisjoint(loop_visitor.loaded):
             return True
         if loop_visitor.has_dynamic_read:
             return True
@@ -265,14 +262,14 @@ def _scope_reads_outputs_after_line(
             stmt_start,
             stmt_end,
             end_col,
-            candidates=outputs,
+            candidates=output_set,
         )
         loop_killed = (
             loop_visitor.unit_entry_killed
             if loop_visitor.unit_entry_killed is not None
             else set()
         )
-        if not outputs.isdisjoint(live_ins - loop_killed):
+        if not output_set.isdisjoint(live_ins - loop_killed):
             return True
 
     return False
@@ -287,6 +284,7 @@ def _compound_stmt_reads_outputs_after(
     """Checks whether outputs are read downstream of an enclosing compound statement."""
     end_raw = getattr(node, "end_lineno", None)
     end_col_raw = getattr(node, "end_col_offset", None)
+    start_col_raw = getattr(node, "col_offset", None)
     b_end = max(
         (
             int(getattr(s, "end_lineno", None) or getattr(s, "lineno", 0) or 0)
@@ -297,8 +295,14 @@ def _compound_stmt_reads_outputs_after(
     s_start = getattr(node, "lineno", None) or 1
     s_end = end_raw if isinstance(end_raw, int) else b_end
     s_end_col = end_col_raw if isinstance(end_col_raw, int) else None
+    s_start_col = start_col_raw if isinstance(start_col_raw, int) else None
     return _scope_reads_outputs_after_line(
-        scope_node, s_end, outputs, end_col=s_end_col, start_line=s_start
+        scope_node,
+        s_end,
+        outputs,
+        end_col=s_end_col,
+        start_line=s_start,
+        start_col=s_start_col,
     )
 
 
@@ -330,7 +334,7 @@ def _enclosing_try_reads_outputs(
                         return True
                 continue
 
-            if isinstance(node, ast.Try) or type(node).__name__ == "TryStar":
+            if is_try_or_trystar_node(node):
                 body_nodes = getattr(node, "body", [])
                 orelse_nodes = getattr(node, "orelse", [])
                 handlers = getattr(node, "handlers", [])
@@ -380,7 +384,7 @@ def _enclosing_try_reads_outputs(
                         ):
                             return True
         return False
-    except (RecursionError, MemoryError):
+    except RecursionError:
         return True
 
 
@@ -413,7 +417,7 @@ def collect_downstream_read_names(
     candidates: Optional[Set[str]] = None,
     *,
     tree: Optional[ast.AST] = None,
-    skip_pre_unit_closures: bool = False,
+    closure_strictness: str = "strict",
     source_digest: Optional[str] = None,
     unit_inputs: Optional[Set[str]] = None,
 ) -> Optional[Set[str]]:
@@ -432,7 +436,7 @@ def collect_downstream_read_names(
         unit: AST unit mapping containing start and end coordinates.
         candidates: Optional set of variable names to restrict analysis to.
         tree: Optional pre-parsed module AST.
-        skip_pre_unit_closures: Whether pre-unit closure read capture is bypassed.
+        closure_strictness: Closure strictness mode ('lenient', 'strict', or 'pedantic').
         source_digest: Optional hex SHA-256 digest of source_text (must match
             hashlib.sha256(source_text.encode('utf-8', 'replace')).hexdigest()).
         unit_inputs: Precomputed live unit inputs.
@@ -443,168 +447,210 @@ def collect_downstream_read_names(
     if bounds is None:
         return None
     u_start, u_end = bounds
+    is_lenient = resolve_closure_strictness_mode(closure_strictness) == "lenient"
 
     # Fast-path early out: if candidate set is explicitly empty, no outputs can match
     if candidates is not None and not candidates:
         return set()
 
     try:
-        effective_tree = tree
-        if effective_tree is None:
-            effective_tree = _get_or_parse_tree(source_text, source_digest=source_digest)
+        with analysis_session() as active_sess:
+            caller_supplied_tree = tree is not None
+            effective_tree = tree
+            if effective_tree is None:
+                effective_tree = _get_or_parse_tree(
+                    source_text, source_digest=source_digest
+                )
 
-        u_end_col = _extract_unit_end_col(unit)
-        scope_node: Optional[ast.AST] = None
-        if u_end_col is None:
-            scope_node = _resolve_downstream_scope_node(source_text, unit, effective_tree)
+            u_end_col = _extract_unit_end_col(unit)
+            scope_node: Optional[ast.AST] = None
+            if u_end_col is None:
+                scope_node = _resolve_downstream_scope_node(
+                    source_text, unit, effective_tree
+                )
+                if scope_node is None:
+                    return None
+                u_end_col = _resolve_unit_ast_end_col(scope_node, unit)
+
+            effective_unit_inputs = unit_inputs
+            if (
+                effective_unit_inputs is None
+                and "inputs" in unit
+                and unit["inputs"] is not None
+            ):
+                coerced_inputs = _coerce_string_frozenset(unit["inputs"])
+                effective_unit_inputs = (
+                    set(coerced_inputs) if coerced_inputs is not None else None
+                )
+
+            cache_key = _build_downstream_cache_key(
+                source_text,
+                unit,
+                u_start,
+                u_end,
+                candidates,
+                is_lenient,
+                source_digest=source_digest,
+                resolved_end_col=u_end_col,
+                unit_inputs=effective_unit_inputs,
+            )
+            if not caller_supplied_tree:
+                with _downstream_cache_lock:
+                    if cache_key in _downstream_reads_cache:
+                        cached = _downstream_reads_cache[cache_key]
+                        _downstream_reads_cache.move_to_end(cache_key)
+                        return set(cached)
+            else:
+                sess_key = (effective_tree, cache_key)
+                sess_bucket = active_sess.get_bucket(_SessionBucket.DOWNSTREAM_READS)
+                if sess_key in sess_bucket:
+                    sess_bucket.move_to_end(sess_key)
+                    return set(sess_bucket[sess_key])
+
             if scope_node is None:
-                return None
-            u_end_col = _resolve_unit_ast_end_col(scope_node, unit)
+                scope_node = _resolve_downstream_scope_node(
+                    source_text, unit, effective_tree
+                )
+                if scope_node is None:
+                    return None
 
-        effective_unit_inputs = unit_inputs
-        if effective_unit_inputs is None and "inputs" in unit and unit["inputs"] is not None:
-            coerced_inputs = _coerce_string_frozenset(unit["inputs"])
-            effective_unit_inputs = (
-                set(coerced_inputs) if coerced_inputs is not None else None
+            u_start_col = _extract_unit_start_col(unit)
+            enclosing_loops = _find_enclosing_loops(
+                scope_node,
+                u_start,
+                u_end,
+                u_start_col=u_start_col,
             )
 
-        cache_key = _build_downstream_cache_key(
-            source_text,
-            unit,
-            u_start,
-            u_end,
-            candidates,
-            skip_pre_unit_closures,
-            source_digest=source_digest,
-            resolved_end_col=u_end_col,
-            unit_inputs=effective_unit_inputs,
-        )
-        with _downstream_cache_lock:
-            if cache_key in _downstream_reads_cache:
-                cached = _downstream_reads_cache[cache_key]
-                _downstream_reads_cache.move_to_end(cache_key)
-                return set(cached)
-
-        if scope_node is None:
-            scope_node = _resolve_downstream_scope_node(source_text, unit, effective_tree)
-            if scope_node is None:
-                return None
-
-        u_start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
-        enclosing_loops = _find_enclosing_loops(
-            scope_node,
-            u_start,
-            u_end,
-            u_start_col=u_start_col,
-        )
-
-        if skip_pre_unit_closures:
-            pre_unit_captured_reads: Set[str] = set()
-            with _downstream_cache_lock:
-                if not _warned_lenient_closure[0]:
-                    _warned_lenient_closure[0] = True
+            if is_lenient:
+                pre_unit_captured_reads: Set[str] = set()
+                if should_warn_closure_event("lenient_closure_mode"):
                     logger.debug(
                         "Lenient closure mode active: suppressed pre-unit "
                         "closure read capture; escaping callback mutations "
                         "may be unobserved"
                     )
-        else:
-            pre_unit_captured_reads = _collect_pre_unit_closures(
+            else:
+                pre_unit_captured_reads = _collect_pre_unit_closures(
+                    scope_node,
+                    u_start,
+                    candidates=candidates,
+                    u_start_col=u_start_col,
+                    module_tree=effective_tree,
+                )
+
+            is_module = isinstance(scope_node, ast.Module)
+            outer_locals = _extract_scope_local_names(
                 scope_node,
-                u_start,
-                candidates=candidates,
-                u_start_col=u_start_col,
-                module_tree=effective_tree,
+                effective_tree,
+                include_classes=False,
+                include_self_name=False,
             )
 
-        is_module = isinstance(scope_node, ast.Module)
-        outer_locals = _extract_scope_local_names(
-            scope_node,
-            effective_tree,
-            include_classes=False,
-            include_self_name=False,
-        )
-
-        visitor = _DownstreamReadVisitor(
-            u_start,
-            u_end,
-            u_end_col,
-            candidates=candidates,
-            enclosing_loops=enclosing_loops,
-            pass_mode=_VisitorPassMode.AFTER_UNIT,
-            is_module_scope=is_module,
-            u_start_col=u_start_col,
-        )
-        visitor.outer_bound.update(outer_locals)
-        scope_stmts = _extract_scope_stmts(scope_node)
-        for stmt in scope_stmts:
-            visitor.visit(stmt)
-
-        loaded = set(visitor.loaded)
-        loop_visitor: Optional[_DownstreamReadVisitor] = None
-        if enclosing_loops:
-            loop_visitor = _DownstreamReadVisitor(
+            visitor = _DownstreamReadVisitor(
                 u_start,
                 u_end,
                 u_end_col,
                 candidates=candidates,
                 enclosing_loops=enclosing_loops,
-                pass_mode=_VisitorPassMode.LOOP_CARRIED,
+                pass_mode=_VisitorPassMode.AFTER_UNIT,
                 is_module_scope=is_module,
                 u_start_col=u_start_col,
             )
-            loop_visitor.outer_bound.update(outer_locals)
+            visitor.outer_bound.update(outer_locals)
+            scope_stmts = _extract_scope_stmts(scope_node)
             for stmt in scope_stmts:
-                loop_visitor.visit(stmt)
-            loaded.update(loop_visitor.loaded)
+                visitor.visit(stmt)
 
-            eff_inputs = (
-                effective_unit_inputs
-                if effective_unit_inputs is not None
-                else _extract_unit_live_in_names(
-                    scope_node,
+            loaded = set(visitor.loaded)
+            loop_visitor: Optional[_DownstreamReadVisitor] = None
+            if enclosing_loops:
+                loop_visitor = _DownstreamReadVisitor(
                     u_start,
                     u_end,
                     u_end_col,
                     candidates=candidates,
+                    enclosing_loops=enclosing_loops,
+                    pass_mode=_VisitorPassMode.LOOP_CARRIED,
+                    is_module_scope=is_module,
                     u_start_col=u_start_col,
                 )
-            )
-            cand_inputs = (
-                set(candidates) & eff_inputs if candidates is not None else set(eff_inputs)
-            )
-            loop_killed = (
-                loop_visitor.unit_entry_killed
-                if loop_visitor.unit_entry_killed is not None
-                else set()
-            )
-            loaded.update(cand_inputs - loop_killed)
+                loop_visitor.outer_bound.update(outer_locals)
+                for stmt in scope_stmts:
+                    loop_visitor.visit(stmt)
+                loaded.update(loop_visitor.loaded)
 
-        has_dynamic = visitor.has_dynamic_read or (
-            loop_visitor is not None and loop_visitor.has_dynamic_read
-        )
-        if has_dynamic:
-            if candidates is not None:
-                loaded.update(candidates)
+                eff_inputs = (
+                    effective_unit_inputs
+                    if effective_unit_inputs is not None
+                    else _extract_unit_live_in_names(
+                        scope_node,
+                        u_start,
+                        u_end,
+                        u_end_col,
+                        candidates=candidates,
+                        u_start_col=u_start_col,
+                    )
+                )
+                cand_inputs = (
+                    set(candidates) & eff_inputs
+                    if candidates is not None
+                    else set(eff_inputs)
+                )
+                loop_killed = (
+                    loop_visitor.unit_entry_killed
+                    if loop_visitor.unit_entry_killed is not None
+                    else set()
+                )
+                loaded.update(cand_inputs - loop_killed)
+
+            has_dynamic = visitor.has_dynamic_read or (
+                loop_visitor is not None and loop_visitor.has_dynamic_read
+            )
+            if has_dynamic:
+                if candidates is not None:
+                    loaded.update(candidates)
+                else:
+                    for subnode in ast.walk(scope_node):
+                        if isinstance(subnode, ast.Name) and isinstance(
+                            subnode.ctx, (ast.Store, ast.Load)
+                        ):
+                            if (
+                                subnode.id not in _BUILTIN_NAMES
+                                and not subnode.id.startswith("__")
+                            ):
+                                loaded.add(subnode.id)
+
+            _merge_pre_unit_closure_reads(loaded, pre_unit_captured_reads, candidates)
+            escaping_bindings = _extract_scope_escaping_bindings(
+                scope_node,
+                u_start,
+                u_end,
+                u_end_col=u_end_col,
+                u_start_col=u_start_col,
+            )
+            if escaping_bindings:
+                if candidates is not None:
+                    loaded.update(escaping_bindings & candidates)
+                else:
+                    loaded.update(escaping_bindings - _BUILTIN_NAMES)
+
+            if not caller_supplied_tree:
+                _store_lru_cache_entry(
+                    _downstream_reads_cache,
+                    cache_key,
+                    frozenset(loaded),
+                    _MAX_DOWNSTREAM_CACHE_SIZE,
+                )
             else:
-                for subnode in ast.walk(scope_node):
-                    if isinstance(subnode, ast.Name) and isinstance(
-                        subnode.ctx, (ast.Store, ast.Load)
-                    ):
-                        if subnode.id not in _BUILTIN_NAMES and not subnode.id.startswith("__"):
-                            loaded.add(subnode.id)
+                active_sess.get_or_compute(
+                    _SessionBucket.DOWNSTREAM_READS,
+                    (effective_tree, cache_key),
+                    lambda: frozenset(loaded),
+                )
 
-        _merge_pre_unit_closure_reads(loaded, pre_unit_captured_reads, candidates)
-
-        _store_lru_cache_entry(
-            _downstream_reads_cache,
-            cache_key,
-            frozenset(loaded),
-            _MAX_DOWNSTREAM_CACHE_SIZE,
-        )
-
-        return loaded
-    except (RecursionError, MemoryError):
+            return loaded
+    except RecursionError:
         return None
 
 

@@ -4,11 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 from pydoppelgangerhunt import (
     check_asymmetric_coverage,
-    compute_repository_dry_stats,
     compute_unit_coverage,
     read_coverage_data,
 )
